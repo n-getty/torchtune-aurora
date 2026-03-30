@@ -1,0 +1,1914 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+#
+# XPU-adapted variant of grpo_full_finetune_distributed.py with:
+# - Device-agnostic memory ops (XPU / CUDA / CPU)
+# - Gradient accumulation with no_sync() for multi-node efficiency
+# - Production mode sync skipping (FSDP_PRODUCTION_MODE env var)
+
+import os
+import sys
+import time
+from functools import partial
+from typing import Any, Optional, Union
+from warnings import warn
+
+# -- XPU / XCCL compatibility shim ---------------------------------------------
+# On Intel XPU (Aurora), running torchtune's ``__init__.py`` while an XCCL
+# process group is active corrupts the L0 USM pointer table, causing every
+# subsequent collective to fail.  The root cause is an interaction between
+# ``torchtune.__init__``'s ``import torchao`` / env-var setup and the XCCL
+# backend's device-context bookkeeping.
+#
+# Workaround:  pre-register the ``torchtune`` package in ``sys.modules``
+# (as a plain ``types.ModuleType``) *before* importing any submodules.
+# This prevents Python from executing ``torchtune/__init__.py`` while still
+# allowing all ``from torchtune.xxx import ...`` statements to work normally.
+#
+# Each rank uses ``device_id=xpu:{LOCAL_RANK + offset}`` instead of
+# ``ZE_AFFINITY_MASK`` — CCL needs to see all device UUIDs for allreduce.
+# --------------------------------------------------------------------------
+
+# 1. Tile affinity — use device_id=xpu:{LOCAL_RANK} (no offset).
+#
+#    IMPORTANT: Do NOT set ZE_AFFINITY_MASK for multi-rank training.
+#    CCL's allreduce needs to see all device UUIDs on the node to build the
+#    topology. When ZE_AFFINITY_MASK restricts each rank to 1 tile, CCL only
+#    discovers 1 UUID and falls back to the "scheduler path" which lacks
+#    ReduceOp.AVG support, causing errors for 3+ ranks.
+#
+#    Instead, leave ZE_AFFINITY_MASK unset and use device_id=xpu:{LOCAL_RANK}.
+#    CCL requires device_id index == LOCAL_RANK for correct topology routing.
+#    vLLM is launched separately with ZE_AFFINITY_MASK on higher-numbered tiles
+#    (e.g., tile 11) to avoid collisions.
+#
+#    Valid rank counts: must evenly divide CCL's topology view (works: 2, 4, 6,
+#    10, 12; fails: 3, 5, 7, 8, 9, 11). CCL maps ranks across 6 cards × 2 tiles.
+_xpu_device_index = int(os.environ.get("LOCAL_RANK", "0"))
+
+import torch
+
+# 2. Pre-register torchtune package to bypass its __init__.py on XPU
+import types as _types
+import importlib.util as _imp_util
+
+if "torchtune" not in sys.modules:
+    _spec = _imp_util.find_spec("torchtune")
+    if _spec is not None and _spec.submodule_search_locations:
+        _torchtune_path = list(_spec.submodule_search_locations)[0]
+    else:
+        # Fallback: assume editable install layout
+        _torchtune_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+            "torchtune",
+        )
+    if os.path.isdir(_torchtune_path):
+        _pkg = _types.ModuleType("torchtune")
+        _pkg.__path__ = [_torchtune_path]
+        _pkg.__file__ = os.path.join(_torchtune_path, "__init__.py")
+        _pkg.__version__ = ""
+        sys.modules["torchtune"] = _pkg
+
+# 3. Ensure torchao is available (torchtune.__init__ normally checks this)
+import torchao  # noqa
+
+from omegaconf import DictConfig, ListConfig
+from torch import nn
+from torch.distributed import destroy_process_group
+from torch.optim import Optimizer
+from torchdata.stateful_dataloader import StatefulDataLoader
+from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
+from torchtune import config, generation, modules, rlhf, training, utils
+from torchtune.config._utils import _get_component_from_path
+from torchtune.datasets import ConcatDataset
+from torchtune.dev.rl.generation import generate
+from torchtune.dev.rl.rewards import batched_rewards
+from torchtune.dev.rl.types import GRPOStats, GRPOTrajectory
+from torchtune.modules import local_kv_cache
+from torchtune.recipe_interfaces import FTRecipeInterface
+from torchtune.training import (
+    device_empty_cache,
+    device_record_memory_history,
+    disable_dropout,
+    DummyProfiler,
+    get_xpu_distributed_backend,
+    init_xpu_process_group,
+    PROFILER_KEY,
+    supports_memory_stats,
+)
+from torchtune.training.lr_schedulers import get_lr
+from tqdm import tqdm
+
+log = utils.get_logger("DEBUG")
+
+# Original device_empty_cache imported above. When colocated vLLM engines
+# are present, torch.xpu.empty_cache() can deadlock if called while another
+# rank is inside an FSDP collective. We replace it with synchronize() which
+# forces completion of pending XPU ops without risking the cache-clearing
+# deadlock, and still frees some memory via the allocator.
+_orig_device_empty_cache = device_empty_cache
+_colocate_vllm_mode = False
+
+def device_empty_cache(device: torch.device) -> None:
+    if device.type == "xpu":
+        # NEVER call empty_cache() on XPU with FSDP. The combination of
+        # empty_cache() + FSDP storage.resize_() leaks UR handles in Level
+        # Zero, causing UR_RESULT_ERROR_OUT_OF_RESOURCES after ~70 iters.
+        # The caching allocator reuses blocks without touching L0 if we
+        # skip empty_cache(). See docs/intel_xpu_resource_leak_bug_report.md
+        pass
+    else:
+        _orig_device_empty_cache(device)
+
+
+def _safe_empty_cache(device: torch.device) -> None:
+    """Empty cache at a synchronized point (after a barrier).
+
+    On XPU, this is a no-op — empty_cache() + FSDP leaks UR handles.
+    """
+    torch.distributed.barrier()
+    if device.type == "xpu":
+        torch.xpu.synchronize()
+        return
+    _orig_device_empty_cache(device)
+
+
+def _slice_trajectory(
+    trajectory: GRPOTrajectory, start: int, end: int
+) -> GRPOTrajectory:
+    """Slice a GRPOTrajectory along the batch dimension.
+
+    Args:
+        trajectory: The full trajectory.
+        start: Start index (inclusive).
+        end: End index (exclusive).
+
+    Returns:
+        A new GRPOTrajectory with only the [start:end] samples.
+    """
+    fields = {}
+    for field_name in trajectory._fields:
+        val = getattr(trajectory, field_name)
+        if isinstance(val, torch.Tensor):
+            fields[field_name] = val[start:end]
+        elif isinstance(val, list):
+            fields[field_name] = val[start:end]
+        else:
+            fields[field_name] = val
+    return GRPOTrajectory(**fields)
+
+
+
+class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
+    """
+    Distributed GRPO full-finetune recipe adapted for Intel XPU (Aurora HPC).
+
+    Key differences from the CUDA-only version:
+    - Device-agnostic memory management (empty_cache, memory stats)
+    - Gradient accumulation with ``no_sync()`` to reduce AllReduce overhead
+    - XPU-safe distributed init (no ``device_id`` for XCCL)
+    - Production mode sync skipping via ``FSDP_PRODUCTION_MODE`` env var
+    """
+
+    def __init__(self, cfg: DictConfig) -> None:
+        # Use the correct XPU device index (LOCAL_RANK + tile offset)
+        if cfg.device == "xpu":
+            self._device = torch.device(f"xpu:{_xpu_device_index}")
+            torch.xpu.set_device(_xpu_device_index)
+        else:
+            self._device = utils.get_device(device=cfg.device)
+        self._dtype = training.get_dtype(cfg.dtype, device=self._device)
+        self._output_dir = cfg.output_dir
+
+        # Logging attributes
+        self._log_every_n_steps = cfg.get("log_every_n_steps", 1)
+        self._log_peak_memory_stats = cfg.get("log_peak_memory_stats", False)
+        if self._log_peak_memory_stats and not supports_memory_stats(self._device):
+            log.info(
+                "log_peak_memory_stats was set to True, however, the device does "
+                "not support memory stats. Setting log_peak_memory_stats=False."
+            )
+            self._log_peak_memory_stats = False
+
+        # Initialize the distributed environment
+        self.fsdp_cpu_offload = cfg.get("fsdp_cpu_offload", False)
+        self.distributed_backend = get_xpu_distributed_backend(
+            self._device.type, offload_ops_to_cpu=self.fsdp_cpu_offload
+        )
+
+        # Colocated vLLM must be initialized BEFORE the training PG because
+        # vLLM creates gloo sub-groups that crash if the default PG was
+        # initialized with device_id=xpu:0.
+        vllm_mode = cfg.get("vllm_mode", None)
+        if cfg.get("vllm_url", None) is not None and vllm_mode is None:
+            vllm_mode = "server"
+        if vllm_mode in ("colocate", "colocate_sleep"):
+            self._init_vllm_early(cfg)
+
+        if not torch.distributed.is_initialized():
+            init_xpu_process_group(self.distributed_backend, device_index=_xpu_device_index)
+        self.world_size, self.rank = utils.get_world_size_and_rank()
+        self._is_rank_zero = self.rank == 0
+
+        # Force math-only SDPA to avoid XPU SDPA kernel UR handle leaks.
+        # The XPU-specific SDPA kernel leaks Unified Runtime handles on each
+        # call, eventually causing GPU segfaults. The math backend uses pure
+        # PyTorch matmul+softmax which doesn't leak.
+        if self._device.type == "xpu":
+            torch.backends.cuda.enable_flash_sdp(False)
+            torch.backends.cuda.enable_mem_efficient_sdp(False)
+            log.info("Rank %d: forced math-only SDPA (disabled flash/mem_efficient to avoid UR leaks)", self.rank)
+
+        # Production mode: skip non-essential torch.xpu.synchronize() calls
+        self._production_mode = (
+            os.environ.get("FSDP_PRODUCTION_MODE", "0") == "1"
+        )
+
+        # Training attributes
+        self._resume_from_checkpoint = cfg.resume_from_checkpoint
+        self._clip_grad_norm = cfg.get("clip_grad_norm", None)
+        self._enable_activation_checkpointing = cfg.get(
+            "enable_activation_checkpointing", False
+        )
+        self._compile = cfg.get("compile", False)
+
+        # Warn about compile + multi-node on XPU
+        if self._compile and self._device.type == "xpu":
+            local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", self.world_size))
+            if self.world_size > local_world_size:
+                log.warning(
+                    "torch.compile is not supported multi-node on XPU. Disabling."
+                )
+                self._compile = False
+
+        # Gradient accumulation
+        self._gradient_accumulation_steps = cfg.get("gradient_accumulation_steps", 1)
+
+        # vLLM generation (optional — None means use native generation)
+        # mode: "server" = external vLLM HTTP server on separate tile(s)
+        #        "colocate" = in-process vLLM engine per rank (TRL-style)
+        #        "colocate_sleep" = colocate with sleep/wake memory management
+        self._vllm_mode = cfg.get("vllm_mode", None)  # None, "server", "colocate", or "colocate_sleep"
+        self._vllm_url = cfg.get("vllm_url", None)
+        self._vllm_group_port = cfg.get("vllm_group_port", 51216)
+        self._vllm_weight_sync = cfg.get("vllm_weight_sync", True)
+        self._vllm_weight_sync_interval = cfg.get("vllm_weight_sync_interval", 1)
+        self._vllm_client = None  # initialized in setup() if vllm_mode == "server"
+        # _vllm_llm may already be set by _init_vllm_early() for colocate mode
+        if not hasattr(self, "_vllm_llm"):
+            self._vllm_llm = None
+        self._vllm_gpu_memory_utilization = cfg.get("vllm_gpu_memory_utilization", 0.3)
+        self._vllm_max_model_len = cfg.get("vllm_max_model_len", 2048)
+
+        # Backward compat: if vllm_url is set but vllm_mode is not, infer "server"
+        if self._vllm_url is not None and self._vllm_mode is None:
+            self._vllm_mode = "server"
+
+        # Recipe state attributes
+        self.seed = training.set_seed(seed=cfg.seed)
+        self.total_epochs = cfg.epochs
+        self.global_step = 0
+        self._steps_run = 0
+        self._total_steps = 0
+        self._epochs_run = 0
+        # torch.Generator does not support XPU — use CPU generator instead
+        _rng_device = self._device if self._device.type == "cuda" else torch.device("cpu")
+        self._rng = torch.Generator(_rng_device).manual_seed(self.seed)
+
+    def _init_vllm_early(self, cfg):
+        """Initialize a colocated vLLM engine on EVERY rank, before the training PG.
+
+        Each rank creates its own vLLM LLM engine on its own XPU tile (TRL-style).
+        This enables distributed generation: sequences are split across ranks,
+        each generates its share, then results are allgathered.
+
+        Strategy per rank: pre-initialize a gloo PG (world_size=1) with a file://
+        store so that vLLM's ``init_distributed_environment`` sees
+        ``is_initialized() == True`` and skips its own ``init_process_group``.
+        We also monkey-patch ``new_group`` to force gloo backend and
+        ``all_reduce`` to skip XPU tensor ops (gloo can't handle XPU tensors).
+
+        Ranks initialize sequentially (file-based barriers) to avoid port and
+        resource conflicts during vLLM startup.
+        """
+        rank = int(os.environ.get("RANK", "0"))
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        local_rank = _xpu_device_index  # The actual XPU tile for this rank
+
+        vllm_mode = cfg.get("vllm_mode", "colocate")
+
+        # For colocate_sleep mode, apply XPU sleep patches BEFORE importing vLLM LLM
+        if vllm_mode == "colocate_sleep":
+            from torchtune.dev.xpu_sleep import patch_vllm_for_xpu_sleep
+            patch_vllm_for_xpu_sleep()
+
+        from vllm import LLM
+
+        model_path = cfg.base_model_path
+        gpu_mem = cfg.get("vllm_gpu_memory_utilization", 0.3)
+        max_model_len = cfg.get("vllm_max_model_len", 2048)
+
+        log.info(
+            "Rank %d: initializing colocated vLLM engine on xpu:%d (gpu_mem=%.2f, max_model_len=%d)",
+            rank, local_rank, gpu_mem, max_model_len,
+        )
+
+        # Wait for previous ranks to finish their vLLM init (serialize to
+        # avoid port/resource conflicts). Use a unique run ID so stale barriers
+        # from previous runs don't cause races.
+        run_id = os.environ.get("TORCHELASTIC_RUN_ID", str(os.getpid()))
+        barrier_dir = f"/tmp/torchtune/vllm_init_barriers_{run_id}"
+        os.makedirs(barrier_dir, exist_ok=True)
+        if rank > 0:
+            prev_barrier = os.path.join(barrier_dir, f"rank_{rank - 1}_done")
+            log.info("Rank %d: waiting for rank %d to finish vLLM init...", rank, rank - 1)
+            while not os.path.exists(prev_barrier):
+                time.sleep(0.5)
+
+        # vLLM V1: disable multiprocessing to avoid EngineCore subprocess hangs.
+        os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+        # Disable torch.compile for vLLM init (not viable on XPU for vLLM).
+        # Save previous value so we can restore it for training model compile.
+        _prev_compile_disable = os.environ.get("TORCH_COMPILE_DISABLE")
+        os.environ["TORCH_COMPILE_DISABLE"] = "1"
+
+        # Override torchrun env vars so vLLM sees world_size=1
+        saved_env = {}
+        for key in ("WORLD_SIZE", "RANK", "LOCAL_RANK", "GROUP_RANK",
+                    "LOCAL_WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT",
+                    "TORCHELASTIC_RUN_ID"):
+            saved_env[key] = os.environ.pop(key, None)
+        os.environ["WORLD_SIZE"] = "1"
+        os.environ["RANK"] = "0"
+        # Set LOCAL_RANK to the actual tile index so vLLM's xpu_worker
+        # calls torch.xpu.set_device(xpu:<local_rank>) on the correct tile.
+        os.environ["LOCAL_RANK"] = str(local_rank)
+        os.environ["MASTER_ADDR"] = "127.0.0.1"
+        # Use a unique port per rank to avoid conflicts
+        os.environ["MASTER_PORT"] = str(29599 + rank)
+
+        # Pre-init a gloo PG (world_size=1) with file:// store.
+        # This makes is_initialized() return True so vLLM skips its own
+        # init_process_group (which would try XCCL and hang).
+        import tempfile
+        _store_file = tempfile.mktemp(prefix=f"vllm_gloo_store_r{rank}_")
+        torch.distributed.init_process_group(
+            backend="gloo",
+            init_method=f"file://{_store_file}",
+            world_size=1,
+            rank=0,
+        )
+
+        # Monkey-patch new_group to force gloo backend for ALL sub-groups.
+        _orig_new_group = torch.distributed.new_group
+        def _gloo_new_group(*args, **kwargs):
+            kwargs["backend"] = "gloo"
+            return _orig_new_group(*args, **kwargs)
+        torch.distributed.new_group = _gloo_new_group
+
+        # Monkey-patch all_reduce to skip XPU tensor ops on gloo groups.
+        # vLLM's xpu_worker does all_reduce(torch.zeros(1).xpu()) as a
+        # oneCCL warmup. With gloo backend this fails. For world_size=1,
+        # allreduce is a no-op anyway.
+        _orig_all_reduce = torch.distributed.all_reduce
+        def _safe_all_reduce(tensor, op=torch.distributed.ReduceOp.SUM,
+                             group=None, async_op=False):
+            if group is not None and group.size() == 1:
+                return None
+            if tensor.is_xpu:
+                return None
+            return _orig_all_reduce(tensor, op=op, group=group,
+                                    async_op=async_op)
+        torch.distributed.all_reduce = _safe_all_reduce
+
+        # Each rank generates all grpo_samples for its own prompts (no split)
+        max_num_seqs = max(cfg.batch_size * cfg.grpo_samples, 1)
+
+        # Monkey-patch UniProcExecutor._distributed_args to return the correct
+        # local_rank for this tile. Without this, vLLM's DeviceConfig creates
+        # torch.device("xpu") (no index) → _distributed_args falls back to
+        # local_rank=0, causing ALL ranks' vLLM models to load on xpu:0.
+        from vllm.v1.executor.uniproc_executor import UniProcExecutor
+        _orig_distributed_args = UniProcExecutor._distributed_args
+        _correct_local_rank = local_rank
+        def _patched_distributed_args(self_exec):
+            method, _rank, _lr = _orig_distributed_args(self_exec)
+            return method, _rank, _correct_local_rank
+        UniProcExecutor._distributed_args = _patched_distributed_args
+
+        llm_kwargs = dict(
+            model=model_path,
+            tensor_parallel_size=1,
+            gpu_memory_utilization=gpu_mem,
+            max_model_len=max_model_len,
+            max_num_seqs=max_num_seqs,
+            enforce_eager=True,
+            dtype="bfloat16",
+            disable_custom_all_reduce=True,
+        )
+        if vllm_mode == "colocate_sleep":
+            llm_kwargs["enable_sleep_mode"] = True
+
+        self._vllm_llm = LLM(**llm_kwargs)
+
+        # Restore original method
+        UniProcExecutor._distributed_args = _orig_distributed_args
+
+        # Restore original functions
+        torch.distributed.new_group = _orig_new_group
+        torch.distributed.all_reduce = _orig_all_reduce
+
+        # Destroy vLLM's gloo PG so we can init the training XCCL PG.
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
+        # Clear vLLM's cached world group reference
+        import vllm.distributed.parallel_state as vllm_ps
+        vllm_ps._WORLD = None
+
+        # Clean up temp store file
+        try:
+            os.unlink(_store_file)
+        except OSError:
+            pass
+
+        # Restore torchrun env vars for the training PG
+        for key, val in saved_env.items():
+            if val is not None:
+                os.environ[key] = val
+            elif key in os.environ:
+                del os.environ[key]
+
+        # Restore TORCH_COMPILE_DISABLE so training model can use torch.compile
+        if _prev_compile_disable is not None:
+            os.environ["TORCH_COMPILE_DISABLE"] = _prev_compile_disable
+        elif "TORCH_COMPILE_DISABLE" in os.environ:
+            del os.environ["TORCH_COMPILE_DISABLE"]
+
+        # Re-set the XPU device to our tile (vLLM may have called set_device)
+        torch.xpu.set_device(local_rank)
+
+        log.info("Rank %d: colocated vLLM engine initialized on xpu:%d, PG reset for training", rank, local_rank)
+
+        # Signal next rank that we're done
+        my_barrier = os.path.join(barrier_dir, f"rank_{rank}_done")
+        with open(my_barrier, "w") as f:
+            f.write("done")
+
+        # Last rank waits briefly then cleans up barrier files
+        if rank == world_size - 1:
+            time.sleep(0.5)
+            for i in range(world_size):
+                try:
+                    os.unlink(os.path.join(barrier_dir, f"rank_{i}_done"))
+                except OSError:
+                    pass
+
+    def load_checkpoint(self, cfg_checkpointer: DictConfig) -> dict[str, Any]:
+        """
+        Extract the checkpoint state from file and validate. If resume_from_checkpoint
+        is True, this also includes the recipe state.
+        """
+        self._checkpointer = config.instantiate(
+            cfg_checkpointer,
+            resume_from_checkpoint=self._resume_from_checkpoint,
+        )
+        checkpoint_dict = self._checkpointer.load_checkpoint()
+        return checkpoint_dict
+
+    def _update_recipe_state(self, ckpt_dict: dict[str, Any]) -> None:
+        """
+        Updates the recipe state from checkpoint.
+        """
+        try:
+            self._epochs_run = ckpt_dict[training.EPOCHS_KEY]
+            self._rng.set_state(ckpt_dict[training.RNG_KEY])
+
+            # on mismatch, warn the user and prevent the override
+            if self.seed != ckpt_dict[training.SEED_KEY]:
+                warn(
+                    message=(
+                        "Config value for seed does not match the checkpoint value, "
+                        f"using the checkpoint value: {ckpt_dict[training.SEED_KEY]}"
+                    )
+                )
+                self.seed = ckpt_dict[training.SEED_KEY]
+
+            # on mismatch, warn the user but allow the override
+            if self.total_epochs != ckpt_dict[training.TOTAL_EPOCHS_KEY]:
+                warn(
+                    message=(
+                        "Config value for total_epochs does not match the checkpoint value, "
+                        f"using the config value: {self.total_epochs}"
+                    )
+                )
+
+        except KeyError as e:
+            raise KeyError(
+                "Checkpoint does not contain the required keys needed for updating recipe state. "
+                "Are you sure you passed in the right recipe checkpoint?"
+            ) from e
+
+    def setup(self, cfg: DictConfig) -> None:
+        """
+        Setup the recipe. This includes training state (if resume_from_checkpoint is True),
+        model, tokenizer, loss, optimizer, lr scheduler, sampler, and dataloader.
+        """
+        if self.fsdp_cpu_offload:
+            training.set_torch_num_threads()
+
+        if self._is_rank_zero:
+            self._metric_logger = config.instantiate(cfg.metric_logger)
+            self._metric_logger.log_config(cfg)
+
+        # Setup model to train
+        checkpoint_dict = self.load_checkpoint(cfg_checkpointer=cfg.checkpointer)
+        if self._resume_from_checkpoint:
+            self._update_recipe_state(checkpoint_dict)
+        # Server mode: vLLM handles generation, so we don't need to keep
+        # unsharded parameters after forward. reshard_after_forward=True
+        # saves ~(model_size / world_size * (world_size - 1)) memory per rank
+        # (critical for 32B+ models where full unshard exceeds tile memory).
+        reshard_policy = self._vllm_mode == "server"
+        self._model = self._setup_model(
+            cfg_model=cfg.model,
+            enable_activation_checkpointing=self._enable_activation_checkpointing,
+            custom_sharded_layers=cfg.get("custom_sharded_layers", None),
+            fsdp_cpu_offload=self.fsdp_cpu_offload,
+            model_sd=checkpoint_dict[training.MODEL_KEY],
+            reshard_after_forward=reshard_policy,
+        )
+        # Setup reference model
+        ref_checkpoint_dict = self.load_checkpoint(
+            cfg_checkpointer=cfg.ref_checkpointer
+        )
+        self._ref_model = self._setup_model(
+            cfg_model=cfg.model,
+            enable_activation_checkpointing=self._enable_activation_checkpointing,
+            custom_sharded_layers=cfg.get("custom_sharded_layers", None),
+            fsdp_cpu_offload=self.fsdp_cpu_offload,
+            model_sd=ref_checkpoint_dict[training.MODEL_KEY],
+            eval_mode=True,
+            reshard_after_forward=True,
+        )
+        torch.distributed.barrier()
+
+        # Utilize the same tokenizer for both models (hack)
+        self._tokenizer = config.instantiate(cfg.tokenizer)
+
+        self._optimizer = self._setup_optimizer(
+            cfg_optimizer=cfg.optimizer,
+            opt_state_dict=(
+                checkpoint_dict[training.OPT_KEY]
+                if self._resume_from_checkpoint
+                else None
+            ),
+        )
+
+        # initialize loss
+        self._loss_fn = config.instantiate(cfg.loss)
+        if self._compile:
+            _saved_tcd = os.environ.pop("TORCH_COMPILE_DISABLE", None)
+            training.compile_loss(self._loss_fn, verbose=self._is_rank_zero)
+            if _saved_tcd is not None:
+                os.environ["TORCH_COMPILE_DISABLE"] = _saved_tcd
+
+        # sampler and dataloader depend on the tokenizer and loss_fn and should be
+        # setup after both of these are initialized
+        collate_name = cfg.get(
+            "collate_fn", "torchtune.dev.grpo.data.padded_collate_rl"
+        )
+        self._dataloader = self._setup_data(
+            cfg_dataset=cfg.dataset,
+            shuffle=cfg.shuffle,
+            batch_size=cfg.batch_size,
+            collate_fn=collate_name,
+            dataloader_state_dict=(
+                checkpoint_dict[training.DATALOADER_KEY]
+                if self._resume_from_checkpoint
+                else None
+            ),
+        )
+
+        # Finally update the recipe state which can only be correctly set after all of the
+        # other components have been initialized and updated.
+        self._steps_per_epoch = len(self._dataloader)
+        self.global_step = self._epochs_run * self._steps_per_epoch
+
+        # Setup lr scheduler
+        self._lr_scheduler = self._setup_lr_scheduler(
+            cfg_lr_scheduler=cfg.get("lr_scheduler", None),
+            num_training_steps=self.total_epochs * self._steps_per_epoch,
+            last_epoch=self.global_step - 1,
+        )
+
+        # Set up profiler, returns DummyProfiler (nullcontext object with no-op `step` method)
+        # if cfg is missing profiler key or if `cfg.profiler.enabled = False`
+        self._profiler = self._setup_profiler(cfg.get(PROFILER_KEY, None))
+
+        # RL params
+        self.grpo_samples = cfg.grpo_samples
+        self._temperature = cfg.temperature
+        self._top_k = cfg.top_k
+        self._max_generated_tokens = cfg.max_generated_tokens
+        self.batch_size = cfg.batch_size
+        self._forward_batch_size = cfg.forward_batch_size
+
+        self._ppo_epochs = cfg.ppo_epochs
+        self._save_every_n_epochs = cfg.save_every_n_epochs
+        self._total_steps = cfg.num_steps
+
+        if cfg.get("stop_token_ids", False):
+            stop_token_ids = cfg.stop_token_ids
+            if self._tokenizer.eos_id not in stop_token_ids:
+                warn(
+                    f"tokenizer eos_id ({self._tokenizer.eos_id}) is not in stop_token_ids ({stop_token_ids})."
+                    "This may lead to unexpected behaviour."
+                )
+        else:
+            if not hasattr(self._tokenizer, "stop_tokens"):
+                warn(
+                    "No stop tokens defined in tokenizer, and no stop_token_ids provided. This may lead to unexpected behaviour."
+                )
+                stop_token_ids = []
+            else:
+                stop_token_ids = self._tokenizer.stop_tokens
+        self._stop_token_ids = torch.tensor(stop_token_ids, device=self._device)
+
+        # --- vLLM initialization ---
+        if self._vllm_mode == "server":
+            self._setup_vllm_server_mode()
+        elif self._vllm_mode in ("colocate", "colocate_sleep"):
+            self._setup_vllm_colocate_mode(cfg)
+            # Use synchronize-only mode for device_empty_cache — the full
+            # torch.xpu.empty_cache() can deadlock when vLLM engines are
+            # present alongside FSDP collectives on the same XPU tile.
+            global _colocate_vllm_mode
+            _colocate_vllm_mode = True
+
+    def _setup_vllm_server_mode(self):
+        """Initialize vLLM in server mode: HTTP client on rank 0 to external vLLM server."""
+        if self._is_rank_zero:
+            from torchtune.dev.grpo.vllm_client import VLLMClient
+
+            self._vllm_client = VLLMClient(
+                base_url=self._vllm_url,
+                group_port=self._vllm_group_port,
+                connection_timeout=300.0,
+            )
+
+            if self._vllm_weight_sync:
+                # On XPU, creating a second ProcessGroupXCCL (for weight sync)
+                # alongside the training XCCL PG causes SIGABRT. Use file-based
+                # weight sync instead: save to /tmp, POST to vLLM to reload.
+                self._build_tune_to_hf_map()
+                self._weight_sync_path = "/tmp/torchtune/weight_update.safetensors"
+                log.info(
+                    "vLLM server client initialized: %s (%d params mapped, file-based sync via %s, interval=%d)",
+                    self._vllm_url,
+                    len(self._tune_to_hf_map),
+                    self._weight_sync_path,
+                    self._vllm_weight_sync_interval,
+                )
+            else:
+                log.info(
+                    "vLLM server client initialized (generation only, no weight sync): %s",
+                    self._vllm_url,
+                )
+        torch.distributed.barrier()
+
+    def _setup_vllm_colocate_mode(self, cfg):
+        """Initialize vLLM in colocate mode: every rank has its own vLLM engine.
+
+        All ranks have vLLM engines (created in _init_vllm_early). Each rank
+        generates all completions for its own prompts locally (no cross-rank
+        communication during generation). Weight sync loads gathered FSDP2
+        params into each rank's local engine.
+
+        Called from setup() AFTER model init.
+        """
+        # Build param name mapping for weight sync
+        self._build_tune_to_hf_map()
+
+        log.info(
+            "Rank %d: colocated vLLM engine ready (%d params mapped, local generation)",
+            self.rank, len(self._tune_to_hf_map),
+        )
+        torch.distributed.barrier()
+
+    def _build_tune_to_hf_map(self):
+        """Build torchtune -> HuggingFace parameter name mapping for weight sync."""
+        from torchtune.models.convert_weights import get_mapped_key
+        from torchtune.models.qwen2._convert_weights import _FROM_HF
+
+        inverted = {v: k for k, v in _FROM_HF.items() if v is not None}
+        self._tune_to_hf_map = {}
+        sharded_sd = self._model.state_dict()
+        for tune_name in sharded_sd.keys():
+            # Strip activation checkpoint wrapper from name for mapping
+            clean_name = tune_name.replace("_checkpoint_wrapped_module.", "")
+            self._tune_to_hf_map[tune_name] = get_mapped_key(
+                clean_name, inverted
+            )
+        del sharded_sd
+
+    def _setup_lr_scheduler(
+        self,
+        cfg_lr_scheduler: Optional[DictConfig],
+        num_training_steps: int,
+        last_epoch: int,
+    ) -> Optional[Optimizer]:
+        if cfg_lr_scheduler is None:
+            if self._is_rank_zero:
+                log.info(
+                    "No learning rate scheduler configured. Using constant learning rate."
+                )
+            return None
+
+        optimizer = self._optimizer
+
+        lr_scheduler = config.instantiate(
+            cfg_lr_scheduler,
+            optimizer,
+            num_training_steps=num_training_steps,
+            last_epoch=last_epoch,
+        )
+
+        if self._is_rank_zero:
+            log.info("Learning rate scheduler is initialized.")
+
+        return lr_scheduler
+
+    def _setup_profiler(
+        self, cfg_profiler: Optional[DictConfig] = None
+    ) -> Union[torch.profiler.profile, DummyProfiler]:
+        # Missing profiler section in config, assume disabled
+        if cfg_profiler is None:
+            cfg_profiler = DictConfig({"enabled": False})
+
+        if cfg_profiler.get("_component_", None) is None:
+            cfg_profiler["_component_"] = "torchtune.training.setup_torch_profiler"
+        else:
+            assert (
+                cfg_profiler.get("_component_")
+                == "torchtune.training.setup_torch_profiler"
+            ), "Only torch profiler supported currently: component must be `torchtune.training.setup_torch_profiler`"
+
+        profiler, profiler_cfg = config.instantiate(cfg_profiler)
+
+        utils.log_rank_zero(
+            log, f" Profiler config after instantiation: {profiler_cfg}"
+        )
+        if self._is_rank_zero:
+            self.profiler_profile_memory = profiler_cfg.get("profile_memory", False)
+            if profiler_cfg["enabled"]:
+                self.profiler_wait_steps = profiler_cfg["wait_steps"]
+                self.profiler_warmup_steps = profiler_cfg["warmup_steps"]
+                self.profiler_active_steps = profiler_cfg["active_steps"]
+                self.profiler_num_cycles = profiler_cfg["num_cycles"]
+
+        return profiler
+
+    def _setup_model(
+        self,
+        cfg_model: DictConfig,
+        enable_activation_checkpointing: bool,
+        fsdp_cpu_offload: bool,
+        model_sd: dict[str, Any],
+        custom_sharded_layers: Optional[list[str]] = None,
+        eval_mode: bool = False,
+        reshard_after_forward: bool = True,
+    ) -> tuple[nn.Module, nn.Module]:
+        """
+        Model initialization has some important considerations:
+           a. To minimize GPU peak memory, we initialize the model on meta device with
+              the right dtype
+           b. All ranks calls ``load_state_dict`` without peaking CPU RAMs since
+              full state dicts are loaded with ``torch.load(mmap=True)``
+        """
+        utils.log_rank_zero(
+            log,
+            "FSDP is enabled. Instantiating model and loading checkpoint on Rank 0 ...",
+        )
+        init_start = time.perf_counter()
+
+        with training.set_default_dtype(self._dtype), torch.device("meta"):
+            model = config.instantiate(cfg_model)
+
+        if eval_mode:
+            model.eval()
+            for p in model.parameters():
+                p.requires_grad = False
+
+        if self._compile:
+            # Temporarily allow torch.compile (TORCH_COMPILE_DISABLE=1 set for vLLM)
+            _saved_tcd = os.environ.pop("TORCH_COMPILE_DISABLE", None)
+            training.compile_model(model, verbose=self._is_rank_zero)
+            if _saved_tcd is not None:
+                os.environ["TORCH_COMPILE_DISABLE"] = _saved_tcd
+
+        if enable_activation_checkpointing:
+            training.set_activation_checkpointing(
+                model, auto_wrap_policy={modules.TransformerSelfAttentionLayer}
+            )
+
+        # For FSDP sharding
+        fsdp_shard_conditions = [
+            partial(
+                training.get_shard_conditions,
+                names_to_match=custom_sharded_layers,
+            )
+        ]
+
+        # Policy doesn't reshard after forward for faster generation.
+        # Reference net reshards after forward because it never calls .backward()
+        training.shard_model(
+            model=model,
+            shard_conditions=fsdp_shard_conditions,
+            cpu_offload=fsdp_cpu_offload,
+            reshard_after_forward=reshard_after_forward,
+        )
+
+        with training.set_default_dtype(self._dtype), self._device:
+            for m in model.modules():
+                # RoPE is not covered in state dict
+                if hasattr(m, "rope_init"):
+                    m.rope_init()
+
+        # This method will convert the full model state dict into a sharded state
+        # dict and load into the model
+        training.load_from_full_model_state_dict(
+            model,
+            model_sd,
+            self._device,
+            strict=True,
+            cpu_offload=fsdp_cpu_offload,
+        )
+
+        # Ensure no params and buffers are on meta device
+        training.validate_no_params_on_meta_device(model)
+        utils.log_rank_zero(
+            log,
+            f"Instantiating model and loading checkpoint took {time.perf_counter() - init_start:.2f} secs",
+        )
+        if self._is_rank_zero:
+            memory_stats = training.get_memory_stats(device=self._device)
+            training.log_memory_stats(memory_stats)
+
+        disable_dropout(model)
+
+        return model
+
+    def _setup_optimizer(
+        self,
+        cfg_optimizer: DictConfig,
+        opt_state_dict: Optional[dict[str, Any]] = None,
+    ) -> Optional[Optimizer]:
+        optimizer = config.instantiate(cfg_optimizer, self._model.parameters())
+        if opt_state_dict:
+            training.load_from_full_optimizer_state_dict(
+                self._model,
+                optimizer,
+                opt_state_dict,
+                self._device,
+            )
+        utils.log_rank_zero(log, "Optimizer is initialized.")
+        return optimizer
+
+    def _setup_data(
+        self,
+        cfg_dataset: DictConfig,
+        shuffle: bool,
+        batch_size: int,
+        collate_fn: str,
+        dataloader_state_dict: Optional[dict[str, Any]] = None,
+    ) -> StatefulDataLoader:
+        if isinstance(cfg_dataset, ListConfig):
+            datasets = [
+                config.instantiate(single_cfg_dataset, self._tokenizer)
+                for single_cfg_dataset in cfg_dataset
+            ]
+            ds = ConcatDataset(datasets=datasets)
+        else:
+            ds = config.instantiate(cfg_dataset, self._tokenizer)
+
+        # Instantiate collate_fn
+        collate_fn = _get_component_from_path(collate_fn)
+
+        sampler = StatefulDistributedSampler(
+            ds,
+            num_replicas=self.world_size,
+            rank=self.rank,
+            shuffle=shuffle,
+            seed=self.seed,
+        )
+        dataloader = StatefulDataLoader(
+            dataset=ds,
+            batch_size=batch_size,
+            sampler=sampler,
+            collate_fn=(
+                partial(
+                    collate_fn,
+                    padding_idx=self._tokenizer.pad_id,
+                )
+            ),
+            # dropping last avoids shape issues with compile + flex attention
+            drop_last=True,
+        )
+        if dataloader_state_dict is not None:
+            dataloader.load_state_dict(dataloader_state_dict)
+            list(dataloader)
+        return dataloader
+
+    def save_checkpoint(
+        self,
+        epoch: int,
+    ) -> None:
+        checkpoint_dict = {}
+
+        intermediate_checkpoint = epoch + 1 < self.total_epochs
+
+        utils.log_rank_zero(
+            log,
+            "Saving checkpoint. This may take some time. Retrieving full model state dict...",
+        )
+        start = time.perf_counter()
+
+        # To prevent GPU memory from spiking during checkpoint save,
+        # we consolidate the full model and optim state dicts on CPU for rank 0
+        cpu_state_dict = training.gather_cpu_state_dict(
+            self._model,
+            self._is_rank_zero,
+            device=self._device,
+        )
+
+        utils.log_rank_zero(
+            log,
+            f"Getting full model state dict took {time.perf_counter() - start:.2f} secs",
+        )
+
+        if intermediate_checkpoint:
+            start = time.perf_counter()
+            utils.log_rank_zero(log, "Getting optimizer state dict...")
+            opt_state_dict = training.get_full_optimizer_state_dict(
+                self._model,
+                self._optimizer,
+                self._is_rank_zero,
+                device=self._device,
+            )
+            utils.log_rank_zero(
+                log,
+                f"Getting optimizer state dict took {time.perf_counter() - start:.2f} secs",
+            )
+        else:
+            opt_state_dict = None
+
+        if self._is_rank_zero:
+            start = time.perf_counter()
+            checkpoint_dict.update({training.MODEL_KEY: cpu_state_dict})
+
+            if intermediate_checkpoint:
+                checkpoint_dict.update(
+                    {
+                        training.OPT_KEY: opt_state_dict,
+                        training.SEED_KEY: self.seed,
+                        training.EPOCHS_KEY: self._epochs_run,
+                        training.TOTAL_EPOCHS_KEY: self.total_epochs,
+                        training.RNG_KEY: self._rng.get_state(),
+                        training.DATALOADER_KEY: self._dataloader.state_dict(),
+                    }
+                )
+
+            self._checkpointer.save_checkpoint(
+                checkpoint_dict,
+                epoch=epoch,
+                intermediate_checkpoint=intermediate_checkpoint,
+            )
+            log.info(f"Saving checkpoint took {time.perf_counter() - start:.2f} secs")
+
+        torch.distributed.barrier()
+
+    def _generate_with_vllm(
+        self,
+        batch_input_ids: torch.Tensor,
+        context_length: int,
+    ) -> torch.Tensor:
+        """Call vLLM server for generation, broadcast results to all ranks.
+
+        Returns:
+            query_responses: ``[B*G, context_length + max_generated_tokens]``
+        """
+        bsz = batch_input_ids.shape[0]
+        total_len = context_length + self._max_generated_tokens
+
+        if self._is_rank_zero:
+            # Strip padding and convert to Python lists for HTTP
+            prompts = []
+            for i in range(bsz):
+                ids = batch_input_ids[i].cpu().tolist()
+                ids = [t for t in ids if t != self._tokenizer.pad_id]
+                prompts.append(ids)
+
+            t0 = time.perf_counter()
+            completions = self._vllm_client.generate(
+                prompts=prompts,
+                n=1,  # prompts already expanded by grpo_samples
+                max_tokens=self._max_generated_tokens,
+                temperature=self._temperature,
+                top_k=self._top_k or 0,
+            )
+            gen_time = time.perf_counter() - t0
+
+            # Build query_responses tensor: [prompt | completion | padding]
+            query_responses = batch_input_ids.new_full((bsz, total_len), self._tokenizer.pad_id)
+            query_responses[:, :context_length] = batch_input_ids
+            for i, comp in enumerate(completions):
+                length = min(len(comp), self._max_generated_tokens)
+                query_responses[i, context_length : context_length + length] = torch.tensor(
+                    comp[:length], dtype=batch_input_ids.dtype, device=self._device
+                )
+
+            total_tokens = sum(len(c) for c in completions)
+            log.info(
+                "vLLM generation: %d sequences, %d tokens in %.1fs (%.1f tok/s)",
+                bsz, total_tokens, gen_time, total_tokens / max(gen_time, 0.01),
+            )
+        else:
+            query_responses = batch_input_ids.new_empty(bsz, total_len)
+
+        torch.distributed.broadcast(query_responses, src=0)
+        return query_responses
+
+    def _generate_with_colocated_vllm(
+        self,
+        batch_input_ids: torch.Tensor,
+        context_length: int,
+    ) -> torch.Tensor:
+        """Generate using this rank's colocated vLLM engine.
+
+        With a DistributedSampler, each rank already has its own subset of
+        prompts. Each rank generates ALL grpo_samples completions for its own
+        prompts locally — no cross-rank communication needed.
+
+        Returns:
+            query_responses: ``[B*G, context_length + max_generated_tokens]``
+        """
+        from vllm import SamplingParams
+
+        bsz = batch_input_ids.shape[0]
+        total_len = context_length + self._max_generated_tokens
+
+        sampling_params = SamplingParams(
+            max_tokens=self._max_generated_tokens,
+            temperature=self._temperature,
+            top_k=self._top_k if self._top_k else -1,
+            detokenize=False,
+        )
+
+        # Strip padding and convert to Python lists
+        prompts = []
+        for i in range(bsz):
+            ids = batch_input_ids[i].cpu().tolist()
+            ids = [t for t in ids if t != self._tokenizer.pad_id]
+            prompts.append(ids)
+
+        t0 = time.perf_counter()
+        outputs = self._vllm_llm.generate(
+            prompts=[{"prompt_token_ids": p} for p in prompts],
+            sampling_params=sampling_params,
+            use_tqdm=False,
+        )
+        gen_time = time.perf_counter() - t0
+
+        # Build query_responses: [prompt | completion | padding]
+        query_responses = batch_input_ids.new_full((bsz, total_len), self._tokenizer.pad_id)
+        query_responses[:, :context_length] = batch_input_ids
+        total_tokens = 0
+        for i, output in enumerate(outputs):
+            comp = output.outputs[0].token_ids
+            total_tokens += len(comp)
+            length = min(len(comp), self._max_generated_tokens)
+            query_responses[i, context_length : context_length + length] = torch.tensor(
+                comp[:length], dtype=batch_input_ids.dtype, device=self._device
+            )
+
+        log.info(
+            "Rank %d: generated %d sequences, %d tokens in %.1fs (%.1f tok/s)",
+            self.rank, bsz, total_tokens, gen_time, total_tokens / max(gen_time, 0.01),
+        )
+
+        # Re-set XPU device context after vLLM generation (vLLM may have
+        # called torch.xpu.set_device internally, shifting the default device).
+        torch.xpu.set_device(_xpu_device_index)
+        torch.xpu.synchronize()
+
+        return query_responses
+
+    _file_barrier_gen = 0
+
+    def _serialized_empty_cache(self) -> None:
+        """Empty XPU cache one rank at a time using file-based serialization.
+
+        NOTE: On XPU with FSDP, empty_cache() leaks UR handles (see
+        docs/intel_xpu_resource_leak_bug_report.md). This method is now a
+        no-op on XPU — kept for non-XPU use or future driver fix.
+        """
+        if self._device.type == "xpu":
+            # Skip — empty_cache + FSDP storage.resize_ leaks UR handles
+            torch.distributed.barrier()
+            return
+
+        gen = self._file_barrier_gen
+        self.__class__._file_barrier_gen = gen + 1
+        barrier_dir = f"/tmp/torchtune/empty_cache_barriers/gen{gen}"
+        os.makedirs(barrier_dir, exist_ok=True)
+
+        for r in range(self.world_size):
+            if r == self.rank:
+                # My turn to call empty_cache
+                torch.xpu.synchronize()
+                log.info("Rank %d: serialized empty_cache gen%d start", self.rank, gen)
+                torch.xpu.empty_cache()
+                log.info("Rank %d: serialized empty_cache gen%d done", self.rank, gen)
+                # Signal done
+                with open(os.path.join(barrier_dir, f"r{r}_done"), "w") as f:
+                    f.write("done")
+            else:
+                # Wait for rank r to finish
+                done_file = os.path.join(barrier_dir, f"r{r}_done")
+                while not os.path.exists(done_file):
+                    time.sleep(0.001)
+
+        # No cleanup — leave barrier files (they're in /tmp and tiny)
+
+    def _build_tune_to_vllm_map(self):
+        """Build mapping from torchtune param names to vLLM param locations.
+
+        vLLM merges q/k/v into qkv_proj and gate/up into gate_up_proj.
+        This mapping tells us where each torchtune param goes in the
+        vLLM model (param name + optional slice for merged params).
+
+        Returns dict: tune_name -> (vllm_name, slice_or_None)
+        """
+        llm_model = self._vllm_llm.llm_engine.model_executor.driver_worker.model_runner.model
+        vllm_params = dict(llm_model.named_parameters())
+
+        mapping = {}
+        unmapped = []
+        for tune_name in dict(self._model.named_parameters()).keys():
+            # Strip activation checkpoint wrapper for HF name lookup
+            clean_name = tune_name.replace("_checkpoint_wrapped_module.", "")
+            hf_name = self._tune_to_hf_map.get(clean_name, None)
+            if hf_name is None:
+                # Also try the original name
+                hf_name = self._tune_to_hf_map.get(tune_name, clean_name)
+
+            # Direct match (o_proj, down_proj, layernorm, embeddings, norm)
+            if hf_name in vllm_params:
+                mapping[tune_name] = (hf_name, None)
+                continue
+
+            matched = False
+            # QKV merge: q_proj/k_proj/v_proj -> qkv_proj
+            for proj, shard_id in [("q_proj", "q"), ("k_proj", "k"), ("v_proj", "v")]:
+                if proj in hf_name:
+                    qkv_name = hf_name.replace(proj, "qkv_proj")
+                    if qkv_name in vllm_params:
+                        mapping[tune_name] = (qkv_name, shard_id)
+                        matched = True
+                    break
+
+            if matched:
+                continue
+
+            # Gate/Up merge: gate_proj/up_proj -> gate_up_proj
+            for proj, shard_idx in [("gate_proj", 0), ("up_proj", 1)]:
+                if proj in hf_name:
+                    merged_name = hf_name.replace(proj, "gate_up_proj")
+                    if merged_name in vllm_params:
+                        mapping[tune_name] = (merged_name, shard_idx)
+                        matched = True
+                    break
+
+            if not matched:
+                unmapped.append((tune_name, hf_name))
+
+        if unmapped and self._is_rank_zero:
+            log.warning("%d unmapped weight sync params (first 3): %s",
+                        len(unmapped), [t for t, _ in unmapped[:3]])
+
+        self._tune_to_vllm_map = mapping
+
+    def _sync_colocated_weights(self) -> None:
+        """Sync FSDP2 weights to every rank's colocated vLLM engine.
+
+        Each rank gathers full params via DTensor.full_tensor() (XCCL
+        allgather — same PG that training uses) and copies them directly
+        into the vLLM model's parameters, handling merged QKV and gate/up.
+        """
+        t0 = time.perf_counter()
+
+        if not hasattr(self, '_tune_to_vllm_map'):
+            self._build_tune_to_vllm_map()
+
+        llm_model = self._vllm_llm.llm_engine.model_executor.driver_worker.model_runner.model
+        vllm_params = dict(llm_model.named_parameters())
+
+        n_synced = 0
+        for tune_name, param in self._model.named_parameters():
+            entry = self._tune_to_vllm_map.get(tune_name)
+            if entry is None:
+                continue
+
+            if hasattr(param, '_local_tensor'):
+                full_param = param.full_tensor()
+            else:
+                full_param = param.data
+
+            vllm_name, shard_info = entry
+            vllm_param = vllm_params[vllm_name]
+
+            if shard_info is None:
+                # Direct copy
+                vllm_param.data.copy_(full_param)
+            elif shard_info in ("q", "k", "v"):
+                # QKV merged: figure out slice from shapes
+                # qkv_proj has shape [q_dim + k_dim + v_dim, hidden]
+                # For Qwen2.5-3B: q=2048, k=256, v=256
+                q_dim = full_param.shape[0] if shard_info == "q" else None
+                total = vllm_param.shape[0]
+                if shard_info == "q":
+                    vllm_param.data[:full_param.shape[0]].copy_(full_param)
+                elif shard_info == "k":
+                    # k starts after q. q_dim = total - 2 * full_param.shape[0]
+                    # (since k and v have same dim for Qwen2)
+                    kv_dim = full_param.shape[0]
+                    q_size = total - 2 * kv_dim
+                    vllm_param.data[q_size:q_size + kv_dim].copy_(full_param)
+                else:  # v
+                    kv_dim = full_param.shape[0]
+                    vllm_param.data[total - kv_dim:].copy_(full_param)
+            else:
+                # gate_up merged: shard_idx 0=gate, 1=up
+                # gate_up_proj shape [gate_dim + up_dim, hidden]
+                half = vllm_param.shape[0] // 2
+                offset = shard_info * half
+                vllm_param.data[offset:offset + half].copy_(full_param)
+
+            n_synced += 1
+            del full_param
+
+        self._vllm_llm.llm_engine.reset_prefix_cache()
+
+        log.info(
+            "Rank %d: weight sync: %d params in %.1fs",
+            self.rank, n_synced, time.perf_counter() - t0,
+        )
+
+    def _sync_weights_to_vllm(self) -> None:
+        """Gather FSDP2 sharded params and push to vLLM server.
+
+        Uses file-based sync: saves weights as safetensors to /tmp, then
+        POSTs to vLLM's /load_weights_from_path/ endpoint. This avoids
+        creating a second XCCL process group which SIGABRTs on XPU.
+
+        All ranks participate in ``full_tensor()`` (required by FSDP2),
+        but only rank 0 writes and triggers the reload.
+        """
+        t0 = time.perf_counter()
+        # Gather all params into a CPU dict (HF names)
+        hf_state_dict = {}
+        sharded_sd = self._model.state_dict()
+        for param_name, param in sharded_sd.items():
+            if param.is_cpu:
+                param = param.to(self._device)
+            # Gather DTensor -> full tensor (all ranks participate)
+            if hasattr(param, "_local_tensor"):
+                param = param.full_tensor()
+            if self._is_rank_zero:
+                hf_name = self._tune_to_hf_map.get(param_name, param_name)
+                hf_state_dict[hf_name] = param.cpu()
+        del sharded_sd
+        torch.distributed.barrier()
+
+        if self._is_rank_zero:
+            from safetensors.torch import save_file
+
+            n_params = len(hf_state_dict)
+            save_path = self._weight_sync_path
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            save_file(hf_state_dict, save_path)
+            del hf_state_dict
+
+            # Tell vLLM to reload from file
+            import requests
+            r = requests.post(
+                f"{self._vllm_url}/load_weights_from_path/",
+                json={"path": save_path},
+                timeout=120,
+            )
+            if r.status_code != 200:
+                log.warning("vLLM weight reload failed: %s %s", r.status_code, r.text)
+            else:
+                result = r.json()
+                if result.get("status") != "ok":
+                    log.warning("vLLM weight reload error: %s", result)
+
+            self._vllm_client.reset_prefix_cache()
+            log.info(
+                "Weight sync to vLLM: %d params in %.1fs (file-based)",
+                n_params, time.perf_counter() - t0,
+            )
+
+        device_empty_cache(self._device)
+
+    def generate_trajectory(
+        self, input_ids: torch.Tensor, answers: list[str]
+    ) -> GRPOTrajectory:
+        """
+        Generates a trajectory given the current policy model, the reference policy model,
+        the reward function, and batch of inputs.
+        """
+        # Synchronize XPU between steps.
+        if self._device.type == "xpu":
+            torch.xpu.synchronize()
+        if not _colocate_vllm_mode:
+            device_empty_cache(self._device)
+        elif self._vllm_mode == "colocate_sleep" and self._vllm_llm is not None and hasattr(self, '_vllm_is_sleeping') and self._vllm_is_sleeping:
+            # Sleep mode: wake weights → sync updated FSDP weights → wake KV cache
+            import gc
+            gc.collect()
+            torch.xpu.synchronize()
+            torch.distributed.barrier()
+            log.info("Rank %d: waking up vLLM for generation", self.rank)
+            t_wake = time.perf_counter()
+            # 1. Restore vLLM weight storage (from CPU backup — old weights)
+            self._vllm_llm.wake_up(tags=["weights"])
+            # 2. Overwrite with updated FSDP weights
+            self._sync_colocated_weights()
+            # 3. Reallocate KV cache
+            self._vllm_llm.wake_up(tags=["kv_cache"])
+            self._vllm_is_sleeping = False
+            log.info("Rank %d: vLLM wake_up + weight sync completed in %.2fs", self.rank, time.perf_counter() - t_wake)
+        elif self._vllm_llm is not None and hasattr(self, '_vllm_kv_cache_shapes'):
+            # Non-sleep colocate: reclaim cached training memory, reallocate KV cache.
+            # NOTE: skip empty_cache() — leaks UR handles with FSDP.
+            import gc
+            gc.collect()
+            torch.xpu.synchronize()
+            torch.distributed.barrier()
+            kv_caches = self._vllm_llm.llm_engine.model_executor.driver_worker.model_runner.kv_caches
+            for i, (shape, dtype) in enumerate(self._vllm_kv_cache_shapes):
+                kv_caches[i] = torch.zeros(shape, dtype=dtype, device=self._device)
+            del self._vllm_kv_cache_shapes
+            self._vllm_llm.llm_engine.reset_prefix_cache()
+
+        batch_size, context_length = input_ids.shape
+        grpo_size = self.grpo_samples
+
+        batch_input_ids = input_ids[:, None, :].expand(-1, grpo_size, -1)
+        batch_input_ids = batch_input_ids.reshape(batch_size * grpo_size, -1)
+
+        # step 1: generate responses using the current policy (or vLLM)
+        if self._vllm_mode in ("colocate", "colocate_sleep"):
+            query_responses = self._generate_with_colocated_vllm(batch_input_ids, context_length)
+        elif self._vllm_mode == "server":
+            query_responses = self._generate_with_vllm(batch_input_ids, context_length)
+        else:
+            with local_kv_cache(
+                model=self._model,
+                batch_size=batch_size * grpo_size,
+                device=self._device,
+                dtype=self._dtype,
+                decoder_max_seq_len=context_length + self._max_generated_tokens,
+            ):
+                query_responses, _ = generate(
+                    model=self._model,
+                    prompt=batch_input_ids,
+                    max_generated_tokens=self._max_generated_tokens,
+                    temperature=self._temperature,
+                    top_k=self._top_k,
+                    pad_id=self._tokenizer.pad_id,
+                    rng=self._rng if self._device.type == "cuda" else None,
+                    stop_tokens=self._tokenizer.stop_tokens,
+                    return_logits=False,
+                )
+
+        # Barrier: all ranks must finish generation before FSDP forward passes.
+        torch.distributed.barrier()
+
+        # Free vLLM GPU memory to reclaim space for training forward/backward passes.
+        if _colocate_vllm_mode and self._vllm_llm is not None:
+            if torch.xpu.is_available():
+                mem_before = torch.xpu.memory_allocated(self._device) / 1024**3
+
+            if self._vllm_mode == "colocate_sleep":
+                # Sleep mode: offload weights to CPU and release all GPU storage
+                # (weights + KV cache). This frees maximum memory for training.
+                log.info("Rank %d: sleeping vLLM (weights + KV cache) for training", self.rank)
+                t_free = time.perf_counter()
+                self._vllm_llm.sleep(level=1)
+                self._vllm_is_sleeping = True
+            else:
+                # Non-sleep colocate: only free KV cache, weights stay on GPU
+                log.info("Rank %d: freeing vLLM KV cache for training", self.rank)
+                t_free = time.perf_counter()
+                kv_caches = self._vllm_llm.llm_engine.model_executor.driver_worker.model_runner.kv_caches
+                self._vllm_kv_cache_shapes = []
+                for i, cache in enumerate(kv_caches):
+                    self._vllm_kv_cache_shapes.append((cache.shape, cache.dtype))
+                    kv_caches[i] = torch.empty(0, device="cpu")
+
+            if torch.xpu.is_available():
+                mem_after = torch.xpu.memory_allocated(self._device) / 1024**3
+                log.info("Rank %d: vLLM memory freed in %.1fs (%.2f -> %.2f GiB, freed %.2f GiB)",
+                         self.rank, time.perf_counter() - t_free,
+                         mem_before, mem_after, mem_before - mem_after)
+            else:
+                log.info("Rank %d: vLLM memory freed in %.1fs", self.rank, time.perf_counter() - t_free)
+
+        responses = query_responses[:, context_length:].clone()
+
+        # Clamp token IDs to valid vocab range (XPU scatter kernel crashes on OOB)
+        vocab_size = self._model.tok_embeddings.weight.shape[0] if hasattr(self._model, 'tok_embeddings') else None
+        if vocab_size is not None:
+            oob_mask = responses >= vocab_size
+            if oob_mask.any():
+                log.warning("Clamping %d OOB token IDs (max=%d, vocab=%d)",
+                            oob_mask.sum().item(), responses.max().item(), vocab_size)
+                responses = responses.clamp(max=vocab_size - 1)
+                query_responses = torch.cat([query_responses[:, :context_length], responses], dim=1)
+
+        query_response_padding_masks = query_responses != self._tokenizer.pad_id
+
+        # step 1.1 create attention masks and position IDs
+        masks = generation.get_causal_mask_from_padding_mask(
+            query_response_padding_masks
+        )
+        position_ids = generation.get_position_ids_from_padding_mask(
+            query_response_padding_masks
+        )
+        del query_response_padding_masks
+
+        # step 2. estimate logprobs of the responses using the current policy
+        # Chunk the forward pass to avoid OOM with many sequences (Config B).
+        # Process forward_batch_size sequences at a time through the model.
+        num_seqs = query_responses.shape[0]
+        fwd_bs = self._forward_batch_size
+        if fwd_bs >= num_seqs:
+            # Single forward pass (no chunking needed)
+            log.info("Rank %d: policy forward start (shape=%s)", self.rank, list(query_responses.shape))
+            logits = self._model(query_responses, input_pos=position_ids, mask=masks)
+            log.info("Rank %d: policy forward done", self.rank)
+            logits = logits[:, context_length - 1 :]
+            logprobs = rlhf.batched_logits_to_logprobs(logits, responses, self._temperature)
+            del logits
+        else:
+            # Chunked forward pass
+            log.info("Rank %d: policy forward start CHUNKED (total=%d, chunk=%d)", self.rank, num_seqs, fwd_bs)
+            logprobs_chunks = []
+            for cs in range(0, num_seqs, fwd_bs):
+                ce = min(cs + fwd_bs, num_seqs)
+                chunk_logits = self._model(
+                    query_responses[cs:ce],
+                    input_pos=position_ids[cs:ce],
+                    mask=masks[cs:ce],
+                )
+                chunk_logits = chunk_logits[:, context_length - 1 :]
+                logprobs_chunks.append(
+                    rlhf.batched_logits_to_logprobs(chunk_logits, responses[cs:ce], self._temperature)
+                )
+                del chunk_logits
+                device_empty_cache(self._device)
+            logprobs = torch.cat(logprobs_chunks, dim=0)
+            del logprobs_chunks
+            log.info("Rank %d: policy forward done (chunked)", self.rank)
+        device_empty_cache(self._device)
+
+        # step 2.1 estimate logprobs of the responses using the reference policy
+        # Barrier: FULL_SHARD ref model needs allgather from all ranks
+        log.info("Rank %d: pre-ref barrier", self.rank)
+        torch.distributed.barrier()
+        if fwd_bs >= num_seqs:
+            log.info("Rank %d: ref forward start", self.rank)
+            ref_logits = self._ref_model(
+                query_responses, input_pos=position_ids, mask=masks
+            )
+            ref_logits = rlhf.truncate_sequence_for_logprobs(ref_logits, context_length)
+            ref_logprobs = rlhf.batched_logits_to_logprobs(
+                ref_logits, responses, self._temperature
+            )
+            del ref_logits
+        else:
+            log.info("Rank %d: ref forward start CHUNKED (total=%d, chunk=%d)", self.rank, num_seqs, fwd_bs)
+            ref_logprobs_chunks = []
+            for cs in range(0, num_seqs, fwd_bs):
+                ce = min(cs + fwd_bs, num_seqs)
+                chunk_ref_logits = self._ref_model(
+                    query_responses[cs:ce],
+                    input_pos=position_ids[cs:ce],
+                    mask=masks[cs:ce],
+                )
+                chunk_ref_logits = rlhf.truncate_sequence_for_logprobs(chunk_ref_logits, context_length)
+                ref_logprobs_chunks.append(
+                    rlhf.batched_logits_to_logprobs(chunk_ref_logits, responses[cs:ce], self._temperature)
+                )
+                del chunk_ref_logits
+                device_empty_cache(self._device)
+            ref_logprobs = torch.cat(ref_logprobs_chunks, dim=0)
+            del ref_logprobs_chunks
+            log.info("Rank %d: ref forward done (chunked)", self.rank)
+        device_empty_cache(self._device)
+        # step 4. replace tokens after first stop token with padding
+        (
+            response_padding_masks,
+            responses,
+        ) = rlhf.truncate_sequence_at_first_stop_token(
+            responses, self._stop_token_ids, self._tokenizer.pad_id
+        )
+
+        # Compute rewards
+        responses = responses.reshape(batch_size, grpo_size, -1)
+        rewards, successes, metadata = batched_rewards(
+            self._tokenizer, responses, answers, device=self._device
+        )
+        rewards = rewards.to(self._device)
+        successes = successes.to(self._device)
+
+        # Aggregate rewards and successes across reward functions
+        rewards = rewards.sum(dim=-1)
+        successes = successes.sum(dim=-1)
+
+        advantages = (rewards - rewards.mean(1, keepdim=True)) / (
+            rewards.std(1, keepdim=True) + 1e-4
+        )
+        advantages = advantages.reshape(batch_size * grpo_size)
+        del responses
+        device_empty_cache(self._device)
+
+        # step 6. mask out all the invalid values in the trajectory due to padding tokens
+        logprobs[response_padding_masks] = 1.0
+        ref_logprobs[response_padding_masks] = 1.0
+
+        return GRPOTrajectory(
+            query_responses=query_responses,
+            logprobs=logprobs,
+            ref_logprobs=ref_logprobs,
+            rewards=rewards.reshape(batch_size * grpo_size),
+            successes=successes.reshape(batch_size * grpo_size),
+            advantages=advantages,
+            masks=masks,
+            position_ids=position_ids,
+            response_padding_masks=response_padding_masks,
+            seq_lens=training.get_unmasked_sequence_lengths(response_padding_masks),
+            answers=answers,
+        )
+
+    def generate_trajectory_batched(
+        self, input_ids: torch.Tensor, answers: list[str]
+    ) -> GRPOTrajectory:
+        """
+        Generates trajectories using forward_batch_size micro-batches.
+        """
+        trajectories: list[GRPOTrajectory] = []
+        with torch.no_grad():
+            for batch_start in range(0, self.batch_size, self._forward_batch_size):
+                batch_input_ids = input_ids[
+                    batch_start : batch_start + self._forward_batch_size
+                ]
+                batch_answers = answers[
+                    batch_start : batch_start + self._forward_batch_size
+                ]
+                device_empty_cache(self._device)
+                trajectories.append(
+                    self.generate_trajectory(batch_input_ids, batch_answers)
+                )
+                device_empty_cache(self._device)
+
+        # Concatenate all trajectory fields except answers (which is a list of strings)
+        concatenated_fields = {}
+        for field_name in trajectories[0]._fields:
+            if field_name == "answers":
+                concatenated_fields[field_name] = []
+                for traj in trajectories:
+                    concatenated_fields[field_name].extend(traj.answers)
+            else:
+                concatenated_fields[field_name] = torch.cat(
+                    [getattr(traj, field_name) for traj in trajectories]
+                )
+
+        return GRPOTrajectory(**concatenated_fields)
+
+    def grpo_step(
+        self,
+        trajectory: GRPOTrajectory,
+        context_length: int,
+    ) -> GRPOStats:
+        """
+        Perform a single GRPO optimization step over a batch of trajectories.
+        """
+        device_empty_cache(self._device)
+        # Synchronize + flush UR resources before forward pass (prevents
+        # UR_RESULT_ERROR_OUT_OF_RESOURCES after ~240 total sequences)
+        if self._device.type == "xpu":
+            torch.xpu.synchronize()
+
+        # estimate logprobs from the policy at the current optimisation step
+        log.info("Rank %d: grpo_step policy forward start", self.rank)
+        pi_logits = self._model(
+            trajectory.query_responses,
+            input_pos=trajectory.position_ids,
+            mask=trajectory.masks,
+        )
+        log.info("Rank %d: grpo_step policy forward done", self.rank)
+
+        pi_logits = rlhf.truncate_sequence_for_logprobs(pi_logits, context_length)
+        pi_logprobs = rlhf.batched_logits_to_logprobs(
+            pi_logits,
+            trajectory.query_responses[:, context_length:],
+            self._temperature,
+            chunk_size=1,
+        )
+
+        pi_logprobs[trajectory.response_padding_masks] = 1.0
+
+        del pi_logits
+        if self._device.type == "xpu":
+            torch.xpu.synchronize()
+        device_empty_cache(self._device)
+
+        # calculate grpo loss
+        loss, policy_loss, kl_loss, ratios, clipfrac = self._loss_fn(
+            trajectory.logprobs,
+            pi_logprobs,
+            trajectory.ref_logprobs,
+            trajectory.advantages,
+            padding_masks=~trajectory.response_padding_masks,
+        )
+
+        # Scale loss for gradient accumulation
+        if self._gradient_accumulation_steps > 1:
+            loss = loss / self._gradient_accumulation_steps
+
+        device_empty_cache(self._device)
+        log.info("Rank %d: backward start", self.rank)
+        loss.backward()
+        log.info("Rank %d: backward done", self.rank)
+
+        with torch.no_grad():
+            approx_policy_kls = (
+                0.5 * (pi_logprobs - trajectory.logprobs).pow(2)
+            ).mean()
+
+        return GRPOStats(
+            loss * self._gradient_accumulation_steps,  # Report unscaled loss
+            policy_loss,
+            kl_loss,
+            ratios,
+            clipfrac,
+            approx_policy_kls,
+            None,  # metadata
+        )
+
+    def train(self) -> None:
+        """
+        The core training loop with gradient accumulation and no_sync() support.
+        """
+        # clean up before training begins
+        training.cleanup_before_training()
+
+        # zero out the gradients before starting training
+        self._optimizer.zero_grad()
+
+        # Initialize tokens count and running loss (for grad accumulation)
+        grad_norm = None
+
+        training_completed = False
+        self._profiler.start()
+        for curr_epoch in range(self._epochs_run, self.total_epochs):
+            pbar = tqdm(total=self._steps_per_epoch, disable=not self._is_rank_zero)
+            self._dataloader.sampler.set_epoch(curr_epoch)
+            for idx, batch in enumerate(self._dataloader):
+                # Start tracking memory for active steps
+                if (
+                    self._is_rank_zero
+                    and curr_epoch == 0
+                    and self.profiler_profile_memory
+                    and idx == self.profiler_wait_steps + self.profiler_warmup_steps
+                    and supports_memory_stats(self._device)
+                ):
+                    device_record_memory_history(self._device, enabled=True)
+
+                tokens = batch["tokens"]
+                answers = batch["answers"]
+                tokens = tokens.to(self._device)
+
+                _, context_length = tokens.shape
+
+                trajectory = self.generate_trajectory_batched(tokens, answers)
+                if not self._production_mode:
+                    torch.distributed.barrier()
+
+                grpo_stats: list[GRPOStats] = []
+
+                for _ in range(self._ppo_epochs):
+                    total_samples = trajectory.query_responses.shape[0]
+
+                    if self._gradient_accumulation_steps > 1:
+                        # Gradient accumulation: disable gradient sync for
+                        # non-final micro-batches (FSDP2 uses
+                        # set_requires_gradient_sync instead of no_sync())
+                        micro_batch_size = total_samples // self._gradient_accumulation_steps
+                        for ga_step in range(self._gradient_accumulation_steps):
+                            start_idx = ga_step * micro_batch_size
+                            end_idx = start_idx + micro_batch_size
+                            micro_trajectory = _slice_trajectory(
+                                trajectory, start_idx, end_idx
+                            )
+
+                            is_last = (ga_step == self._gradient_accumulation_steps - 1)
+                            self._model.set_requires_gradient_sync(is_last)
+
+                            step_stats = self.grpo_step(
+                                micro_trajectory, context_length
+                            )
+                            grpo_stats.append(step_stats)
+
+                            # Memory cleanup between GA steps — gc only,
+                            # skip empty_cache (leaks UR handles with FSDP)
+                            if not is_last and self._device.type == "xpu":
+                                import gc
+                                gc.collect()
+                    else:
+                        # No gradient accumulation — single step
+                        step_stats = self.grpo_step(trajectory, context_length)
+                        grpo_stats.append(step_stats)
+
+                    if self._clip_grad_norm is not None:
+                        grad_norm = torch.nn.utils.clip_grad_norm_(
+                            self._model.parameters(),
+                            max_norm=float(self._clip_grad_norm),
+                        )
+
+                    if not self._production_mode:
+                        torch.distributed.barrier()
+
+                    # Synchronize before optimizer — no empty_cache in
+                    # colocate mode (it hangs with vLLM engines).
+                    if _colocate_vllm_mode and self._device.type == "xpu":
+                        log.info("Rank %d: pre-optimizer sync", self.rank)
+                        torch.xpu.synchronize()
+
+                    log.info("Rank %d: optimizer.step()", self.rank)
+                    self._optimizer.step()
+                    self._optimizer.zero_grad(set_to_none=True)
+                    log.info("Rank %d: optimizer done", self.rank)
+                    if not self._production_mode:
+                        torch.distributed.barrier()
+
+                    self.global_step += 1
+
+                    if self._lr_scheduler is not None:
+                        self._lr_scheduler.step()
+
+                # Sync updated weights to vLLM (after all ppo_epochs)
+                # For colocate_sleep, sync happens during wake_up in generate_trajectory
+                if self._vllm_mode == "colocate":
+                    self._sync_colocated_weights()
+                elif self._vllm_mode == "server" and self._vllm_weight_sync:
+                    if self._steps_run % self._vllm_weight_sync_interval == 0:
+                        self._sync_weights_to_vllm()
+
+                # Stop tracking memory
+                if (
+                    self._is_rank_zero
+                    and curr_epoch == 0
+                    and self.profiler_profile_memory
+                    and idx
+                    == self.profiler_wait_steps
+                    + self.profiler_warmup_steps
+                    + self.profiler_active_steps
+                    and supports_memory_stats(self._device)
+                ):
+                    device_record_memory_history(self._device, enabled=None)
+
+                self._steps_run += 1
+                if self._steps_run % self._log_every_n_steps == 0:
+                    extra_metrics = {}
+                    extra_metrics["lr"] = get_lr(self._optimizer)
+                    if grad_norm is not None:
+                        extra_metrics["grad_norm"] = grad_norm
+
+                    # Concatenate GRPOStats fields properly
+                    concatenated_stats = {}
+                    for field_name in grpo_stats[0]._fields:
+                        if field_name == "metadata":
+                            concatenated_stats[field_name] = None
+                        else:
+                            concatenated_stats[field_name] = torch.stack(
+                                [getattr(stat, field_name) for stat in grpo_stats]
+                            )
+
+                    self.log_metrics(
+                        trajectory,
+                        GRPOStats(**concatenated_stats),
+                        **extra_metrics,
+                    )
+
+                self.cleanup_after_step(trajectory, grpo_stats)
+                self._profiler.step()
+
+                pbar.update(1)
+
+                if self._steps_run == self._total_steps:
+                    training_completed = True
+                    break
+
+            self._epochs_run += 1
+            if self._epochs_run % self._save_every_n_epochs == 0:
+                self.save_checkpoint(curr_epoch)
+            if training_completed:
+                return
+
+        self._profiler.stop()
+
+    def log_metrics(
+        self, trajectory: GRPOTrajectory, grpo_stats: GRPOStats, **extras
+    ) -> None:
+        rewards = trajectory.rewards.mean()
+        torch.distributed.reduce(rewards, dst=0, op=torch.distributed.ReduceOp.SUM)
+        rewards /= self.world_size
+
+        successes = trajectory.successes.mean()
+        torch.distributed.reduce(successes, dst=0, op=torch.distributed.ReduceOp.SUM)
+        successes /= self.world_size
+
+        log_dict = {
+            "rewards": rewards,
+            "successes": successes,
+            "num_stop_tokens": trajectory.response_padding_masks.any(-1).sum(),
+            "loss": grpo_stats.loss.mean(),
+            "policy_loss": grpo_stats.policy_loss.mean(),
+            "kl_loss": grpo_stats.kl_loss.mean(),
+            "clipfrac": grpo_stats.clipfrac.mean(),
+            "ratios": grpo_stats.ratios.mean(),
+            "approx_policy_kl": grpo_stats.approx_policy_kls.mean(),
+            "response_lengths": trajectory.seq_lens.float().mean(),
+            **extras,
+        }
+
+        if supports_memory_stats(self._device) and self._log_peak_memory_stats:
+            log_dict.update(training.get_memory_stats(device=self._device))
+        if self._is_rank_zero:
+            self._metric_logger.log_dict(log_dict, step=self.global_step)
+
+    def cleanup(self) -> None:
+        if self._vllm_client is not None and self._vllm_weight_sync and self._vllm_client.communicator is not None:
+            self._vllm_client.close_communicator()
+        if self._vllm_llm is not None:
+            del self._vllm_llm
+            self._vllm_llm = None
+        if self._is_rank_zero:
+            self._metric_logger.close()
+        destroy_process_group()
+
+    def cleanup_after_step(
+        self,
+        trajectory: GRPOTrajectory,
+        l_grpo_stats: list[GRPOStats],
+    ) -> None:
+        for v in trajectory:
+            del v
+        del trajectory
+        for g in l_grpo_stats:
+            for v in g:
+                del v
+            del g
+        del l_grpo_stats
+        # Memory cleanup — gc only, skip empty_cache (leaks UR handles with FSDP)
+        if self._device.type == "xpu":
+            import gc
+            gc.collect()
+
+
+@config.parse
+def recipe_main(cfg: DictConfig) -> None:
+    """
+    Entry point for the recipe.
+
+    Configurable parameters are read in the following order:
+        - Parameters specified in config (see available configs through ``tune ls``)
+        - Overwritten by arguments from the command-line
+    """
+
+    recipe = GRPOFullFinetuneDistributedXPU(cfg=cfg)
+    config.log_config(recipe_name="GRPOFullFinetuneDistributedXPU", cfg=cfg)
+    recipe.setup(cfg=cfg)
+    recipe.train()
+    recipe.cleanup()
+
+
+if __name__ == "__main__":
+    sys.exit(recipe_main())
