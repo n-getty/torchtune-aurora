@@ -395,7 +395,13 @@ def load_from_full_model_state_dict(
         for param_name, full_tensor in full_sd.items():
             sharded_meta_param = meta_sharded_sd.get(param_name)
             assert sharded_meta_param is not None, f"{param_name} not found in model"
-            full_tensor = full_tensor.to(sharded_meta_param.dtype).to(device)
+            # For 2D meshes (HSDP), shard on CPU first to avoid OOM from full tensor on device.
+            # For 1D meshes, keep original behavior (distribute_tensor needs device tensor).
+            _is_2d_mesh = hasattr(sharded_meta_param, "device_mesh") and sharded_meta_param.device_mesh.ndim > 1
+            if _is_2d_mesh:
+                full_tensor = full_tensor.to(sharded_meta_param.dtype)  # keep on CPU
+            else:
+                full_tensor = full_tensor.to(sharded_meta_param.dtype).to(device)
             if hasattr(sharded_meta_param, "_local_tensor") and isinstance(
                 sharded_meta_param._local_tensor, NF4Tensor
             ):
@@ -443,13 +449,45 @@ def load_from_full_model_state_dict(
 
             elif not hasattr(sharded_meta_param, "device_mesh"):
                 # In cases where parts of the model aren't sharded, some parameters will be plain tensors
-                sharded_tensor = full_tensor
+                sharded_tensor = full_tensor if not _is_2d_mesh else full_tensor.to(device)
             else:
-                sharded_tensor = distribute_tensor(
-                    full_tensor,
-                    sharded_meta_param.device_mesh,
-                    sharded_meta_param.placements,
-                )
+                mesh = sharded_meta_param.device_mesh
+                placements = sharded_meta_param.placements
+                # All ranks already have the full tensor (loaded from checkpoint).
+                # Use DTensor.from_local with local sharding instead of distribute_tensor,
+                # which tries scatter collectives that deadlock XCCL on 2D meshes.
+                if mesh.ndim > 1:
+                    # HSDP 2D mesh: placements=(Replicate(), Shard(dim)).
+                    # Compute local shard on CPU without communication, then move to device.
+                    from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
+                    local_shape, global_offset = compute_local_shape_and_global_offset(
+                        full_tensor.shape, mesh, placements
+                    )
+                    # Extract the local shard from the full tensor (on CPU)
+                    slices = tuple(
+                        slice(off, off + size)
+                        for off, size in zip(global_offset, local_shape)
+                    )
+                    local_tensor = full_tensor[slices].contiguous().to(device)
+                    sharded_tensor = DTensor(
+                        local_tensor=local_tensor,
+                        spec=DTensorSpec(
+                            mesh=mesh,
+                            placements=placements,
+                            tensor_meta=TensorMeta(
+                                shape=sharded_meta_param.size(),
+                                dtype=sharded_meta_param.dtype,
+                                stride=sharded_meta_param.stride(),
+                            ),
+                        ),
+                        requires_grad=sharded_meta_param.requires_grad,
+                    )
+                else:
+                    sharded_tensor = distribute_tensor(
+                        full_tensor,
+                        mesh,
+                        placements,
+                    )
             if cpu_offload:
                 sharded_tensor = sharded_tensor.cpu()
             sharded_sd[param_name] = nn.Parameter(sharded_tensor)

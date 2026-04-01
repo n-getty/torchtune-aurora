@@ -47,7 +47,11 @@ from warnings import warn
 #
 #    Valid rank counts: must evenly divide CCL's topology view (works: 2, 4, 6,
 #    10, 12; fails: 3, 5, 7, 8, 9, 11). CCL maps ranks across 6 cards × 2 tiles.
-_xpu_device_index = int(os.environ.get("LOCAL_RANK", "0"))
+#
+#    Multi-node: ZE_AFFINITY_MASK must be set (e.g., to LOCAL_RANK) so each rank
+#    sees only its tile as xpu:0. With ring algorithms, device_id is not needed.
+_use_affinity_mask = "ZE_AFFINITY_MASK" in os.environ and os.environ["ZE_AFFINITY_MASK"] != ""
+_xpu_device_index = 0 if _use_affinity_mask else int(os.environ.get("LOCAL_RANK", "0"))
 
 import torch
 
@@ -103,6 +107,34 @@ from torchtune.training.lr_schedulers import get_lr
 from tqdm import tqdm
 
 log = utils.get_logger("DEBUG")
+
+# -- FSDP2 XPU fix: ReduceOp.AVG not supported by XCCL -----------------------
+# FSDP2's reduce_scatter uses ReduceOp.AVG which XCCL doesn't support.
+# Monkey-patch _get_gradient_divide_factors to force SUM reduction on XPU
+# (same approach as MTIA in upstream PyTorch).
+try:
+    import torch.distributed.fsdp._fully_shard._fsdp_collectives as _fsdp_coll
+    _orig_get_gradient_divide_factors = _fsdp_coll._get_gradient_divide_factors
+
+    def _xpu_get_gradient_divide_factors(*args, **kwargs):
+        # args: (reduce_scatter_group, all_reduce_group, reduce_dtype,
+        #        device_type, gradient_divide_factor, force_sum_reduction_for_comms)
+        # Force SUM reduction for XPU (XCCL doesn't support AVG)
+        if len(args) >= 4 and args[3] == "xpu":
+            args = list(args)
+            if len(args) >= 6:
+                args[5] = True  # force_sum_reduction_for_comms
+            else:
+                kwargs["force_sum_reduction_for_comms"] = True
+            args = tuple(args)
+        elif kwargs.get("device_type") == "xpu":
+            kwargs["force_sum_reduction_for_comms"] = True
+        return _orig_get_gradient_divide_factors(*args, **kwargs)
+
+    _fsdp_coll._get_gradient_divide_factors = _xpu_get_gradient_divide_factors
+    log.info("Patched FSDP2 _get_gradient_divide_factors for XPU (force SUM reduction)")
+except Exception as e:
+    log.warning("Failed to patch FSDP2 for XPU: %s", e)
 
 # Original device_empty_cache imported above. When colocated vLLM engines
 # are present, torch.xpu.empty_cache() can deadlock if called while another
@@ -222,9 +254,12 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             torch.backends.cuda.enable_mem_efficient_sdp(False)
             log.info("Rank %d: forced math-only SDPA (disabled flash/mem_efficient to avoid UR leaks)", self.rank)
 
-        # Production mode: skip non-essential torch.xpu.synchronize() calls
+        # Production mode: skip non-essential barriers/synchronize() calls.
+        # HSDP (dp_replicate > 1) REQUIRES production mode because world-level
+        # barriers conflict with FSDP1's shard/replicate sub-PG operations on XCCL.
         self._production_mode = (
             os.environ.get("FSDP_PRODUCTION_MODE", "0") == "1"
+            or cfg.get("data_parallel_replicate_dim", 1) > 1
         )
 
         # Training attributes
@@ -244,6 +279,46 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                 )
                 self._compile = False
 
+        # HSDP: dp_replicate × dp_shard mesh for multi-node
+        # dp_replicate=1 (default): pure FSDP across all ranks
+        # dp_replicate=NUM_NODES: FSDP within node, DDP across nodes (HSDP)
+        self._dp_replicate = cfg.get("data_parallel_replicate_dim", 1)
+        if self._dp_replicate > 1:
+            from torch.distributed.device_mesh import init_device_mesh
+            self._dp_shard = self.world_size // self._dp_replicate
+            log.info(
+                "HSDP enabled: dp_replicate=%d × dp_shard=%d (world_size=%d)",
+                self._dp_replicate, self._dp_shard, self.world_size,
+            )
+            # Create a simple 2D mesh directly (avoid ParallelDims.build_mesh
+            # which creates many submeshes that can deadlock XCCL).
+            self._dp_mesh = init_device_mesh(
+                self._device.type,
+                (self._dp_replicate, self._dp_shard),
+                mesh_dim_names=("dp_replicate", "dp_shard"),
+            )
+            # Get shard PG for generation early-stopping all_reduce.
+            # The shard group = ranks within same node (FSDP shards of same model).
+            self._shard_pg = self._dp_mesh.get_group("dp_shard")
+            # Shard group leader = local rank 0 within each shard group (= each node).
+            # For replicated vLLM, each shard leader talks to its local vLLM.
+            self._shard_rank = torch.distributed.get_rank(self._shard_pg)
+            self._is_shard_leader = (self._shard_rank == 0)
+            # Global rank of this shard group's leader (for broadcast src).
+            # torch.distributed.broadcast requires global rank as src, even with group.
+            shard_ranks = torch.distributed.get_process_group_ranks(self._shard_pg)
+            self._shard_leader_global_rank = shard_ranks[0]
+            self._dp_degree = self.world_size
+            self._dp_rank = self.rank
+        else:
+            self._dp_shard = self.world_size
+            self._dp_degree = self.world_size
+            self._dp_rank = self.rank
+            self._dp_mesh = None
+            self._shard_pg = None
+            self._shard_rank = self.rank
+            self._is_shard_leader = self._is_rank_zero
+
         # Gradient accumulation
         self._gradient_accumulation_steps = cfg.get("gradient_accumulation_steps", 1)
 
@@ -262,6 +337,7 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             self._vllm_llm = None
         self._vllm_gpu_memory_utilization = cfg.get("vllm_gpu_memory_utilization", 0.3)
         self._vllm_max_model_len = cfg.get("vllm_max_model_len", 2048)
+        self._vllm_tp_size = cfg.get("vllm_tensor_parallel_size", 1)
 
         # Backward compat: if vllm_url is set but vllm_mode is not, infer "server"
         if self._vllm_url is not None and self._vllm_mode is None:
@@ -279,26 +355,23 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         self._rng = torch.Generator(_rng_device).manual_seed(self.seed)
 
     def _init_vllm_early(self, cfg):
-        """Initialize a colocated vLLM engine on EVERY rank, before the training PG.
+        """Initialize colocated vLLM engine(s) before the training PG.
 
-        Each rank creates its own vLLM LLM engine on its own XPU tile (TRL-style).
-        This enables distributed generation: sequences are split across ranks,
-        each generates its share, then results are allgathered.
+        Two modes based on ``vllm_tensor_parallel_size``:
 
-        Strategy per rank: pre-initialize a gloo PG (world_size=1) with a file://
-        store so that vLLM's ``init_distributed_environment`` sees
-        ``is_initialized() == True`` and skips its own ``init_process_group``.
-        We also monkey-patch ``new_group`` to force gloo backend and
-        ``all_reduce`` to skip XPU tensor ops (gloo can't handle XPU tensors).
+        **TP=1** (default): Each rank creates its own isolated vLLM engine
+        using a gloo PG (world_size=1). Sequential init via file barriers.
 
-        Ranks initialize sequentially (file-based barriers) to avoid port and
-        resource conflicts during vLLM startup.
+        **TP>1**: Ranks are grouped into DP groups of size tp_size. Each group
+        creates one shared vLLM engine via ``external_launcher`` with an XCCL
+        PG of size tp_size. All ranks in a group call generate() together.
         """
         rank = int(os.environ.get("RANK", "0"))
         world_size = int(os.environ.get("WORLD_SIZE", "1"))
         local_rank = _xpu_device_index  # The actual XPU tile for this rank
 
         vllm_mode = cfg.get("vllm_mode", "colocate")
+        tp_size = cfg.get("vllm_tensor_parallel_size", 1)
 
         # For colocate_sleep mode, apply XPU sleep patches BEFORE importing vLLM LLM
         if vllm_mode == "colocate_sleep":
@@ -312,13 +385,49 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         max_model_len = cfg.get("vllm_max_model_len", 2048)
 
         log.info(
-            "Rank %d: initializing colocated vLLM engine on xpu:%d (gpu_mem=%.2f, max_model_len=%d)",
-            rank, local_rank, gpu_mem, max_model_len,
+            "Rank %d: initializing colocated vLLM engine on xpu:%d (tp=%d, gpu_mem=%.2f, max_model_len=%d)",
+            rank, local_rank, tp_size, gpu_mem, max_model_len,
         )
 
-        # Wait for previous ranks to finish their vLLM init (serialize to
-        # avoid port/resource conflicts). Use a unique run ID so stale barriers
-        # from previous runs don't cause races.
+        # vLLM V1: disable multiprocessing to avoid EngineCore subprocess hangs.
+        os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+        # Disable torch.compile for vLLM init (not viable on XPU for vLLM).
+        _prev_compile_disable = os.environ.get("TORCH_COMPILE_DISABLE")
+        os.environ["TORCH_COMPILE_DISABLE"] = "1"
+
+        # Each rank generates all grpo_samples for its own prompts (no split)
+        max_num_seqs = max(cfg.batch_size * cfg.grpo_samples, 1)
+
+        if tp_size > 1:
+            self._init_vllm_tp(
+                cfg, rank, world_size, local_rank, tp_size,
+                model_path, gpu_mem, max_model_len, max_num_seqs, vllm_mode, LLM,
+            )
+        else:
+            self._init_vllm_tp1(
+                cfg, rank, world_size, local_rank,
+                model_path, gpu_mem, max_model_len, max_num_seqs, vllm_mode, LLM,
+            )
+
+        # Restore TORCH_COMPILE_DISABLE so training model can use torch.compile
+        if _prev_compile_disable is not None:
+            os.environ["TORCH_COMPILE_DISABLE"] = _prev_compile_disable
+        elif "TORCH_COMPILE_DISABLE" in os.environ:
+            del os.environ["TORCH_COMPILE_DISABLE"]
+
+        # Re-set the XPU device to our tile (vLLM may have called set_device)
+        torch.xpu.set_device(local_rank)
+
+        log.info("Rank %d: colocated vLLM engine initialized on xpu:%d, PG reset for training", rank, local_rank)
+
+    def _init_vllm_tp1(self, cfg, rank, world_size, local_rank,
+                        model_path, gpu_mem, max_model_len, max_num_seqs,
+                        vllm_mode, LLM):
+        """Initialize TP=1 colocated vLLM: one isolated engine per rank.
+
+        Uses gloo PG (world_size=1) with sequential init via file barriers.
+        """
+        # Sequential init to avoid port/resource conflicts.
         run_id = os.environ.get("TORCHELASTIC_RUN_ID", str(os.getpid()))
         barrier_dir = f"/tmp/torchtune/vllm_init_barriers_{run_id}"
         os.makedirs(barrier_dir, exist_ok=True)
@@ -328,13 +437,6 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             while not os.path.exists(prev_barrier):
                 time.sleep(0.5)
 
-        # vLLM V1: disable multiprocessing to avoid EngineCore subprocess hangs.
-        os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
-        # Disable torch.compile for vLLM init (not viable on XPU for vLLM).
-        # Save previous value so we can restore it for training model compile.
-        _prev_compile_disable = os.environ.get("TORCH_COMPILE_DISABLE")
-        os.environ["TORCH_COMPILE_DISABLE"] = "1"
-
         # Override torchrun env vars so vLLM sees world_size=1
         saved_env = {}
         for key in ("WORLD_SIZE", "RANK", "LOCAL_RANK", "GROUP_RANK",
@@ -343,16 +445,11 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             saved_env[key] = os.environ.pop(key, None)
         os.environ["WORLD_SIZE"] = "1"
         os.environ["RANK"] = "0"
-        # Set LOCAL_RANK to the actual tile index so vLLM's xpu_worker
-        # calls torch.xpu.set_device(xpu:<local_rank>) on the correct tile.
         os.environ["LOCAL_RANK"] = str(local_rank)
         os.environ["MASTER_ADDR"] = "127.0.0.1"
-        # Use a unique port per rank to avoid conflicts
         os.environ["MASTER_PORT"] = str(29599 + rank)
 
-        # Pre-init a gloo PG (world_size=1) with file:// store.
-        # This makes is_initialized() return True so vLLM skips its own
-        # init_process_group (which would try XCCL and hang).
+        # Pre-init a gloo PG (world_size=1) so vLLM skips its own init.
         import tempfile
         _store_file = tempfile.mktemp(prefix=f"vllm_gloo_store_r{rank}_")
         torch.distributed.init_process_group(
@@ -362,17 +459,14 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             rank=0,
         )
 
-        # Monkey-patch new_group to force gloo backend for ALL sub-groups.
+        # Monkey-patch new_group to force gloo backend.
         _orig_new_group = torch.distributed.new_group
         def _gloo_new_group(*args, **kwargs):
             kwargs["backend"] = "gloo"
             return _orig_new_group(*args, **kwargs)
         torch.distributed.new_group = _gloo_new_group
 
-        # Monkey-patch all_reduce to skip XPU tensor ops on gloo groups.
-        # vLLM's xpu_worker does all_reduce(torch.zeros(1).xpu()) as a
-        # oneCCL warmup. With gloo backend this fails. For world_size=1,
-        # allreduce is a no-op anyway.
+        # Monkey-patch all_reduce to skip XPU tensor ops on gloo.
         _orig_all_reduce = torch.distributed.all_reduce
         def _safe_all_reduce(tensor, op=torch.distributed.ReduceOp.SUM,
                              group=None, async_op=False):
@@ -384,13 +478,7 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                                     async_op=async_op)
         torch.distributed.all_reduce = _safe_all_reduce
 
-        # Each rank generates all grpo_samples for its own prompts (no split)
-        max_num_seqs = max(cfg.batch_size * cfg.grpo_samples, 1)
-
-        # Monkey-patch UniProcExecutor._distributed_args to return the correct
-        # local_rank for this tile. Without this, vLLM's DeviceConfig creates
-        # torch.device("xpu") (no index) → _distributed_args falls back to
-        # local_rank=0, causing ALL ranks' vLLM models to load on xpu:0.
+        # Monkey-patch _distributed_args for correct local_rank.
         from vllm.v1.executor.uniproc_executor import UniProcExecutor
         _orig_distributed_args = UniProcExecutor._distributed_args
         _correct_local_rank = local_rank
@@ -414,21 +502,17 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
 
         self._vllm_llm = LLM(**llm_kwargs)
 
-        # Restore original method
+        # Restore monkey-patches
         UniProcExecutor._distributed_args = _orig_distributed_args
-
-        # Restore original functions
         torch.distributed.new_group = _orig_new_group
         torch.distributed.all_reduce = _orig_all_reduce
 
         # Destroy vLLM's gloo PG so we can init the training XCCL PG.
         if torch.distributed.is_initialized():
             torch.distributed.destroy_process_group()
-        # Clear vLLM's cached world group reference
         import vllm.distributed.parallel_state as vllm_ps
         vllm_ps._WORLD = None
 
-        # Clean up temp store file
         try:
             os.unlink(_store_file)
         except OSError:
@@ -441,23 +525,12 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             elif key in os.environ:
                 del os.environ[key]
 
-        # Restore TORCH_COMPILE_DISABLE so training model can use torch.compile
-        if _prev_compile_disable is not None:
-            os.environ["TORCH_COMPILE_DISABLE"] = _prev_compile_disable
-        elif "TORCH_COMPILE_DISABLE" in os.environ:
-            del os.environ["TORCH_COMPILE_DISABLE"]
-
-        # Re-set the XPU device to our tile (vLLM may have called set_device)
-        torch.xpu.set_device(local_rank)
-
-        log.info("Rank %d: colocated vLLM engine initialized on xpu:%d, PG reset for training", rank, local_rank)
-
         # Signal next rank that we're done
         my_barrier = os.path.join(barrier_dir, f"rank_{rank}_done")
         with open(my_barrier, "w") as f:
             f.write("done")
 
-        # Last rank waits briefly then cleans up barrier files
+        # Last rank cleans up barrier files
         if rank == world_size - 1:
             time.sleep(0.5)
             for i in range(world_size):
@@ -465,6 +538,116 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                     os.unlink(os.path.join(barrier_dir, f"rank_{i}_done"))
                 except OSError:
                     pass
+
+    def _init_vllm_tp(self, cfg, rank, world_size, local_rank, tp_size,
+                       model_path, gpu_mem, max_model_len, max_num_seqs,
+                       vllm_mode, LLM):
+        """Initialize TP>1 colocated vLLM: one engine per DP group via external_launcher.
+
+        Groups ranks into DP groups of tp_size. Each group creates an XCCL PG
+        of size tp_size and a shared vLLM engine with external_launcher.
+        All ranks in a group must call generate() with identical prompts.
+
+        Pattern:
+        1. File-based barrier (all ranks in DP group signal ready)
+        2. Override env: WORLD_SIZE, RANK, LOCAL_RANK, MASTER_PORT; disable elastic agent store
+        3. Create TP-sized XCCL PG per DP group (TCP rendezvous, unique port)
+        4. Create vLLM LLM with external_launcher
+        5. Destroy TP PG, restore env (training PG created later via elastic agent store)
+        """
+        assert world_size % tp_size == 0, (
+            f"world_size={world_size} must be divisible by vllm_tensor_parallel_size={tp_size}"
+        )
+        dp_size = world_size // tp_size
+        dp_rank = rank // tp_size
+        tp_rank = rank % tp_size
+
+        # Store TP/DP info for later use
+        self._vllm_dp_rank = dp_rank
+        self._vllm_tp_rank = tp_rank
+        self._vllm_dp_size = dp_size
+
+        log.info(
+            "Rank %d: TP init — dp_rank=%d, tp_rank=%d, dp_size=%d, tp_size=%d",
+            rank, dp_rank, tp_rank, dp_size, tp_size,
+        )
+
+        # Step 1: File-based barrier — all ranks signal ready before any creates PG.
+        # torchrun sets TORCHELASTIC_USE_AGENT_STORE=True; consuming it for a
+        # throwaway global PG would prevent reuse for the training PG later.
+        _run_id = os.environ.get("TORCHELASTIC_RUN_ID", str(os.getpid()))
+        _barrier_dir = f"/tmp/torchtune/vllm_tp_barrier_{_run_id}"
+        os.makedirs(_barrier_dir, exist_ok=True)
+        # Signal this rank is ready
+        with open(os.path.join(_barrier_dir, f"rank_{rank}"), "w") as f:
+            f.write("ready")
+        # Wait for all ranks in our DP group to be ready
+        dp_group_ranks = list(range(dp_rank * tp_size, (dp_rank + 1) * tp_size))
+        for r in dp_group_ranks:
+            while not os.path.exists(os.path.join(_barrier_dir, f"rank_{r}")):
+                time.sleep(0.1)
+        log.info("Rank %d: all %d ranks in DP group %d ready", rank, tp_size, dp_rank)
+
+        # Step 2: Override env for TP subgroup
+        saved_env = {}
+        for key in ("WORLD_SIZE", "RANK", "LOCAL_RANK", "MASTER_PORT",
+                    "TORCHELASTIC_USE_AGENT_STORE"):
+            saved_env[key] = os.environ.get(key)
+
+        original_port = os.environ.get("MASTER_PORT", "29500")
+        os.environ["WORLD_SIZE"] = str(tp_size)
+        os.environ["RANK"] = str(tp_rank)
+        os.environ["LOCAL_RANK"] = str(local_rank)
+        # Unique port per DP group to avoid collisions
+        os.environ["MASTER_PORT"] = str(int(original_port) + dp_rank + 1)
+        # Disable elastic agent store — use TCP rendezvous for TP subgroup
+        os.environ.pop("TORCHELASTIC_USE_AGENT_STORE", None)
+
+        # Step 3: Create XCCL PG for this TP subgroup
+        torch.distributed.init_process_group(
+            backend="xccl",
+            world_size=tp_size,
+            rank=tp_rank,
+        )
+        log.info("Rank %d: TP subgroup PG initialized (dp_group=%d, size=%d)",
+                 rank, dp_rank, torch.distributed.get_world_size())
+
+        # Step 5: Create vLLM LLM engine
+        llm_kwargs = dict(
+            model=model_path,
+            tensor_parallel_size=tp_size,
+            distributed_executor_backend="external_launcher",
+            gpu_memory_utilization=gpu_mem,
+            max_model_len=max_model_len,
+            max_num_seqs=max_num_seqs,
+            enforce_eager=True,
+            dtype="bfloat16",
+        )
+        if vllm_mode == "colocate_sleep":
+            llm_kwargs["enable_sleep_mode"] = True
+
+        self._vllm_llm = LLM(**llm_kwargs)
+
+        # Step 6: Destroy TP PG — training will create its own global XCCL PG
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
+        import vllm.distributed.parallel_state as vllm_ps
+        vllm_ps._WORLD = None
+
+        # Restore env vars
+        for key, val in saved_env.items():
+            if val is not None:
+                os.environ[key] = val
+            elif key in os.environ:
+                del os.environ[key]
+
+        # Clean up barrier files (best-effort)
+        if rank == 0:
+            import shutil
+            try:
+                shutil.rmtree(_barrier_dir, ignore_errors=True)
+            except OSError:
+                pass
 
     def load_checkpoint(self, cfg_checkpointer: DictConfig) -> dict[str, Any]:
         """
@@ -527,11 +710,11 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         checkpoint_dict = self.load_checkpoint(cfg_checkpointer=cfg.checkpointer)
         if self._resume_from_checkpoint:
             self._update_recipe_state(checkpoint_dict)
-        # Server mode: vLLM handles generation, so we don't need to keep
-        # unsharded parameters after forward. reshard_after_forward=True
-        # saves ~(model_size / world_size * (world_size - 1)) memory per rank
-        # (critical for 32B+ models where full unshard exceeds tile memory).
-        reshard_policy = self._vllm_mode == "server"
+        # For server and colocate_sleep modes, reshard parameters after forward
+        # to avoid keeping the full unsharded model in memory. For 32B with
+        # FSDP-12, full unshard = 64 GiB which exceeds tile capacity.
+        # colocate (non-sleep) keeps unshard since model stays on GPU anyway.
+        reshard_policy = self._vllm_mode in ("server", "colocate_sleep")
         self._model = self._setup_model(
             cfg_model=cfg.model,
             enable_activation_checkpointing=self._enable_activation_checkpointing,
@@ -649,8 +832,22 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             _colocate_vllm_mode = True
 
     def _setup_vllm_server_mode(self):
-        """Initialize vLLM in server mode: HTTP client on rank 0 to external vLLM server."""
-        if self._is_rank_zero:
+        """Initialize vLLM in server mode.
+
+        For HSDP (dp_replicate > 1): each shard group leader (local rank 0 on
+        each node) creates an HTTP client to its local vLLM server. Each node
+        has its own vLLM instance at the same URL (localhost).
+
+        For non-HSDP: only global rank 0 creates the client (original behavior).
+        """
+        # In HSDP mode, each shard leader talks to its local vLLM.
+        # In non-HSDP mode, only rank 0 talks to vLLM.
+        should_init_client = (
+            self._is_shard_leader if self._shard_pg is not None
+            else self._is_rank_zero
+        )
+
+        if should_init_client:
             from torchtune.dev.grpo.vllm_client import VLLMClient
 
             self._vllm_client = VLLMClient(
@@ -666,7 +863,8 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                 self._build_tune_to_hf_map()
                 self._weight_sync_path = "/tmp/torchtune/weight_update.safetensors"
                 log.info(
-                    "vLLM server client initialized: %s (%d params mapped, file-based sync via %s, interval=%d)",
+                    "Rank %d: vLLM server client initialized: %s (%d params mapped, file-based sync via %s, interval=%d)",
+                    self.rank,
                     self._vllm_url,
                     len(self._tune_to_hf_map),
                     self._weight_sync_path,
@@ -674,10 +872,15 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                 )
             else:
                 log.info(
-                    "vLLM server client initialized (generation only, no weight sync): %s",
-                    self._vllm_url,
+                    "Rank %d: vLLM server client initialized (generation only, no weight sync): %s",
+                    self.rank, self._vllm_url,
                 )
-        torch.distributed.barrier()
+
+        # Use shard PG barrier for HSDP to avoid world-level PG mixing.
+        if self._shard_pg is not None:
+            torch.distributed.barrier(group=self._shard_pg)
+        else:
+            torch.distributed.barrier()
 
     def _setup_vllm_colocate_mode(self, cfg):
         """Initialize vLLM in colocate mode: every rank has its own vLLM engine.
@@ -699,20 +902,24 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         torch.distributed.barrier()
 
     def _build_tune_to_hf_map(self):
-        """Build torchtune -> HuggingFace parameter name mapping for weight sync."""
+        """Build torchtune -> HuggingFace parameter name mapping for weight sync.
+
+        Uses named_parameters() instead of state_dict() to avoid triggering
+        FSDP1's AllGather collective (which would deadlock if only shard leaders
+        call this function).
+        """
         from torchtune.models.convert_weights import get_mapped_key
         from torchtune.models.qwen2._convert_weights import _FROM_HF
 
         inverted = {v: k for k, v in _FROM_HF.items() if v is not None}
         self._tune_to_hf_map = {}
-        sharded_sd = self._model.state_dict()
-        for tune_name in sharded_sd.keys():
-            # Strip activation checkpoint wrapper from name for mapping
-            clean_name = tune_name.replace("_checkpoint_wrapped_module.", "")
+        for tune_name, _ in self._model.named_parameters():
+            # Strip FSDP and activation checkpoint wrapper prefixes for mapping
+            clean_name = tune_name.replace("_fsdp_wrapped_module.", "")
+            clean_name = clean_name.replace("_checkpoint_wrapped_module.", "")
             self._tune_to_hf_map[tune_name] = get_mapped_key(
                 clean_name, inverted
             )
-        del sharded_sd
 
     def _setup_lr_scheduler(
         self,
@@ -787,7 +994,36 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
               the right dtype
            b. All ranks calls ``load_state_dict`` without peaking CPU RAMs since
               full state dicts are loaded with ``torch.load(mmap=True)``
+
+        HSDP mode (dp_replicate > 1):
+           Uses FSDP1 FullyShardedDataParallel with HYBRID_SHARD strategy.
+           FSDP2's per-layer fully_shard() creates too many XCCL sub-communicators
+           which hang on Aurora XPU. FSDP1's single wrapping call avoids this.
         """
+        # HSDP mode: use FSDP1 path for small models (fits on single tile).
+        # For large models (>60 GiB), FSDP1 OOMs during flatten (needs full model
+        # on device + flat buffer simultaneously). Fall through to FSDP2 FULL_SHARD
+        # which uses meta device init and never materializes the full model.
+        # FSDP2 FULL_SHARD across all ranks (no HSDP mesh) avoids the sub-PG deadlock.
+        model_bytes = sum(v.numel() * v.element_size() for v in model_sd.values())
+        model_gib = model_bytes / (1024 ** 3)
+        if self._dp_replicate > 1 and model_gib < 50.0:
+            self._use_fsdp1 = True
+            return self._setup_model_fsdp1_hsdp(
+                cfg_model=cfg_model,
+                enable_activation_checkpointing=enable_activation_checkpointing,
+                model_sd=model_sd,
+                eval_mode=eval_mode,
+                reshard_after_forward=reshard_after_forward,
+            )
+        elif self._dp_replicate > 1:
+            utils.log_rank_zero(
+                log,
+                f"Model too large for FSDP1 HSDP ({model_gib:.1f} GiB). "
+                f"Using FSDP2 with HSDP mesh (dp_replicate={self._dp_replicate} × dp_shard={self._dp_shard}).",
+            )
+
+        self._use_fsdp1 = False
         utils.log_rank_zero(
             log,
             "FSDP is enabled. Instantiating model and loading checkpoint on Rank 0 ...",
@@ -824,11 +1060,16 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
 
         # Policy doesn't reshard after forward for faster generation.
         # Reference net reshards after forward because it never calls .backward()
+        # Use HSDP mesh for all models. FSDP2 with 2D DeviceMesh reuses cached
+        # ProcessGroups from init_device_mesh (no new XCCL communicators per-module).
+        # DeviceMesh uses new_group() (not split()) on XPU since torch.cuda.is_available()=False.
+        fsdp2_mesh = self._dp_mesh
         training.shard_model(
             model=model,
             shard_conditions=fsdp_shard_conditions,
             cpu_offload=fsdp_cpu_offload,
             reshard_after_forward=reshard_after_forward,
+            dp_mesh=fsdp2_mesh,
         )
 
         with training.set_default_dtype(self._dtype), self._device:
@@ -849,9 +1090,121 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
 
         # Ensure no params and buffers are on meta device
         training.validate_no_params_on_meta_device(model)
+
+        # Store vocab size for OOB clamping (FSDP2 with use_orig_params keeps shapes)
+        if not hasattr(self, '_vocab_size') and hasattr(model, 'tok_embeddings'):
+            self._vocab_size = model.tok_embeddings.weight.shape[0]
+
         utils.log_rank_zero(
             log,
             f"Instantiating model and loading checkpoint took {time.perf_counter() - init_start:.2f} secs",
+        )
+        if self._is_rank_zero:
+            memory_stats = training.get_memory_stats(device=self._device)
+            training.log_memory_stats(memory_stats)
+
+        disable_dropout(model)
+
+        return model
+
+    def _setup_model_fsdp1_hsdp(
+        self,
+        cfg_model: DictConfig,
+        enable_activation_checkpointing: bool,
+        model_sd: dict[str, Any],
+        eval_mode: bool = False,
+        reshard_after_forward: bool = True,
+    ) -> nn.Module:
+        """FSDP1-based HSDP model setup.
+
+        Uses FullyShardedDataParallel with HYBRID_SHARD strategy and a 2D
+        DeviceMesh. This is proven to work on Aurora XPU (used by PRISM).
+
+        FSDP2's composable fully_shard() creates per-layer XCCL sub-communicators
+        which hang on Aurora. FSDP1's single FSDP() call avoids this by managing
+        all sub-communicators internally in one initialization.
+        """
+        from torch.distributed.fsdp import (
+            FullyShardedDataParallel as FSDP,
+            MixedPrecision,
+            ShardingStrategy,
+        )
+
+        utils.log_rank_zero(
+            log,
+            f"HSDP (FSDP1): Instantiating model on device "
+            f"(dp_replicate={self._dp_replicate} × dp_shard={self._dp_shard})...",
+        )
+        init_start = time.perf_counter()
+
+        # Instantiate on CPU first, load state dict, then move to device.
+        # For large models (32B), ZE_AFFINITY_MASK must be unset so the
+        # allocator can spill across tiles during FSDP1 flatten.
+        with training.set_default_dtype(self._dtype):
+            model = config.instantiate(cfg_model)
+
+        if eval_mode:
+            model.eval()
+            for p in model.parameters():
+                p.requires_grad = False
+
+        # Load checkpoint BEFORE wrapping with FSDP1
+        model.load_state_dict(model_sd, strict=True)
+        del model_sd  # free CPU memory
+
+        # Move to device
+        model = model.to(device=self._device, dtype=self._dtype)
+
+        # Store vocab size BEFORE FSDP wrapping (FSDP shards tok_embeddings,
+        # making .weight.shape[0] return shard size instead of vocab size)
+        if hasattr(model, 'tok_embeddings'):
+            self._vocab_size = model.tok_embeddings.weight.shape[0]
+
+        # Initialize RoPE
+        for m in model.modules():
+            if hasattr(m, "rope_init"):
+                m.rope_init()
+
+        if enable_activation_checkpointing:
+            training.set_activation_checkpointing(
+                model, auto_wrap_policy={modules.TransformerSelfAttentionLayer}
+            )
+
+        # Mixed precision policy
+        mp_policy = MixedPrecision(
+            param_dtype=self._dtype,
+            reduce_dtype=self._dtype,
+            buffer_dtype=self._dtype,
+        )
+
+        # Sharding strategy: reshard_after_forward=True → HYBRID_SHARD (FULL_SHARD intra-node)
+        #                     reshard_after_forward=False → _HYBRID_SHARD_ZERO2 (SHARD_GRAD_OP intra-node)
+        if reshard_after_forward:
+            sharding = ShardingStrategy.HYBRID_SHARD
+            shard_label = "HYBRID_SHARD"
+        else:
+            try:
+                sharding = ShardingStrategy._HYBRID_SHARD_ZERO2
+                shard_label = "_HYBRID_SHARD_ZERO2"
+            except AttributeError:
+                sharding = ShardingStrategy.HYBRID_SHARD
+                shard_label = "HYBRID_SHARD (fallback)"
+
+        utils.log_rank_zero(log, f"HSDP: Using {shard_label} strategy")
+
+        # Wrap with FSDP1 — single call, minimal sub-communicator creation
+        model = FSDP(
+            model,
+            sharding_strategy=sharding,
+            mixed_precision=mp_policy,
+            device_mesh=self._dp_mesh,
+            use_orig_params=True,
+            limit_all_gathers=True,
+        )
+
+        utils.log_rank_zero(
+            log,
+            f"HSDP model setup took {time.perf_counter() - init_start:.2f} secs",
         )
         if self._is_rank_zero:
             memory_stats = training.get_memory_stats(device=self._device)
@@ -897,10 +1250,29 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         # Instantiate collate_fn
         collate_fn = _get_component_from_path(collate_fn)
 
+        # When using TP>1 for vLLM, all ranks in a TP group must see identical
+        # data so they generate the same prompts (deterministic scheduling).
+        # Use dp_size/dp_rank instead of world_size/rank for the sampler.
+        #
+        # For HSDP: ranks within the same dp_shard group process the same batch
+        # (they're FSDP shards of the same model copy). Only dp_replicate copies
+        # need different data. So sampler_replicas = dp_replicate, sampler_rank =
+        # replicate index.
+        if self._dp_replicate > 1:
+            # HSDP: each replicate group sees different data
+            sampler_replicas = self._dp_replicate
+            sampler_rank = self.rank // self._dp_shard
+        elif self._vllm_tp_size > 1:
+            sampler_replicas = self.world_size // self._vllm_tp_size
+            sampler_rank = self.rank // self._vllm_tp_size
+        else:
+            sampler_replicas = self.world_size
+            sampler_rank = self.rank
+
         sampler = StatefulDistributedSampler(
             ds,
-            num_replicas=self.world_size,
-            rank=self.rank,
+            num_replicas=sampler_replicas,
+            rank=sampler_rank,
             shuffle=shuffle,
             seed=self.seed,
         )
@@ -997,13 +1369,19 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
     ) -> torch.Tensor:
         """Call vLLM server for generation, broadcast results to all ranks.
 
+        For HSDP (dp_replicate > 1): each shard group leader (local rank 0 per
+        node) calls its local vLLM server and broadcasts within the shard group.
+        This doubles generation throughput with replicated vLLM.
+
+        For non-HSDP: only global rank 0 calls vLLM and broadcasts to all.
+
         Returns:
             query_responses: ``[B*G, context_length + max_generated_tokens]``
         """
         bsz = batch_input_ids.shape[0]
         total_len = context_length + self._max_generated_tokens
 
-        if self._is_rank_zero:
+        if self._is_shard_leader:
             # Strip padding and convert to Python lists for HTTP
             prompts = []
             for i in range(bsz):
@@ -1032,13 +1410,18 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
 
             total_tokens = sum(len(c) for c in completions)
             log.info(
-                "vLLM generation: %d sequences, %d tokens in %.1fs (%.1f tok/s)",
-                bsz, total_tokens, gen_time, total_tokens / max(gen_time, 0.01),
+                "Rank %d: vLLM generation: %d sequences, %d tokens in %.1fs (%.1f tok/s)",
+                self.rank, bsz, total_tokens, gen_time, total_tokens / max(gen_time, 0.01),
             )
         else:
             query_responses = batch_input_ids.new_empty(bsz, total_len)
 
-        torch.distributed.broadcast(query_responses, src=0)
+        # Broadcast within shard group (HSDP) or world (non-HSDP).
+        # src must be the GLOBAL rank of the shard leader (not group-local rank).
+        if self._shard_pg is not None:
+            torch.distributed.broadcast(query_responses, src=self._shard_leader_global_rank, group=self._shard_pg)
+        else:
+            torch.distributed.broadcast(query_responses, src=0)
         return query_responses
 
     def _generate_with_colocated_vllm(
@@ -1143,124 +1526,49 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
 
         # No cleanup — leave barrier files (they're in /tmp and tiny)
 
-    def _build_tune_to_vllm_map(self):
-        """Build mapping from torchtune param names to vLLM param locations.
-
-        vLLM merges q/k/v into qkv_proj and gate/up into gate_up_proj.
-        This mapping tells us where each torchtune param goes in the
-        vLLM model (param name + optional slice for merged params).
-
-        Returns dict: tune_name -> (vllm_name, slice_or_None)
-        """
-        llm_model = self._vllm_llm.llm_engine.model_executor.driver_worker.model_runner.model
-        vllm_params = dict(llm_model.named_parameters())
-
-        mapping = {}
-        unmapped = []
-        for tune_name in dict(self._model.named_parameters()).keys():
-            # Strip activation checkpoint wrapper for HF name lookup
-            clean_name = tune_name.replace("_checkpoint_wrapped_module.", "")
-            hf_name = self._tune_to_hf_map.get(clean_name, None)
-            if hf_name is None:
-                # Also try the original name
-                hf_name = self._tune_to_hf_map.get(tune_name, clean_name)
-
-            # Direct match (o_proj, down_proj, layernorm, embeddings, norm)
-            if hf_name in vllm_params:
-                mapping[tune_name] = (hf_name, None)
-                continue
-
-            matched = False
-            # QKV merge: q_proj/k_proj/v_proj -> qkv_proj
-            for proj, shard_id in [("q_proj", "q"), ("k_proj", "k"), ("v_proj", "v")]:
-                if proj in hf_name:
-                    qkv_name = hf_name.replace(proj, "qkv_proj")
-                    if qkv_name in vllm_params:
-                        mapping[tune_name] = (qkv_name, shard_id)
-                        matched = True
-                    break
-
-            if matched:
-                continue
-
-            # Gate/Up merge: gate_proj/up_proj -> gate_up_proj
-            for proj, shard_idx in [("gate_proj", 0), ("up_proj", 1)]:
-                if proj in hf_name:
-                    merged_name = hf_name.replace(proj, "gate_up_proj")
-                    if merged_name in vllm_params:
-                        mapping[tune_name] = (merged_name, shard_idx)
-                        matched = True
-                    break
-
-            if not matched:
-                unmapped.append((tune_name, hf_name))
-
-        if unmapped and self._is_rank_zero:
-            log.warning("%d unmapped weight sync params (first 3): %s",
-                        len(unmapped), [t for t, _ in unmapped[:3]])
-
-        self._tune_to_vllm_map = mapping
-
     def _sync_colocated_weights(self) -> None:
-        """Sync FSDP2 weights to every rank's colocated vLLM engine.
+        """Sync FSDP2 weights to colocated vLLM via load_weights().
 
-        Each rank gathers full params via DTensor.full_tensor() (XCCL
-        allgather — same PG that training uses) and copies them directly
-        into the vLLM model's parameters, handling merged QKV and gate/up.
+        For each param: full_tensor() → load_weights() → del. One param
+        at a time to minimize peak GPU memory (critical for 32B where
+        optimizer states + vLLM weights leave <1 GiB free).
+
+        vLLM's load_weights() handles TP slicing and QKV/gate_up merging
+        internally via per-param weight_loader functions.
         """
+        import gc
+
         t0 = time.perf_counter()
-
-        if not hasattr(self, '_tune_to_vllm_map'):
-            self._build_tune_to_vllm_map()
-
         llm_model = self._vllm_llm.llm_engine.model_executor.driver_worker.model_runner.model
-        vllm_params = dict(llm_model.named_parameters())
 
         n_synced = 0
         for tune_name, param in self._model.named_parameters():
-            entry = self._tune_to_vllm_map.get(tune_name)
-            if entry is None:
-                continue
+            clean = tune_name.replace("_checkpoint_wrapped_module.", "")
+            hf_name = self._tune_to_hf_map.get(
+                clean, self._tune_to_hf_map.get(tune_name, clean)
+            )
 
-            if hasattr(param, '_local_tensor'):
-                full_param = param.full_tensor()
+            if hasattr(param, 'full_tensor'):
+                weight_data = param.full_tensor()
             else:
-                full_param = param.data
+                weight_data = param.data
 
-            vllm_name, shard_info = entry
-            vllm_param = vllm_params[vllm_name]
-
-            if shard_info is None:
-                # Direct copy
-                vllm_param.data.copy_(full_param)
-            elif shard_info in ("q", "k", "v"):
-                # QKV merged: figure out slice from shapes
-                # qkv_proj has shape [q_dim + k_dim + v_dim, hidden]
-                # For Qwen2.5-3B: q=2048, k=256, v=256
-                q_dim = full_param.shape[0] if shard_info == "q" else None
-                total = vllm_param.shape[0]
-                if shard_info == "q":
-                    vllm_param.data[:full_param.shape[0]].copy_(full_param)
-                elif shard_info == "k":
-                    # k starts after q. q_dim = total - 2 * full_param.shape[0]
-                    # (since k and v have same dim for Qwen2)
-                    kv_dim = full_param.shape[0]
-                    q_size = total - 2 * kv_dim
-                    vllm_param.data[q_size:q_size + kv_dim].copy_(full_param)
-                else:  # v
-                    kv_dim = full_param.shape[0]
-                    vllm_param.data[total - kv_dim:].copy_(full_param)
-            else:
-                # gate_up merged: shard_idx 0=gate, 1=up
-                # gate_up_proj shape [gate_dim + up_dim, hidden]
-                half = vllm_param.shape[0] // 2
-                offset = shard_info * half
-                vllm_param.data[offset:offset + half].copy_(full_param)
-
+            llm_model.load_weights([(hf_name, weight_data)])
             n_synced += 1
-            del full_param
+            del weight_data
+
+            # Sync + gc every 5 params to bound UR handle pressure
+            # (707 full_tensor all-gathers create UR handles that must be
+            # reclaimed before the subsequent FSDP backward pass).
+            if n_synced % 5 == 0 and torch.xpu.is_available():
+                gc.collect()
+                torch.xpu.synchronize(self._device)
 
         self._vllm_llm.llm_engine.reset_prefix_cache()
+
+        gc.collect()
+        if torch.xpu.is_available():
+            torch.xpu.synchronize(self._device)
 
         log.info(
             "Rank %d: weight sync: %d params in %.1fs",
@@ -1268,32 +1576,53 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         )
 
     def _sync_weights_to_vllm(self) -> None:
-        """Gather FSDP2 sharded params and push to vLLM server.
+        """Gather sharded params and push to vLLM server.
 
         Uses file-based sync: saves weights as safetensors to /tmp, then
         POSTs to vLLM's /load_weights_from_path/ endpoint. This avoids
         creating a second XCCL process group which SIGABRTs on XPU.
 
-        All ranks participate in ``full_tensor()`` (required by FSDP2),
-        but only rank 0 writes and triggers the reload.
+        FSDP2: all ranks participate in ``full_tensor()``, shard leader saves.
+        FSDP1 (HSDP): uses FSDP.state_dict() which gathers on all ranks in
+        the shard group, shard leader saves.
+
+        For HSDP: each shard leader syncs to its local vLLM independently.
         """
         t0 = time.perf_counter()
-        # Gather all params into a CPU dict (HF names)
         hf_state_dict = {}
-        sharded_sd = self._model.state_dict()
-        for param_name, param in sharded_sd.items():
-            if param.is_cpu:
-                param = param.to(self._device)
-            # Gather DTensor -> full tensor (all ranks participate)
-            if hasattr(param, "_local_tensor"):
-                param = param.full_tensor()
-            if self._is_rank_zero:
-                hf_name = self._tune_to_hf_map.get(param_name, param_name)
-                hf_state_dict[hf_name] = param.cpu()
-        del sharded_sd
-        torch.distributed.barrier()
 
-        if self._is_rank_zero:
+        if getattr(self, '_use_fsdp1', False) and self._dp_replicate > 1:
+            # FSDP1 path: state_dict() handles gathering within shard group.
+            # All ranks in the shard group participate.
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, StateDictType
+            with FSDP.state_dict_type(self._model, StateDictType.FULL_STATE_DICT):
+                full_sd = self._model.state_dict()
+            if self._is_shard_leader:
+                for param_name, param in full_sd.items():
+                    hf_name = self._tune_to_hf_map.get(param_name, param_name)
+                    hf_state_dict[hf_name] = param.cpu()
+            del full_sd
+        else:
+            # FSDP2 path: gather DTensor -> full tensor.
+            # With HSDP 2D mesh, full_tensor() all-gathers within shard group only
+            # (dp_shard dim). Each shard leader gets a full copy independently.
+            sharded_sd = self._model.state_dict()
+            for param_name, param in sharded_sd.items():
+                if param.is_cpu:
+                    param = param.to(self._device)
+                if hasattr(param, "_local_tensor"):
+                    param = param.full_tensor()
+                if self._is_shard_leader:
+                    hf_name = self._tune_to_hf_map.get(param_name, param_name)
+                    hf_state_dict[hf_name] = param.cpu()
+            del sharded_sd
+
+        if self._shard_pg is not None:
+            torch.distributed.barrier(group=self._shard_pg)
+        else:
+            torch.distributed.barrier()
+
+        if self._is_shard_leader:
             from safetensors.torch import save_file
 
             n_params = len(hf_state_dict)
@@ -1318,8 +1647,8 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
 
             self._vllm_client.reset_prefix_cache()
             log.info(
-                "Weight sync to vLLM: %d params in %.1fs (file-based)",
-                n_params, time.perf_counter() - t0,
+                "Rank %d: weight sync to vLLM: %d params in %.1fs (file-based)",
+                self.rank, n_params, time.perf_counter() - t0,
             )
 
         device_empty_cache(self._device)
@@ -1384,6 +1713,18 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                 dtype=self._dtype,
                 decoder_max_seq_len=context_length + self._max_generated_tokens,
             ):
+                # For HSDP: disable early stopping during generation.
+                # With HSDP, different replicate groups process different data
+                # and finish at different times. Early stopping via all_reduce
+                # on the shard PG works per-node, but then the world-level
+                # barrier after generation deadlocks because one node finishes
+                # before the other. Always generating max tokens ensures all
+                # ranks take the same number of steps (stop_token_mask zeros
+                # out tokens past EOS).
+                _stop_tokens = (
+                    None if self._dp_replicate > 1
+                    else self._tokenizer.stop_tokens
+                )
                 query_responses, _ = generate(
                     model=self._model,
                     prompt=batch_input_ids,
@@ -1392,12 +1733,16 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                     top_k=self._top_k,
                     pad_id=self._tokenizer.pad_id,
                     rng=self._rng if self._device.type == "cuda" else None,
-                    stop_tokens=self._tokenizer.stop_tokens,
+                    stop_tokens=_stop_tokens,
                     return_logits=False,
                 )
 
         # Barrier: all ranks must finish generation before FSDP forward passes.
-        torch.distributed.barrier()
+        # HSDP: use shard PG to avoid mixing world PG with FSDP1 sub-PGs on XCCL.
+        if self._shard_pg is not None:
+            torch.distributed.barrier(group=self._shard_pg)
+        else:
+            torch.distributed.barrier()
 
         # Free vLLM GPU memory to reclaim space for training forward/backward passes.
         if _colocate_vllm_mode and self._vllm_llm is not None:
@@ -1432,8 +1777,8 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         responses = query_responses[:, context_length:].clone()
 
         # Clamp token IDs to valid vocab range (XPU scatter kernel crashes on OOB)
-        vocab_size = self._model.tok_embeddings.weight.shape[0] if hasattr(self._model, 'tok_embeddings') else None
-        if vocab_size is not None:
+        vocab_size = getattr(self, '_vocab_size', None)
+        if vocab_size is not None and vocab_size > 0:
             oob_mask = responses >= vocab_size
             if oob_mask.any():
                 log.warning("Clamping %d OOB token IDs (max=%d, vocab=%d)",
@@ -1488,9 +1833,12 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         device_empty_cache(self._device)
 
         # step 2.1 estimate logprobs of the responses using the reference policy
-        # Barrier: FULL_SHARD ref model needs allgather from all ranks
+        # Barrier: FSDP ref model needs allgather from all ranks in shard group
         log.info("Rank %d: pre-ref barrier", self.rank)
-        torch.distributed.barrier()
+        if self._shard_pg is not None:
+            torch.distributed.barrier(group=self._shard_pg)
+        else:
+            torch.distributed.barrier()
         if fwd_bs >= num_seqs:
             log.info("Rank %d: ref forward start", self.rank)
             ref_logits = self._ref_model(
@@ -1718,8 +2066,9 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
 
                     if self._gradient_accumulation_steps > 1:
                         # Gradient accumulation: disable gradient sync for
-                        # non-final micro-batches (FSDP2 uses
-                        # set_requires_gradient_sync instead of no_sync())
+                        # non-final micro-batches.
+                        # FSDP2 uses set_requires_gradient_sync()
+                        # FSDP1 (HSDP) uses no_sync() context manager
                         micro_batch_size = total_samples // self._gradient_accumulation_steps
                         for ga_step in range(self._gradient_accumulation_steps):
                             start_idx = ga_step * micro_batch_size
@@ -1729,11 +2078,22 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                             )
 
                             is_last = (ga_step == self._gradient_accumulation_steps - 1)
-                            self._model.set_requires_gradient_sync(is_last)
-
-                            step_stats = self.grpo_step(
-                                micro_trajectory, context_length
-                            )
+                            if hasattr(self._model, 'set_requires_gradient_sync'):
+                                # FSDP2 path
+                                self._model.set_requires_gradient_sync(is_last)
+                                step_stats = self.grpo_step(
+                                    micro_trajectory, context_length
+                                )
+                            elif not is_last and hasattr(self._model, 'no_sync'):
+                                # FSDP1 path
+                                with self._model.no_sync():
+                                    step_stats = self.grpo_step(
+                                        micro_trajectory, context_length
+                                    )
+                            else:
+                                step_stats = self.grpo_step(
+                                    micro_trajectory, context_length
+                                )
                             grpo_stats.append(step_stats)
 
                             # Memory cleanup between GA steps — gc only,
@@ -1838,12 +2198,17 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         self, trajectory: GRPOTrajectory, grpo_stats: GRPOStats, **extras
     ) -> None:
         rewards = trajectory.rewards.mean()
-        torch.distributed.reduce(rewards, dst=0, op=torch.distributed.ReduceOp.SUM)
-        rewards /= self.world_size
+        # HSDP: skip world-level reduce to avoid mixing world PG with FSDP1
+        # sub-PGs on XCCL. Each replicate group processes the same model with
+        # different data, so rank 0's local metrics are representative.
+        if self._shard_pg is None:
+            torch.distributed.reduce(rewards, dst=0, op=torch.distributed.ReduceOp.SUM)
+            rewards /= self.world_size
 
         successes = trajectory.successes.mean()
-        torch.distributed.reduce(successes, dst=0, op=torch.distributed.ReduceOp.SUM)
-        successes /= self.world_size
+        if self._shard_pg is None:
+            torch.distributed.reduce(successes, dst=0, op=torch.distributed.ReduceOp.SUM)
+            successes /= self.world_size
 
         log_dict = {
             "rewards": rewards,
