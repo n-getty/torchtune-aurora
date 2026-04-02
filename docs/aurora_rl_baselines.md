@@ -12,7 +12,7 @@ torchtune RL recipes on Aurora HPC (Intel Max 1550 GPUs).
 | Memory | 64 GB HBM2e per tile |
 | Interconnect | Slingshot-11 (HSN, 200+ Gb/s) |
 | Backend | oneCCL / XCCL |
-| PyTorch | via `module load frameworks` (aurora_frameworks-2025.2.0) |
+| PyTorch | via `module load frameworks` (aurora_frameworks-2025.3.1) |
 | Precision | BF16 |
 
 ## Phase 0: XPU Utility Module
@@ -447,7 +447,7 @@ Steady-state average (steps 2-5): **4.9 s/step, 136 tok/s generation**
 
 1. **CCL_ATL_TRANSPORT=mpi for vLLM process**: vLLM with TP=1 doesn't need OFI/CXI transport. If vLLM initializes CCL with `CCL_ATL_TRANSPORT=ofi` (the training setting), it contaminates CXI fabric state, causing SIGABRT in the training XCCL process group. Override to `mpi` for the vLLM subprocess.
 
-2. **Do NOT set CCL_ALLREDUCE=ring / CCL_REDUCE_SCATTER=ring**: These force XCCL's "scheduler path" which doesn't support `ReduceOp.AVG` used by FSDP2's reduce-scatter. Without these vars, XCCL uses the default path that supports AVG.
+2. **Do NOT set CCL_REDUCE_SCATTER=ring**: On single-node, this forces XCCL's "scheduler path" which doesn't support `ReduceOp.AVG` used by FSDP2. On multi-node, it causes a **63x ReduceScatter bandwidth regression** (1.9 GiB/s vs 138 GiB/s). `CCL_ALLREDUCE=ring` is fine and used in production.
 
 3. **CXI fabric tuning (from PRISM production)**: Set `FI_CXI_RX_MATCH_MODE=hybrid`, `FI_CXI_OFLOW_BUF_SIZE=8388608`, `FI_CXI_DEFAULT_CQ_SIZE=131072`, `FI_MR_CACHE_MONITOR=userfaultfd`.
 
@@ -810,10 +810,11 @@ serializing one request per prompt. vLLM's continuous batching processes them co
 | Config | Gen Time | Gen tok/s | Step Time | Peak Mem | Status |
 |--------|----------|-----------|-----------|----------|--------|
 | TP=2, sequential (old) | 31.7s | 16.2 | **48.3 s** | 41.6 GiB | Baseline |
-| TP=2, batched | **8.6s** | **59.7** | **25.6 s** | 41.6 GiB | **Best** |
+| TP=2, batched | **8.6s** | **59.7** | **25.6 s** | 41.6 GiB | fbs=1 |
+| TP=2, batched, **fbs=4** | **8.4s** | **~60** | **18.1 s** | 34.2 GiB | **Best** (see Phase 10) |
 | TP=4, batched | **7.0s** | **73.5** | ~78s (OOM step 3) | 49 GiB | OOM — FSDP-8 too tight |
 
-**TP=2 with batched generation is optimal**: 25.6 s/step with 22 GiB headroom.
+**TP=2 with batched generation + fbs=4 is optimal**: 18.1 s/step with 34 GiB headroom.
 TP=4 saves 1.6s on generation but uses 8 GiB more per training tile (FSDP-8 vs FSDP-10),
 pushing reserved memory to 63/64 GiB and causing allocator thrashing then OOM.
 
@@ -842,7 +843,7 @@ Added dual-API support to `torchtune/dev/grpo/vllm_client.py` for 32B server mod
 | 8B | A (4×256) | 15.7 s | **10.1 s** | 6 | **1.55×** | 35.3 GiB |
 | 8B | A var (4×512) | 30.6 s | **13.0 s** | 12 | **2.35×** | 37.1 GiB |
 | 8B | B (16×512) | OOM | OOM | 12 | — | >40 GiB |
-| 32B | A (4×128) | **OOM** | **25.6 s** | 10+2 vLLM | **∞ (A100 can't run)** | >40 GiB |
+| 32B | A (4×128) | **OOM** | **18.1 s** | 10+2 vLLM | **∞ (A100 can't run)** | >40 GiB |
 
 **Summary**:
 - Aurora is **faster at larger models** (8B: 1.55-2.35× speedup) where A100 is memory-constrained
@@ -949,7 +950,7 @@ export CCL_ATL_TRANSPORT=ofi
 export FI_PROVIDER=cxi
 export CCL_KVS_IFACE=hsn0          # training uses HSN for inter-node
 export CCL_ALLREDUCE=ring           # required for multi-node
-export CCL_REDUCE_SCATTER=ring
+# NOTE: Do NOT set CCL_REDUCE_SCATTER=ring — causes 63x regression on multi-node
 export CCL_CHUNK_SIZE=16777216      # 16 MB
 export ZE_AFFINITY_MASK=$LOCAL_RANK # CRITICAL for vLLM coexistence
 export FI_MR_CACHE_MONITOR=disabled
@@ -1073,12 +1074,450 @@ FSDP2 with 2D HSDP mesh (dp_replicate=2 × dp_shard=10) now works after fixing t
 - `DeviceMesh` on XPU uses `new_group()` (not `split()`), avoiding torch-xpu-ops#3233
 - The "FSDP2 sub-communicator deadlock" hypothesis was wrong — only `distribute_tensor` deadlocks
 
-### Next Steps
+## Phase 10: Multi-Node HSDP Profiling & Optimization (2026-04-01)
 
-- **Profile** HSDP AllReduce vs compute time to understand the 11.4x regression
-- **Gradient accumulation**: Accumulate N micro-batches before AllReduce to reduce communication frequency
-- **Larger batch sizes**: More compute per AllReduce improves scaling efficiency
-- **3+ node scaling**: Test if additional nodes improve throughput with HSDP
+**Goal**: Profile and fix the 11.4x multi-node HSDP regression (291s/step vs 25.6s single-node).
+
+### Investigation Summary
+
+Systematically isolated the multi-node regression using focused benchmarks:
+
+| Experiment | Config | Forward time | Notes |
+|-----------|--------|-------------|-------|
+| Simple model (16 linears) 1-node | 1D mesh (10 ranks) | 876ms | Baseline |
+| Simple model 1-node | 2D mesh (1×10) | 872ms | **No 2D overhead** |
+| Simple model 1-node | 2D mesh (2×5 HSDP) | 752ms | 2D faster (smaller AG group) |
+| Simple model 2-node | 1D mesh (20 ranks) | 2122ms | Inter-node AllGather |
+| Simple model 2-node | 2D mesh (2×10 HSDP) | 1893ms | 2D faster |
+| 3B model 1-node | 1D mesh (10 ranks) | 4275ms | Baseline |
+| 3B model 1-node | 2D mesh (2×5) | 1920ms | 2D faster |
+| 3B model 2-node | 1D mesh (20 ranks) | 3118ms | Inter-node AG |
+| 3B model 2-node | 2D mesh (2×10 HSDP) | 4191ms | 2D ~1.3x slower |
+| **32B model 1-node** | **1D mesh (10 ranks)** | **24.31s** | **Baseline** (no AC) |
+| **32B model 1-node** | **2D mesh (1×10)** | **24.29s** | **No 2D overhead** |
+
+**Key finding**: The 2D HSDP mesh does NOT cause any forward pass regression.
+The 24s per forward was the real cost of FSDP2 AllGather for 32B with
+`reshard_after_forward=True` and no activation checkpointing.
+
+### Root Cause: `forward_batch_size` Was the Bottleneck
+
+The 291s/step was **not** a mesh topology bug. It was caused by excessive forward
+passes due to `forward_batch_size=1`:
+
+**Old config (fbs=1, batch_size=1, grpo_samples=4):**
+```
+Gen phase:  4 policy_fwd chunks + 4 ref_fwd chunks = 8 forward passes
+GRPO phase: 1 forward + 1 backward
+Total:      10 model-forward-equivalent passes per step
+```
+
+**New config (fbs=4):**
+```
+Gen phase:  1 policy_fwd + 1 ref_fwd = 2 forward passes
+GRPO phase: 1 forward + 1 backward
+Total:      4 model-forward-equivalent passes per step
+```
+
+Each forward pass incurs FSDP AllGather overhead (64 layers × ~100 MiB/layer per
+shard × 10 shards = 64 GiB data movement). Reducing passes from 10 to 4 saves
+~60% of AllGather traffic.
+
+### OOM Check: `forward_batch_size=4` Is Safe for 32B
+
+Tested with `test_32b_fbs.py` (10 tiles, seq_len=640, activation checkpointing):
+
+| Batch Size | no_grad Forward | grad Forward | Backward | Peak Memory |
+|-----------|----------------|-------------|---------|-------------|
+| 1 | 2.42s | 1.49s | 5.39s | 13.7 / 31.1 GiB |
+| 2 | 2.19s | 1.91s | 4.53s | 14.1 / 31.1 GiB |
+| **4** | **3.10s** | **2.84s** | **7.23s** | **14.9 / 34.2 GiB** |
+
+Peak memory at bs=4 is **34.2 GiB** out of 68.7 GiB total — ample headroom.
+
+### FSDP2 Monkey-Patch Update (frameworks-2025.3.1)
+
+The `_get_gradient_divide_factors` function signature changed from 1 arg to 6 args:
+```python
+def _get_gradient_divide_factors(
+    reduce_scatter_group, all_reduce_group, reduce_dtype,
+    device_type='', factor=None, force_sum_reduction_for_comms=False
+) -> tuple[Optional[float], Optional[float], ReduceOp, ReduceOp]
+```
+
+The old monkey-patch `(ws) -> (ws, 1)` breaks with `TypeError: takes 1 positional
+argument but 6 were given`. The recipe now wraps the original function and sets
+`force_sum_reduction_for_comms=True` (same approach as MTIA in upstream PyTorch)
+to avoid `ReduceOp.AVG` on XPU.
+
+### Results: Single-Node 32B with `forward_batch_size=4`
+
+| Metric | fbs=1 (old) | fbs=4 (new) | Change |
+|--------|-------------|-------------|--------|
+| **Total step time** | **25.6 s** | **18.1 s** | **1.4x faster** |
+| vLLM generation | 8.6s | 8.4s | same |
+| Policy forward (gen) | 4×~2.5s = ~10s | 1×2.2s = 2.2s | 4.5x |
+| Ref forward (gen) | 4×~2.5s = ~10s | 1×1.5s = 1.5s | 6.7x |
+| GRPO forward (train) | ~2s | 1.8s | same |
+| GRPO backward (train) | ~12s | 5.7s | 2.1x |
+| Optimizer | 1.7s | 0.2s | 8.5x |
+| Peak memory/tile | 41.6 / 58.8 GiB | ~14.9 / 34.2 GiB | 42% less |
+
+### Results: Multi-Node 32B HSDP with `forward_batch_size=4`
+
+| Metric | fbs=1 HSDP | fbs=4 HSDP | Single-node fbs=4 |
+|--------|-----------|-----------|-------------------|
+| **Total step time** | **291 s** | **143.6 s** | **18.1 s** |
+| Gen phase | ~213s | 59.9s | 12.0s |
+| - vLLM | 12s | 10s | 8.4s |
+| - policy_fwd | 4×25s | 1×27s | 1×2.2s |
+| - ref_fwd | 4×25s | 1×24s | 1×1.5s |
+| GRPO phase | ~85s | 83.5s | 5.8s |
+| - forward | 24.5s | 24.6s | 1.8s |
+| - backward | 60s | 59.0s | 5.7s |
+| Optimizer | 1.7s | 0.2s | 0.2s |
+
+### Remaining Bottleneck: CCL Sub-Communicator Performance
+
+The multi-node forward passes are **13x slower** than single-node despite both using
+dp_shard=10 (intra-node AllGather):
+
+- Single-node no_grad forward (bs=4): **2.2s**
+- Multi-node HSDP no_grad forward (bs=4): **27s**
+
+Both use the same dp_shard=10 group. AllGather should be purely intra-node within
+the shard dimension. But CCL/XCCL on Intel Max GPUs runs sub-communicator collectives
+13x slower when the parent world communicator spans multiple nodes.
+
+**Confirmed NOT caused by:**
+- 2D mesh topology (tested 1D vs 2D on single node — identical)
+- Ring algorithm settings (`CCL_ALLREDUCE=ring`)
+- `ZE_AFFINITY_MASK` settings
+- Forward batch size (same regression with fbs=1 or fbs=4)
+
+**This appears to be a CCL/XCCL sub-communicator performance bug** on Intel Max
+1550 GPUs. When `torch.distributed.new_group()` creates a sub-communicator from a
+world PG that spans multiple nodes, the AllGather on that sub-group runs at inter-node
+speeds even when all group members are on the same node.
+
+**Raw AllGather bandwidth (single-node, world group, no HSDP):**
+```
+AllGather 10 MiB × 10 = 100 MiB:   1.1ms,   90 GiB/s
+AllGather 100 MiB × 10 = 1000 MiB:  8.9ms,  110 GiB/s
+AllGather 500 MiB × 10 = 5000 MiB:  44.0ms, 111 GiB/s
+AllGather 1000 MiB × 10 = 10000 MiB: 87.8ms, 111 GiB/s
+```
+
+At 111 GiB/s intra-node bandwidth, a full 32B AllGather (64 layers × ~1 GiB) should
+take ~0.6s if perfectly pipelined. The 2.2s single-node forward includes compute and
+serialization overhead. The 27s multi-node forward implies the sub-communicator
+bandwidth has dropped to ~2.4 GiB/s — a 46x bandwidth regression.
+
+### Updated Performance Summary
+
+| Model | Tiles | Step Time | Notes |
+|-------|-------|-----------|-------|
+| Qwen2.5-3B | 2 | 16.2 s | Baseline (no vLLM) |
+| Qwen2.5-3B | 6 | 5.9 s | vLLM TP=1, 6 training |
+| Qwen2.5-3B | 10 | 5.1 s | vLLM TP=1, 10 training (best 3B) |
+| **Qwen3-32B** | **10+2** | **18.1 s** | **vLLM TP=2, fbs=4 (best 32B)** |
+| Qwen3-32B | 10+2 | 25.6 s | vLLM TP=2, fbs=1 |
+| Qwen3-32B | 20+4 (2 nodes) | 143.6 s | HSDP, fbs=4, CCL bottleneck |
+| Qwen3-32B | 20+4 (2 nodes) | 291 s | HSDP, fbs=1 |
+| Qwen3-32B | 20 flat (2 nodes) | 447 s | FULL_SHARD, fbs=1 |
+
+### CCL Transport Benchmark: MPI vs OFI (2026-04-01)
+
+After reviewing official Aurora oneCCL documentation, we discovered our CCL config
+(`CCL_ATL_TRANSPORT=ofi`, `CCL_PROCESS_LAUNCHER=none`) diverges from the recommended
+setup (`CCL_ATL_TRANSPORT=mpi`, `CCL_PROCESS_LAUNCHER=pmix`). A targeted benchmark
+isolates the effect.
+
+**Test scripts**: `recipes/dev/test_fsdp2_multinode_minimal.py`, `test_fsdp2_multinode_wrapper.sh`, `test_fsdp2_multinode_launch.sh`
+
+#### Small Model Results (16 layers, dim=4096, ~6.4 GiB, 2 nodes × 10 tiles)
+
+| Config | Transport | Algorithm | Shard AG 500MiB (GiB/s) | FSDP Fwd (ms) | FSDP Total (ms) |
+|--------|-----------|-----------|-------------------------|---------------|-----------------|
+| Single-node baseline | ofi | ring | N/A (world: 2.4) | 2602 | 8377 |
+| Multi-node (current) | ofi | ring | **2.4** | 2531 | 8056 |
+| Multi-node | **mpi** | **topo** | **4.6** | 2404 | 8839 |
+| Multi-node | **mpi** | ring | **4.4** | 2467 | 8418 |
+| Multi-node | ofi | topo | 2.4 | 2524 | 8672 |
+
+**Key insight**: MPI transport is the differentiator, not the algorithm. MPI ~doubles
+AllGather bandwidth (2.4→4.4 GiB/s) regardless of algorithm. The `topo` algorithm
+alone (ofi+topo) provides zero improvement.
+
+#### Large Model Results (64 layers, dim=5120, ~40 GiB, 2 nodes × 10 tiles)
+
+| Config | Transport | Forward (ms) | Backward (ms) | Total (ms) | Shard AG (GiB/s) |
+|--------|-----------|-------------|---------------|------------|-------------------|
+| ofi+ring (current) | ofi | 15,678 | 33,752 | **49,430** | 2.4 |
+| **mpi+ring** | **mpi** | **10,352** | **33,974** | **44,326** | **4.2** |
+| Improvement | | **34% faster** | same | **10.3% faster** | **1.75x** |
+
+The MPI transport gives **34% faster forward** by doubling AllGather bandwidth.
+Backward is unchanged (dominated by ReduceScatter, same ring algo).
+Combined end-to-end: **10.3% faster**.
+
+#### ROOT CAUSE FOUND: `CCL_WORKER_COUNT=4` Causes 48x AllGather Regression
+
+Further investigation revealed the **true root cause** of the AllGather performance gap:
+
+| Config | CCL_WORKER_COUNT | AllGather 1000MiB (10 tiles) | Bandwidth |
+|--------|------------------|------------------------------|-----------|
+| torchrun, defaults | **1** (default) | **87.8 ms** | **111 GiB/s** |
+| torchrun, our CCL vars | **4** | **4054 ms** | **2.4 GiB/s** |
+| torchrun, CCL_WORKER_COUNT=1 + all other vars | **1** | **88.2 ms** | **111 GiB/s** |
+
+**`CCL_WORKER_COUNT=4` alone drops bandwidth from 111 GiB/s to 2.3 GiB/s — a 48x regression.**
+
+With `CCL_WORKER_COUNT=1`, multi-node AllGather (20 ranks across 2 nodes) runs at
+**97.7 GiB/s** (vs 4.0 GiB/s with count=4).
+
+**Root cause**: `CCL_WORKER_COUNT` controls the number of CCL progress threads per
+communicator. With 10 ranks/node × 4 workers = 40 worker threads all competing for
+Level Zero device access, creating massive contention. This setting was copied from
+older Aurora examples that used fewer ranks per node (e.g., 6 tiles).
+
+The "13x sub-communicator regression" and the "25-50x mpiexec vs torchrun gap" were
+both caused by this single env var — NOT by transport choice, algorithm, affinity
+masks, or sub-communicator bugs.
+
+#### Production Config Updated
+
+Updated ALL launch scripts (`aurora_grpo_vllm_wrapper.sh`, `aurora_grpo_vllm_hsdp_multinode.sh`,
+and 8 other scripts):
+- **`CCL_WORKER_COUNT=1`** (was `4`) — **the critical fix**
+- `CCL_ATL_TRANSPORT=mpi` (was `ofi`) — additional ~2x improvement
+- `CCL_PROCESS_LAUNCHER=pmix` (was `none`)
+- `CCL_KVS_MODE=mpi`, `CCL_KVS_USE_MPI_RANKS=1`
+- `mpiexec --pmi=pmix` (was `--no-vni`)
+- Added `mpi4py` pre-init to GRPO recipe
+
+#### FSDP2 HSDP Results with `CCL_WORKER_COUNT=1` + MPI Transport
+
+Large model (40.3 GiB, 64 layers, dim=5120), 2 nodes × 10 tiles:
+
+| Metric | Before (WORKER=4, ofi) | After (WORKER=1, mpi) | Single-node 1D |
+|--------|------------------------|----------------------|----------------|
+| **Forward** | 15,678 ms | **686 ms** | 692 ms |
+| **Backward** | 33,752 ms | **17,944 ms** | 1,220 ms |
+| **Total** | 49,430 ms | **18,630 ms** | 1,913 ms |
+| Shard AG 500MiB | 2.4 GiB/s | **111 GiB/s** | 111 GiB/s |
+| World AG 500MiB | 1.6 GiB/s | **91.7 GiB/s** | N/A |
+
+**Forward is perfectly scaled** — 686ms multi-node vs 692ms single-node.
+The remaining bottleneck is the backward pass inter-node AllReduce for gradient sync
+(17.9s multi-node vs 1.2s single-node).
+
+### 32B GRPO Results: Near-Linear Multi-Node Scaling (2 nodes, HSDP 2×10)
+
+Config: Qwen3-32B, vLLM TP=2/node, fbs=4, `CCL_WORKER_COUNT=1` + MPI transport + no `CCL_REDUCE_SCATTER=ring`.
+
+**Per-step timing (steady state, step 2):**
+
+| Phase | Multi-node (2 nodes) | Single-node | Ratio |
+|-------|---------------------|-------------|-------|
+| vLLM generation | 8.3s | 8.4s | **0.99x** |
+| policy_fwd | 1.5s | 2.2s | **0.68x (faster)** |
+| ref_fwd | 1.5s | 1.5s | **1.0x** |
+| grpo_step fwd | 1.6s | 1.8s | **0.89x** |
+| backward | **6.3s** | 5.7s | **1.1x** |
+| optimizer | 0.2s | 0.2s | **1.0x** |
+| **Total step** | **19.4s** | **18.1s** | **1.07x** |
+
+**Step-by-step:**
+
+| Step | Total | Gen | GRPO (fwd+bwd) | Clip | Opt |
+|------|-------|-----|----------------|------|-----|
+| 0 (warmup) | 25.5s | 13.5s | 9.9s | 0.5s | 1.5s |
+| 1 | 19.9s | 12.0s | 7.7s | 0.1s | 0.2s |
+| 2 | **19.4s** | 11.3s | 7.9s | 0.1s | 0.2s |
+
+**Progression of multi-node fixes:**
+
+| Fix | Step Time | vs Single-node | Cumulative Speedup |
+|-----|-----------|---------------|-------------------|
+| Original (WORKER=4, RS=ring, ofi) | 143.6s | 7.9x slower | 1.0x |
+| + CCL_WORKER_COUNT=1 + MPI transport | 47.3s | 2.6x slower | 3.0x |
+| + Remove CCL_REDUCE_SCATTER=ring | **19.4s** | **1.07x** | **7.4x** |
+
+**Two env var fixes turned an 8x regression into near-linear scaling.** The 2-node setup
+now processes 2x the effective batch (2 vLLM servers, 2 gradient replicas) in essentially
+the same wall time as single-node.
+
+#### Second Root Cause: `CCL_REDUCE_SCATTER=ring` (63x ReduceScatter Regression)
+
+Raw ReduceScatter benchmark on dp_shard group (10 intra-node tiles):
+
+| Config | 100 MiB | 500 MiB | 1000 MiB | Bandwidth |
+|--------|---------|---------|----------|-----------|
+| `CCL_REDUCE_SCATTER=ring` | 51ms | 254ms | 441ms | **1.9-2.2 GiB/s** |
+| CCL default (no setting) | 1.1ms | 3.6ms | 7.0ms | **138 GiB/s** |
+| **Regression** | **46x** | **71x** | **63x** | |
+
+Single-node (torchrun) ReduceScatter runs at 138 GiB/s regardless of algorithm setting.
+The `ring` algorithm only regresses in multi-node mpiexec contexts — same class of bug
+as `CCL_WORKER_COUNT=4`.
+
+**Impact**: Each of 64 layers does a ~1 GiB ReduceScatter. At 2.2 GiB/s: 64 × 441ms =
+28.2s in ReduceScatter alone, explaining the 34s backward. At 138 GiB/s: 64 × 7ms = 0.4s.
+
+### Updated Performance Summary
+
+| Model | Tiles | Step Time | Notes |
+|-------|-------|-----------|-------|
+| Qwen2.5-3B | 2 | 16.2 s | Baseline (no vLLM) |
+| Qwen2.5-3B | 6 | 5.9 s | vLLM TP=1, 6 training |
+| Qwen2.5-3B | 10 | 5.1 s | vLLM TP=1, 10 training (best 3B) |
+| **Qwen3-32B** | **10+2** | **18.1 s** | **vLLM TP=2, fbs=4 (best single-node)** |
+| Qwen3-32B | 10+2 | 25.6 s | vLLM TP=2, fbs=1 |
+| **Qwen3-32B** | **20+4 (2 nodes)** | **19.4 s** | **HSDP, near-linear scaling!** |
+| Qwen3-32B | 20+4 (2 nodes) | 47.3 s | CCL partially fixed (RS=ring still set) |
+| Qwen3-32B | 20+4 (2 nodes) | 143.6 s | CCL broken (WORKER=4, RS=ring) |
+
+### Recommendations
+
+1. **NEVER set `CCL_WORKER_COUNT=4`** — causes 48x AllGather regression on 10+ tile configs
+2. **Always use `CCL_WORKER_COUNT=1`** (the default) for 10-tile training
+3. **Use MPI transport** (`CCL_ATL_TRANSPORT=mpi` + `--pmi=pmix`) for multi-node
+4. **Always use `forward_batch_size: 4`** for 32B GRPO configs
+5. **Next optimization**: Profile backward ReduceScatter + AllReduce overlap; consider `reshard_after_forward=False` or gradient accumulation across micro-batches
+6. **Report to Intel**: `CCL_WORKER_COUNT=4` regression with 10+ ranks per node
+
+## Phase 11: grpo_samples Scaling & Tile Allocation (2026-04-01)
+
+**Goal**: Measure how vLLM batching efficiency scales with more generation samples,
+and test whether 8 training + 4 vLLM tiles (TP=4) is viable for 32B.
+
+### grpo_samples Scaling — 32B Qwen3, Single Node (10+2)
+
+Config: 10 training tiles, 2 vLLM tiles (TP=2), forward_batch_size=4,
+max_generated_tokens=128, `CCL_WORKER_COUNT=1`.
+
+| | G=4 (baseline) | G=8 | G=16 |
+|---|---|---|---|
+| **vLLM tok/s** | 60 | 119 | 214 |
+| **vLLM wall time** | 8.4s | 8.6s | 9.6s |
+| **Policy fwd** | 2.2s | 3.7s | 6.6s |
+| **Ref fwd** | 1.5s | 2.9s | 5.8s |
+| **Backward** | 5.7s | 6.2s | 11.5s |
+| **Step time** | 18.1s | 24.2s | 36.9s |
+| **Sequences/step** | 4 | 8 | 16 |
+| **Time/sequence** | 4.5s | 3.0s | 2.3s |
+| **vLLM throughput gain** | 1.0x | 2.0x | 3.6x |
+
+**Key findings:**
+
+1. **vLLM batching is highly efficient**: 4x more sequences costs only +1.2s of
+   generation wall time (9.6s vs 8.4s). vLLM throughput scales 3.6x (60 → 214 tok/s).
+
+2. **Training time scales linearly**: Policy fwd 3x, ref fwd 3.9x, backward 2x for
+   4x sequences — expected since more sequences = more forward/backward work. The
+   `forward_batch_size=4` setting chunks 16 sequences into 4 batches of 4.
+
+3. **Per-sequence efficiency improves 2x**: 4.5s/seq at G=4 → 2.3s/seq at G=16.
+   Fixed overhead (FSDP AllGather, optimizer step, communication) amortizes across
+   more sequences.
+
+4. **No OOM at G=16**: 10-way FSDP handles 16 sequences with forward_batch_size=4
+   chunking without memory issues.
+
+5. **Bottleneck shifts**: Generation dominates at G=4 (46% of step time), but training
+   dominates at G=16 (60%). A dedicated vLLM node would shift balance further toward
+   training — desirable since training scales with more FSDP nodes.
+
+### 8 Training + 4 vLLM Tiles (TP=4) — OOM
+
+Tested 32B GRPO with 8 training tiles + 4 vLLM tiles (TP=4) on single node.
+
+**Result: OOM crash on step 2.** GPU segfault (`Segmentation fault from GPU...
+NotPresent, Write, banned, aborting`).
+
+| Step | Forward | Backward | Total | Status |
+|------|---------|----------|-------|--------|
+| 0 | 3.3s | 5.3s | 22.6s | OK |
+| 1 | 2.7s | **64.2s** (11x regression) | 77.4s | Memory thrashing |
+| 2 | 41.8s | — | — | GPU segfault (SIGABRT) |
+
+**Root cause:** 8-way FSDP creates 8.1 GiB shards per tile (vs 6.5 GiB with 10-way).
+Total per-tile memory: model(8.1) + ref(8.1) + optimizer(16.2) + activations(~15-20)
+≈ 47-52 GiB. Exceeds available memory after Level Zero overhead (~12-15 GiB).
+
+**Conclusion:** 10 training + 2 vLLM (TP=2) is the optimal single-node 32B config.
+For generation speedup, use higher grpo_samples (batching) or multi-node HSDP with
+additional vLLM servers — not fewer training tiles.
+
+### Implications for 70B+ Models
+
+- **70B cannot fit on a single node**: 70B × 2 bytes = 140 GiB. Even 12-way FSDP
+  gives ~11.7 GiB/tile for model alone, plus reference model and optimizer states.
+  Needs 2+ nodes for training (20-way FSDP = ~7 GiB/tile).
+
+- **Dedicated vLLM node architecture**: Training uses all 12 tiles/node for maximum
+  FSDP sharding. Separate node(s) for vLLM with TP=12 or TP=6 × 2 replicas. Higher
+  grpo_samples (16+) makes the dedicated-node overhead worthwhile since vLLM batching
+  nearly eliminates generation time scaling.
+
+### Dedicated vLLM Node Test (2 nodes: 1 vLLM, 1 training)
+
+Tested the dedicated vLLM node architecture at 32B to prototype 70B.
+Node 0 runs vLLM only (12 tiles), Node 1 runs training only (12-tile FSDP).
+
+**Implementation:** Added multi-URL vLLM support (comma-separated `vllm_url`,
+parallel ThreadPoolExecutor dispatch), IP-based URLs to bypass Aurora's Squid proxy.
+
+**Scripts:** `recipes/dev/aurora_grpo_dedicated_vllm.sh`, config
+`recipes/configs/dev/qwen32B_grpo_dedicated_vllm_xpu.yaml`
+
+**Qwen3-32B head constraints**: 64 attn / 8 KV heads → valid TP: 1, 2, 4, 8
+
+| Metric | Colocated 10+2 (G=16) | Dedicated TP=4 DP=3 | Dedicated TP=2 DP=6 |
+|--------|----------------------|---------------------|---------------------|
+| **vLLM tok/s** | 214 | **248** | 220 |
+| **vLLM wall time** | 9.6s | **8.3s** | 9.3s |
+| **Policy fwd** | 6.6s | 6.5s | 6.5s |
+| **Ref fwd** | 5.8s | 5.7s | 5.7s |
+| **Backward** | 11.5s | 10.8s | 10.8s |
+| **Step time** | 36.9s | **35.6s** | 36.4s |
+| **Training tiles** | 10 | 12 | 12 |
+| **Total nodes** | 1 | 2 | 2 |
+
+**Key findings:**
+
+1. **TP=4 DP=3 wins** (248 tok/s, 35.6s/step) over TP=2 DP=6 (220 tok/s,
+   36.4s/step). With G=16, each TP=2 replica gets only ~2-3 sequences — not
+   enough to saturate the tiles.
+
+2. **Marginal improvement over colocated** — 35.6s vs 36.9s (**3.5% faster**) using
+   2x the nodes. The 2 extra training tiles help backward (10.8s vs 11.5s, -6%)
+   and vLLM is slightly faster (8.3s vs 9.6s), but the overhead of using a full
+   extra node is poor efficiency for 32B.
+
+3. **For 70B, this is about feasibility, not speedup** — 70B can't fit on 1 node
+   for training + vLLM. The dedicated vLLM node architecture is the only option.
+   At 70B scale, the training node count would increase to 2-3, making the vLLM
+   node cost proportionally smaller.
+
+4. **Aurora Squid proxy issue**: Cross-node HTTP via hostname is intercepted by
+   Squid. Fix: use IP addresses in URLs and set `no_proxy=*`.
+
+### Updated Performance Summary
+
+| Model | Config | Step Time | Time/seq | Notes |
+|-------|--------|-----------|----------|-------|
+| Qwen2.5-3B | 2 tiles, no vLLM | 16.2s | 16.2s | Baseline |
+| Qwen2.5-3B | 1+6, vLLM TP=1 | 5.9s | 5.9s | Best 3B colocated |
+| Qwen2.5-3B | 1+10, vLLM TP=1 | 5.1s | 5.1s | Best 3B |
+| **Qwen3-32B** | **10+2, G=4** | **18.1s** | **4.5s** | **Best single-node 32B** |
+| Qwen3-32B | 10+2, G=8 | 24.2s | 3.0s | 2x per-seq efficiency |
+| Qwen3-32B | 10+2, G=16 | 36.9s | 2.3s | Best per-seq efficiency |
+| Qwen3-32B | 8+4, G=4 | OOM | — | 8-way FSDP shards too large |
+| Qwen3-32B | Dedicated TP=4 DP=3, G=16 | 35.6s | 2.2s | 2 nodes, marginal vs colocated |
+| Qwen3-32B | Dedicated TP=2 DP=6, G=16 | 36.4s | 2.3s | 2 nodes, TP=2 too small per replica |
+| **Qwen3-32B** | **20+4, HSDP, G=4** | **19.4s** | **4.9s** | **Near-linear 2-node scaling** |
 
 ## Phase 9: TRL GRPO at 7B/32B Scale on Polaris (2026-03-31)
 
@@ -1166,9 +1605,221 @@ a genuine competitive advantage:
 |-------|-------------------------------|-------------------|
 | 3B | Works (3.7-13.3 s/step) | Works (5.3-16.2 s/step) |
 | 7B | **OOM** (all modes, 1 node) | **Works** (9.5 s/step, 23 GiB) |
-| 32B | **OOM** (all modes, 1-2 nodes) | **Works** (25.6 s/step, 41.6 GiB) |
+| 32B | **OOM** (all modes, 1-2 nodes) | **Works** (18.1 s/step, 34.2 GiB) |
 
 The memory advantage becomes decisive at 7B+ — Aurora can run models that are physically
 impossible on A100-40GB regardless of framework (TRL, torchtune, verl), node count, or
 optimization (vLLM, sleep mode, gradient checkpointing). For 32B, TRL cannot even load the
 un-sharded model (65 GiB BF16) to a single 40 GiB GPU, making multi-node scaling irrelevant.
+
+## Phase 8: Qwen2.5-72B GRPO — Cross-Node True FSDP (2026-04-02)
+
+**Model**: Qwen/Qwen2.5-72B-Instruct (80 layers, 64 heads, 8 KV heads, ~144 GiB BF16)
+**Architecture**: 3 nodes — 1 dedicated vLLM + 2 training (24-tile true FSDP)
+**Config**: `recipes/configs/dev/qwen72B_grpo_dedicated_vllm_xpu.yaml`
+**Script**: `recipes/dev/aurora_grpo_72b_dedicated_vllm.sh`
+
+### Why Cross-Node FSDP is Required
+
+72B model + optimizer states (~720 GiB total) far exceeds single-node capacity (576 GiB).
+True FSDP shards across all 24 training tiles on 2 nodes (`dp_replicate=1`).
+
+| Component | Per-Tile (24-way FSDP) |
+|-----------|----------------------|
+| Policy shard (BF16) | ~6 GiB |
+| Ref shard (BF16) | ~6 GiB |
+| AdamW states (FP32: param + exp_avg + exp_avg_sq) | ~36 GiB |
+| **Total persistent** | **~48 GiB** |
+
+Without CPU offload, AdamW's FP32 optimizer states fill the entire 48 GiB tile, leaving
+zero headroom for activations. Step 1 works (optimizer states not yet allocated), but
+step 2+ crashes with GPU memory exhaustion. **FSDP CPU offload is required**.
+
+### Results — 3 Steps Complete
+
+| Phase | Step 1 | Step 2 | Step 3 |
+|-------|--------|--------|--------|
+| **Total step time** | **102.7s** | **83.5s** | **84.6s** |
+| vLLM generation (4 seq, 3 replicas) | 10.5s (49 tok/s) | 10.7s (50 tok/s) | 10.6s (51 tok/s) |
+| Policy forward (chunked, fbs=1) | 21.6s | 22.6s | 21.3s |
+| Ref forward (chunked, fbs=1) | 19.3s | 19.6s | 19.8s |
+| GRPO step (fwd+bwd) | 39.3s | 22.0s | 24.5s |
+| Backward | 32.2s | 15.3s | 17.6s |
+| Optimizer step | 9.1s | 6.5s | 6.5s |
+| Grad clip | 2.6s | 2.0s | 2.0s |
+| Rewards | 3.438 | 0.312 | 0.854 |
+| Successes | 71.9% | 22.9% | 79.2% |
+
+**Steady-state step time: ~84s** (step 1 slower due to optimizer state lazy init).
+
+Step 1 backward (32.2s) includes first-time optimizer state allocation overhead. Steps 2-3
+backward (15-18s) are consistent, confirming no memory degradation with CPU offload.
+
+### Memory
+
+| Metric | Value |
+|--------|-------|
+| Policy shard (on-device with CPU offload) | 2.45 GiB |
+| Ref shard (on-device with CPU offload) | 2.48 GiB |
+| Total on-device after model init | 2.48 GiB |
+| Optimizer states | Offloaded to CPU RAM |
+| Checkpoint gather time | 166.7s |
+| Checkpoint save time | 121.8s |
+
+### vLLM Configuration
+
+| Setting | Value |
+|---------|-------|
+| Tensor parallelism | TP=4 |
+| Data parallelism | DP=3 (3 replicas) |
+| GPU memory utilization | 0.80 |
+| Max model length | 2048 |
+| Generation throughput | 49-51 tok/s |
+| Startup time (cached weights) | ~80s |
+
+TP=4 is required for 72B on 48 GiB tiles (TP=2 → 72 GiB/tile). TP=4 uses ~36 GiB/tile
+for model weights, leaving ~12 GiB for KV cache per tile.
+
+### GRPO Settings
+
+| Setting | Value |
+|---------|-------|
+| grpo_samples | 4 |
+| forward_batch_size | 1 |
+| max_generated_tokens | 128 |
+| max_seq_len | 512 |
+| fsdp_cpu_offload | True |
+| enable_activation_checkpointing | True |
+
+### Issues Resolved
+
+1. **CCL barrier crash on cross-node FSDP**: World-level `torch.distributed.barrier()`
+   calls crash with `broadcast_scaleout_sycl.cpp:65` after FSDP2 sub-communicators are
+   created on multi-node XPU. Fix: auto-enable production_mode for multi-node XPU
+   (skip non-essential world barriers on critical path).
+
+2. **Checkpoint save barrier crash**: `gather_cpu_state_dict()` in
+   `torchtune/training/_distributed.py` calls world-level barrier per parameter during
+   state dict gathering. Fix: `_gather_cpu_state_dict_safe()` method in recipe uses
+   shard process group barriers instead.
+
+3. **OOM on step 2+ without CPU offload**: AdamW FP32 optimizer states (3× policy shard ×
+   FP32 multiplier = ~36 GiB) plus model shards (12 GiB) fills entire 48 GiB tile.
+   Step 1 succeeds (optimizer states not yet allocated), step 2 backward degrades to 65s
+   (4× slower due to memory thrashing), step 3 crashes with GPU segfault. Fix:
+   `fsdp_cpu_offload: True` in config.
+
+4. **debug queue 2-node limit**: debug queue supports max 2 nodes. Fix: use
+   `debug-scaling` queue (supports up to 256 nodes, 1h walltime).
+
+### Infrastructure
+
+| Item | Value |
+|------|-------|
+| Queue | debug-scaling |
+| Nodes | 3 (select=3) |
+| Walltime | 1:00:00 |
+| Model staging time | ~6 min (144 GiB to /tmp per node) |
+| Policy model load (FSDP2) | ~380s (~6.3 min) |
+| Ref model load (FSDP2) | ~376s (~6.3 min) |
+| Total startup (staging + vLLM + model loads) | ~20 min |
+| Effective training time per 1h job | ~40 min |
+
+### Comparison with 32B
+
+| Metric | 32B single-node | 32B HSDP 2-node | 72B True FSDP 3-node |
+|--------|-----------------|-----------------|----------------------|
+| **Step time** | **18.1s** | **19.4s** | **84.6s** |
+| vLLM generation | 8.4s | 8.4s | 10.6s |
+| Policy forward | 2.2s | 1.5s | 21.3s |
+| Ref forward | 1.5s | 1.5s | 19.8s |
+| Backward | 5.7s | 6.3s | 17.6s |
+| Optimizer | 0.2s | 0.2s | 6.5s |
+| forward_batch_size | 4 | 4 | **1** |
+| Training tiles | 10 | 20 (HSDP 2×10) | 24 (True FSDP ×24) |
+| vLLM tiles | 2 (TP=2) | 4 (TP=2, DP=2) | 12 (TP=4, DP=3) |
+| CPU offload | No | No | Required |
+
+### Scaling Analysis: 72B vs 32B Expectations
+
+72B has 2.25× the parameters of 32B, so a naive expectation is 2.25× the step time.
+Against the 32B single-node baseline (18.1s), the expected 72B step time would be ~41s.
+The actual 84.6s is **2.1× worse than parameter scaling predicts**. The gap comes from
+two specific, addressable factors:
+
+**Phase-by-phase analysis (vs 32B single-node):**
+
+| Phase | 32B | 72B | Ratio | Expected (2.25×) | Diagnosis |
+|-------|-----|-----|-------|-------------------|-----------|
+| vLLM gen | 8.4s | 10.6s | 1.26× | ~19s | Better than expected (3 replicas vs 1) |
+| Policy fwd | 2.2s | 21.3s | **9.7×** | ~5s | fbs=1 vs fbs=4 + cross-node AllGather |
+| Ref fwd | 1.5s | 19.8s | **13.2×** | ~3.4s | Same — fbs=1 + cross-node AllGather |
+| Backward | 5.7s | 17.6s | 3.1× | ~13s | Reasonable (CPU offload adds ~2-3s) |
+| Optimizer | 0.2s | 6.5s | **32.5×** | ~0.5s | CPU offload H2D/D2H transfer penalty |
+
+**Key bottleneck: `forward_batch_size=1`.**
+
+The forward passes (policy: 21.3s, ref: 19.8s) account for **49% of step time** and are
+9-13× slower than 32B despite only 2.25× more parameters. The dominant factor is
+`forward_batch_size=1` — the 72B config processes one sample at a time (4 sequential
+forward passes per grpo_samples=4), vs the 32B config which batches all 4 samples in a
+single forward pass (fbs=4). This alone accounts for a ~4× slowdown in forward time.
+
+The remaining gap comes from cross-node AllGather latency: with true FSDP across 24 tiles
+on 2 nodes, every forward pass must AllGather parameters across the Slingshot-11
+interconnect. The 32B HSDP config keeps AllGather intra-node (10 tiles) and only does
+inter-node AllReduce for gradient sync.
+
+**Estimated impact of increasing fbs from 1 to 4:**
+
+If fbs=4 works within memory (may require more nodes or reduced grpo_samples):
+- Policy forward: ~21s → ~7s (4× reduction from batching, minus some overhead)
+- Ref forward: ~20s → ~6s (same)
+- Net saving: ~28s → step time ~57s (~1.5× better)
+
+This would bring the 72B step time to ~57s, or 3.1× the 32B single-node — much closer
+to the 2.25× parameter scaling expectation.
+
+**Second bottleneck: CPU offload optimizer overhead (6.5s vs 0.2s).**
+
+FSDP CPU offload moves optimizer states to CPU RAM, requiring CPU↔GPU data transfers each
+step. This adds ~6.3s of pure data movement. With more training nodes (reducing per-tile
+memory), CPU offload becomes unnecessary and optimizer time drops back to ~0.2s.
+
+### External Benchmarks
+
+No published step-time benchmarks exist for GRPO at 70B+ scale. The major frameworks
+(TRL, verl, OpenRLHF) document accuracy results and relative speedups but not absolute
+step times, because performance depends heavily on hardware, GPU count, batch size,
+sequence length, and generation settings.
+
+Reference configurations for comparison:
+- **TRL**: 5 nodes × 8 H100s (32 training + 8 vLLM = 40 GPUs) for Qwen2.5-72B GRPO
+  with DeepSpeed ZeRO-3. No step-time published.
+- **verl**: Qwen2.5-72B-Instruct GRPO-LoRA achieves 96.0 on GSM8k. Hardware/timing
+  not disclosed.
+- **OpenRLHF**: Claims 70B+ capability via Ray + vLLM + DeepSpeed ZeRO-3. No step-time
+  published.
+
+**Compute comparison with TRL's reference setup:**
+TRL uses 32 H100 training GPUs (~990 BF16 TFLOPS each = ~31,680 TFLOPS total).
+We use 24 XPU tiles (~420 BF16 TFLOPS each = ~10,080 TFLOPS total).
+The H100 setup has ~3.1× more raw compute. If they achieve ~25-30s/step, our 84.6s
+(or ~57s with fbs=4) is in a reasonable range given the compute differential.
+
+### Optimization Roadmap for 72B
+
+1. **Increase `forward_batch_size` to 2-4** (estimated -28s, biggest single improvement)
+   - Requires either more training nodes or reduced grpo_samples to fit activations
+   - With 3 training nodes (36-way FSDP): ~4 GiB/shard, may allow fbs=2 without CPU offload
+2. **Add more training nodes** (4+ nodes, 36-48 way FSDP)
+   - Removes need for CPU offload (saves ~6s optimizer overhead)
+   - Enables larger forward_batch_size
+   - 1+3 nodes: 36-way FSDP, ~24 GiB persistent/tile, ~24 GiB for activations
+   - 1+4 nodes: 48-way FSDP, ~18 GiB persistent/tile, ~30 GiB for activations
+3. **Increase `grpo_samples`** (from 4 to 8-16)
+   - More samples per step improves learning signal quality
+   - Requires memory headroom from optimization 1 or 2
+4. **Increase `max_generated_tokens`** (from 128 to 256-512)
+   - Longer responses improve reasoning quality for math tasks
+   - vLLM generation time scales roughly linearly

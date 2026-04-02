@@ -38,6 +38,7 @@ def generate(
     rng: Optional[torch.Generator] = None,
     custom_generate_next_token: Optional[Callable] = None,
     return_logits: bool = True,
+    stop_token_group: Optional["torch.distributed.ProcessGroup"] = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """
     Generates tokens from a model conditioned on a prompt, and also returns logits for the generations.
@@ -182,6 +183,12 @@ def generate(
             return generated_tokens, generated_logits if return_logits else None
 
     world_size, rank = utils.get_world_size_and_rank()
+    # For HSDP, use the shard group for early-stopping all_reduce.
+    # The shard group contains ranks that share the same data (FSDP shards).
+    # Using the world PG deadlocks when different replicate groups finish
+    # generation at different times (XCCL can't mix PG operations).
+    _stop_group = stop_token_group
+    _stop_group_size = _stop_group.size() if _stop_group is not None else world_size
     for _ in (pbar := trange(max_generated_tokens - 1, leave=False, disable=rank > 0)):
         # update stop_token_mask if we reached a stop token in a previous step
         # by appending the logical not of stop_token_reached to the end of the mask
@@ -230,8 +237,8 @@ def generate(
                     break
             else:
                 all_done = stop_token_reached.all().int()
-                torch.distributed.all_reduce(all_done)
-                if all_done == world_size:
+                torch.distributed.all_reduce(all_done, group=_stop_group)
+                if all_done == _stop_group_size:
                     # Multiple devices
                     break
 

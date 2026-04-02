@@ -41,7 +41,7 @@ VLLM_MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-2048}
 MODEL_SRC=${MODEL_SRC:-/lus/flare/projects/ModCon/ngetty/models/Qwen2.5-3B}
 MODEL_PATH=${MODEL_PATH:-/tmp/torchtune/$(basename ${MODEL_SRC})}
 NSTEPS=${NSTEPS:-5}
-CONFIG=${CONFIG:-recipes/configs/dev/qwen3B_grpo_vllm_hsdp_multinode_xpu.yaml}
+CONFIG=${CONFIG:-recipes/configs/dev/production/qwen3B_grpo_vllm_hsdp_multinode_xpu.yaml}
 WRAPPER="${TORCHTUNE_DIR}/recipes/dev/aurora_grpo_vllm_wrapper.sh"
 
 # ============================================================
@@ -53,15 +53,25 @@ module load frameworks 2>/dev/null || true
 export PATH=$(echo "$PATH" | tr ':' '\n' | grep -v myenv | tr '\n' ':' | sed 's/:$//')
 unset VIRTUAL_ENV
 
-# CCL / XPU environment — multi-node ring algorithms
-export CCL_PROCESS_LAUNCHER=none
-export CCL_ATL_TRANSPORT=ofi
+# CCL / XPU environment — MPI transport (official Aurora recommendation)
+# MPI transport uses topology-aware sub-communicator routing, giving ~2x
+# intra-node AllGather bandwidth vs ofi (4.5 GiB/s vs 2.4 GiB/s).
+# Requires: mpiexec --pmi=pmix AND mpi4py pre-init in Python.
+export CCL_PROCESS_LAUNCHER=pmix
+export CCL_ATL_TRANSPORT=mpi
+export CCL_KVS_MODE=mpi
+export CCL_KVS_USE_MPI_RANKS=1
+export CCL_CONFIGURATION=cpu_gpu_dpcpp
+export CCL_KVS_CONNECTION_TIMEOUT=600
+export CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD=1024
 export CCL_OP_SYNC=1
 export FI_PROVIDER=cxi
-export CCL_KVS_IFACE=hsn0
-export CCL_WORKER_COUNT=4
+# CRITICAL: CCL_WORKER_COUNT=4 causes 48x AllGather bandwidth degradation
+# (2.4 GiB/s vs 111 GiB/s with default of 1). Keep at 1.
+export CCL_WORKER_COUNT=1
 export CCL_ALLREDUCE=ring
-export CCL_REDUCE_SCATTER=ring
+# CCL_REDUCE_SCATTER=ring causes 63x regression on multi-node. Do NOT set.
+# export CCL_REDUCE_SCATTER=ring  # DISABLED
 export CCL_CHUNK_SIZE=16777216
 export FI_CXI_RX_MATCH_MODE=hybrid
 export FI_CXI_OFLOW_BUF_SIZE=8388608
@@ -275,19 +285,20 @@ echo "All vLLM servers ready."
 # ============================================================
 # Launch training via mpiexec
 # ============================================================
-# GPU affinity: FSDP2 (used for large models >50 GiB) doesn't need multi-tile
-# visibility — each rank only materializes one module shard at a time (~3 GiB).
-# Setting ZE_AFFINITY_MASK=$LOCAL_RANK prevents CXI conflicts with vLLM on tiles 10-11.
-# For FSDP1 (small models), unset it so flatten can spill across tiles.
-export USE_AFFINITY_MASK=${USE_AFFINITY_MASK:-1}
+# GPU affinity: CCL needs full device visibility for proper UUID-based routing.
+# Without it, CCL warns "narrow device affinity mask" and falls back to a slow
+# communication path (25s/forward vs 2s/forward for 32B FSDP).
+# vLLM is already isolated on tiles 10-11 via its own ZE_AFFINITY_MASK in the
+# vLLM launch section. Training ranks see all 12 tiles but use device_id=xpu:{LOCAL_RANK}.
+export USE_AFFINITY_MASK=${USE_AFFINITY_MASK:-training}
 
 echo ""
 echo "Starting HSDP GRPO training (${TOTAL_RANKS} ranks, USE_AFFINITY_MASK=${USE_AFFINITY_MASK})..."
 mpiexec \
+    --pmi=pmix \
     --hostfile "${PBS_NODEFILE}" \
     -n "${TOTAL_RANKS}" \
     -ppn "${NGPUS_PER_NODE}" \
-    --no-vni \
     --cpu-bind depth \
     --depth 8 \
     bash "${WRAPPER}" \

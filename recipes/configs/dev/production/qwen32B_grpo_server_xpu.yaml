@@ -1,32 +1,33 @@
-# GRPO with replicated vLLM + HSDP on Aurora XPU (2+ nodes) — Qwen3-32B
-#
-# Each node runs: vLLM (tiles 10-11, TP=2) + 10 training ranks (tiles 0-9)
-# HSDP: FSDP within node (dp_shard=10), DDP across nodes (dp_replicate=2)
-# Each shard leader talks to its local vLLM at localhost.
+# GRPO with vLLM server mode on Intel XPU (Aurora HPC) — Qwen3-32B
+# 32B model is too large for colocated vLLM (64 GiB model > 64 GiB tile).
+# Uses server mode: 2 tiles run vLLM (TP=2), 10 tiles run FSDP training.
 #
 # Memory budget per training tile (64 GiB):
-#   FSDP shard (32B / 20 ranks): ~3.2 GiB (half of single-node)
-#   Ref FSDP shard: ~3.2 GiB
-#   Optimizer states (2× shard): ~6.4 GiB
+#   FSDP shard (32B / 10 ranks): ~6.4 GiB
+#   Ref FSDP shard: ~6.4 GiB
+#   Optimizer states (2× shard): ~12.8 GiB
 #   Activations + KV cache: ~10-15 GiB
-#   Total estimated: ~23-28 GiB — well within 64 GiB
+#   Total estimated: ~35-40 GiB — fits within 64 GiB
 #
-# Single-node baseline: 25.6 s/step (10 tiles + TP=2 vLLM)
+# Memory budget per vLLM tile (TP=2, 64 GiB each):
+#   Model shard (32B / 2): ~32 GiB
+#   KV cache: ~10-15 GiB
+#   Total estimated: ~45 GiB — fits within 64 GiB
+#
+# A100-40GB comparison: 32B is infeasible (OOM). Aurora is the only option.
 #
 # Launch:
-#   bash recipes/dev/aurora_grpo_vllm_hsdp_multinode.sh
-#   (set MODEL_SRC, CONFIG overrides as needed)
+#   bash recipes/dev/run_grpo_vllm_xpu.sh 2 10 \
+#     /lus/flare/projects/ModCon/ngetty/models/Qwen3-32B [num_steps] \
+#     --config recipes/configs/dev/qwen32B_grpo_server_xpu.yaml
+#   Default: 2 vLLM tiles (TP=2), 10 training tiles, 10 steps
 
-name: grpo_vllm_hsdp_qwen3_32b_xpu
+name: grpo_server_qwen3_32b_xpu
 
-output_dir: /tmp/torchtune/grpo_vllm_hsdp_32b
-
+output_dir: /tmp/torchtune/grpo_server_32b
 base_model_path: /lus/flare/projects/ModCon/ngetty/models/Qwen3-32B
 
-# HSDP: set by launcher (data_parallel_replicate_dim=NUM_NODES)
-data_parallel_replicate_dim: 2
-
-# vLLM generation server (each node has its own at localhost)
+# vLLM server mode
 vllm_url: "http://localhost:8001"
 vllm_group_port: 51216
 vllm_weight_sync: false
@@ -107,7 +108,7 @@ save_every_n_epochs: 1
 # GRPO parameters — conservative for 32B
 batch_size: 1
 grpo_samples: 4
-forward_batch_size: 1
+forward_batch_size: 4
 max_generated_tokens: 128
 top_k: null
 temperature: 1.0
@@ -115,7 +116,7 @@ temperature: 1.0
 ppo_epochs: 1
 gradient_accumulation_steps: 1
 
-num_steps: 5
+num_steps: 10
 
 clip_grad_norm: 1.0
 

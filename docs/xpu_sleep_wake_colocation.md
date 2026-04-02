@@ -112,6 +112,31 @@ to fit alongside FSDP training state.
 | During FSDP training | ~20-24 GiB (shards + optimizer + activations) |
 | After wake_up + sync | ~36-46 GiB |
 
+### GRPO benchmark: Qwen3-32B, 12 tiles, 3 steps (TP=4, DP=3)
+
+**Date:** 2026-03-31 | **Node:** x4311c6s7b0n0
+
+| Mode | Tiles | Per-step | Peak memory | Weight sync |
+|------|-------|----------|-------------|-------------|
+| `colocate_sleep` (TP=4 DP=3) | 12 all | **~128 s/step** | 55.3 GiB | 707 full_tensor() × 1.6s |
+| `server` (TP=2 + FSDP-10) | 2+10 | **25.6 s/step** | 41.6 GiB | HTTP push |
+
+**128 s/step is 5x slower than server baseline.** The bottleneck is
+`_sync_colocated_weights`: 707 individual `full_tensor()` all-gathers
+(12-way XCCL) per step to sync FSDP weights to TP-sharded vLLM params.
+
+Issues resolved during 32B bring-up:
+- PG init hang: torchrun's elastic agent store can't be reused after
+  destroy; fixed with file-based barrier + TCP rendezvous for TP subgroups
+- FSDP OOM: `reshard_after_forward=False` kept full unshard (64 GiB) in
+  memory; enabled reshard for colocate_sleep mode
+- UR handle exhaustion: 707 all-gathers exceed L0 UR handle pool; mitigated
+  with periodic `synchronize()`, `gc.collect()`, and `CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD=4096`
+
+Optimization targets: replace `full_tensor()` with TP-group-local gather
+(4-way instead of 12-way), batch into reusable buffers, or map FSDP local
+shards directly to vLLM TP params.
+
 ## Constraints
 
 1. Must pre-register `torchtune` in `sys.modules` to avoid torchao XCCL USM bug

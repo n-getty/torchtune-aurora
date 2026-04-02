@@ -1,0 +1,148 @@
+# GRPO with colocated vLLM on Intel XPU (Aurora HPC) — Qwen3-8B Config B
+# Config B: larger batch (16 samples), longer generation (512 tokens)
+# Uses gradient accumulation + chunked forward to manage memory.
+#
+# A100 comparison: Config B with 16 samples OOMs on A100-40GB.
+# Aurora's 64 GiB tiles should handle it with FSDP sharding.
+#
+# Memory budget per tile (64 GiB):
+#   Training (FSDP shard + ref shard + optimizer + activations): ~25-30 GiB
+#   vLLM model (full, stays on GPU): ~16 GiB
+#   KV cache: freed during training, reallocated before generation
+#   Total estimated: ~45-50 GiB — tight but feasible
+#
+# Launch:
+#   bash recipes/dev/run_grpo_colocate_xpu.sh [num_tiles] \
+#     /lus/flare/projects/ModCon/ngetty/models/Qwen3-8B [num_steps] \
+#     recipes/configs/dev/qwen8B_grpo_colocate_xpu_configB.yaml
+#   Default: 12 tiles, 10 steps
+
+name: grpo_colocate_qwen3_8b_xpu_configB
+
+output_dir: /tmp/torchtune/grpo_colocate_8b_configB
+base_model_path: /lus/flare/projects/ModCon/ngetty/models/Qwen3-8B
+
+# Colocated vLLM — in-process engine per rank
+vllm_mode: "colocate"
+vllm_gpu_memory_utilization: 0.08
+vllm_max_model_len: 512
+
+# Tokenizer
+tokenizer:
+  _component_: torchtune.models.qwen3.qwen3_tokenizer
+  path: ${base_model_path}/vocab.json
+  merges_file: ${base_model_path}/merges.txt
+  max_seq_len: 1024
+
+# Dataset
+dataset:
+  _component_: torchtune.dev.grpo.gsm8k.gsm8k_dataset
+  partition: 1-9/10
+seed: 42
+shuffle: False
+
+# Model
+model:
+  _component_: torchtune.models.qwen3.qwen3_8b_base
+
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [
+    model-00001-of-00005.safetensors,
+    model-00002-of-00005.safetensors,
+    model-00003-of-00005.safetensors,
+    model-00004-of-00005.safetensors,
+    model-00005-of-00005.safetensors,
+  ]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: QWEN3
+
+ref_checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [
+    model-00001-of-00005.safetensors,
+    model-00002-of-00005.safetensors,
+    model-00003-of-00005.safetensors,
+    model-00004-of-00005.safetensors,
+    model-00005-of-00005.safetensors,
+  ]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}/ref
+  model_type: QWEN3
+
+resume_from_checkpoint: False
+save_every_n_epochs: 1
+
+# GRPO parameters — Config B (large)
+batch_size: 1
+grpo_samples: 16
+forward_batch_size: 2
+max_generated_tokens: 512
+top_k: null
+temperature: 1.0
+
+ppo_epochs: 1
+gradient_accumulation_steps: 4
+
+num_steps: 10
+
+clip_grad_norm: 1.0
+
+epochs: 1
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 1e-5
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  num_warmup_steps: 2
+loss:
+  _component_: torchtune.dev.grpo.loss.GRPOSimpleLoss
+  kl_coeff: 0.01
+  epsilon: 0.2
+
+# XPU device
+device: xpu
+
+# Memory management
+enable_activation_checkpointing: True
+compile: False
+
+# Precision
+dtype: bf16
+
+reward_functions:
+    - _component_: torchtune.dev.rl.rewards.FormattedMathCorrectnessReward
+      answer_tag: answer
+      positive_reward: 10.0
+      negative_reward: 0.0
+    - _component_: torchtune.dev.rl.rewards.ThinkingAnswerFormattingReward
+      think_tag: think
+      answer_tag: answer
+      positive_reward: 1.0
+      negative_reward: 0.0
+
+# Logging
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+log_every_n_steps: 1
+log_peak_memory_stats: True
+
+# Profiler disabled
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: False
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: True
+  cuda: False
+  profile_memory: False
+  with_stack: False
+  record_shapes: False
+  with_flops: False
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1

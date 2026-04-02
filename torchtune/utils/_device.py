@@ -232,7 +232,7 @@ class DeviceSupport(Enum):
     CPU = ("cpu", "CPU", "gloo")
     CUDA = ("cuda", "GPU", "nccl")
     NPU = ("npu", "NPU", "hccl")
-    XPU = ("xpu", "XPU", "ccl")
+    XPU = ("xpu", "XPU", "xccl")
     MPS = ("mps", "MPS", "gloo")
     HPU = ("hpu", "HPU", "hccl")
 

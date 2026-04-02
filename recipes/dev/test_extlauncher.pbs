@@ -1,0 +1,12 @@
+#!/bin/bash
+#PBS -l select=1
+#PBS -l filesystems=home:flare
+#PBS -l walltime=00:30:00
+#PBS -q debug
+#PBS -A ModCon
+#PBS -o /lus/flare/projects/ModCon/ngetty/torchtune/logs/test_extlauncher.out
+#PBS -e /lus/flare/projects/ModCon/ngetty/torchtune/logs/test_extlauncher.err
+#PBS -N test_extlauncher
+
+cd /lus/flare/projects/ModCon/ngetty/torchtune
+bash recipes/dev/run_test_external_launcher.sh 1

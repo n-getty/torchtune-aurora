@@ -80,6 +80,13 @@ from torchtune.training.precision import (
 )
 from torchtune.training.quantization import get_quantizer_mode
 from torchtune.training.seed import set_seed
+from torchtune.training.xpu_utils import (
+    device_empty_cache,
+    device_record_memory_history,
+    get_xpu_distributed_backend,
+    init_xpu_process_group,
+    supports_memory_stats,
+)
 
 __all__ = [
     "get_act_offloading_ctx_manager",
@@ -151,4 +158,9 @@ __all__ = [
     "DATALOADER_KEY",
     "get_context_parallel_manager",
     "get_train_context",
+    "device_empty_cache",
+    "device_record_memory_history",
+    "get_xpu_distributed_backend",
+    "init_xpu_process_group",
+    "supports_memory_stats",
 ]

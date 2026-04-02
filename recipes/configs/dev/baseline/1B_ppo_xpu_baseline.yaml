@@ -1,0 +1,174 @@
+# PPO baseline on Intel XPU (Aurora) with TinyLlama 1B
+# Uses sentiment reward model.
+#
+# Launch (2 tiles):
+#   bash recipes/dev/run_ppo_xpu.sh 2 5
+#
+# Full node (12 tiles):
+#   bash recipes/dev/run_ppo_xpu.sh 12 10
+
+output_dir: /tmp/torchtune/ppo_baseline
+
+base_model_path: /lus/flare/projects/ModCon/ngetty/models/TinyLlama_v1.1
+reward_model_path: /lus/flare/projects/ModCon/ngetty/models/tinyllama_rm_sentiment_1b
+
+# Tokenizer
+tokenizer:
+  _component_: torchtune.models.llama2.llama2_tokenizer
+  path: ${base_model_path}/tokenizer.model
+  max_seq_len: 512
+
+# Dataset
+dataset:
+  _component_: torchtune.datasets.text_completion_dataset
+  source: trl-internal-testing/sentiment-trl-style
+  split: train
+  column: prompt
+  add_eos: False
+
+seed: 42
+shuffle: True
+
+# Policy model (TinyLlama 1.1B)
+policy_model:
+  _component_: torchtune.models.llama2.llama2
+  vocab_size: 32000
+  num_layers: 22
+  num_heads: 32
+  num_kv_heads: 4
+  embed_dim: 2048
+  max_seq_len: 2048
+  intermediate_dim: 5632
+  attn_dropout: 0.0
+  norm_eps: 1e-5
+
+# Reward and value model (classifier head)
+reward_and_value_model:
+  _component_: torchtune.models.llama2.llama2_classifier
+  num_classes: 1
+  vocab_size: 32000
+  num_layers: 22
+  num_heads: 32
+  num_kv_heads: 4
+  embed_dim: 2048
+  max_seq_len: 2048
+  intermediate_dim: 5632
+  attn_dropout: 0.0
+  norm_eps: 1e-5
+
+# Checkpointers
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [
+    "pytorch_model.bin",
+  ]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}/policy
+  model_type: LLAMA2
+
+ref_policy_checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [
+    "pytorch_model.bin",
+  ]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}/ref_policy
+  model_type: LLAMA2
+
+value_checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${reward_model_path}
+  checkpoint_files: [
+    "model.safetensors"
+  ]
+  output_dir: ${output_dir}/value
+  model_type: REWARD
+
+reward_checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${reward_model_path}
+  checkpoint_files: [
+    "model.safetensors"
+  ]
+  output_dir: ${output_dir}/reward
+  model_type: REWARD
+
+resume_from_checkpoint: False
+
+# XPU device
+device: xpu
+
+# Training arguments — baseline: small batch, short runs
+batch_size: 4
+num_steps: 10
+ppo_epochs: 1
+ppo_batch_size: 4
+gradient_accumulation_steps: 1
+
+# Memory management
+compile: False
+enable_activation_checkpointing: True
+enable_kv_cache: True
+
+# Precision
+dtype: bf16
+
+# Generation
+forward_batch_size: 4
+max_generated_tokens: 58
+temperature: 0.7
+top_k: null
+
+# Reward masking
+min_response_length: 18
+penalise_no_eos: True
+reward_penalty: -3
+
+# Stop tokens
+stop_token_ids: [
+  2,
+  29889
+]
+whiten_rewards: False
+
+# GAE hyperparameters
+gamma: 1
+lmbda: 0.95
+
+# PPO hyperparameters
+loss:
+  _component_: torchtune.rlhf.loss.PPOLoss
+  epsilon: 0.2
+  value_coeff: 0.1
+  value_clip_range: 0.2
+kl_coeff: 0.01
+clip_grad_norm: 1.0
+
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 3e-6
+log_peak_memory_stats: True
+
+# Logging
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+log_every_n_steps: 1
+
+# Profiler disabled
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: False
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: True
+  cuda: False
+  profile_memory: False
+  with_stack: False
+  record_shapes: False
+  with_flops: False
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1

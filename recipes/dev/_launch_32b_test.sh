@@ -18,10 +18,10 @@ if [[ -z "$PBS_JOBID" ]]; then
 fi
 
 export PBS_NODEFILE="/var/spool/pbs/aux/${PBS_JOBID}"
-export USE_AFFINITY_MASK=1
+export USE_AFFINITY_MASK=training
 export MODEL_SRC=/lus/flare/projects/ModCon/ngetty/models/Qwen3-32B
-export CONFIG=recipes/configs/dev/qwen32B_grpo_vllm_hsdp_multinode_xpu.yaml
-export NSTEPS=2
+export CONFIG=recipes/configs/dev/production/qwen32B_grpo_vllm_hsdp_multinode_xpu.yaml
+export NSTEPS=1
 export VLLM_MAX_MODEL_LEN=1024
 
 # Disable weight sync for initial HSDP test (TP=2 vLLM doesn't have

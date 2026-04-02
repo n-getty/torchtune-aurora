@@ -1,0 +1,121 @@
+# Polaris A100 benchmark: Qwen3-32B GRPO Config A (small)
+# grpo_samples=4, max_generated_tokens=256
+# NOTE: 32B requires 2 nodes (8 GPUs) — OOM on single node 4x40GB
+#
+# Setup:
+#   huggingface-cli download Qwen/Qwen3-32B --local-dir /tmp/Qwen3-32B
+#
+# Launch (8 GPUs, 2 nodes):
+#   tune run --nnodes 2 --nproc_per_node 4 dev/grpo_full_finetune_distributed \
+#     --config dev/qwen32B_grpo_a100_configA
+
+name: grpo_qwen3_32b_a100_configA
+
+output_dir: /tmp/checkpoints/${name}
+base_model_path: /tmp/Qwen3-32B
+
+# Tokenizer
+tokenizer:
+  _component_: torchtune.models.qwen3.qwen3_tokenizer
+  path: /tmp/Qwen3-32B/vocab.json
+  merges_file: /tmp/Qwen3-32B/merges.txt
+  max_seq_len: 1024
+
+# Dataset
+dataset:
+  _component_: torchtune.dev.grpo.gsm8k.gsm8k_dataset
+  partition: 1-9/10
+seed: null
+shuffle: False
+
+# Model (instruct only — no base variant for 32B)
+model:
+  _component_: torchtune.models.qwen3.qwen3_32b
+
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files:
+    filename_format: model-{}-of-{}.safetensors
+    max_filename: "00017"
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: QWEN3
+
+ref_checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files:
+    filename_format: model-{}-of-{}.safetensors
+    max_filename: "00017"
+  recipe_checkpoint: null
+  output_dir: ${output_dir}/ref
+  model_type: QWEN3
+
+resume_from_checkpoint: False
+save_every_n_epochs: 1
+
+# GRPO parameters — Config A (small)
+batch_size: 1
+grpo_samples: 4
+forward_batch_size: 4
+max_generated_tokens: 256
+top_k: null
+temperature: 1.0
+
+ppo_epochs: 1
+num_steps: 10
+clip_grad_norm: 1.0
+epochs: 10
+
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 1e-5
+  fused: True
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  num_warmup_steps: 50
+loss:
+  _component_: torchtune.dev.grpo.loss.GRPOSimpleLoss
+  kl_coeff: 0.01
+  epsilon: 0.2
+
+# Training env
+device: cuda
+enable_activation_checkpointing: True
+compile: False
+dtype: bf16
+
+reward_functions:
+    - _component_: torchtune.dev.rl.rewards.FormattedMathCorrectnessReward
+      answer_tag: answer
+      positive_reward: 10.0
+      negative_reward: 0.0
+    - _component_: torchtune.dev.rl.rewards.ThinkingAnswerFormattingReward
+      think_tag: think
+      answer_tag: answer
+      positive_reward: 1.0
+      negative_reward: 0.0
+
+# Logging
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+log_every_n_steps: 1
+log_peak_memory_stats: True
+
+# Profiler (disabled)
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: False
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: True
+  cuda: True
+  profile_memory: False
+  with_stack: False
+  record_shapes: True
+  with_flops: False
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1

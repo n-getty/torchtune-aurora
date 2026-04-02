@@ -51,7 +51,11 @@ from warnings import warn
 #    Multi-node: ZE_AFFINITY_MASK must be set (e.g., to LOCAL_RANK) so each rank
 #    sees only its tile as xpu:0. With ring algorithms, device_id is not needed.
 _use_affinity_mask = "ZE_AFFINITY_MASK" in os.environ and os.environ["ZE_AFFINITY_MASK"] != ""
-_xpu_device_index = 0 if _use_affinity_mask else int(os.environ.get("LOCAL_RANK", "0"))
+# With single-tile affinity (e.g. "3"), rank sees 1 tile as xpu:0.
+# With multi-tile affinity (e.g. "0,1,...,9"), rank sees N tiles and must select by LOCAL_RANK.
+# Without affinity, all 12 tiles visible — also select by LOCAL_RANK.
+_affinity_tiles = os.environ.get("ZE_AFFINITY_MASK", "").split(",") if _use_affinity_mask else []
+_xpu_device_index = 0 if (len(_affinity_tiles) == 1) else int(os.environ.get("LOCAL_RANK", "0"))
 
 import torch
 
@@ -240,6 +244,15 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         if vllm_mode in ("colocate", "colocate_sleep"):
             self._init_vllm_early(cfg)
 
+        # If using MPI transport (CCL_ATL_TRANSPORT=mpi), pre-init MPI so CCL can
+        # use it. This follows the official Aurora DDP pattern.
+        if os.environ.get("CCL_ATL_TRANSPORT") == "mpi":
+            try:
+                from mpi4py import MPI
+                MPI.COMM_WORLD.Barrier()
+            except ImportError:
+                pass
+
         if not torch.distributed.is_initialized():
             init_xpu_process_group(self.distributed_backend, device_index=_xpu_device_index)
         self.world_size, self.rank = utils.get_world_size_and_rank()
@@ -255,11 +268,14 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             log.info("Rank %d: forced math-only SDPA (disabled flash/mem_efficient to avoid UR leaks)", self.rank)
 
         # Production mode: skip non-essential barriers/synchronize() calls.
-        # HSDP (dp_replicate > 1) REQUIRES production mode because world-level
-        # barriers conflict with FSDP1's shard/replicate sub-PG operations on XCCL.
+        # Multi-node XPU REQUIRES production mode because world-level barriers
+        # conflict with FSDP's sub-PG operations on XCCL (both HSDP sub-PGs and
+        # FSDP2's per-module sub-communicators trigger broadcast_scaleout failures).
+        _is_multinode = self.world_size > int(os.environ.get("LOCAL_WORLD_SIZE", self.world_size))
         self._production_mode = (
             os.environ.get("FSDP_PRODUCTION_MODE", "0") == "1"
             or cfg.get("data_parallel_replicate_dim", 1) > 1
+            or (_is_multinode and self._device.type == "xpu")
         )
 
         # Training attributes
@@ -328,10 +344,18 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         #        "colocate_sleep" = colocate with sleep/wake memory management
         self._vllm_mode = cfg.get("vllm_mode", None)  # None, "server", "colocate", or "colocate_sleep"
         self._vllm_url = cfg.get("vllm_url", None)
+        # Multi-URL support: comma-separated URLs for DP vLLM replicas
+        if self._vllm_url and "," in self._vllm_url:
+            self._vllm_urls = [u.strip() for u in self._vllm_url.split(",")]
+        elif self._vllm_url:
+            self._vllm_urls = [self._vllm_url]
+        else:
+            self._vllm_urls = []
         self._vllm_group_port = cfg.get("vllm_group_port", 51216)
         self._vllm_weight_sync = cfg.get("vllm_weight_sync", True)
         self._vllm_weight_sync_interval = cfg.get("vllm_weight_sync_interval", 1)
-        self._vllm_client = None  # initialized in setup() if vllm_mode == "server"
+        self._vllm_clients = []  # initialized in setup() if vllm_mode == "server"
+        self._vllm_client = None  # backward compat: first client
         # _vllm_llm may already be set by _init_vllm_early() for colocate mode
         if not hasattr(self, "_vllm_llm"):
             self._vllm_llm = None
@@ -850,11 +874,16 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         if should_init_client:
             from torchtune.dev.grpo.vllm_client import VLLMClient
 
-            self._vllm_client = VLLMClient(
-                base_url=self._vllm_url,
-                group_port=self._vllm_group_port,
-                connection_timeout=300.0,
-            )
+            # Create clients for all vLLM URLs (supports DP vLLM replicas)
+            self._vllm_clients = []
+            for url in self._vllm_urls:
+                client = VLLMClient(
+                    base_url=url,
+                    group_port=self._vllm_group_port,
+                    connection_timeout=300.0,
+                )
+                self._vllm_clients.append(client)
+            self._vllm_client = self._vllm_clients[0]  # backward compat
 
             if self._vllm_weight_sync:
                 # On XPU, creating a second ProcessGroupXCCL (for weight sync)
@@ -863,17 +892,18 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                 self._build_tune_to_hf_map()
                 self._weight_sync_path = "/tmp/torchtune/weight_update.safetensors"
                 log.info(
-                    "Rank %d: vLLM server client initialized: %s (%d params mapped, file-based sync via %s, interval=%d)",
+                    "Rank %d: vLLM %d client(s) initialized: %s (%d params mapped, file-based sync via %s, interval=%d)",
                     self.rank,
-                    self._vllm_url,
+                    len(self._vllm_clients),
+                    ",".join(self._vllm_urls),
                     len(self._tune_to_hf_map),
                     self._weight_sync_path,
                     self._vllm_weight_sync_interval,
                 )
             else:
                 log.info(
-                    "Rank %d: vLLM server client initialized (generation only, no weight sync): %s",
-                    self.rank, self._vllm_url,
+                    "Rank %d: vLLM %d client(s) initialized (generation only, no weight sync): %s",
+                    self.rank, len(self._vllm_clients), ",".join(self._vllm_urls),
                 )
 
         # Use shard PG barrier for HSDP to avoid world-level PG mixing.
@@ -1294,6 +1324,45 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             list(dataloader)
         return dataloader
 
+    def _gather_cpu_state_dict_safe(
+        self,
+        model,
+        is_rank_zero: bool,
+        device=None,
+    ) -> dict:
+        """Like training.gather_cpu_state_dict but uses shard PG for barriers.
+
+        On multi-node XPU, world-level barriers crash after FSDP2 sub-communicators
+        are created (broadcast_scaleout_sycl.cpp:65). This replaces the per-parameter
+        world barrier with a shard PG barrier when available.
+        """
+        from torchtune.training._distributed import _gather_nf4_tensor
+        try:
+            from torchao.dtypes import NF4Tensor
+        except ImportError:
+            NF4Tensor = None
+
+        cpu_state_dict = {}
+        sharded_sd = model.state_dict()
+        for param_name, param in sharded_sd.items():
+            if param.is_cpu:
+                param = param.to(device)
+            if hasattr(param, "_local_tensor"):
+                if NF4Tensor is not None and isinstance(param._local_tensor, NF4Tensor):
+                    param = _gather_nf4_tensor(param)
+                else:
+                    param = param.full_tensor()
+            if NF4Tensor is not None and isinstance(param, NF4Tensor):
+                param = param.to(param.dtype)
+            if is_rank_zero:
+                cpu_state_dict[param_name] = param.cpu()
+            # Use shard PG barrier instead of world barrier
+            if self._shard_pg is not None:
+                torch.distributed.barrier(group=self._shard_pg)
+            elif not self._production_mode:
+                torch.distributed.barrier()
+        return cpu_state_dict
+
     def save_checkpoint(
         self,
         epoch: int,
@@ -1309,8 +1378,10 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         start = time.perf_counter()
 
         # To prevent GPU memory from spiking during checkpoint save,
-        # we consolidate the full model and optim state dicts on CPU for rank 0
-        cpu_state_dict = training.gather_cpu_state_dict(
+        # we consolidate the full model and optim state dicts on CPU for rank 0.
+        # Use shard PG for barriers when available (multi-node XPU: world barriers
+        # crash after FSDP2 sub-communicators are created).
+        cpu_state_dict = self._gather_cpu_state_dict_safe(
             self._model,
             self._is_rank_zero,
             device=self._device,
@@ -1360,7 +1431,11 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             )
             log.info(f"Saving checkpoint took {time.perf_counter() - start:.2f} secs")
 
-        torch.distributed.barrier()
+        # Use shard PG for barrier (world PG crashes on multi-node XPU after FSDP2)
+        if self._shard_pg is not None:
+            torch.distributed.barrier(group=self._shard_pg)
+        elif not self._production_mode:
+            torch.distributed.barrier()
 
     def _generate_with_vllm(
         self,
@@ -1389,14 +1464,41 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                 ids = [t for t in ids if t != self._tokenizer.pad_id]
                 prompts.append(ids)
 
-            t0 = time.perf_counter()
-            completions = self._vllm_client.generate(
-                prompts=prompts,
+            gen_kwargs = dict(
                 n=1,  # prompts already expanded by grpo_samples
                 max_tokens=self._max_generated_tokens,
                 temperature=self._temperature,
                 top_k=self._top_k or 0,
             )
+
+            t0 = time.perf_counter()
+            num_clients = len(self._vllm_clients)
+            if num_clients > 1:
+                # DP vLLM: split sequences round-robin across replicas, call in parallel
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+                chunks = [prompts[i::num_clients] for i in range(num_clients)]
+
+                def _call_vllm(client, chunk):
+                    return client.generate(prompts=chunk, **gen_kwargs) if chunk else []
+
+                with ThreadPoolExecutor(max_workers=num_clients) as pool:
+                    futures = {
+                        pool.submit(_call_vllm, client, chunk): idx
+                        for idx, (client, chunk) in enumerate(zip(self._vllm_clients, chunks))
+                    }
+                    chunk_results = [None] * num_clients
+                    for future in as_completed(futures):
+                        idx = futures[future]
+                        chunk_results[idx] = future.result()
+
+                # Interleave results back to original prompt order
+                completions = [None] * bsz
+                for i in range(bsz):
+                    client_idx = i % num_clients
+                    within_idx = i // num_clients
+                    completions[i] = chunk_results[client_idx][within_idx]
+            else:
+                completions = self._vllm_client.generate(prompts=prompts, **gen_kwargs)
             gen_time = time.perf_counter() - t0
 
             # Build query_responses tensor: [prompt | completion | padding]
@@ -1410,8 +1512,8 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
 
             total_tokens = sum(len(c) for c in completions)
             log.info(
-                "Rank %d: vLLM generation: %d sequences, %d tokens in %.1fs (%.1f tok/s)",
-                self.rank, bsz, total_tokens, gen_time, total_tokens / max(gen_time, 0.01),
+                "Rank %d: vLLM generation: %d sequences (%d clients), %d tokens in %.1fs (%.1f tok/s)",
+                self.rank, bsz, num_clients, total_tokens, gen_time, total_tokens / max(gen_time, 0.01),
             )
         else:
             query_responses = batch_input_ids.new_empty(bsz, total_len)
@@ -1500,7 +1602,8 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         """
         if self._device.type == "xpu":
             # Skip — empty_cache + FSDP storage.resize_ leaks UR handles
-            torch.distributed.barrier()
+            if not self._production_mode:
+                torch.distributed.barrier()
             return
 
         gen = self._file_barrier_gen
@@ -1701,6 +1804,7 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         batch_input_ids = batch_input_ids.reshape(batch_size * grpo_size, -1)
 
         # step 1: generate responses using the current policy (or vLLM)
+        _vllm_t0 = time.perf_counter()
         if self._vllm_mode in ("colocate", "colocate_sleep"):
             query_responses = self._generate_with_colocated_vllm(batch_input_ids, context_length)
         elif self._vllm_mode == "server":
@@ -1737,11 +1841,18 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                     return_logits=False,
                 )
 
+        if self._device.type == "xpu":
+            torch.xpu.synchronize()
+        _vllm_time = time.perf_counter() - _vllm_t0
+
         # Barrier: all ranks must finish generation before FSDP forward passes.
+        # For vLLM server mode, the broadcast in _generate_with_vllm already
+        # synchronizes all ranks — skip the world barrier to avoid cross-node
+        # CCL broadcast_scaleout failures on multi-node XPU.
         # HSDP: use shard PG to avoid mixing world PG with FSDP1 sub-PGs on XCCL.
         if self._shard_pg is not None:
             torch.distributed.barrier(group=self._shard_pg)
-        else:
+        elif self._vllm_mode != "server" and not self._production_mode:
             torch.distributed.barrier()
 
         # Free vLLM GPU memory to reclaim space for training forward/backward passes.
@@ -1800,6 +1911,7 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         # step 2. estimate logprobs of the responses using the current policy
         # Chunk the forward pass to avoid OOM with many sequences (Config B).
         # Process forward_batch_size sequences at a time through the model.
+        _policy_fwd_t0 = time.perf_counter()
         num_seqs = query_responses.shape[0]
         fwd_bs = self._forward_batch_size
         if fwd_bs >= num_seqs:
@@ -1832,12 +1944,19 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             log.info("Rank %d: policy forward done (chunked)", self.rank)
         device_empty_cache(self._device)
 
+        if self._device.type == "xpu":
+            torch.xpu.synchronize()
+        _policy_fwd_time = time.perf_counter() - _policy_fwd_t0
+
         # step 2.1 estimate logprobs of the responses using the reference policy
-        # Barrier: FSDP ref model needs allgather from all ranks in shard group
-        log.info("Rank %d: pre-ref barrier", self.rank)
+        # Barrier: sync before ref model forward. FSDP2 uses lazy allgather
+        # which is itself a synchronization point — skip world barrier for
+        # multi-node to avoid CCL broadcast_scaleout failures.
+        _ref_fwd_t0 = time.perf_counter()
+        log.info("Rank %d: pre-ref forward", self.rank)
         if self._shard_pg is not None:
             torch.distributed.barrier(group=self._shard_pg)
-        else:
+        elif not self._production_mode:
             torch.distributed.barrier()
         if fwd_bs >= num_seqs:
             log.info("Rank %d: ref forward start", self.rank)
@@ -1869,6 +1988,15 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             del ref_logprobs_chunks
             log.info("Rank %d: ref forward done (chunked)", self.rank)
         device_empty_cache(self._device)
+        if self._device.type == "xpu":
+            torch.xpu.synchronize()
+        _ref_fwd_time = time.perf_counter() - _ref_fwd_t0
+
+        log.info(
+            "Rank %d: GENTIMING vllm=%.1fs policy_fwd=%.1fs ref_fwd=%.1fs",
+            self.rank, _vllm_time, _policy_fwd_time, _ref_fwd_time,
+        )
+
         # step 4. replace tokens after first stop token with padding
         (
             response_padding_masks,
@@ -1888,6 +2016,24 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         # Aggregate rewards and successes across reward functions
         rewards = rewards.sum(dim=-1)
         successes = successes.sum(dim=-1)
+
+        # Log sample responses for verification (rank 0 only, first sample)
+        if self._is_rank_zero:
+            try:
+                sample_resp = responses[0, 0]  # first prompt, first sample
+                # Decode only non-pad tokens
+                non_pad = sample_resp[sample_resp != self._tokenizer.pad_id]
+                decoded = self._tokenizer.decode(non_pad.tolist())
+                log.info(
+                    "SAMPLE_RESPONSE step=%d reward=%.1f success=%.1f answer=%s response=%s",
+                    self._steps_run,
+                    rewards[0, 0].item(),
+                    successes[0, 0].item(),
+                    answers[0][:80],
+                    decoded[:200],
+                )
+            except Exception as e:
+                log.warning("Could not decode sample response: %s", e)
 
         advantages = (rewards - rewards.mean(1, keepdim=True)) / (
             rewards.std(1, keepdim=True) + 1e-4
@@ -1957,20 +2103,23 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         """
         Perform a single GRPO optimization step over a batch of trajectories.
         """
-        device_empty_cache(self._device)
         # Synchronize + flush UR resources before forward pass (prevents
         # UR_RESULT_ERROR_OUT_OF_RESOURCES after ~240 total sequences)
         if self._device.type == "xpu":
             torch.xpu.synchronize()
 
         # estimate logprobs from the policy at the current optimisation step
+        _fwd_t0 = time.perf_counter()
         log.info("Rank %d: grpo_step policy forward start", self.rank)
         pi_logits = self._model(
             trajectory.query_responses,
             input_pos=trajectory.position_ids,
             mask=trajectory.masks,
         )
-        log.info("Rank %d: grpo_step policy forward done", self.rank)
+        if self._device.type == "xpu":
+            torch.xpu.synchronize()
+        _fwd_time = time.perf_counter() - _fwd_t0
+        log.info("Rank %d: grpo_step forward=%.1fs", self.rank, _fwd_time)
 
         pi_logits = rlhf.truncate_sequence_for_logprobs(pi_logits, context_length)
         pi_logprobs = rlhf.batched_logits_to_logprobs(
@@ -1985,7 +2134,6 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         del pi_logits
         if self._device.type == "xpu":
             torch.xpu.synchronize()
-        device_empty_cache(self._device)
 
         # calculate grpo loss
         loss, policy_loss, kl_loss, ratios, clipfrac = self._loss_fn(
@@ -2000,10 +2148,13 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         if self._gradient_accumulation_steps > 1:
             loss = loss / self._gradient_accumulation_steps
 
-        device_empty_cache(self._device)
+        _bwd_t0 = time.perf_counter()
         log.info("Rank %d: backward start", self.rank)
         loss.backward()
-        log.info("Rank %d: backward done", self.rank)
+        if self._device.type == "xpu":
+            torch.xpu.synchronize()
+        _bwd_time = time.perf_counter() - _bwd_t0
+        log.info("Rank %d: backward=%.1fs", self.rank, _bwd_time)
 
         with torch.no_grad():
             approx_policy_kls = (
@@ -2055,11 +2206,16 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
 
                 _, context_length = tokens.shape
 
+                _step_t0 = time.perf_counter()
                 trajectory = self.generate_trajectory_batched(tokens, answers)
+                if self._device.type == "xpu":
+                    torch.xpu.synchronize()
+                _gen_time = time.perf_counter() - _step_t0
                 if not self._production_mode:
                     torch.distributed.barrier()
 
                 grpo_stats: list[GRPOStats] = []
+                _grpo_t0 = time.perf_counter()
 
                 for _ in range(self._ppo_epochs):
                     total_samples = trajectory.query_responses.shape[0]
@@ -2106,11 +2262,20 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                         step_stats = self.grpo_step(trajectory, context_length)
                         grpo_stats.append(step_stats)
 
+                    # Sync device before timing grad clip
+                    if self._device.type == "xpu":
+                        torch.xpu.synchronize()
+                    _grpo_time = time.perf_counter() - _grpo_t0
+
+                    _clip_t0 = time.perf_counter()
                     if self._clip_grad_norm is not None:
                         grad_norm = torch.nn.utils.clip_grad_norm_(
                             self._model.parameters(),
                             max_norm=float(self._clip_grad_norm),
                         )
+                    if self._device.type == "xpu":
+                        torch.xpu.synchronize()
+                    _clip_time = time.perf_counter() - _clip_t0
 
                     if not self._production_mode:
                         torch.distributed.barrier()
@@ -2121,9 +2286,13 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                         log.info("Rank %d: pre-optimizer sync", self.rank)
                         torch.xpu.synchronize()
 
+                    _opt_t0 = time.perf_counter()
                     log.info("Rank %d: optimizer.step()", self.rank)
                     self._optimizer.step()
                     self._optimizer.zero_grad(set_to_none=True)
+                    if self._device.type == "xpu":
+                        torch.xpu.synchronize()
+                    _opt_time = time.perf_counter() - _opt_t0
                     log.info("Rank %d: optimizer done", self.rank)
                     if not self._production_mode:
                         torch.distributed.barrier()
@@ -2153,6 +2322,15 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                     and supports_memory_stats(self._device)
                 ):
                     device_record_memory_history(self._device, enabled=None)
+
+                _step_time = time.perf_counter() - _step_t0
+                if self._is_rank_zero:
+                    log.info(
+                        "TIMING step=%d  total=%.1fs  gen=%.1fs  grpo=%.1fs  clip=%.1fs  opt=%.1fs  other=%.1fs",
+                        self._steps_run, _step_time, _gen_time, _grpo_time,
+                        _clip_time, _opt_time,
+                        _step_time - _gen_time - _grpo_time - _clip_time - _opt_time,
+                    )
 
                 self._steps_run += 1
                 if self._steps_run % self._log_every_n_steps == 0:
@@ -2228,6 +2406,23 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             log_dict.update(training.get_memory_stats(device=self._device))
         if self._is_rank_zero:
             self._metric_logger.log_dict(log_dict, step=self.global_step)
+            # Also log key metrics to stdout for verification
+            log.info(
+                "METRICS step=%d  loss=%.4f  policy_loss=%.4f  kl_loss=%.6f  "
+                "rewards=%.3f  successes=%.3f  grad_norm=%.4f  "
+                "clipfrac=%.4f  ratios=%.4f  approx_kl=%.6f  resp_len=%.1f",
+                self.global_step,
+                log_dict["loss"].item() if hasattr(log_dict["loss"], "item") else log_dict["loss"],
+                log_dict["policy_loss"].item() if hasattr(log_dict["policy_loss"], "item") else log_dict["policy_loss"],
+                log_dict["kl_loss"].item() if hasattr(log_dict["kl_loss"], "item") else log_dict["kl_loss"],
+                log_dict["rewards"].item() if hasattr(log_dict["rewards"], "item") else log_dict["rewards"],
+                log_dict["successes"].item() if hasattr(log_dict["successes"], "item") else log_dict["successes"],
+                log_dict.get("grad_norm", 0.0),
+                log_dict["clipfrac"].item() if hasattr(log_dict["clipfrac"], "item") else log_dict["clipfrac"],
+                log_dict["ratios"].item() if hasattr(log_dict["ratios"], "item") else log_dict["ratios"],
+                log_dict["approx_policy_kl"].item() if hasattr(log_dict["approx_policy_kl"], "item") else log_dict["approx_policy_kl"],
+                log_dict["response_lengths"].item() if hasattr(log_dict["response_lengths"], "item") else log_dict["response_lengths"],
+            )
 
     def cleanup(self) -> None:
         if self._vllm_client is not None and self._vllm_weight_sync and self._vllm_client.communicator is not None:

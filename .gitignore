@@ -187,3 +187,16 @@ cover/
 
 # wandb
 wandb/
+
+# Claude Code
+.claude/
+CLAUDE.md
+
+# Aurora/XPU development artifacts
+core.*
+*.out
+logs/
+fsdp_debug.*
+tests/recipes/dev/
+tests/torchtune/training/test_xpu_utils.py
+benchmarks/
