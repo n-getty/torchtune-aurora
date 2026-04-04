@@ -126,6 +126,7 @@ class ModelType(Enum):
     CLIP_TEXT: str = "clip_text"
     T5_ENCODER: str = "t5_encoder"
     QWEN3: str = "qwen3"
+    GEMMA4: str = "gemma4"
 
 
 class FormattedCheckpointFiles:

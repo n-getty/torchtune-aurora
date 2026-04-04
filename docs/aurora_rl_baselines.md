@@ -1506,18 +1506,94 @@ parallel ThreadPoolExecutor dispatch), IP-based URLs to bypass Aurora's Squid pr
 
 ### Updated Performance Summary
 
-| Model | Config | Step Time | Time/seq | Notes |
+| Model | Config | Step Time | Seqs/min | Notes |
 |-------|--------|-----------|----------|-------|
-| Qwen2.5-3B | 2 tiles, no vLLM | 16.2s | 16.2s | Baseline |
-| Qwen2.5-3B | 1+6, vLLM TP=1 | 5.9s | 5.9s | Best 3B colocated |
-| Qwen2.5-3B | 1+10, vLLM TP=1 | 5.1s | 5.1s | Best 3B |
-| **Qwen3-32B** | **10+2, G=4** | **18.1s** | **4.5s** | **Best single-node 32B** |
-| Qwen3-32B | 10+2, G=8 | 24.2s | 3.0s | 2x per-seq efficiency |
-| Qwen3-32B | 10+2, G=16 | 36.9s | 2.3s | Best per-seq efficiency |
+| Qwen2.5-3B | 2 tiles, no vLLM | 16.2s | 3.7 | Baseline |
+| Qwen2.5-3B | 1+6, vLLM TP=1 | 5.9s | 10.2 | Best 3B colocated |
+| Qwen2.5-3B | 1+10, vLLM TP=1 | 5.1s | 11.8 | Best 3B |
+| Qwen3-32B | 10+2, G=4, fbs=4 | 18.5s | 12.6 | Single-node baseline |
+| **Qwen3-32B** | **10+2, G=8, fbs=8** | **22.8s** | **20.5** | **Best single-node 32B (63% ↑)** |
+| Qwen3-32B | 10+2, G=16, fbs=8 | ~34s | — | UR OOM step 3-4 (60 GiB) |
 | Qwen3-32B | 8+4, G=4 | OOM | — | 8-way FSDP shards too large |
-| Qwen3-32B | Dedicated TP=4 DP=3, G=16 | 35.6s | 2.2s | 2 nodes, marginal vs colocated |
-| Qwen3-32B | Dedicated TP=2 DP=6, G=16 | 36.4s | 2.3s | 2 nodes, TP=2 too small per replica |
-| **Qwen3-32B** | **20+4, HSDP, G=4** | **19.4s** | **4.9s** | **Near-linear 2-node scaling** |
+| Qwen3-32B | Dedicated TP=4 DP=3, G=16 | 35.6s | 26.9 | 2 nodes, marginal vs colocated |
+| Qwen3-32B | 20+4 HSDP, G=4, fbs=4 | 19.5s | 24.0 | Near-linear 2-node scaling |
+| **Qwen3-32B** | **20+4 HSDP, G=8, fbs=8** | **23.8s** | **39.3** | **Best overall 32B (3.1× baseline)** |
+| Qwen3-32B | 20+4 HSDP, G=16, fbs=8 | ~34s | — | UR OOM step 3-4 |
+
+## Phase 12: 32B forward_batch_size Optimization (2026-04-04)
+
+**Goal**: Increase `forward_batch_size` from 4→8 for 32B GRPO to reduce FSDP AllGather
+overhead (fewer chunked forward passes), and test G=8/G=16 scaling with optimized fbs.
+
+### Motivation
+
+Phase 11 tested G=4/8/16 with `forward_batch_size=4`. With G=8, the 8 sequences are
+chunked into 2 forward passes of 4 each. By increasing fbs=8, all 8 sequences are
+processed in a single forward pass, eliminating one FSDP AllGather round-trip.
+
+### Bug Fix: PYTORCH_ALLOC_CONF=expandable_segments Crashing vLLM TP>1
+
+**Problem:** vLLM with TP=2 crashed with `CCL_ERROR: invalid usm pointer type: unknown`
+when launched from the HSDP multinode script.
+
+**Root cause:** The parent script set `PYTORCH_ALLOC_CONF=expandable_segments:True` for
+training, and vLLM TP workers inherited it. `expandable_segments` creates virtual memory
+pointers that can't be registered for RDMA DMA, crashing oneCCL's AllGather during TP
+weight distribution.
+
+**Fix:**
+- `aurora_grpo_vllm_hsdp_multinode.sh:203`: `unset PYTORCH_ALLOC_CONF` in vLLM env block
+- `run_grpo_vllm_xpu.sh:123`: `PYTORCH_ALLOC_CONF=` per-command override for TP>1
+
+### Single-Node Results (10 training + 2 vLLM tiles)
+
+| Config | G | fbs | Step Time | Seqs/min | Memory | Status |
+|--------|---|-----|-----------|----------|--------|--------|
+| **Baseline G=4/fbs=4** | 4 | 4 | 18.0-19.3s (avg 18.5s) | 12.6 | 58.8 GiB | Stable |
+| **G=8/fbs=8** | 8 | 8 | 22.1-23.3s (avg 22.8s) | **20.5** | ~59 GiB | Stable |
+| G=16/fbs=8 | 16 | 8 | ~34-40s | — | 60.0 GiB | **UR OOM step 3-4** |
+
+### Two-Node HSDP Results (20 training + 4 vLLM tiles, dp_replicate=2 × dp_shard=10)
+
+| Config | G | fbs | Step Time | Seqs/min | Status |
+|--------|---|-----|-----------|----------|--------|
+| **Baseline G=4/fbs=4** | 4 | 4 | 19.0-19.8s (avg 19.5s) | 24.0 | Stable |
+| **G=8/fbs=8** | 8 | 8 | 22.9-24.7s (avg 23.8s) | **39.3** | Stable |
+| G=16/fbs=8 | 16 | 8 | 34.0-34.3s (steps 1-2) | — | **UR OOM step 3-4** |
+
+### Timing Breakdown (steady state, Rank 0)
+
+| Config | vLLM gen | Policy fwd | Ref fwd | Overhead |
+|--------|----------|------------|---------|----------|
+| G=4/fbs=4 1-node | 8.2s | 2.2s | 1.5s | ~6.6s |
+| G=8/fbs=8 1-node | 9.2s | 3.4s | 2.2s | ~8.0s |
+| G=16/fbs=8 1-node | 9.5s | 4.8s | 4.2s | ~15.5s |
+| G=8/fbs=8 2-node HSDP | 9.0s | 3.2s | 2.0s | ~9.6s |
+
+### Key Findings
+
+1. **G=8/fbs=8 is the optimal 32B config**: 63% more sequences/minute vs G=4/fbs=4
+   baseline (20.5 vs 12.6 seqs/min) with only 23% longer step time. Stable at ~59 GiB.
+
+2. **fbs=8 halves forward AllGather overhead**: Policy forward 2×2.8s (two fbs=4 chunks)
+   → 1×3.4s (one fbs=8 pass) — net saving of ~2.2s per step.
+
+3. **HSDP scaling maintained at G=8**: 2-node HSDP G=8/fbs=8 achieves 39.3 seqs/min —
+   **3.1× single-node G=4 baseline**. Only 4% inter-node overhead (23.8s vs 22.8s).
+
+4. **G=16 is memory-unsafe for 32B**: UR_RESULT_ERROR_OUT_OF_RESOURCES crash on step 3-4
+   due to XPU allocator splintering (60 GiB reserved, 31 GiB fragmentation gap). Same
+   failure on both 1-node and 2-node. Root cause: XPU allocator ignores
+   `garbage_collection_threshold` and `max_split_size_mb` settings.
+
+5. **vLLM generation bottleneck**: vLLM takes ~8-9.5s regardless of G (similar prompt
+   count per step). Doubling G from 4→8 adds only ~1s to vLLM time but doubles output.
+
+### Production Config Updates
+
+Updated both production configs to G=8/fbs=8:
+- `recipes/configs/dev/production/qwen32B_grpo_server_xpu.yaml`
+- `recipes/configs/dev/production/qwen32B_grpo_vllm_hsdp_multinode_xpu.yaml`
 
 ## Phase 9: TRL GRPO at 7B/32B Scale on Polaris (2026-03-31)
 

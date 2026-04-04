@@ -105,10 +105,12 @@ ref_checkpointer:
 resume_from_checkpoint: False
 save_every_n_epochs: 1
 
-# GRPO parameters — conservative for 32B
+# GRPO parameters — G=8/fbs=8 optimal (63% more seqs/min vs G=4/fbs=4)
+# Tested: 22.8s/step avg, 20.5 seqs/min (vs 18.5s/step, 12.6 seqs/min baseline)
+# G=16 not viable — UR OOM from allocator splintering at 60 GiB
 batch_size: 1
-grpo_samples: 4
-forward_batch_size: 4
+grpo_samples: 8
+forward_batch_size: 8
 max_generated_tokens: 128
 top_k: null
 temperature: 1.0

@@ -11,7 +11,9 @@
 #   Activations + KV cache: ~10-15 GiB
 #   Total estimated: ~23-28 GiB — well within 64 GiB
 #
-# Single-node baseline: 25.6 s/step (10 tiles + TP=2 vLLM)
+# Performance (G=8/fbs=8):
+#   Single-node: 22.8 s/step, 20.5 seqs/min
+#   2-node HSDP: 23.8 s/step, 39.3 seqs/min (3.1x single-node G=4 baseline)
 #
 # Launch:
 #   bash recipes/dev/aurora_grpo_vllm_hsdp_multinode.sh
@@ -104,10 +106,10 @@ ref_checkpointer:
 resume_from_checkpoint: False
 save_every_n_epochs: 1
 
-# GRPO parameters — conservative for 32B
+# GRPO parameters — G=8/fbs=8 optimal (63% more seqs/min vs G=4/fbs=4)
 batch_size: 1
-grpo_samples: 4
-forward_batch_size: 4
+grpo_samples: 8
+forward_batch_size: 8
 max_generated_tokens: 128
 top_k: null
 temperature: 1.0

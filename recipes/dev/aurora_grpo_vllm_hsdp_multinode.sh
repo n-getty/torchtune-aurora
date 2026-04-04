@@ -99,8 +99,8 @@ fi
 
 UNIQUE_NODES=($(cut -d'.' -f1 "$PBS_NODEFILE" | awk '!seen[$0]++'))
 NUM_NODES=${#UNIQUE_NODES[@]}
-if [[ ${NUM_NODES} -lt 2 ]]; then
-    echo "ERROR: Need at least 2 nodes, got ${NUM_NODES}"
+if [[ ${NUM_NODES} -lt 1 ]]; then
+    echo "ERROR: Need at least 1 node, got ${NUM_NODES}"
     exit 1
 fi
 
@@ -200,7 +200,7 @@ export ZE_FLAT_DEVICE_HIERARCHY=FLAT
 export ZE_AFFINITY_MASK=${VLLM_MASK}
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export TORCH_COMPILE_DISABLE=1
-export PYTORCH_ALLOC_CONF=expandable_segments:True
+unset PYTORCH_ALLOC_CONF
 export PYTHONPATH='${TORCHTUNE_DIR}:/flare/ModCon/ngetty/trl:${VLLM_CUSTOMIZATION}'
 export HF_DATASETS_OFFLINE=1
 export HF_HUB_OFFLINE=1

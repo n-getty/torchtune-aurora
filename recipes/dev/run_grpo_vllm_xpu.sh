@@ -114,9 +114,17 @@ echo "Starting vLLM server on tile(s) ${VLLM_MASK}..."
 # The vllm CLI serve uses the AsyncLLMEngine path which works.
 if [ ${VLLM_TILES} -gt 1 ]; then
     echo "Using vllm serve CLI (TP=${VLLM_TILES})"
+    # IMPORTANT: unset PYTORCH_ALLOC_CONF for vLLM TP>1.
+    # expandable_segments:True creates virtual memory pointers that can't be
+    # registered for RDMA DMA, causing "invalid usm pointer type" in oneCCL.
     ZE_AFFINITY_MASK=${VLLM_MASK} \
         VLLM_WORKER_MULTIPROC_METHOD=spawn \
         TORCH_COMPILE_DISABLE=1 \
+        PYTORCH_ALLOC_CONF= \
+        CCL_PROCESS_LAUNCHER=none \
+        CCL_ATL_TRANSPORT=ofi \
+        FI_PROVIDER=cxi \
+        CCL_KVS_IFACE=lo \
         python3 -m vllm.entrypoints.openai.api_server \
         --model "${MODEL_PATH}" \
         --tensor-parallel-size ${VLLM_TILES} \

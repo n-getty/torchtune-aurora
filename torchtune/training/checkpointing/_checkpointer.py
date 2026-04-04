@@ -695,6 +695,18 @@ class FullModelHFCheckpointer(_CheckpointerInterface):
                 dim=self._config["hidden_size"],
                 head_dim=self._config.get("head_dim", None),
             )
+        elif self._model_type == ModelType.GEMMA4:
+            from torchtune.models.gemma4._convert_weights import gemma4_hf_to_tune
+
+            # Gemma4 config.json nests text params under "text_config"
+            text_config = self._config.get("text_config", self._config)
+            converted_state_dict[training.MODEL_KEY] = gemma4_hf_to_tune(
+                merged_state_dict,
+                num_heads=text_config["num_attention_heads"],
+                num_kv_heads=text_config["num_key_value_heads"],
+                dim=text_config["hidden_size"],
+                head_dim=text_config.get("head_dim", None),
+            )
         elif self._model_type == ModelType.T5_ENCODER:
             from torchtune.models.t5._convert_weights import t5_encoder_hf_to_tune
 
@@ -859,6 +871,17 @@ class FullModelHFCheckpointer(_CheckpointerInterface):
                     num_kv_heads=self._config["num_key_value_heads"],
                     dim=self._config["hidden_size"],
                     head_dim=self._config.get("head_dim", None),
+                )
+            elif self._model_type == ModelType.GEMMA4:
+                from torchtune.models.gemma4._convert_weights import gemma4_tune_to_hf
+
+                text_config = self._config.get("text_config", self._config)
+                state_dict[training.MODEL_KEY] = gemma4_tune_to_hf(
+                    state_dict[training.MODEL_KEY],
+                    num_heads=text_config["num_attention_heads"],
+                    num_kv_heads=text_config["num_key_value_heads"],
+                    dim=text_config["hidden_size"],
+                    head_dim=text_config.get("head_dim", None),
                 )
             elif self._model_type == ModelType.LLAMA4:
                 from torchtune.models.llama4._convert_weights import llama4_tune_to_hf

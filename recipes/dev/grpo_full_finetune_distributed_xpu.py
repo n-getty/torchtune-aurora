@@ -753,11 +753,13 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         checkpoint_dict = self.load_checkpoint(cfg_checkpointer=cfg.checkpointer)
         if self._resume_from_checkpoint:
             self._update_recipe_state(checkpoint_dict)
-        # For server and colocate_sleep modes, reshard parameters after forward
-        # to avoid keeping the full unsharded model in memory. For 32B with
-        # FSDP-12, full unshard = 64 GiB which exceeds tile capacity.
-        # colocate (non-sleep) keeps unshard since model stays on GPU anyway.
-        reshard_policy = self._vllm_mode in ("server", "colocate_sleep")
+        # Reshard parameters after forward to avoid keeping the full unsharded
+        # model in memory. For 31B+ with FSDP-10/12, full unshard = 62+ GiB
+        # which exceeds tile capacity. Always reshard except in colocate mode
+        # (non-sleep) where model stays on GPU anyway.
+        # Can be overridden via config: reshard_after_forward: false
+        reshard_policy = cfg.get("reshard_after_forward",
+                                 self._vllm_mode != "colocate")
         self._model = self._setup_model(
             cfg_model=cfg.model,
             enable_activation_checkpointing=self._enable_activation_checkpointing,
