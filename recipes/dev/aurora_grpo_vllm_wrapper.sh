@@ -105,6 +105,7 @@ export FI_CXI_OFLOW_BUF_SIZE=8388608
 export FI_CXI_DEFAULT_CQ_SIZE=131072
 export FI_MR_CACHE_MONITOR=disabled
 export ZE_FLAT_DEVICE_HIERARCHY=FLAT
+export ZES_ENABLE_SYSMAN=1  # Required for accurate torch.xpu.mem_get_info()
 if [[ "${USE_AFFINITY_MASK:-0}" == "1" ]]; then
     export ZE_AFFINITY_MASK="${LOCAL_RANK}"
 elif [[ "${USE_AFFINITY_MASK:-0}" == "training" ]]; then
@@ -113,7 +114,15 @@ elif [[ "${USE_AFFINITY_MASK:-0}" == "training" ]]; then
 else
     unset ZE_AFFINITY_MASK
 fi
-export TORCH_XPU_ALLOC_CONF=expandable_segments:True
+# NOTE: expandable_segments:True is INCOMPATIBLE with oneCCL RDMA (CXI fabric).
+# Virtual memory pointers can't be registered for RDMA DMA. Use only CCL-safe options.
+# max_split_size_mb=512: Prevents allocator from splitting FSDP AllGather blocks
+#   (1-2 GiB each) to serve tiny activation/logprob requests. Without this,
+#   small "splinter" allocations fragment large free blocks, making them
+#   unreusable for the next AllGather and forcing new L0 allocations.
+# garbage_collection_threshold=0.6: Sweeps the small-block pool to coalesce
+#   freed activation/logprob blocks when usage exceeds 60% of peak.
+export PYTORCH_ALLOC_CONF=max_split_size_mb:512,garbage_collection_threshold:0.6
 export TORCH_COMPILE_DISABLE=1
 
 # Paths

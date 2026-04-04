@@ -231,6 +231,9 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
 
         # Initialize the distributed environment
         self.fsdp_cpu_offload = cfg.get("fsdp_cpu_offload", False)
+        self._disable_prefetch = cfg.get("disable_prefetch", False)
+        self._fsdp_diagnostics = cfg.get("fsdp_diagnostics", False)
+        self._empty_cache_before_backward = cfg.get("empty_cache_before_backward", False)
         self.distributed_backend = get_xpu_distributed_backend(
             self._device.type, offload_ops_to_cpu=self.fsdp_cpu_offload
         )
@@ -258,14 +261,16 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         self.world_size, self.rank = utils.get_world_size_and_rank()
         self._is_rank_zero = self.rank == 0
 
-        # Force math-only SDPA to avoid XPU SDPA kernel UR handle leaks.
-        # The XPU-specific SDPA kernel leaks Unified Runtime handles on each
-        # call, eventually causing GPU segfaults. The math backend uses pure
-        # PyTorch matmul+softmax which doesn't leak.
-        if self._device.type == "xpu":
+        # SDPA backend selection for XPU.
+        # Default: force math-only SDPA (disable flash/mem_efficient) as a
+        # precaution against UR handle leaks observed with broken CCL config.
+        # Set force_math_sdpa=False to re-enable optimized SDPA backends.
+        if self._device.type == "xpu" and cfg.get("force_math_sdpa", True):
             torch.backends.cuda.enable_flash_sdp(False)
             torch.backends.cuda.enable_mem_efficient_sdp(False)
-            log.info("Rank %d: forced math-only SDPA (disabled flash/mem_efficient to avoid UR leaks)", self.rank)
+            log.info("Rank %d: forced math-only SDPA (set force_math_sdpa=False to test optimized backends)", self.rank)
+        elif self._device.type == "xpu":
+            log.info("Rank %d: using default SDPA backends (flash/mem_efficient enabled)", self.rank)
 
         # Production mode: skip non-essential barriers/synchronize() calls.
         # Multi-node XPU REQUIRES production mode because world-level barriers
@@ -285,15 +290,29 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             "enable_activation_checkpointing", False
         )
         self._compile = cfg.get("compile", False)
+        # dynamic=True uses symbolic shapes to avoid recompilation on
+        # variable-length sequences (essential for RL workloads).
+        # Default True on XPU (matches PRISM's proven approach).
+        self._compile_dynamic = cfg.get(
+            "compile_dynamic", True if self._device.type == "xpu" else False
+        )
 
-        # Warn about compile + multi-node on XPU
+        # Compile + multi-node on XPU: historically deadlocked with oneCCL,
+        # but may work with fixed CCL config (WORKER_COUNT=1, MPI transport).
+        # Set allow_compile_multinode=True to test.
         if self._compile and self._device.type == "xpu":
             local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", self.world_size))
             if self.world_size > local_world_size:
-                log.warning(
-                    "torch.compile is not supported multi-node on XPU. Disabling."
-                )
-                self._compile = False
+                if cfg.get("allow_compile_multinode", False):
+                    log.warning(
+                        "compile + multi-node XPU: EXPERIMENTAL (allow_compile_multinode=True)"
+                    )
+                else:
+                    log.warning(
+                        "torch.compile disabled for multi-node XPU. "
+                        "Set allow_compile_multinode=True to test."
+                    )
+                    self._compile = False
 
         # HSDP: dp_replicate × dp_shard mesh for multi-node
         # dp_replicate=1 (default): pure FSDP across all ranks
@@ -776,6 +795,13 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
 
         # initialize loss
         self._loss_fn = config.instantiate(cfg.loss)
+        # Detect chunked output loss (takes raw logits instead of logprobs)
+        self._use_chunked_loss = hasattr(self._loss_fn, "num_output_chunks")
+        if self._use_chunked_loss:
+            log.info(
+                "Using chunked output loss with %d chunks",
+                self._loss_fn.num_output_chunks,
+            )
         if self._compile:
             _saved_tcd = os.environ.pop("TORCH_COMPILE_DISABLE", None)
             training.compile_loss(self._loss_fn, verbose=self._is_rank_zero)
@@ -822,6 +848,12 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         self._max_generated_tokens = cfg.max_generated_tokens
         self.batch_size = cfg.batch_size
         self._forward_batch_size = cfg.forward_batch_size
+
+        # Sequence packing: bin-pack variable-length sequences to eliminate
+        # padding waste in the training forward/backward pass.
+        self._enable_packing = cfg.get("enable_packing", False)
+        if self._enable_packing:
+            log.info("Sequence packing enabled for GRPO training forward/backward")
 
         self._ppo_epochs = cfg.ppo_epochs
         self._save_every_n_epochs = cfg.save_every_n_epochs
@@ -1071,7 +1103,9 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         if self._compile:
             # Temporarily allow torch.compile (TORCH_COMPILE_DISABLE=1 set for vLLM)
             _saved_tcd = os.environ.pop("TORCH_COMPILE_DISABLE", None)
-            training.compile_model(model, verbose=self._is_rank_zero)
+            training.compile_model(
+                model, verbose=self._is_rank_zero, dynamic=self._compile_dynamic
+            )
             if _saved_tcd is not None:
                 os.environ["TORCH_COMPILE_DISABLE"] = _saved_tcd
 
@@ -1100,6 +1134,7 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             cpu_offload=fsdp_cpu_offload,
             reshard_after_forward=reshard_after_forward,
             dp_mesh=fsdp2_mesh,
+            disable_prefetch=self._disable_prefetch,
         )
 
         with training.set_default_dtype(self._dtype), self._device:
@@ -1132,6 +1167,34 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         if self._is_rank_zero:
             memory_stats = training.get_memory_stats(device=self._device)
             training.log_memory_stats(memory_stats)
+
+        # Verify allocator config is applied (PYTORCH_ALLOC_CONF, not TORCH_XPU_ALLOC_CONF)
+        if self._is_rank_zero:
+            _alloc_conf = os.environ.get("PYTORCH_ALLOC_CONF", "<NOT SET>")
+            _bad_conf = os.environ.get("TORCH_XPU_ALLOC_CONF")
+            log.info("PYTORCH_ALLOC_CONF=%s", _alloc_conf)
+            if _bad_conf:
+                log.warning(
+                    "TORCH_XPU_ALLOC_CONF=%s is set but NOT recognized by PyTorch. "
+                    "Use PYTORCH_ALLOC_CONF instead.", _bad_conf
+                )
+
+        # FSDP diagnostic: log wrapping structure and per-unit reshard settings
+        if self._fsdp_diagnostics and self._is_rank_zero:
+            training.log_fsdp_structure(model, log=log)
+            training.verify_activation_checkpointing(model, log=log)
+            if self._disable_prefetch:
+                log.info("FSDP prefetch DISABLED (reshard_after_forward at root = per-layer setting)")
+            else:
+                log.info("FSDP prefetch ENABLED (reshard_after_forward=None at root)")
+
+        # Register per-layer memory hooks for diagnostics (rank 0 only)
+        if self._fsdp_diagnostics and self._is_rank_zero:
+            self._layer_mem_hooks = training.register_per_layer_memory_hooks(
+                model, self._device, log, sample_every=10,
+            )
+        else:
+            self._layer_mem_hooks = []
 
         disable_dropout(model)
 
@@ -1925,6 +1988,9 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         else:
             # Chunked forward pass
             log.info("Rank %d: policy forward start CHUNKED (total=%d, chunk=%d)", self.rank, num_seqs, fwd_bs)
+            if self.rank == 0 and self._device.type == "xpu":
+                log.info("Rank 0: PRE-policy-fwd memory: alloc=%.2f GiB, resv=%.2f GiB",
+                         torch.xpu.memory_allocated() / 1024**3, torch.xpu.memory_reserved() / 1024**3)
             logprobs_chunks = []
             for cs in range(0, num_seqs, fwd_bs):
                 ce = min(cs + fwd_bs, num_seqs)
@@ -1933,11 +1999,17 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                     input_pos=position_ids[cs:ce],
                     mask=masks[cs:ce],
                 )
+                if self.rank == 0 and self._device.type == "xpu":
+                    log.info("Rank 0: POST-chunk[%d:%d] memory: alloc=%.2f GiB, resv=%.2f GiB",
+                             cs, ce, torch.xpu.memory_allocated() / 1024**3, torch.xpu.memory_reserved() / 1024**3)
                 chunk_logits = chunk_logits[:, context_length - 1 :]
                 logprobs_chunks.append(
                     rlhf.batched_logits_to_logprobs(chunk_logits, responses[cs:ce], self._temperature)
                 )
                 del chunk_logits
+                # NOTE: empty_cache() between forward chunks causes GPU segfaults
+                # on XPU — FSDP2 internal handles reference the freed blocks.
+                # Instead, use fbs >= grpo_samples to avoid chunking entirely.
                 device_empty_cache(self._device)
             logprobs = torch.cat(logprobs_chunks, dim=0)
             del logprobs_chunks
@@ -1947,6 +2019,10 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         if self._device.type == "xpu":
             torch.xpu.synchronize()
         _policy_fwd_time = time.perf_counter() - _policy_fwd_t0
+
+        # NOTE: Removed policy→ref defrag. With fbs >= grpo_samples (no chunking),
+        # post-policy reserved ~29 GiB leaves enough headroom for ref forward.
+        # Each empty_cache() accelerates UR handle leak, so minimize calls.
 
         # step 2.1 estimate logprobs of the responses using the reference policy
         # Barrier: sync before ref model forward. FSDP2 uses lazy allgather
@@ -2108,45 +2184,122 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         if self._device.type == "xpu":
             torch.xpu.synchronize()
 
+        # FSDP memory diagnostics: track memory at each phase
+        if self._fsdp_diagnostics and self._is_rank_zero:
+            training.log_fsdp_memory_per_phase(self._device, "pre_forward", log=log)
+            # Reset peak stats to measure per-phase peaks
+            if self._device.type == "xpu":
+                torch.xpu.reset_peak_memory_stats()
+
         # estimate logprobs from the policy at the current optimisation step
         _fwd_t0 = time.perf_counter()
-        log.info("Rank %d: grpo_step policy forward start", self.rank)
-        pi_logits = self._model(
-            trajectory.query_responses,
-            input_pos=trajectory.position_ids,
-            mask=trajectory.masks,
-        )
+
+        if self._enable_packing:
+            # Pack sequences to eliminate padding waste in forward/backward
+            from torchtune.dev.grpo.packing import (
+                pack_trajectory_for_training,
+                unpack_tensor,
+            )
+            packed_tokens, packed_positions, packed_masks, bins, actual_lens = (
+                pack_trajectory_for_training(
+                    trajectory.query_responses,
+                    trajectory.position_ids,
+                    self._tokenizer.pad_id,
+                )
+            )
+            log.info(
+                "Rank %d: grpo_step packed forward start (%d seqs -> %d packs)",
+                self.rank, trajectory.query_responses.shape[0], packed_tokens.shape[0],
+            )
+            packed_logits = self._model(
+                packed_tokens, input_pos=packed_positions, mask=packed_masks,
+            )
+            del packed_tokens, packed_positions, packed_masks
+            # Unpack back to per-sequence layout
+            pi_logits = unpack_tensor(
+                packed_logits, bins, actual_lens,
+                num_sequences=trajectory.query_responses.shape[0],
+                total_len=trajectory.query_responses.shape[1],
+            )
+            del packed_logits
+        else:
+            log.info("Rank %d: grpo_step policy forward start", self.rank)
+            pi_logits = self._model(
+                trajectory.query_responses,
+                input_pos=trajectory.position_ids,
+                mask=trajectory.masks,
+            )
+
         if self._device.type == "xpu":
             torch.xpu.synchronize()
         _fwd_time = time.perf_counter() - _fwd_t0
         log.info("Rank %d: grpo_step forward=%.1fs", self.rank, _fwd_time)
 
         pi_logits = rlhf.truncate_sequence_for_logprobs(pi_logits, context_length)
-        pi_logprobs = rlhf.batched_logits_to_logprobs(
-            pi_logits,
-            trajectory.query_responses[:, context_length:],
-            self._temperature,
-            chunk_size=1,
-        )
 
-        pi_logprobs[trajectory.response_padding_masks] = 1.0
+        if self._use_chunked_loss:
+            # Chunked loss: pass raw logits directly to loss function.
+            # The loss computes logprobs internally per chunk, avoiding
+            # materializing the full [B*G, seq, vocab] fp32 logit tensor.
+            targets = trajectory.query_responses[:, context_length:]
+            num_chunks = self._loss_fn.num_output_chunks
+            pi_logit_chunks = list(pi_logits.chunk(num_chunks, dim=1))
+            del pi_logits
+            if self._device.type == "xpu":
+                torch.xpu.synchronize()
 
-        del pi_logits
-        if self._device.type == "xpu":
-            torch.xpu.synchronize()
+            loss, policy_loss, kl_loss, ratios, clipfrac, pi_logprobs = (
+                self._loss_fn(
+                    pi_logit_chunks,
+                    targets,
+                    trajectory.ref_logprobs,
+                    trajectory.advantages,
+                    padding_masks=~trajectory.response_padding_masks,
+                )
+            )
+            pi_logprobs[trajectory.response_padding_masks] = 1.0
+        else:
+            # Standard loss: convert logits to logprobs first
+            pi_logprobs = rlhf.batched_logits_to_logprobs(
+                pi_logits,
+                trajectory.query_responses[:, context_length:],
+                self._temperature,
+                chunk_size=1,
+            )
+            pi_logprobs[trajectory.response_padding_masks] = 1.0
 
-        # calculate grpo loss
-        loss, policy_loss, kl_loss, ratios, clipfrac = self._loss_fn(
-            trajectory.logprobs,
-            pi_logprobs,
-            trajectory.ref_logprobs,
-            trajectory.advantages,
-            padding_masks=~trajectory.response_padding_masks,
-        )
+            del pi_logits
+            if self._device.type == "xpu":
+                torch.xpu.synchronize()
+
+            loss, policy_loss, kl_loss, ratios, clipfrac = self._loss_fn(
+                trajectory.logprobs,
+                pi_logprobs,
+                trajectory.ref_logprobs,
+                trajectory.advantages,
+                padding_masks=~trajectory.response_padding_masks,
+            )
 
         # Scale loss for gradient accumulation
         if self._gradient_accumulation_steps > 1:
             loss = loss / self._gradient_accumulation_steps
+
+        if self._fsdp_diagnostics and self._is_rank_zero:
+            training.log_fsdp_memory_per_phase(self._device, "post_forward", log=log)
+            # Reset peak to measure backward peak separately
+            if self._device.type == "xpu":
+                torch.xpu.reset_peak_memory_stats()
+
+        # NOTE: Pre-backward empty_cache() removed. Each empty_cache() call on
+        # XPU leaks UR handles in Level Zero, causing GPU segfaults after ~4 calls.
+        # Instead, rely on between-step empty_cache (1 call/step) + aggressive
+        # GC threshold (0.4) to keep fragmentation manageable.
+        if self._fsdp_diagnostics and self._is_rank_zero and self._device.type == "xpu":
+            log.info(
+                "[PRE_BACKWARD] alloc=%.2f GiB, resv=%.2f GiB (no defrag)",
+                torch.xpu.memory_allocated(self._device) / (1024**3),
+                torch.xpu.memory_reserved(self._device) / (1024**3),
+            )
 
         _bwd_t0 = time.perf_counter()
         log.info("Rank %d: backward start", self.rank)
@@ -2155,6 +2308,9 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             torch.xpu.synchronize()
         _bwd_time = time.perf_counter() - _bwd_t0
         log.info("Rank %d: backward=%.1fs", self.rank, _bwd_time)
+
+        if self._fsdp_diagnostics and self._is_rank_zero:
+            training.log_fsdp_memory_per_phase(self._device, "post_backward", log=log)
 
         with torch.no_grad():
             approx_policy_kls = (
@@ -2205,6 +2361,16 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                 tokens = tokens.to(self._device)
 
                 _, context_length = tokens.shape
+
+                # NOTE: No empty_cache() here. With PYTORCH_ALLOC_CONF=expandable_segments:True,
+                # the allocator handles fragmentation internally without UR handle leaks.
+
+                # Memory diagnostics before each step
+                if self._device.type == "xpu" and self.rank == 0:
+                    _alloc = torch.xpu.memory_allocated() / 1024**3
+                    _resv = torch.xpu.memory_reserved() / 1024**3
+                    log.info("Rank 0: PRE-STEP %d memory: allocated=%.2f GiB, reserved=%.2f GiB",
+                             self._steps_run, _alloc, _resv)
 
                 _step_t0 = time.perf_counter()
                 trajectory = self.generate_trajectory_batched(tokens, answers)
@@ -2294,6 +2460,17 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                         torch.xpu.synchronize()
                     _opt_time = time.perf_counter() - _opt_t0
                     log.info("Rank %d: optimizer done", self.rank)
+
+                    if self._fsdp_diagnostics and self._is_rank_zero:
+                        training.log_fsdp_memory_per_phase(self._device, "post_optimizer", log=log)
+
+                    # Remove per-layer hooks after first step to avoid noise
+                    if self._fsdp_diagnostics and self._steps_run == 0 and self._layer_mem_hooks:
+                        for h in self._layer_mem_hooks:
+                            h.remove()
+                        log.info("Removed per-layer memory hooks after step 0")
+                        self._layer_mem_hooks = []
+
                     if not self._production_mode:
                         torch.distributed.barrier()
 
@@ -2356,6 +2533,21 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                     )
 
                 self.cleanup_after_step(trajectory, grpo_stats)
+
+                # NOTE: No empty_cache() between steps. With PYTORCH_ALLOC_CONF=
+                # expandable_segments:True, the allocator avoids fragmentation by
+                # expanding existing segments in-place. This avoids the UR handle
+                # leak that empty_cache() causes with FSDP on XPU.
+                if self._device.type == "xpu" and not self.fsdp_cpu_offload:
+                    torch.xpu.synchronize()
+                    _mem_alloc = torch.xpu.memory_allocated() / 1024**3
+                    _mem_resv = torch.xpu.memory_reserved() / 1024**3
+                    log.info(
+                        "Rank %d: between-step memory: allocated=%.2f GiB, "
+                        "reserved=%.2f GiB, gap=%.2f GiB",
+                        self.rank, _mem_alloc, _mem_resv, _mem_resv - _mem_alloc,
+                    )
+
                 self._profiler.step()
 
                 pbar.update(1)

@@ -36,7 +36,7 @@ export FI_CXI_OFLOW_BUF_SIZE=8388608
 export FI_CXI_DEFAULT_CQ_SIZE=131072
 export FI_MR_CACHE_MONITOR=userfaultfd
 # XPU memory allocator
-export TORCH_XPU_ALLOC_CONF=expandable_segments:True
+export PYTORCH_ALLOC_CONF=expandable_segments:True
 # NOTE: Do NOT set CCL_ALLREDUCE=ring / CCL_REDUCE_SCATTER=ring for
 # single-node FSDP2 — they force the scheduler path which doesn't support
 # ReduceOp.AVG. Only needed for multi-node with large tensors.

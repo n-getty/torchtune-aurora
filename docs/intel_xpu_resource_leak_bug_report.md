@@ -1,12 +1,14 @@
 # XPU UR_RESULT_ERROR_OUT_OF_RESOURCES: `empty_cache()` + FSDP `storage.resize_()` Leak
 
-**Status**: ROOT CAUSE IDENTIFIED, WORKAROUND DEPLOYED (2026-03-30)
+**Status**: ROOT CAUSE IDENTIFIED, ALL ALLOCATOR MITIGATIONS EXHAUSTED, ACCEPT CPU OFFLOAD FOR 72B (2026-04-04)
 
 ## Summary
 
 When using PyTorch FSDP (both FSDP1 and FSDP2) on Intel Data Center GPU Max 1550 (XPU), calling `torch.xpu.empty_cache()` between FSDP forward passes causes `UR_RESULT_ERROR_OUT_OF_RESOURCES` after a deterministic number of iterations. The root cause is the interaction between `empty_cache()` and FSDP's `storage.resize_()` cycle: each `zeMemAllocDevice`/`zeMemFree` cycle through Level Zero leaks a UR handle.
 
-**The fix is simple: never call `torch.xpu.empty_cache()` in FSDP training loops.** The caching allocator reuses blocks from its free pool without touching Level Zero, preventing the leak entirely. This has been verified stable at 200+ iterations.
+**The workaround is: never call `torch.xpu.empty_cache()` in FSDP training loops.** The caching allocator reuses blocks from its free pool without touching Level Zero, preventing the leak entirely. This has been verified stable at 200+ iterations for small models (~3B params).
+
+**However, this workaround is insufficient for large models (72B+).** Without `empty_cache()`, the XPU caching allocator accumulates 20+ GiB of fragmented reserved-but-unused blocks during FSDP AllGather/reshard cycles. On 48 GiB tiles, this fragmentation causes OOM even though actual allocated memory is only ~25 GiB. Large models *require* periodic `empty_cache()` calls to defragment, creating a direct conflict with this bug. See "Large Model Impact" section below.
 
 The leak does **not** occur with:
 - FSDP + RL pattern, **without** `empty_cache()` calls (200+ iterations stable)
@@ -80,38 +82,48 @@ Each iteration does ~3 FSDP allgathers. The `--simple` mode does only 1 allgathe
 
 **FSDP2 (`fully_shard` composable API):**
 
-| Model size | Seqs/iter | Crash iteration | Total no_grad fwd passes |
-|-----------|-----------|-----------------|--------------------------|
-| 12L/1024h (0.4 GiB) | 4 | ~70 | ~140 |
-| 36L/2048h (3.9 GiB) | 4 | ~13* | ~26 |
-| 36L/2048h (3.9 GiB) | 16 | ~5* | ~10 |
+| Model size | FSDP units | Seqs/iter | Crash iteration | Total `empty_cache()` calls | Error type |
+|-----------|------------|-----------|-----------------|----------------------------|------------|
+| 12L/1024h (0.4 GiB) | 13 | 4 | ~70 | ~210 | UR_RESULT_ERROR_OUT_OF_RESOURCES |
+| 36L/2048h (3.9 GiB) | 37 | 4 | ~13* | ~39 | UR_RESULT_ERROR_OUT_OF_RESOURCES |
+| 36L/2048h (3.9 GiB) | 37 | 16 | ~5* | ~15 | UR_RESULT_ERROR_OUT_OF_RESOURCES |
+| **80L Qwen2.5-72B** | **81** | **4** | **step 2** | **~4** | **GPU segfault (NotPresent/PML5)** |
 
 **FSDP1 (`FullyShardedDataParallel` wrapper API):**
 
-| Model size | Seqs/iter | Crash iteration | Total no_grad fwd passes |
-|-----------|-----------|-----------------|--------------------------|
-| 12L/1024h (0.4 GiB) | 4 | ~145 | ~290 |
+| Model size | FSDP units | Seqs/iter | Crash iteration | Total `empty_cache()` calls | Error type |
+|-----------|------------|-----------|-----------------|----------------------------|------------|
+| 12L/1024h (0.4 GiB) | 13 | 4 | ~145 | ~435 | UR_RESULT_ERROR_OUT_OF_RESOURCES |
 
-FSDP1 leaks at roughly **half the rate** of FSDP2, but still crashes. Both FSDP versions trigger the same `UR_RESULT_ERROR_OUT_OF_RESOURCES` error. Without FSDP (DDP or single-device), the same RL pattern runs 500+ iterations with no issues.
+FSDP1 leaks at roughly **half the rate** of FSDP2, but still crashes. Without FSDP (DDP or single-device), the same RL pattern runs 500+ iterations with no issues.
+
+**Key observation**: The leak rate scales with the number of FSDP units. With 81 FSDP units (72B model), only **~4 cumulative `empty_cache()` calls** (2 steps × 2 calls/step) are needed to trigger a crash. Each `empty_cache()` call cycles through all 81 FSDP units' storage, leaking proportionally more handles per call.
 
 *From full GRPO workload (includes additional overhead from vLLM, chunked forwards, etc.)
 
 ## Error Messages
 
-The crash manifests as either:
+The crash manifests in three forms, depending on model size and leak stage:
 
+**Form 1** — UR handle exhaustion (small models, gradual leak):
 ```
 RuntimeError: level_zero backend failed with error: 40 (UR_RESULT_ERROR_OUT_OF_RESOURCES)
 ```
 
-or (on larger models / more memory pressure):
-
+**Form 2** — Page table corruption at PDE level (medium models):
 ```
 Segmentation fault from GPU at 0xff000004XXXXXXXX, ctx_id: 1 (CCS)
   type: 0 (NotPresent), level: 1 (PDE), access: 1 (Write), banned: 1, aborting.
 Abort was called at 288 line in file:
   .../intel-compute-runtime-.../shared/source/os_interface/linux/drm_neo.cpp
 ```
+
+**Form 3** — Page table corruption at PML5 level (large models / 72B, fast leak):
+```
+Segmentation fault from GPU at 0xff06001ba9400000, ctx_id: 1 (CCS)
+  type: 0 (NotPresent), level: 4 (PML5), access: 0 (Read), banned: 1, aborting.
+```
+This form occurs with 72B models where the leak is fast enough (81 FSDP units per `empty_cache()` call) that Level Zero's page tables are corrupted before the UR handle counter overflows. The GPU tries to read from a freed virtual address, hitting a PML5 (5-level page table) fault.
 
 ## Workaround
 
@@ -126,6 +138,35 @@ Higher peak memory usage — cached but unused blocks aren't returned to the dev
 - `gc.collect()` still works to release Python-side references, allowing the caching allocator to reuse blocks sooner
 
 For Qwen 2.5-3B on 64 GiB tiles, peak reserved memory is ~24-29 GiB with the workaround — well within budget.
+
+### Workaround Fails for Large Models (72B+)
+
+For Qwen2.5-72B on 48 GiB tiles (36-way FSDP, 3 training nodes), the workaround creates an **unsolvable conflict**:
+
+- **Without `empty_cache()`**: XPU allocator fragmentation accumulates 20+ GiB of reserved-but-unused blocks. Peak allocated = 24.90 GiB (fits in 48 GiB), but peak reserved = 45.66 GiB. Step 1 OOMs because optimizer states (+3.77 GiB) push reserved past 48 GiB.
+- **With `empty_cache()`**: Defragmentation works — step 1 completes with peak reserved = 37.68 GiB (10 GiB headroom). But the UR handle leak causes GPU segfault at step 2 after ~4 cumulative `empty_cache()` calls.
+
+The fragmentation breakdown (72B, 36-way FSDP, step 0):
+
+| Phase | allocated (GiB) | reserved (GiB) | fragmentation gap |
+|-------|----------------|----------------|-------------------|
+| pre_forward | 7.60 | 8.34 | 0.74 |
+| post_forward | 9.19 | 29.03 | 19.84 |
+| post_defrag | 9.19 | 9.88 | 0.69 |
+| post_backward | 11.37 | 37.37 | 26.00 |
+| post_optimizer | 15.14 | 37.61 | 22.47 |
+
+The 20+ GiB gap is caused by FSDP AllGather/reshard cycles: each of the 80 layers AllGathers its shard (~1.8 GiB), uses it for forward, then reshards — but the allocator retains the freed 1.8 GiB block in its cache rather than reusing it for the next layer's AllGather (due to size/alignment mismatch or fragmentation).
+
+**This makes the UR handle leak a blocking issue for large-model FSDP training on XPU, not just a nuisance.**
+
+### Additional Constraints Discovered (72B Testing)
+
+1. **`empty_cache()` during active FSDP forward is immediately fatal.** Calling `empty_cache()` between chunked forward passes (where FSDP has in-flight AllGather buffers) causes instant GPU segfault — not a gradual leak. FSDP's internal UR handles reference the freed blocks.
+
+2. **`empty_cache()` between model calls is safe per-call but accumulates.** Calling between policy→ref forward or between steps (no active FSDP ops) works correctly but contributes to the cumulative UR handle leak.
+
+3. **Leak rate scales with FSDP units, not iterations.** The relevant metric is total `empty_cache()` calls × FSDP units, not iterations. With 81 FSDP units, each call leaks ~81× more handles than with 13 units.
 
 ### Verification Results
 
@@ -142,9 +183,13 @@ For Qwen 2.5-3B on 64 GiB tiles, peak reserved memory is ~24-29 GiB with the wor
 
 | Config | Tiles | Steps | Step Time | Result |
 |--------|-------|-------|-----------|--------|
-| Config A (grpo_samples=4, max_gen=256) | 2 | 20 | ~5.3 s | **STABLE** |
+| Qwen 2.5-3B, grpo_samples=4 | 2 | 20 | ~5.3 s | **STABLE** (no `empty_cache()`) |
+| Qwen 2.5-32B, 12 tiles | 12 | 20+ | ~25.6 s | **STABLE** (no `empty_cache()`, fits in memory) |
+| Qwen 2.5-72B, 36 tiles, no `empty_cache()` | 36 | 0 | — | **OOM** at step 1 (fragmentation) |
+| Qwen 2.5-72B, 36 tiles, 2 `empty_cache()`/step | 36 | 1 | 60.7 s | Step 1 OK, **CRASH** at step 2 |
+| Qwen 2.5-72B, 36 tiles, 1 `empty_cache()`/step | 36 | ? | — | **UNTESTED** (v6, job expired) |
 
-Previously crashed at step 5-13 depending on configuration. After removing all `empty_cache()` calls: stable through entire training run.
+Previously crashed at step 5-13 depending on configuration. After removing all `empty_cache()` calls: stable through entire training run for models that fit without defragmentation.
 
 ### How the Fix Was Applied
 
@@ -159,13 +204,21 @@ In `recipes/dev/grpo_full_finetune_distributed_xpu.py`:
 | Attempted mitigation | Result |
 |---------------------|--------|
 | `torch.xpu.empty_cache()` every iteration | **CAUSES the leak** (see Root Cause) |
-| `gc.collect()` every iteration | No effect |
+| `gc.collect()` every iteration | No effect on UR leak or fragmentation |
 | `torch.compile` (per-layer, inductor backend) | No effect |
-| `TORCH_XPU_ALLOC_CONF=expandable_segments:True/False` | No effect |
+| `TORCH_XPU_ALLOC_CONF=expandable_segments:True/False` | No effect — wrong env var (silently ignored) |
+| `TORCH_XPU_ALLOC_CONF=garbage_collection_threshold:0.6` | No effect — wrong env var (silently ignored) |
+| `PYTORCH_ALLOC_CONF=garbage_collection_threshold:0.4` (v6c) | No effect — XPU allocator does not implement GC threshold |
+| `PYTORCH_ALLOC_CONF=max_split_size_mb:512,garbage_collection_threshold:0.6` (v6d) | No effect — XPU allocator does not read any config options |
+| `PYTORCH_ALLOC_CONF=expandable_segments:True` (v6b) | CCL RDMA crash at init — virtual memory pointers incompatible with RDMA |
 | `UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=1` | No effect |
 | `NEOReadDebugKeys=1 OverrideMaxNumberOfHandles=1000000` | No effect |
 | `ZEX_NUMBER_OF_CCS=0:1` | No effect |
 | Math-only SDPA | No effect |
+| Reducing `empty_cache()` calls to 2/step | Crashes at step 2 (same as 3/step) |
+| Reducing `empty_cache()` calls to 1/step | Untested (job expired) |
+| `empty_cache()` between forward chunks (during FSDP) | **Immediate segfault** — corrupts active UR handles |
+| `forward_batch_size >= grpo_samples` (no chunking) | Avoids mid-forward crash but doesn't fix cumulative leak |
 
 ## Root Cause: `torch.xpu.empty_cache()` + FSDP `storage.resize_()` Interaction
 
@@ -235,21 +288,29 @@ FSDP2's composable API uses per-layer `fully_shard()` with individual `FSDPParam
 
 ## Impact
 
-**RESOLVED via workaround.** Prior to the fix, this blocked all RL training (GRPO, PPO, DPO) on Aurora:
-- Crashed after 5-13 GRPO steps depending on configuration
-- Made XPU non-competitive despite matching/beating A100 per-step throughput
+**PARTIALLY RESOLVED.** The workaround (remove `empty_cache()`) enables stable training for models that fit in memory without defragmentation:
+- Qwen 2.5-3B on 2 tiles: stable, 20+ steps
+- Qwen 2.5-32B on 12 tiles: stable, 20+ steps
 
-With the workaround applied (remove `empty_cache()`), GRPO training runs stably with no step limit. Config B (grpo_samples=16, max_gen=256) on 2 XPU tiles achieves ~8.0 s/step, **27% faster than 4x A100 TRL+vLLM** (10.9 s/step).
+**BLOCKING for large models.** For 72B+ models where FSDP allocator fragmentation exceeds available headroom:
+- Without `empty_cache()`: OOM from fragmentation (reserved 45.66 GiB on 48 GiB tiles, allocated only 24.90 GiB)
+- With `empty_cache()`: GPU segfault after ~4 calls (2 training steps)
+- **No viable path** to stable 72B FSDP training on 48 GiB XPU tiles until this is fixed
 
-The underlying Level Zero bug still exists — if `empty_cache()` is called in an FSDP loop, the leak will recur. A driver-level fix is still needed for full correctness.
+The bug also blocks any future `garbage_collection_threshold`-based mitigation, since the GC threshold internally uses the same L0 `zeMemFree` path that triggers the leak.
+
+With the workaround applied on compatible configs, GRPO training runs stably with no step limit. Config B (grpo_samples=16, max_gen=256) on 2 XPU tiles achieves ~8.0 s/step, **27% faster than 4x A100 TRL+vLLM** (10.9 s/step).
 
 ## Requested Action
 
+**This is now a blocking issue for large-model training on Aurora.** The workaround (skip `empty_cache()`) is insufficient for 72B+ models where allocator fragmentation requires defragmentation to avoid OOM.
+
 Since the leak is in the FSDP ↔ XPU interaction (not raw driver primitives), the fix likely involves:
 
-1. **Fix the UR handle leak in Level Zero's memory alloc/dealloc path** — each `zeMemAllocDevice` / `zeMemFree` cycle (triggered by PyTorch's `empty_cache()` + FSDP's `storage.resize_`) leaks a UR handle. The handles should be properly released when memory is freed.
-2. **Short-term workaround (available now)**: Remove `torch.xpu.empty_cache()` calls from FSDP training loops. This prevents the alloc/dealloc cycles through Level Zero.
-3. **Long-term fix**: Either fix the handle lifecycle in Level Zero, or add XPU-aware logic to PyTorch's caching allocator to avoid cycling blocks through Level Zero when FSDP's `storage.resize_` pattern is detected.
+1. **[CRITICAL] Fix the UR handle leak in Level Zero's memory alloc/dealloc path** — each `zeMemAllocDevice` / `zeMemFree` cycle (triggered by PyTorch's `empty_cache()` + FSDP's `storage.resize_`) leaks a UR handle. The handles should be properly released when memory is freed. The leak scales with the number of FSDP units (~81 for 72B), making it crash after just 4 `empty_cache()` calls on large models.
+2. **[ALTERNATIVE] Add a defragmentation API that doesn't cycle through L0** — a "compact" or "coalesce" operation in the caching allocator that reorganizes its free pool without calling `zeMemFree`/`zeMemAllocDevice`. This would allow defragmentation without triggering the UR handle leak.
+3. **[ALTERNATIVE] Improve XPU caching allocator block reuse** — the 20+ GiB fragmentation gap suggests the allocator is not efficiently reusing freed blocks from FSDP AllGather/reshard cycles. Better size-class matching or block coalescing within the allocator could reduce fragmentation enough to avoid needing `empty_cache()` altogether.
+4. **Short-term workaround (available now, small models only)**: Remove `torch.xpu.empty_cache()` calls from FSDP training loops. Works for models ≤32B where fragmentation doesn't exceed tile memory.
 
 ## Investigation Methodology & Test Scripts
 
@@ -285,7 +346,7 @@ The investigation proceeded bottom-up: test each XPU primitive in isolation, the
 
 **Conclusion**: `empty_cache()` is the trigger, but only in combination with FSDP. Without FSDP, `empty_cache()` is safe. Without `empty_cache()`, FSDP is safe. The leak is in the interaction.
 
-### Phase 4: Verify fix in production
+### Phase 4: Verify fix in production (small models)
 
 The workaround was applied to `recipes/dev/grpo_full_finetune_distributed_xpu.py` by making all `empty_cache()` calls no-ops on XPU:
 - `device_empty_cache()`: skips on XPU
@@ -294,3 +355,124 @@ The workaround was applied to `recipes/dev/grpo_full_finetune_distributed_xpu.py
 - Direct `torch.xpu.empty_cache()` calls: removed or replaced with `gc.collect()`
 
 Full GRPO training (Qwen 2.5-3B, Config A, 2 tiles) completed 20 steps at ~5.3 s/step with no crash.
+
+### Phase 5: Large model testing reveals workaround insufficiency (72B)
+
+Testing Qwen2.5-72B-Instruct on 4 nodes (3 training × 12 tiles = 36-way FSDP2, 1 vLLM node), 48 GiB/tile:
+
+**Step 1: Confirmed fragmentation is the root cause of OOM (not FSDP wrapping)**
+- FSDP wrapping: correct (81 units, per-layer, `reshard_after_forward=True`)
+- Activation checkpointing: correct (all 80 layers verified)
+- Peak allocated: 24.90 GiB (fits in 48 GiB)
+- Peak reserved: 45.66 GiB (barely fits step 0, OOMs step 1 with optimizer states)
+- Fragmentation gap: 20.76 GiB
+
+**Step 2: Tested `empty_cache()` defragmentation strategies**
+
+| Strategy | `empty_cache()` calls/step | Step 0 | Step 1 | Step 2 | Failure mode |
+|----------|--------------------------|--------|--------|--------|-------------|
+| No defrag (workaround) | 0 | OK | OOM | — | Fragmentation exceeds 48 GiB with optimizer states |
+| Inter-chunk defrag (v3) | N/A | Segfault | — | — | `empty_cache()` during active FSDP forward destroys in-flight UR handles |
+| Full defrag (v4): policy→ref + pre-backward + between-step | 3 | OK (60.7s) | OK (37.68 GiB peak) | Segfault | UR handle leak after ~4 calls |
+| Reduced defrag (v5): pre-backward + between-step | 2 | OK | OK | Segfault | UR handle leak after ~4 calls |
+| Minimal defrag (v6): between-step only | 1 | ? | ? | ? | Job expired before completion |
+| expandable_segments (v6b): zero empty_cache | 0 | CRASH at init | — | — | oneCCL RDMA rejects virtual memory USM pointers |
+
+**Key findings:**
+1. `empty_cache()` **works for defragmentation** — freed 19-22 GiB per call, reduced peak reserved from 45.66 → 37.68 GiB
+2. Step 1 **completes** with `empty_cache()` — 10 GiB headroom on 48 GiB tiles
+3. GPU segfault occurs reproducibly at step 2 after **~4 cumulative calls** regardless of placement (pre-backward, between-step, or both)
+4. `empty_cache()` during active FSDP forward (between chunked model calls) causes **immediate** segfault, not gradual leak
+5. Setting `forward_batch_size >= grpo_samples` (no chunking) avoids the mid-forward crash
+6. All previous tests used `TORCH_XPU_ALLOC_CONF` which is **NOT recognized by PyTorch** — `expandable_segments` and `garbage_collection_threshold` were silently disabled in every test. Must use `PYTORCH_ALLOC_CONF` instead (see "PYTORCH_ALLOC_CONF Discovery" section).
+7. `PYTORCH_ALLOC_CONF=expandable_segments:True` is **fundamentally incompatible with oneCCL RDMA** on CXI fabric — crashes during first AllGather (see "expandable_segments vs CCL RDMA" section).
+
+**Conclusion:** The UR handle leak makes `empty_cache()` unusable beyond ~4 calls for 81-unit FSDP models, while the allocator splintering makes `empty_cache()` mandatory for 72B to fit in 48 GiB. All allocator config options (`garbage_collection_threshold`, `max_split_size_mb`, `roundup_power2_divisions`) are **not implemented** in the XPU allocator (v2.8), and `expandable_segments` is incompatible with oneCCL RDMA. This is a dead end — a driver-level fix (UR handle leak) or XPU allocator upgrade (GC support) is required. **Accepted resolution: use `fsdp_cpu_offload: True` for 72B** (6.5s/step overhead, ~8% of step time).
+
+### PYTORCH_ALLOC_CONF Discovery (2026-04-04)
+
+All previous tests set `TORCH_XPU_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.6`. **This env var is not recognized by PyTorch.** The allocator only reads:
+- `PYTORCH_ALLOC_CONF` (primary, all backends including XPU)
+- `PYTORCH_CUDA_ALLOC_CONF` (backward compat, CUDA/HIP only)
+
+Confirmed by grepping `c10/core/AllocatorConfig.h` — no reference to `TORCH_XPU_ALLOC_CONF` anywhere in PyTorch source. The `ExpandableSegment` class *does* exist in `libc10_xpu.so` (confirmed via `nm -C`), meaning the feature is implemented for XPU but was **never activated** in any of our tests.
+
+This means findings 1-5 above were all tested **without** `expandable_segments` or `garbage_collection_threshold` actually enabled, despite the env var being set. The fragmentation gap of 20+ GiB was observed with the default allocator behavior.
+
+### expandable_segments vs CCL RDMA (2026-04-04)
+
+`expandable_segments:True` uses Level Zero virtual memory APIs (`zeVirtualMemReserve` / `zePhysicalMemCreate` / `zeVirtualMemMap`) to stitch non-contiguous physical memory blocks together under a single virtual address range. This avoids the contiguous-block allocation failures that cause the 20+ GiB fragmentation gap.
+
+However, **oneCCL over CXI fabric (Slingshot 11) relies on RDMA** (Remote Direct Memory Access). RDMA network interface cards require memory regions to be:
+1. **Physically contiguous** — the NIC does DMA directly to physical pages
+2. **Pinned (registered)** — pages must be locked in physical memory and registered with the NIC
+
+When FSDP passes a virtually-stitched, non-standard USM pointer to oneCCL for AllGather, the RDMA registration fails because the underlying physical memory is non-contiguous. The NIC cannot perform DMA across discontiguous physical pages mapped through virtual memory, causing an immediate RECV failure and collapsing all communicators.
+
+**Error signature** (all 36 ranks, simultaneously):
+```
+CCL_ERROR: entry: RECV failed. atl_status: FAILURE
+dt bfloat16, cnt 34603008, buf (src: 0x55cc8f494a50, size 69206016, off 0, type: 1, ptr: 0x14366ac00000)
+terminate called after throwing an instance of 'ccl::v1::exception'
+```
+
+The `type: 1` USM pointer type confirms these are device-allocated pointers (not shared or host). The crash occurs during the **first** AllGather — the very first FSDP operation after model sharding — meaning every CCL collective is affected, not just specific tensor sizes.
+
+**Same root cause also affects vLLM**: When vLLM processes have `expandable_segments:True` set, their internal CCL (used for tensor parallelism) crashes with `oneCCL: invalid usm pointer type: unknown`.
+
+**Implication**: `expandable_segments` cannot be used in **any** process that communicates via oneCCL on CXI fabric, whether training (FSDP AllGather/ReduceScatter) or inference (vLLM TP). This eliminates the most promising allocator-level mitigation for the fragmentation problem.
+
+**Remaining option**: `garbage_collection_threshold` alone (without `expandable_segments`) does not change pointer types and should be CCL-safe. It forces the allocator to reclaim fragmented blocks before allocating new ones. However, this has not yet been tested with the correct env var (`PYTORCH_ALLOC_CONF`).
+
+### XPU Allocator Does Not Read PYTORCH_ALLOC_CONF (2026-04-04)
+
+**Critical discovery**: The XPU caching allocator on Aurora (PyTorch 2.8.0a0, `libc10_xpu.so`) is a **simplified, standalone implementation** that does NOT read `AcceleratorAllocatorConfig`. Unlike the CUDA allocator, which queries `garbage_collection_threshold`, `max_split_size_mb`, `roundup_power2_divisions`, and `expandable_segments` from the parsed config, the XPU allocator hardcodes all behavior:
+
+| Feature | CUDA Allocator | XPU Allocator (v2.8) |
+|---------|---------------|---------------------|
+| `garbage_collection_threshold` | Proactive GC at threshold | **Not implemented** — no GC code path exists |
+| `max_split_size_mb` | Configurable split limit | **Hardcoded** — splits if remainder > 1 MiB (large pool) or ≥ 512 B (small pool) |
+| `roundup_power2_divisions` | Configurable rounding | **Hardcoded** — rounds to 512-byte multiples |
+| `expandable_segments` | Implemented | **Not in v2.8** (added in main/v2.10+, but CCL-incompatible) |
+| Block search | Best-fit with size classes | `lower_bound` on `(queue, size, ptr)` — first-fit by size |
+| OOM recovery | Release specific blocks, GC | **Release ALL cached blocks** (`release_cached_blocks()`) |
+
+**Confirmed via**:
+- `nm -CD libc10_xpu.so` — only 9 symbols exported: `emptyCache`, `raw_alloc`, `raw_delete`, `getDeviceStats`, `init`, `recordStream`, `get`, `resetPeakStats`, `resetAccumulatedStats`. No `garbage_collect`, `release_cached_blocks`, or config-related symbols.
+- XPU allocator header (`c10/xpu/XPUCachingAllocator.h`) — minimal interface, inherits from `CachingDeviceAllocator` for stats only.
+- PyTorch v2.8.0 source (`c10/xpu/XPUCachingAllocator.cpp`) — `malloc()` calls `get_free_block()` → `alloc_block()` → `release_cached_blocks() && alloc_block()`. No threshold check, no config query.
+
+**Implication**: ALL `PYTORCH_ALLOC_CONF` settings are silently ignored by the XPU allocator. Tests v6c (`garbage_collection_threshold:0.4`) and v6d (`max_split_size_mb:512,garbage_collection_threshold:0.6`) produced identical 30.25-31.37 GiB gaps because **neither setting was ever read by the allocator**. The config is parsed by `AcceleratorAllocatorConfig` but the XPU `malloc()` never queries it.
+
+**What the XPU allocator actually does on allocation failure**:
+```cpp
+block_found = alloc_block(params, false) ||
+    (release_cached_blocks() && alloc_block(params, true));
+```
+When allocation fails, it calls `release_cached_blocks()` which frees **ALL** non-split free blocks via `sycl::free()` (= `zeMemFree`). This is equivalent to `empty_cache()` — and triggers the same UR handle leak. There is no partial release, no GC threshold, no size-class-aware reclamation.
+
+### Allocator Mitigation: Dead End (2026-04-04)
+
+All allocator-level approaches to the 30 GiB splintering gap are exhausted:
+
+| Approach | Why it fails |
+|----------|-------------|
+| `garbage_collection_threshold` | XPU allocator doesn't implement it |
+| `max_split_size_mb` | XPU allocator doesn't read it |
+| `roundup_power2_divisions` | XPU allocator doesn't read it |
+| `expandable_segments` | (a) Not in v2.8, (b) incompatible with CCL RDMA |
+| `empty_cache()` | Works for defrag but triggers UR handle leak (crashes after ~4 calls on 72B) |
+| OOM-triggered release | Uses same `release_cached_blocks()` → `sycl::free()` path as `empty_cache()` — same UR leak |
+
+**The splintering gap cannot be resolved at the allocator configuration level.** The XPU allocator is too simple (no config, no GC, no partial release), and the one operation that does release memory (`sycl::free` via `empty_cache()` or OOM retry) triggers a driver-level UR handle leak.
+
+### Resolution: Accept CPU Offload (2026-04-04)
+
+**Context**: The fragmentation investigation was motivated by the 72B optimization roadmap (Phase 8 in `aurora_rl_baselines.md`). With 3 training nodes (36-way FSDP), per-tile allocated memory is only ~24.9 GiB — well within 48 GiB. The goal was to eliminate CPU offload (which adds ~6.5s/step optimizer overhead) by fitting without defragmentation.
+
+**Decision**: Accept `fsdp_cpu_offload: True` for 72B models. The 6.5s/step overhead (~8% of 84.6s step time) is not worth fighting a driver-level allocator bug. Optimization effort is better directed at:
+- `forward_batch_size=4` (estimated -28s, 4× more impactful than eliminating offload)
+- More training nodes (reduces both per-tile memory AND offload need)
+- Scaling `grpo_samples` and `max_generated_tokens` for training quality
+
+**This bug remains blocking for any future attempt to run 72B without CPU offload on 48 GiB tiles.** A driver fix (UR handle leak in `zeMemFree`) or an upgraded XPU allocator (with GC threshold support) would reopen this path.

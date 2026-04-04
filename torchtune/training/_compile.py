@@ -24,6 +24,7 @@ log = get_logger("INFO")
 def compile_model(
     model: Union[TransformerDecoder, DeepFusionModel],
     verbose: bool = True,
+    dynamic: bool = False,
 ) -> None:
     """
     Utility to compile a transformer model inplace. On PyTorch nightlies we use per-layer compile
@@ -34,6 +35,10 @@ def compile_model(
             Can be a TransformerDecoder or DeepFusionModel; in the latter case only
             the model's decoder will be compiled.
         verbose (bool): Whether to log compile info. Default: True
+        dynamic (bool): Whether to use dynamic shapes. When True, Dynamo uses
+            symbolic shapes to avoid recompilation on input shape changes.
+            Essential for workloads with variable sequence lengths (e.g. RL).
+            Default: False
     Returns:
         None
 
@@ -44,13 +49,15 @@ def compile_model(
     # Per-layer compilation by default
     if verbose:
         log.info(
-            "Compiling model layers with torch.compile. Expect a relatively slower first step."
+            "Compiling model layers with torch.compile (dynamic=%s). "
+            "Expect a relatively slower first step.",
+            dynamic,
         )
     for m in reversed(list(model.modules())):
         if isinstance(m, TransformerSelfAttentionLayer) or isinstance(
             m, TransformerCrossAttentionLayer
         ):
-            m.compile(backend=backend)
+            m.compile(backend=backend, dynamic=dynamic)
 
 
 def compile_loss(loss: nn.Module, verbose: bool = True) -> nn.Module:

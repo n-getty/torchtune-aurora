@@ -703,6 +703,7 @@ def shard_model(
     cpu_offload: bool,
     reshard_after_forward: bool = True,
     dp_mesh: Optional[DeviceMesh] = None,
+    disable_prefetch: bool = False,
 ) -> None:
     """
     Utility to shard a model with FSDP using the PyTorch Distributed fully_shard API.
@@ -723,6 +724,9 @@ def shard_model(
             from FSDP1, while setting it to False corresponds to the SHARD_GRAD_OP sharding strategy.
         dp_mesh (Optional[DeviceMesh]): Device mesh to use for FSDP sharding under mutliple parallelism.
             Default to None.
+        disable_prefetch (bool): If True, disable AllGather prefetch at root level by using
+            reshard_after_forward=True instead of None. Reduces peak memory at cost of
+            potentially less compute-comms overlap. Default False.
 
     Raises:
         ValueError: If no layer modules were sharded, indicating that no shard_condition was triggered.
@@ -746,10 +750,298 @@ def shard_model(
 
     # Finally shard the entire model to account for any stragglers
     root_kwargs = deepcopy(fsdp_kwargs)
-    root_kwargs["reshard_after_forward"] = False
-    # TODO: we should actually use reshard_after_forward=None
-    # on latest nightlies: https://github.com/pytorch/pytorch/pull/155319
+    if disable_prefetch:
+        # Disable AllGather prefetch: use same reshard policy as per-layer.
+        # This reduces peak memory by preventing FSDP2 from eagerly unsharding
+        # multiple layers ahead of computation.
+        root_kwargs["reshard_after_forward"] = reshard_after_forward
+    else:
+        # reshard_after_forward=None enables AllGather-compute overlap (prefetching).
+        # See https://github.com/pytorch/pytorch/pull/155319
+        # Falls back to False if None is not supported by the installed PyTorch.
+        try:
+            root_kwargs["reshard_after_forward"] = None
+            fully_shard(model, **root_kwargs)
+            return
+        except (TypeError, ValueError):
+            root_kwargs["reshard_after_forward"] = False
     fully_shard(model, **root_kwargs)
+
+
+def _get_fsdp_state(module: nn.Module):
+    """Get the FSDPState for an FSDP2-wrapped module, or None."""
+    try:
+        from torch.distributed.fsdp._fully_shard._fsdp_state import _get_module_fsdp_state
+        return _get_module_fsdp_state(module)
+    except ImportError:
+        pass
+    # Fallback: check direct attributes (FSDP1 or older FSDP2)
+    for attr in ("_fsdp_state", "_fsdp_param_group"):
+        val = getattr(module, attr, None)
+        if val is not None:
+            return val
+    return None
+
+
+def _is_fsdp_module(module: nn.Module) -> bool:
+    """Check if a module is wrapped by FSDP2's fully_shard()."""
+    try:
+        from torch.distributed.fsdp._fully_shard._fully_shard import FSDPModule
+        return isinstance(module, FSDPModule)
+    except ImportError:
+        pass
+    # Fallback: check for FSDP state
+    return _get_fsdp_state(module) is not None
+
+
+def log_fsdp_structure(model: nn.Module, log: Optional[logging.Logger] = None) -> str:
+    """Log the FSDP wrapping structure of a model, showing which modules are
+    individual FSDP units and their parameter sizes.
+
+    Returns the structure as a string for logging.
+    """
+    lines = ["=== FSDP Module Structure ==="]
+    fsdp_unit_count = 0
+    total_params = 0
+
+    for name, module in model.named_modules():
+        if not _is_fsdp_module(module):
+            continue
+
+        fsdp_unit_count += 1
+        state = _get_fsdp_state(module)
+
+        # Count params in this FSDP unit (sharded size on this rank)
+        num_params = sum(p.numel() for p in module.parameters(recurse=False))
+
+        # Get reshard_after_forward from FSDPParamGroup
+        raf = "unknown"
+        if state is not None:
+            pg = getattr(state, "_fsdp_param_group", None)
+            if pg is not None:
+                raf = getattr(pg, "_reshard_after_forward", "unknown")
+            # Also check auto_reshard
+            auto_raf = getattr(state, "_auto_reshard_after_forward", None)
+            if auto_raf is not None:
+                raf = f"{raf} (auto={auto_raf})"
+
+        # Check activation checkpointing
+        ac_enabled = any(
+            hasattr(m, "_checkpoint_wrapped_module")
+            for m in module.modules()
+            if m is not module
+        )
+
+        param_mib = num_params * 2 / (1024 ** 2)  # BF16
+        total_params += num_params
+        depth = name.count('.')
+        indent = "  " * min(depth, 4)
+        lines.append(
+            f"  {indent}[FSDP#{fsdp_unit_count}] {name or 'ROOT'}: "
+            f"params={num_params:,} ({param_mib:.1f} MiB BF16), "
+            f"reshard_after_forward={raf}, AC={ac_enabled}"
+        )
+
+    lines.append(f"\nTotal FSDP units: {fsdp_unit_count}")
+    lines.append(f"Total params (sharded): {total_params:,}")
+    lines.append("=" * 40)
+
+    result = "\n".join(lines)
+    if log:
+        log.info(result)
+    return result
+
+
+def log_fsdp_memory_per_phase(
+    device: torch.device,
+    phase: str,
+    log: Optional[logging.Logger] = None,
+) -> dict:
+    """Log memory stats at a specific phase of training for diagnostics.
+
+    Args:
+        device: The device to query memory from.
+        phase: Label for the phase (e.g., "pre_forward", "post_forward", "post_backward").
+        log: Optional logger.
+
+    Returns:
+        Dict with memory stats in GiB.
+    """
+    if device.type == "xpu":
+        torch.xpu.synchronize()
+        allocated = torch.xpu.memory_allocated(device) / (1024 ** 3)
+        reserved = torch.xpu.memory_reserved(device) / (1024 ** 3)
+        max_allocated = torch.xpu.max_memory_allocated(device) / (1024 ** 3)
+        max_reserved = torch.xpu.max_memory_reserved(device) / (1024 ** 3)
+    elif device.type == "cuda":
+        torch.cuda.synchronize()
+        allocated = torch.cuda.memory_allocated(device) / (1024 ** 3)
+        reserved = torch.cuda.memory_reserved(device) / (1024 ** 3)
+        max_allocated = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
+        max_reserved = torch.cuda.max_memory_reserved(device) / (1024 ** 3)
+    else:
+        return {}
+
+    stats = {
+        "phase": phase,
+        "allocated_gib": round(allocated, 2),
+        "reserved_gib": round(reserved, 2),
+        "max_allocated_gib": round(max_allocated, 2),
+        "max_reserved_gib": round(max_reserved, 2),
+    }
+
+    msg = (
+        f"[MEM {phase}] allocated={allocated:.2f} GiB, reserved={reserved:.2f} GiB, "
+        f"max_allocated={max_allocated:.2f} GiB, max_reserved={max_reserved:.2f} GiB"
+    )
+    if log:
+        log.info(msg)
+
+    return stats
+
+
+def verify_activation_checkpointing(
+    model: nn.Module,
+    log: Optional[logging.Logger] = None,
+) -> dict:
+    """Verify that activation checkpointing is correctly applied to transformer layers.
+
+    Checks each transformer layer for the presence of checkpoint wrapping
+    (``_checkpoint_wrapped_module`` attribute from ``torch.utils.checkpoint``).
+
+    Returns:
+        Dict with ``total_layers``, ``ac_layers``, ``non_ac_layers`` (list of names).
+    """
+    total = 0
+    ac_count = 0
+    non_ac = []
+
+    for name, module in model.named_modules():
+        parts = name.split(".")
+        if len(parts) >= 2 and parts[-2] == "layers" and parts[-1].isdigit():
+            total += 1
+            # Check for AC wrapper — PyTorch's apply_activation_checkpointing
+            # wraps the module and stores original as _checkpoint_wrapped_module
+            has_ac = hasattr(module, "_checkpoint_wrapped_module")
+            if not has_ac:
+                # Also check children for checkpoint wrapper
+                has_ac = any(
+                    hasattr(child, "_checkpoint_wrapped_module")
+                    for child in module.children()
+                )
+            if has_ac:
+                ac_count += 1
+            else:
+                non_ac.append(name)
+
+    result = {
+        "total_layers": total,
+        "ac_layers": ac_count,
+        "non_ac_layers": non_ac,
+    }
+
+    if log:
+        if ac_count == total and total > 0:
+            log.info(f"[AC_CHECK] All {total} transformer layers have activation checkpointing")
+        elif ac_count == 0:
+            log.warning(f"[AC_CHECK] NO transformer layers have activation checkpointing! ({total} layers found)")
+        else:
+            log.warning(
+                f"[AC_CHECK] Only {ac_count}/{total} layers have AC. "
+                f"Missing: {non_ac[:5]}{'...' if len(non_ac) > 5 else ''}"
+            )
+
+    return result
+
+
+def register_per_layer_memory_hooks(
+    model: nn.Module,
+    device: torch.device,
+    log: logging.Logger,
+    sample_every: int = 10,
+) -> list:
+    """Register forward/backward hooks on transformer layers to track per-layer
+    memory allocation. This reveals whether memory accumulates across layers
+    (indicating broken resharding/AC) or stays flat (proper per-layer cleanup).
+
+    Samples every ``sample_every`` layers plus the first 3 and last 3 to capture
+    the full memory trajectory without excessive output.
+
+    Args:
+        model: The FSDP-wrapped model.
+        device: Device to query memory from.
+        log: Logger instance.
+        sample_every: Sample one layer every N layers (default 10).
+
+    Returns:
+        List of hook handles (call .remove() to detach).
+    """
+    # First, discover all transformer layers
+    layer_modules = []
+    for name, module in model.named_modules():
+        parts = name.split(".")
+        if len(parts) >= 2 and parts[-2] == "layers" and parts[-1].isdigit():
+            idx = int(parts[-1])
+            layer_modules.append((name, module, idx))
+
+    num_layers = len(layer_modules)
+    if num_layers == 0:
+        log.warning("No transformer layers found for memory hooks")
+        return []
+
+    # Select which layers to instrument: first 3, last 3, and every sample_every
+    sample_indices = set()
+    for i in range(min(3, num_layers)):
+        sample_indices.add(i)
+    for i in range(max(0, num_layers - 3), num_layers):
+        sample_indices.add(i)
+    for i in range(0, num_layers, sample_every):
+        sample_indices.add(i)
+
+    def _get_mem(dev):
+        if dev.type == "xpu":
+            return (
+                torch.xpu.memory_allocated(dev) / (1024**3),
+                torch.xpu.memory_reserved(dev) / (1024**3),
+            )
+        elif dev.type == "cuda":
+            return (
+                torch.cuda.memory_allocated(dev) / (1024**3),
+                torch.cuda.memory_reserved(dev) / (1024**3),
+            )
+        return (0.0, 0.0)
+
+    hooks = []
+    for list_idx, (name, module, layer_id) in enumerate(layer_modules):
+        if list_idx not in sample_indices:
+            continue
+
+        def make_fwd_hook(lname, lid, total):
+            def hook(mod, inp, out):
+                alloc, resv = _get_mem(device)
+                log.info(
+                    f"[LAYER_FWD {lid:3d}/{total}] alloc={alloc:.2f} resv={resv:.2f} GiB  ({lname})"
+                )
+            return hook
+
+        def make_bwd_hook(lname, lid, total):
+            def hook(mod, grad_in, grad_out):
+                alloc, resv = _get_mem(device)
+                log.info(
+                    f"[LAYER_BWD {lid:3d}/{total}] alloc={alloc:.2f} resv={resv:.2f} GiB  ({lname})"
+                )
+            return hook
+
+        h1 = module.register_forward_hook(make_fwd_hook(name, layer_id, num_layers))
+        h2 = module.register_full_backward_hook(make_bwd_hook(name, layer_id, num_layers))
+        hooks.extend([h1, h2])
+
+    sampled = sorted(sample_indices)
+    log.info(
+        f"Registered memory hooks on {len(sampled)}/{num_layers} layers: "
+        f"{[layer_modules[i][2] for i in sampled]}"
+    )
+    return hooks
 
 
 def prepare_mha_for_tp(

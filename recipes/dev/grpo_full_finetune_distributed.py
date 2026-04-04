@@ -224,6 +224,18 @@ class GRPOFullFinetuneRecipeDistributed(FTRecipeInterface):
         self._save_every_n_epochs = cfg.save_every_n_epochs
         self._total_steps = cfg.num_steps
 
+        # vLLM server mode (optional) — all ranks create their own HTTP client
+        self._vllm_url = cfg.get("vllm_url", None)
+        self._vllm_client = None
+        if self._vllm_url is not None:
+            from torchtune.dev.grpo.vllm_client import VLLMClient
+            self._vllm_client = VLLMClient(
+                base_url=self._vllm_url,
+                connection_timeout=300.0,
+            )
+            if self._is_rank_zero:
+                log.info("vLLM client initialized on all ranks: %s", self._vllm_url)
+
         if cfg.get("stop_token_ids", False):
             stop_token_ids = cfg.stop_token_ids
             if self._tokenizer.eos_id not in stop_token_ids:
@@ -584,25 +596,65 @@ class GRPOFullFinetuneRecipeDistributed(FTRecipeInterface):
         batch_input_ids = input_ids[:, None, :].expand(-1, grpo_size, -1)  # [B, G, L]
         batch_input_ids = batch_input_ids.reshape(batch_size * grpo_size, -1)
 
-        # step 1: generate responses, and logits corresponding to the responses using the current policy
-        with local_kv_cache(
-            model=self._model,
-            batch_size=batch_size * grpo_size,
-            device=self._device,
-            dtype=self._dtype,
-            decoder_max_seq_len=context_length + self._max_generated_tokens,
-        ):
-            query_responses, _ = generate(  # [B x G, L], [B x G, L, V]
-                model=self._model,
-                prompt=batch_input_ids,
-                max_generated_tokens=self._max_generated_tokens,
+        # step 1: generate responses using vLLM server (if configured) or native generation
+        if self._vllm_url is not None:
+            # vLLM server mode: all ranks call vLLM HTTP API with their own prompts.
+            # Each rank has different data (DistributedSampler), so each needs its own completions.
+            # No NCCL broadcast needed — vLLM handles concurrent HTTP requests.
+            bsz = batch_input_ids.shape[0]
+            total_len = context_length + self._max_generated_tokens
+
+            # Strip padding and convert to Python lists for HTTP
+            prompts = []
+            for i in range(bsz):
+                ids = batch_input_ids[i].cpu().tolist()
+                ids = [t for t in ids if t != self._tokenizer.pad_id]
+                prompts.append(ids)
+
+            t0 = time.perf_counter()
+            completions = self._vllm_client.generate(
+                prompts=prompts,
+                n=1,
+                max_tokens=self._max_generated_tokens,
                 temperature=self._temperature,
-                top_k=self._top_k,
-                pad_id=self._tokenizer.pad_id,
-                rng=self._rng,
-                stop_tokens=self._tokenizer.stop_tokens,
-                return_logits=False,
+                top_k=self._top_k or 0,
             )
+            gen_time = time.perf_counter() - t0
+
+            if self._is_rank_zero:
+                total_tokens = sum(len(c) for c in completions)
+                log.info(
+                    "vLLM generation: %d sequences, %d tokens in %.1fs (%.1f tok/s)",
+                    bsz, total_tokens, gen_time, total_tokens / max(gen_time, 0.01),
+                )
+
+            # Build query_responses: [prompt | completion | padding]
+            query_responses = batch_input_ids.new_full((bsz, total_len), self._tokenizer.pad_id)
+            query_responses[:, :context_length] = batch_input_ids
+            for i, comp in enumerate(completions):
+                length = min(len(comp), self._max_generated_tokens)
+                query_responses[i, context_length : context_length + length] = torch.tensor(
+                    comp[:length], dtype=batch_input_ids.dtype, device=self._device
+                )
+        else:
+            with local_kv_cache(
+                model=self._model,
+                batch_size=batch_size * grpo_size,
+                device=self._device,
+                dtype=self._dtype,
+                decoder_max_seq_len=context_length + self._max_generated_tokens,
+            ):
+                query_responses, _ = generate(  # [B x G, L], [B x G, L, V]
+                    model=self._model,
+                    prompt=batch_input_ids,
+                    max_generated_tokens=self._max_generated_tokens,
+                    temperature=self._temperature,
+                    top_k=self._top_k,
+                    pad_id=self._tokenizer.pad_id,
+                    rng=self._rng,
+                    stop_tokens=self._tokenizer.stop_tokens,
+                    return_logits=False,
+                )
 
         responses = query_responses[:, context_length:].clone()
         query_response_padding_masks = query_responses != self._tokenizer.pad_id

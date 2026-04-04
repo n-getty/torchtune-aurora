@@ -44,7 +44,7 @@ else
 fi
 export CCL_CHUNK_SIZE=16777216
 export TORCH_COMPILE_DISABLE=1
-export TORCH_XPU_ALLOC_CONF=expandable_segments:True
+export PYTORCH_ALLOC_CONF=expandable_segments:True
 
 TORCHTUNE_DIR="/lus/flare/projects/ModCon/ngetty/torchtune"
 export PYTHONPATH="${TORCHTUNE_DIR}:/flare/ModCon/ngetty/trl"

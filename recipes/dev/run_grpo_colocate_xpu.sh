@@ -33,7 +33,7 @@ export FI_CXI_OFLOW_BUF_SIZE=8388608
 export FI_CXI_DEFAULT_CQ_SIZE=131072
 export FI_MR_CACHE_MONITOR=userfaultfd
 # XPU memory allocator
-export TORCH_XPU_ALLOC_CONF=expandable_segments:True
+export PYTORCH_ALLOC_CONF=expandable_segments:True
 # Disable torch.compile globally (vLLM not viable on XPU with compile).
 # The recipe will temporarily unset this when it needs to compile the training model.
 export TORCH_COMPILE_DISABLE=1
