@@ -5,14 +5,14 @@ This guide covers environment setup and running GRPO training on Aurora HPC (Int
 ## Prerequisites
 
 - **Aurora HPC allocation** (PBS project, e.g., `AuroraGPT`)
-- Models staged to `/lus/flare/projects/ModCon/ngetty/models/` (Qwen2.5-3B, Qwen3-32B, etc.)
+- Models staged to `/lus/flare/projects/ModCon/ngetty/models/` (Qwen2.5-3B, Qwen3-32B, gemma-4-31B, etc.)
 
 ## Environment Setup
 
 ### 1. Install (one-time, on a login node)
 
 ```bash
-module load frameworks
+module load frameworks/2025.2.0    # IMPORTANT: 2025.3.1 has broken XCCL allreduce
 # Remove any user virtualenv that conflicts with frameworks
 export PATH=$(echo "$PATH" | tr ':' '\n' | grep -v myenv | tr '\n' ':' | sed 's/:$//')
 unset VIRTUAL_ENV
@@ -20,12 +20,14 @@ unset VIRTUAL_ENV
 pip install -e /lus/flare/projects/ModCon/ngetty/torchtune
 ```
 
-`module load frameworks` provides:
+`module load frameworks/2025.2.0` provides:
 - PyTorch 2.10+ with XPU backend
 - Python 3.12
 - oneCCL/XCCL distributed backend
 - Intel Level Zero drivers
-- vLLM (bundled in frameworks)
+- vLLM 0.10.1 (bundled in frameworks)
+
+> **Warning**: `frameworks/2025.3.1` has a broken XCCL allreduce (USM pointer validation failure). Always use `2025.2.0` until this is fixed upstream.
 
 ### 2. Verify installation
 
@@ -37,7 +39,7 @@ python -c "from torchtune.training import get_xpu_distributed_backend; print(get
 
 ## Running GRPO Training
 
-### Quick start — single-node 32B (interactive)
+### Quick start — Qwen3-32B single-node (interactive)
 
 ```bash
 # Hold a node
@@ -47,13 +49,30 @@ qsub -I -l select=1:system=aurora -l walltime=1:00:00 -l filesystems=home:flare 
 cd /lus/flare/projects/ModCon/ngetty/torchtune
 bash recipes/dev/run_grpo_vllm_xpu.sh 2 10 \
     /lus/flare/projects/ModCon/ngetty/models/Qwen3-32B 5 \
-    --config recipes/configs/dev/qwen32B_grpo_server_xpu.yaml
+    --config recipes/configs/dev/production/qwen32B_grpo_server_xpu.yaml
 ```
 
 This launches:
 - vLLM server on 2 tiles (TP=2, tiles 10-11)
 - 10 FSDP training ranks on tiles 0-9
-- Expected: ~18 s/step, ~41 GiB peak memory
+- Production config: G=8, fbs=8 (optimal — 63% more seqs/min vs G=4/fbs=4)
+- Expected: ~22.8 s/step, 20.5 seqs/min, ~59 GiB peak reserved
+
+### Quick start — Gemma4-31B single-node (interactive)
+
+```bash
+# On a compute node:
+cd /lus/flare/projects/ModCon/ngetty/torchtune
+bash recipes/dev/run_gemma4_grpo_vllm.sh 2 10 5
+```
+
+This launches:
+- vLLM server with Gemma4 overlay on 2 tiles (TP=2, tiles 10-11)
+- 10 FSDP training ranks on tiles 0-9
+- Uses custom `vllm_gemma4_overlay/` to add Gemma4 support to vLLM 0.10.1
+- Expected: ~23.6 s/step, 10.2 seqs/min, ~55 GiB peak reserved
+
+> **Note**: Gemma4's larger head dimensions (local 256, global 512 vs Qwen3's 128) make vLLM generation ~60% slower than Qwen3-32B, but training is 31% faster due to K=V architecture. See `docs/aurora_rl_baselines.md` Phase 13 for details.
 
 ### Multi-node 32B HSDP (2 nodes)
 
@@ -74,7 +93,8 @@ Architecture per node:
 - vLLM server on tiles 10-11 (TP=2)
 - 10 training ranks on tiles 0-9
 - HSDP: FSDP within node (dp_shard=10), DDP across nodes (dp_replicate=2)
-- Expected: ~19.4 s/step (near-linear scaling from single-node)
+- Production config: G=8, fbs=8 — best overall throughput
+- Expected: ~23.8 s/step, 39.3 seqs/min (3.1x single-node baseline)
 
 ### Smaller models (3B, 8B)
 
@@ -82,13 +102,27 @@ Architecture per node:
 # 3B single-node with colocated vLLM
 bash recipes/dev/run_grpo_colocate_xpu.sh \
     /lus/flare/projects/ModCon/ngetty/models/Qwen2.5-3B 5 \
-    --config recipes/configs/dev/qwen3B_grpo_colocate_xpu.yaml
+    --config recipes/configs/dev/production/qwen3B_grpo_colocate_xpu.yaml
 
 # 8B single-node with colocated vLLM (12 tiles)
 bash recipes/dev/run_grpo_colocate_xpu.sh \
     /lus/flare/projects/ModCon/ngetty/models/Qwen3-8B 5 \
-    --config recipes/configs/dev/qwen8B_grpo_colocate_xpu.yaml
+    --config recipes/configs/dev/production/qwen8B_grpo_colocate_xpu.yaml
 ```
+
+## Production Performance Summary
+
+Best validated results on Aurora (Intel Max 1550, 64 GiB/tile):
+
+| Model | Config | Tiles | Step Time | Seqs/min | Notes |
+|-------|--------|-------|-----------|----------|-------|
+| Qwen2.5-3B | colocated vLLM | 12 | 7.3 s | 11.8 | Best 3B |
+| Qwen3-32B | server G=8/fbs=8 | 10+2 | 22.8 s | 20.5 | Best single-node 32B |
+| Qwen3-32B | HSDP G=8/fbs=8 | 20+4 (2 nodes) | 23.8 s | 39.3 | Best overall 32B |
+| Gemma4-31B | server G=4/fbs=4 | 10+2 | 23.6 s | 10.2 | vLLM overlay |
+| Qwen2.5-72B | dedicated vLLM + CPU offload | 24+12 (3 nodes) | 84.6 s | 2.8 | True FSDP cross-node |
+
+A100-40GB comparison: 32B+ models are **infeasible** on A100-40GB (OOM in all configs). Aurora's 64 GiB tiles are required.
 
 ## PBS Job Template
 
@@ -107,7 +141,7 @@ set -e
 cd /lus/flare/projects/ModCon/ngetty/torchtune
 
 # --- Environment ---
-module load frameworks 2>/dev/null || true
+module load frameworks/2025.2.0 2>/dev/null || true    # NOT 2025.3.1 (broken XCCL)
 export PATH=$(echo "$PATH" | tr ':' '\n' | grep -v myenv | tr '\n' ':' | sed 's/:$//')
 unset VIRTUAL_ENV
 
@@ -130,7 +164,9 @@ export FI_CXI_OFLOW_BUF_SIZE=8388608
 export FI_CXI_DEFAULT_CQ_SIZE=131072
 export FI_MR_CACHE_MONITOR=disabled
 export ZE_FLAT_DEVICE_HIERARCHY=FLAT
-export TORCH_XPU_ALLOC_CONF=expandable_segments:True
+# NOTE: Do NOT set PYTORCH_ALLOC_CONF — XPU allocator ignores it, and
+# expandable_segments is incompatible with CCL (USM pointer errors)
+unset PYTORCH_ALLOC_CONF
 export TORCH_COMPILE_DISABLE=1
 
 # --- Paths ---
@@ -149,11 +185,14 @@ export HF_HUB_OFFLINE=1
 | `recipes/dev/grpo_full_finetune_distributed_xpu.py` | Main training recipe (~2300 lines) |
 | `recipes/dev/aurora_grpo_vllm_hsdp_multinode.sh` | Multi-node launcher (vLLM + HSDP) |
 | `recipes/dev/aurora_grpo_vllm_wrapper.sh` | Per-rank wrapper (env, affinity, CCL) |
-| `recipes/dev/run_grpo_vllm_xpu.sh` | Single-node vLLM server mode launcher |
+| `recipes/dev/run_grpo_vllm_xpu.sh` | Single-node vLLM server mode launcher (Qwen) |
+| `recipes/dev/run_gemma4_grpo_vllm.sh` | Single-node vLLM server mode launcher (Gemma4) |
 | `recipes/dev/run_grpo_colocate_xpu.sh` | Single-node colocated vLLM launcher |
-| `recipes/dev/_usercustomize_vllm/` | Runtime patches for vLLM on XPU (see below) |
-| `recipes/configs/dev/production/` | Optimized configs (32B, 8B, 3B) |
+| `recipes/dev/vllm_gemma4_overlay/` | Gemma4 model support for vLLM 0.10.1 |
+| `recipes/dev/_usercustomize_vllm/` | Runtime patches for vLLM on XPU |
+| `recipes/configs/dev/production/` | Optimized configs (Qwen3-32B, Gemma4-31B, 8B, 3B) |
 | `recipes/configs/dev/baseline/` | Reference/comparison configs (A100, XPU baselines) |
+| `torchtune/models/gemma4/` | Native torchtune Gemma4 model module |
 | `docs/aurora_rl_baselines.md` | Full benchmarking results and history |
 
 ## Overriding Config Values

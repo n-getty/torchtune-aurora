@@ -1,0 +1,136 @@
+# GRPO without vLLM on Intel XPU (Aurora HPC) — Gemma 4 31B
+# Uses native generation (no vLLM server). All tiles run FSDP training.
+#
+# vLLM doesn't support Gemma4 yet (requires transformers 5.x).
+# Native generation is slower but functional for baseline runs.
+#
+# Memory budget per training tile (64 GiB):
+#   FSDP shard (31B / 10 ranks): ~6.2 GiB
+#   Ref FSDP shard: ~6.2 GiB
+#   Optimizer states (2x shard): ~12.4 GiB
+#   Activations + KV cache: ~10-15 GiB
+#   Total estimated: ~35-40 GiB — fits within 64 GiB
+#
+# Launch:
+#   bash recipes/dev/run_grpo_xpu.sh 10 5
+
+name: grpo_novllm_gemma4_31b_xpu
+
+output_dir: /tmp/torchtune/grpo_novllm_gemma4_31b
+base_model_path: /lus/flare/projects/ModCon/ngetty/models/gemma-4-31B
+
+# No vLLM — uses native generation
+
+# Tokenizer (HF fast tokenizer format)
+tokenizer:
+  _component_: torchtune.models.gemma4.gemma4_tokenizer
+  tokenizer_json_path: ${base_model_path}/tokenizer.json
+  tokenizer_config_json_path: ${base_model_path}/tokenizer_config.json
+  max_seq_len: 512
+
+# Dataset
+dataset:
+  _component_: torchtune.dev.grpo.gsm8k.gsm8k_dataset
+  partition: 1-9/10
+seed: 42
+shuffle: False
+
+# Model
+model:
+  _component_: torchtune.models.gemma4.gemma4_31b
+
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [
+    model-00001-of-00002.safetensors,
+    model-00002-of-00002.safetensors,
+  ]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: GEMMA4
+
+ref_checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [
+    model-00001-of-00002.safetensors,
+    model-00002-of-00002.safetensors,
+  ]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}/ref
+  model_type: GEMMA4
+
+resume_from_checkpoint: False
+save_every_n_epochs: 1
+
+# GRPO parameters — conservative for 31B baseline
+batch_size: 1
+grpo_samples: 4
+forward_batch_size: 4
+max_generated_tokens: 128
+top_k: null
+temperature: 1.0
+
+ppo_epochs: 1
+gradient_accumulation_steps: 1
+
+num_steps: 5
+
+clip_grad_norm: 1.0
+
+epochs: 1
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 5e-6
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  num_warmup_steps: 2
+loss:
+  _component_: torchtune.dev.grpo.loss.GRPOSimpleLoss
+  kl_coeff: 0.01
+  epsilon: 0.2
+
+# XPU device
+device: xpu
+
+# Memory management
+enable_activation_checkpointing: True
+compile: False
+
+# Precision
+dtype: bf16
+
+reward_functions:
+    - _component_: torchtune.dev.rl.rewards.FormattedMathCorrectnessReward
+      answer_tag: answer
+      positive_reward: 10.0
+      negative_reward: 0.0
+    - _component_: torchtune.dev.rl.rewards.ThinkingAnswerFormattingReward
+      think_tag: think
+      answer_tag: answer
+      positive_reward: 1.0
+      negative_reward: 0.0
+
+# Logging
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+log_every_n_steps: 1
+log_peak_memory_stats: True
+
+# Profiler disabled
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: False
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: True
+  cuda: False
+  profile_memory: False
+  with_stack: False
+  record_shapes: False
+  with_flops: False
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1
