@@ -8,16 +8,22 @@
 # Training ranks do NOT use ZE_AFFINITY_MASK (CCL needs full device visibility).
 # Valid train_tiles: 2, 4, 6, 10, 12 (must align with CCL topology).
 # Default: 1 vLLM tile (tile 11), 10 training tiles (tiles 0-9)
+#
+# vLLM Data Parallelism:
+#   VLLM_DP=2 bash recipes/dev/run_grpo_vllm_xpu.sh 2 10 ...
+#   Launches VLLM_DP independent vLLM instances, each with TP=VLLM_TILES/VLLM_DP.
+#   Nearly doubles generation throughput for small models (3B).
 set -e
 
 cd /lus/flare/projects/ModCon/ngetty/torchtune
 
-# Load Aurora frameworks module (provides XPU-enabled PyTorch + python 3.12)
-module load frameworks 2>/dev/null || true
+# Load Aurora frameworks module — MUST use 2025.2.0 (2025.3.1 has broken XCCL allreduce)
+module load frameworks/2025.2.0 2>/dev/null || true
 
 # Remove user virtualenv from PATH so frameworks python is used
 export PATH=$(echo "$PATH" | tr ':' '\n' | grep -v myenv | tr '\n' ':' | sed 's/:$//')
 unset VIRTUAL_ENV
+# NOTE: Do NOT set PYTHONNOUSERSITE=1 — math_verify is only in ~/.local
 
 # CCL / XPU environment
 export CCL_PROCESS_LAUNCHER=none
@@ -53,13 +59,15 @@ NSTEPS=${4:-10}
 CONFIG=${5:-recipes/configs/dev/experimental/qwen3B_grpo_vllm_xpu.yaml}
 shift 5 2>/dev/null || true
 EXTRA_ARGS="$@"  # additional config overrides (e.g., vllm_weight_sync=true)
-VLLM_PORT=8001
+VLLM_BASE_PORT=8001
+VLLM_DP=${VLLM_DP:-1}
+VLLM_TP=$((VLLM_TILES / VLLM_DP))
 VLLM_LOG=/tmp/torchtune/vllm_server.log
 # vLLM max_model_len: must be >= max prompt length + max_generated_tokens.
 # Default 2048 covers Config B (max_gen=512 + prompt ~300).
 VLLM_MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-2048}
 
-echo "=== GRPO + vLLM XPU: ${VLLM_TILES} vLLM tile(s), ${TRAIN_TILES} training tiles, ${NSTEPS} steps, config=${CONFIG} ==="
+echo "=== GRPO + vLLM XPU: ${VLLM_TILES} vLLM tile(s) (TP=${VLLM_TP} × DP=${VLLM_DP}), ${TRAIN_TILES} training tiles, ${NSTEPS} steps, config=${CONFIG} ==="
 echo "Node: $(hostname), Date: $(date)"
 echo "Python: $(which python3)"
 echo "Model: ${MODEL_PATH}"
@@ -103,95 +111,123 @@ print('Cache warmed successfully')
 " 2>&1 | tail -3
 echo ""
 
-# --- 1. Launch vLLM server ---
+# --- 1. Launch vLLM server(s) ---
 # For TP=1: override CCL to MPI transport to isolate from training's OFI/CXI.
 # For TP>1: vLLM workers need CCL for allreduce, so use OFI transport (same as
 # training). ZE_AFFINITY_MASK isolates vLLM to its own tiles. Training doesn't
 # start until vLLM is ready, and they use separate process groups.
-echo "Starting vLLM server on tile(s) ${VLLM_MASK}..."
-# Choose server launch: TRL's vllm_serve for TP=1, vllm CLI serve for TP>1
-# TRL's vllm_serve uses the LLM API which fails with V1 TP>1 on XPU.
-# The vllm CLI serve uses the AsyncLLMEngine path which works.
-if [ ${VLLM_TILES} -gt 1 ]; then
-    echo "Using vllm serve CLI (TP=${VLLM_TILES})"
-    # IMPORTANT: unset PYTORCH_ALLOC_CONF for vLLM TP>1.
-    # expandable_segments:True creates virtual memory pointers that can't be
-    # registered for RDMA DMA, causing "invalid usm pointer type" in oneCCL.
-    ZE_AFFINITY_MASK=${VLLM_MASK} \
+#
+# DP>1: launch multiple independent vLLM instances on separate tiles/ports.
+# Each replica gets TP tiles. Round-robin dispatch in the training recipe.
+
+VLLM_PIDS=()
+VLLM_URLS=""
+
+launch_vllm_replica() {
+    local REPLICA=$1
+    local TILE_MASK=$2
+    local PORT=$3
+    local LOG="${VLLM_LOG}.${REPLICA}"
+
+    echo "  Replica ${REPLICA}: tiles=${TILE_MASK}, port=${PORT}, log=${LOG}"
+
+    # Use vllm CLI serve for all cases.
+    # TRL's vllm_serve_xpu.py hits HF Hub snapshot_download bug with HF_HUB_OFFLINE=1.
+    # For TP>1: needs OFI transport and --distributed-executor-backend mp.
+    # For TP=1: use MPI transport to isolate from training's OFI/CXI.
+    local EXTRA_VLLM_ARGS=""
+    local VLLM_CCL_TRANSPORT="mpi"
+    local VLLM_CCL_LAUNCHER="None"
+    local VLLM_ALLOC_CONF="${PYTORCH_ALLOC_CONF}"
+    if [ ${VLLM_TP} -gt 1 ]; then
+        EXTRA_VLLM_ARGS="--distributed-executor-backend mp"
+        VLLM_CCL_TRANSPORT="ofi"
+        VLLM_CCL_LAUNCHER="none"
+        VLLM_ALLOC_CONF=""  # expandable_segments breaks CCL RDMA for TP>1
+    fi
+
+    ZE_AFFINITY_MASK=${TILE_MASK} \
         VLLM_WORKER_MULTIPROC_METHOD=spawn \
         TORCH_COMPILE_DISABLE=1 \
-        PYTORCH_ALLOC_CONF= \
-        CCL_PROCESS_LAUNCHER=none \
-        CCL_ATL_TRANSPORT=ofi \
+        PYTORCH_ALLOC_CONF=${VLLM_ALLOC_CONF} \
+        CCL_PROCESS_LAUNCHER=${VLLM_CCL_LAUNCHER} \
+        CCL_ATL_TRANSPORT=${VLLM_CCL_TRANSPORT} \
         FI_PROVIDER=cxi \
         CCL_KVS_IFACE=lo \
         python3 -m vllm.entrypoints.openai.api_server \
         --model "${MODEL_PATH}" \
-        --tensor-parallel-size ${VLLM_TILES} \
-        --port ${VLLM_PORT} \
+        --tensor-parallel-size ${VLLM_TP} \
+        --port ${PORT} \
         --enforce-eager \
         --dtype bfloat16 \
         --gpu-memory-utilization 0.80 \
         --max-model-len ${VLLM_MAX_MODEL_LEN} \
-        --distributed-executor-backend mp \
-        > "${VLLM_LOG}" 2>&1 &
-else
-    echo "Using TRL vllm_serve (TP=1)"
-    ZE_AFFINITY_MASK=${VLLM_MASK} \
-        VLLM_WORKER_MULTIPROC_METHOD=spawn \
-        TORCH_COMPILE_DISABLE=1 \
-        CCL_ATL_TRANSPORT=mpi \
-        CCL_PROCESS_LAUNCHER=None \
-        python3 recipes/dev/vllm_serve_xpu.py \
-        --model "${MODEL_PATH}" \
-        --tensor_parallel_size ${VLLM_TILES} \
-        --port ${VLLM_PORT} \
-        --enforce_eager \
-        --dtype bfloat16 \
-        --gpu_memory_utilization 0.80 \
-        --max_model_len ${VLLM_MAX_MODEL_LEN} \
-        > "${VLLM_LOG}" 2>&1 &
-fi
-VLLM_PID=$!
+        ${EXTRA_VLLM_ARGS} \
+        > "${LOG}" 2>&1 &
+    VLLM_PIDS+=($!)
+}
 
-# Cleanup on exit — kill entire process tree (vLLM spawns EngineCore + workers)
+echo "Starting ${VLLM_DP} vLLM replica(s) (TP=${VLLM_TP} each) on tile(s) ${VLLM_MASK}..."
+for ((r=0; r<VLLM_DP; r++)); do
+    REPLICA_TILE_START=$((VLLM_TILE_START + r * VLLM_TP))
+    REPLICA_TILE_END=$((REPLICA_TILE_START + VLLM_TP - 1))
+    REPLICA_MASK=$(seq -s, ${REPLICA_TILE_START} ${REPLICA_TILE_END})
+    REPLICA_PORT=$((VLLM_BASE_PORT + r))
+
+    launch_vllm_replica ${r} ${REPLICA_MASK} ${REPLICA_PORT}
+
+    if [ -n "${VLLM_URLS}" ]; then
+        VLLM_URLS="${VLLM_URLS},http://localhost:${REPLICA_PORT}"
+    else
+        VLLM_URLS="http://localhost:${REPLICA_PORT}"
+    fi
+done
+
+# Cleanup on exit — kill all vLLM process trees
 cleanup() {
-    echo "Cleaning up vLLM server (PID ${VLLM_PID}) and child processes..."
-    # Kill the whole process group, then any stragglers
-    kill -- -${VLLM_PID} 2>/dev/null || true
-    pkill -P ${VLLM_PID} 2>/dev/null || true
-    kill ${VLLM_PID} 2>/dev/null || true
-    wait ${VLLM_PID} 2>/dev/null || true
-    # Give L0 driver a moment to release contexts
+    echo "Cleaning up ${#VLLM_PIDS[@]} vLLM server(s)..."
+    for PID in "${VLLM_PIDS[@]}"; do
+        kill -- -${PID} 2>/dev/null || true
+        pkill -P ${PID} 2>/dev/null || true
+        kill ${PID} 2>/dev/null || true
+        wait ${PID} 2>/dev/null || true
+    done
     sleep 1
 }
 trap cleanup EXIT
 
-# --- 2. Wait for vLLM to be ready ---
-echo "Waiting for vLLM health check on port ${VLLM_PORT}..."
+# --- 2. Wait for all vLLM replicas to be ready ---
 VLLM_TIMEOUT=600
-ELAPSED=0
-while ! curl -s http://localhost:${VLLM_PORT}/health/ > /dev/null 2>&1; do
-    sleep 5
-    ELAPSED=$((ELAPSED + 5))
-    if [ ${ELAPSED} -ge ${VLLM_TIMEOUT} ]; then
-        echo "ERROR: vLLM server did not start within ${VLLM_TIMEOUT}s"
-        echo "=== vLLM log ==="
-        tail -50 "${VLLM_LOG}"
-        exit 1
-    fi
+for ((r=0; r<VLLM_DP; r++)); do
+    PORT=$((VLLM_BASE_PORT + r))
+    echo "Waiting for vLLM replica ${r} health check on port ${PORT}..."
+    ELAPSED=0
+    while ! curl -s http://localhost:${PORT}/health/ > /dev/null 2>&1; do
+        sleep 5
+        ELAPSED=$((ELAPSED + 5))
+        if [ ${ELAPSED} -ge ${VLLM_TIMEOUT} ]; then
+            echo "ERROR: vLLM replica ${r} did not start within ${VLLM_TIMEOUT}s"
+            echo "=== vLLM log (replica ${r}) ==="
+            tail -50 "${VLLM_LOG}.${r}"
+            exit 1
+        fi
+    done
+    echo "vLLM replica ${r} ready (took ${ELAPSED}s)"
 done
-echo "vLLM server ready (took ${ELAPSED}s)"
+echo "All ${VLLM_DP} vLLM replica(s) ready"
 
 # --- 3. Launch training ---
 # Training uses tiles 0..TRAIN_TILES-1 with NO ZE_AFFINITY_MASK.
 # CCL needs to see all 12 device UUIDs for ReduceOp.AVG; each rank
 # targets its tile via device_id=xpu:LOCAL_RANK.
 echo "Starting training on ${TRAIN_TILES} tiles (xpu:0 through xpu:$((TRAIN_TILES-1)))..."
+# Pass vLLM URL(s) to training — comma-separated for DP>1
+VLLM_URL_OVERRIDE="vllm_url=${VLLM_URLS}"
+echo "vLLM URLs: ${VLLM_URLS}"
 python3 -m torch.distributed.run --standalone --nproc_per_node=${TRAIN_TILES} \
     recipes/dev/grpo_full_finetune_distributed_xpu.py \
     --config ${CONFIG} \
     base_model_path=${MODEL_PATH} \
-    num_steps=${NSTEPS} ${EXTRA_ARGS}
+    num_steps=${NSTEPS} ${VLLM_URL_OVERRIDE} ${EXTRA_ARGS}
 
 echo "=== Training complete ==="

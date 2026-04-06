@@ -386,6 +386,15 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         if self._vllm_url is not None and self._vllm_mode is None:
             self._vllm_mode = "server"
 
+        # Eval config
+        self._eval_every_n_steps = cfg.get("eval_every_n_steps", 0)
+        self._eval_max_examples = cfg.get("eval_max_examples", 50)
+        self._eval_grpo_samples = cfg.get("eval_grpo_samples", None)
+        self._eval_enabled = False  # set in setup() if eval_dataset configured
+
+        # Step-based checkpointing
+        self._save_every_n_steps = cfg.get("save_every_n_steps", None)
+
         # Recipe state attributes
         self.seed = training.set_seed(seed=cfg.seed)
         self.total_epochs = cfg.epochs
@@ -781,7 +790,10 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             eval_mode=True,
             reshard_after_forward=True,
         )
-        torch.distributed.barrier()
+        # Skip barrier on multi-node (XCCL sub-communicator creation deadlocks
+        # on 2D mesh). FSDP will implicitly sync during first forward pass.
+        if not self._production_mode:
+            torch.distributed.barrier()
 
         # Utilize the same tokenizer for both models (hack)
         self._tokenizer = config.instantiate(cfg.tokenizer)
@@ -826,6 +838,19 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                 else None
             ),
         )
+
+        # Setup eval dataset (if configured)
+        cfg_eval_dataset = cfg.get("eval_dataset", None)
+        if cfg_eval_dataset is not None and self._eval_every_n_steps > 0:
+            eval_ds = config.instantiate(cfg_eval_dataset, self._tokenizer)
+            max_ex = min(self._eval_max_examples, len(eval_ds))
+            self._eval_examples = [eval_ds[i] for i in range(max_ex)]
+            self._eval_enabled = True
+            if self._is_rank_zero:
+                log.info("Eval dataset loaded: %d examples (from %d total), eval every %d steps",
+                         max_ex, len(eval_ds), self._eval_every_n_steps)
+        else:
+            self._eval_examples = []
 
         # Finally update the recipe state which can only be correctly set after all of the
         # other components have been initialized and updated.
@@ -892,18 +917,14 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
     def _setup_vllm_server_mode(self):
         """Initialize vLLM in server mode.
 
-        For HSDP (dp_replicate > 1): each shard group leader (local rank 0 on
-        each node) creates an HTTP client to its local vLLM server. Each node
-        has its own vLLM instance at the same URL (localhost).
+        Only global rank 0 creates HTTP clients and calls vLLM for generation.
+        Results are broadcast to all ranks via the world process group.
 
-        For non-HSDP: only global rank 0 creates the client (original behavior).
+        NOTE: XCCL on Aurora deadlocks when using shard-level sub-communicators,
+        so per-node vLLM generation with shard-level broadcast is not possible.
+        Only rank 0's vLLM server is used; other nodes' vLLM servers are idle.
         """
-        # In HSDP mode, each shard leader talks to its local vLLM.
-        # In non-HSDP mode, only rank 0 talks to vLLM.
-        should_init_client = (
-            self._is_shard_leader if self._shard_pg is not None
-            else self._is_rank_zero
-        )
+        should_init_client = self._is_rank_zero
 
         if should_init_client:
             from torchtune.dev.grpo.vllm_client import VLLMClient
@@ -940,10 +961,11 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                     self.rank, len(self._vllm_clients), ",".join(self._vllm_urls),
                 )
 
-        # Use shard PG barrier for HSDP to avoid world-level PG mixing.
-        if self._shard_pg is not None:
-            torch.distributed.barrier(group=self._shard_pg)
-        else:
+        # NOTE: Do NOT use shard_pg for any explicit collectives on Aurora.
+        # XCCL deadlocks when creating sub-communicators from device_mesh groups.
+        # FSDP2 internally manages its own communicators and works fine, but
+        # explicit operations on dp_mesh.get_group("dp_shard") deadlock.
+        if not self._production_mode:
             torch.distributed.barrier()
 
     def _setup_vllm_colocate_mode(self, cfg):
@@ -1353,7 +1375,12 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         # (they're FSDP shards of the same model copy). Only dp_replicate copies
         # need different data. So sampler_replicas = dp_replicate, sampler_rank =
         # replicate index.
-        if self._dp_replicate > 1:
+        if self._vllm_mode == "server":
+            # vLLM server mode: rank 0 generates and broadcasts to all ranks.
+            # All ranks must see the same batch for matching tensor shapes.
+            sampler_replicas = 1
+            sampler_rank = 0
+        elif self._dp_replicate > 1:
             # HSDP: each replicate group sees different data
             sampler_replicas = self._dp_replicate
             sampler_rank = self.rank // self._dp_shard
@@ -1421,10 +1448,8 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                 param = param.to(param.dtype)
             if is_rank_zero:
                 cpu_state_dict[param_name] = param.cpu()
-            # Use shard PG barrier instead of world barrier
-            if self._shard_pg is not None:
-                torch.distributed.barrier(group=self._shard_pg)
-            elif not self._production_mode:
+            # Skip barrier — FSDP full_tensor() is itself a synchronization point
+            if not self._production_mode:
                 torch.distributed.barrier()
         return cpu_state_dict
 
@@ -1496,10 +1521,9 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             )
             log.info(f"Saving checkpoint took {time.perf_counter() - start:.2f} secs")
 
-        # Use shard PG for barrier (world PG crashes on multi-node XPU after FSDP2)
-        if self._shard_pg is not None:
-            torch.distributed.barrier(group=self._shard_pg)
-        elif not self._production_mode:
+        # Skip barrier in production mode — checkpoint save is rank-0 only,
+        # other ranks just need to stay out of the way during full_tensor() gather.
+        if not self._production_mode:
             torch.distributed.barrier()
 
     def _generate_with_vllm(
@@ -1509,19 +1533,17 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
     ) -> torch.Tensor:
         """Call vLLM server for generation, broadcast results to all ranks.
 
-        For HSDP (dp_replicate > 1): each shard group leader (local rank 0 per
-        node) calls its local vLLM server and broadcasts within the shard group.
-        This doubles generation throughput with replicated vLLM.
-
-        For non-HSDP: only global rank 0 calls vLLM and broadcasts to all.
+        Only global rank 0 calls vLLM and broadcasts to all ranks via the world
+        process group. Uses a fixed buffer size (tokenizer.max_seq_len) so all
+        ranks have matching tensor shapes regardless of per-rank batch variation.
 
         Returns:
-            query_responses: ``[B*G, context_length + max_generated_tokens]``
+            query_responses: ``[B*G, max_seq_len]`` (padded to fixed length)
         """
         bsz = batch_input_ids.shape[0]
         total_len = context_length + self._max_generated_tokens
 
-        if self._is_shard_leader:
+        if self._is_rank_zero:
             # Strip padding and convert to Python lists for HTTP
             prompts = []
             for i in range(bsz):
@@ -1583,12 +1605,11 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         else:
             query_responses = batch_input_ids.new_empty(bsz, total_len)
 
-        # Broadcast within shard group (HSDP) or world (non-HSDP).
-        # src must be the GLOBAL rank of the shard leader (not group-local rank).
-        if self._shard_pg is not None:
-            torch.distributed.broadcast(query_responses, src=self._shard_leader_global_rank, group=self._shard_pg)
-        else:
-            torch.distributed.broadcast(query_responses, src=0)
+        # Broadcast from rank 0 to all ranks via world PG.
+        # Broadcast from rank 0 to all ranks via world PG.
+        # XCCL on Aurora deadlocks when creating sub-communicators for shard PG,
+        # so we always use the world PG for explicit collectives.
+        torch.distributed.broadcast(query_responses, src=0)
         return query_responses
 
     def _generate_with_colocated_vllm(
@@ -1785,9 +1806,8 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                     hf_state_dict[hf_name] = param.cpu()
             del sharded_sd
 
-        if self._shard_pg is not None:
-            torch.distributed.barrier(group=self._shard_pg)
-        else:
+        # Barrier: ensure all ranks finished full_tensor() before saving
+        if not self._production_mode:
             torch.distributed.barrier()
 
         if self._is_shard_leader:
@@ -1911,13 +1931,9 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         _vllm_time = time.perf_counter() - _vllm_t0
 
         # Barrier: all ranks must finish generation before FSDP forward passes.
-        # For vLLM server mode, the broadcast in _generate_with_vllm already
-        # synchronizes all ranks — skip the world barrier to avoid cross-node
-        # CCL broadcast_scaleout failures on multi-node XPU.
-        # HSDP: use shard PG to avoid mixing world PG with FSDP1 sub-PGs on XCCL.
-        if self._shard_pg is not None:
-            torch.distributed.barrier(group=self._shard_pg)
-        elif self._vllm_mode != "server" and not self._production_mode:
+        # For vLLM server mode, the world broadcast in _generate_with_vllm
+        # already synchronizes all ranks. For other modes, use world barrier.
+        if self._vllm_mode != "server" and not self._production_mode:
             torch.distributed.barrier()
 
         # Free vLLM GPU memory to reclaim space for training forward/backward passes.
@@ -2032,9 +2048,8 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         # multi-node to avoid CCL broadcast_scaleout failures.
         _ref_fwd_t0 = time.perf_counter()
         log.info("Rank %d: pre-ref forward", self.rank)
-        if self._shard_pg is not None:
-            torch.distributed.barrier(group=self._shard_pg)
-        elif not self._production_mode:
+        # FSDP AllGather in ref forward provides implicit sync
+        if not self._production_mode:
             torch.distributed.barrier()
         if fwd_bs >= num_seqs:
             log.info("Rank %d: ref forward start", self.rank)
@@ -2550,17 +2565,53 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                         self.rank, _mem_alloc, _mem_resv, _mem_resv - _mem_alloc,
                     )
 
+                # Periodic evaluation on held-out data
+                if (self._eval_enabled and self._steps_run > 0 and
+                        self._steps_run % self._eval_every_n_steps == 0):
+                    self.run_eval()
+
+                # Step-based checkpointing
+                if (self._save_every_n_steps is not None and self._steps_run > 0 and
+                        self._steps_run % self._save_every_n_steps == 0):
+                    try:
+                        self.save_checkpoint(curr_epoch)
+                    except Exception as e:
+                        utils.log_rank_zero(
+                            log,
+                            f"WARNING: Step checkpoint save failed: {e}. "
+                            "Continuing training.",
+                        )
+
                 self._profiler.step()
 
                 pbar.update(1)
 
                 if self._steps_run == self._total_steps:
+                    # Final eval (skip if periodic eval already ran this step)
+                    if (self._eval_enabled and
+                            self._steps_run % self._eval_every_n_steps != 0):
+                        self.run_eval()
+                    try:
+                        self.save_checkpoint(curr_epoch)
+                    except Exception as e:
+                        utils.log_rank_zero(
+                            log,
+                            f"WARNING: Final checkpoint save failed: {e}. "
+                            "Training results are still valid.",
+                        )
                     training_completed = True
                     break
 
             self._epochs_run += 1
             if self._epochs_run % self._save_every_n_epochs == 0:
-                self.save_checkpoint(curr_epoch)
+                try:
+                    self.save_checkpoint(curr_epoch)
+                except Exception as e:
+                    utils.log_rank_zero(
+                        log,
+                        f"WARNING: Epoch checkpoint save failed: {e}. "
+                        "Continuing training.",
+                    )
             if training_completed:
                 return
 
@@ -2616,6 +2667,110 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                 log_dict["ratios"].item() if hasattr(log_dict["ratios"], "item") else log_dict["ratios"],
                 log_dict["approx_policy_kl"].item() if hasattr(log_dict["approx_policy_kl"], "item") else log_dict["approx_policy_kl"],
                 log_dict["response_lengths"].item() if hasattr(log_dict["response_lengths"], "item") else log_dict["response_lengths"],
+            )
+
+    def run_eval(self) -> None:
+        """Run evaluation on held-out data. Generates via vLLM, computes rewards.
+
+        All ranks participate (required for vLLM broadcast), but only rank 0 logs.
+        """
+        if not self._eval_enabled:
+            return
+
+        eval_t0 = time.perf_counter()
+        if self._is_rank_zero:
+            log.info("EVAL starting at step %d (%d examples)",
+                     self._steps_run, len(self._eval_examples))
+
+        all_rewards = []
+        all_successes = []
+        all_response_lengths = []
+        eval_grpo_samples = self._eval_grpo_samples or self.grpo_samples
+
+        collate_fn = _get_component_from_path("torchtune.dev.grpo.data.padded_collate_rl")
+
+        for eval_idx, example in enumerate(self._eval_examples):
+            batch = collate_fn([example], padding_idx=self._tokenizer.pad_id)
+            tokens = batch["tokens"].to(self._device)
+            answers = batch["answers"]
+            _, context_length = tokens.shape
+
+            # Expand for grpo_samples
+            batch_input_ids = tokens[:, None, :].expand(-1, eval_grpo_samples, -1)
+            batch_input_ids = batch_input_ids.reshape(eval_grpo_samples, -1)
+
+            with torch.no_grad():
+                if self._vllm_mode == "server":
+                    query_responses = self._generate_with_vllm(batch_input_ids, context_length)
+                elif self._vllm_mode in ("colocate", "colocate_sleep"):
+                    query_responses = self._generate_with_colocated_vllm(batch_input_ids, context_length)
+                else:
+                    # Native generation
+                    with local_kv_cache(
+                        model=self._model,
+                        batch_size=eval_grpo_samples,
+                        device=self._device,
+                        dtype=self._dtype,
+                        decoder_max_seq_len=context_length + self._max_generated_tokens,
+                    ):
+                        query_responses, _ = generate(
+                            model=self._model,
+                            prompt=batch_input_ids,
+                            max_generated_tokens=self._max_generated_tokens,
+                            temperature=self._temperature,
+                            top_k=self._top_k,
+                            pad_id=self._tokenizer.pad_id,
+                            stop_tokens=self._tokenizer.stop_tokens if hasattr(self._tokenizer, 'stop_tokens') else None,
+                            return_logits=False,
+                        )
+
+                responses = query_responses[:, context_length:].clone()
+
+                # Truncate at stop tokens
+                response_padding_masks, responses = rlhf.truncate_sequence_at_first_stop_token(
+                    responses, self._stop_token_ids, self._tokenizer.pad_id
+                )
+
+                # Compute rewards
+                responses_reshaped = responses.reshape(1, eval_grpo_samples, -1)
+                rewards, successes, _ = batched_rewards(
+                    self._tokenizer, responses_reshaped, answers, device=self._device
+                )
+                # Sum across reward functions, mean across samples
+                rewards = rewards.sum(dim=-1).mean().item()
+                successes_mean = successes[:, :, -1].mean().item()  # math_response_correct is last
+
+                all_rewards.append(rewards)
+                all_successes.append(successes_mean)
+
+                seq_lens = response_padding_masks.any(-1).sum()
+                resp_len = (~response_padding_masks).sum(dim=-1).float().mean().item()
+                all_response_lengths.append(resp_len)
+
+            del tokens, batch_input_ids, query_responses, responses, response_padding_masks
+            if self._device.type == "xpu":
+                import gc
+                gc.collect()
+
+        eval_time = time.perf_counter() - eval_t0
+        avg_reward = sum(all_rewards) / len(all_rewards) if all_rewards else 0.0
+        avg_success = sum(all_successes) / len(all_successes) if all_successes else 0.0
+        avg_resp_len = sum(all_response_lengths) / len(all_response_lengths) if all_response_lengths else 0.0
+
+        eval_log_dict = {
+            "eval/rewards": avg_reward,
+            "eval/successes": avg_success,
+            "eval/response_lengths": avg_resp_len,
+            "eval/num_examples": len(self._eval_examples),
+            "eval/time_seconds": eval_time,
+        }
+
+        if self._is_rank_zero:
+            self._metric_logger.log_dict(eval_log_dict, step=self.global_step)
+            log.info(
+                "EVAL step=%d  rewards=%.3f  successes=%.3f  resp_len=%.1f  time=%.1fs  (%d examples)",
+                self._steps_run, avg_reward, avg_success, avg_resp_len, eval_time,
+                len(self._eval_examples),
             )
 
     def cleanup(self) -> None:

@@ -72,24 +72,38 @@ export MASTER_PORT=${MASTER_PORT:-29500}
 # ============================================================
 # Module and environment
 # ============================================================
-module load frameworks >/dev/null 2>&1 || true
+module load frameworks/2025.2.0 >/dev/null 2>&1 || true
+
+# Ensure MPI library is in LD_LIBRARY_PATH (CCL MPI transport needs libmpi.so.12)
+MPI_LIB_DIR="/opt/aurora/25.190.0/oneapi/2025.2/lib"
+if [[ -d "${MPI_LIB_DIR}" ]] && [[ ":${LD_LIBRARY_PATH:-}:" != *":${MPI_LIB_DIR}:"* ]]; then
+    export LD_LIBRARY_PATH="${MPI_LIB_DIR}:${LD_LIBRARY_PATH:-}"
+fi
 
 # CRITICAL: Re-export CCL env vars AFTER module load.
 # `module load frameworks` resets CCL_PROCESS_LAUNCHER to "pmix".
 #
-# MPI transport (official Aurora recommendation, tested to 1024 nodes):
-#   - Uses MPI's topology-aware sub-communicator routing
-#   - Intra-node AllGather: ~4.5 GiB/s (vs 2.4 GiB/s with ofi)
-#   - Requires: mpiexec --pmi=pmix AND mpi4py pre-init in Python
-#   - See: /flare/ModCon/ngetty/user-guides/docs/aurora/data-science/frameworks/oneCCL.md
+# Transport selection (set CCL_TRANSPORT_OVERRIDE in launcher to override):
+#   mpi: topology-aware sub-communicator routing, ~4.5 GiB/s AllGather intra-node
+#        Requires: mpiexec --pmi=pmix AND mpi4py pre-init in Python
+#        BUG: deadlocks on multi-node broadcast (XCCL communicator creation fails)
+#   ofi: libfabric/CXI direct, ~2.4 GiB/s AllGather intra-node
+#        No MPI dependency for transport, works reliably on multi-node
+_CCL_TRANSPORT="${CCL_TRANSPORT_OVERRIDE:-mpi}"
 export CCL_PROCESS_LAUNCHER=pmix
-export CCL_ATL_TRANSPORT=mpi
-export CCL_KVS_MODE=mpi
-export CCL_KVS_USE_MPI_RANKS=1
+export CCL_ATL_TRANSPORT="${_CCL_TRANSPORT}"
+if [[ "${_CCL_TRANSPORT}" == "mpi" ]]; then
+    export CCL_KVS_MODE=mpi
+    export CCL_KVS_USE_MPI_RANKS=1
+else
+    # OFI transport: use pmix KVS (not MPI KVS)
+    unset CCL_KVS_MODE
+    unset CCL_KVS_USE_MPI_RANKS
+fi
 export CCL_CONFIGURATION_PATH=""
 export CCL_CONFIGURATION=cpu_gpu_dpcpp
 export CCL_KVS_CONNECTION_TIMEOUT=600
-export CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD=1024
+export CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD=4096
 export CCL_OP_SYNC=1
 export FI_PROVIDER=cxi
 # CRITICAL: CCL_WORKER_COUNT=4 causes 48x AllGather bandwidth degradation
@@ -133,6 +147,11 @@ export PATH=$(echo "$PATH" | tr ':' '\n' | grep -v myenv | tr '\n' ':' | sed 's/
 unset VIRTUAL_ENV 2>/dev/null; true
 export HF_DATASETS_OFFLINE=1
 export HF_HUB_OFFLINE=1
+# Disable HTTP proxy for training — vLLM requests are local/intra-cluster.
+# Aurora compute nodes have http_proxy set to Squid, which blocks inter-node
+# HTTP on non-standard ports (vLLM on 8001).
+export no_proxy="*"
+export NO_PROXY="*"
 
 # ============================================================
 # Log rank info
@@ -141,7 +160,7 @@ if [[ "${RANK}" == "0" ]]; then
     echo "[Rank ${RANK}] node=$(hostname) LOCAL_RANK=${LOCAL_RANK} WORLD_SIZE=${WORLD_SIZE} LOCAL_WORLD_SIZE=${LOCAL_WORLD_SIZE}"
     echo "[Rank ${RANK}] MASTER_ADDR=${MASTER_ADDR} MASTER_PORT=${MASTER_PORT}"
     echo "[Rank ${RANK}] ZE_AFFINITY_MASK=${ZE_AFFINITY_MASK:-<unset>}"
-    echo "[Rank ${RANK}] CCL_PROCESS_LAUNCHER=${CCL_PROCESS_LAUNCHER} CCL_ATL_TRANSPORT=${CCL_ATL_TRANSPORT}"
+    echo "[Rank ${RANK}] CCL_PROCESS_LAUNCHER=${CCL_PROCESS_LAUNCHER} CCL_ATL_TRANSPORT=${CCL_ATL_TRANSPORT} CCL_KVS_MODE=${CCL_KVS_MODE:-<unset>}"
 fi
 
 # ============================================================

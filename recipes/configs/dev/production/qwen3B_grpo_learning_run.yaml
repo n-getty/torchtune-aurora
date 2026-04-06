@@ -1,0 +1,144 @@
+# GRPO learning run on GSM8K — Qwen2.5-3B on Aurora XPU
+# Fast iteration config for validating eval loop and learning signal.
+#
+# Setup: 2 tiles vLLM (DP=2, TP=1 each), 10 tiles FSDP training
+# G=16, fbs=16, max_gen=512 — aggressive for 3B (tiny model, big batch)
+# Estimated: ~5s/step, 200 steps + 10 evals ≈ 35 min
+#
+# Launch:
+#   VLLM_DP=2 bash recipes/dev/run_grpo_vllm_xpu.sh 2 10 \
+#     /lus/flare/projects/ModCon/ngetty/models/Qwen2.5-3B 200 \
+#     recipes/configs/dev/production/qwen3B_grpo_learning_run.yaml
+
+name: grpo_learning_run_qwen3b_xpu
+
+output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/results/qwen3b_learning_run
+base_model_path: /lus/flare/projects/ModCon/ngetty/models/Qwen2.5-3B
+
+# vLLM server mode — DP=2 URLs set by launch script override
+vllm_url: "http://localhost:8001,http://localhost:8002"
+vllm_group_port: 51216
+vllm_weight_sync: false
+
+# Tokenizer
+tokenizer:
+  _component_: torchtune.models.qwen2_5.qwen2_5_tokenizer
+  path: ${base_model_path}/vocab.json
+  merges_file: ${base_model_path}/merges.txt
+  max_seq_len: 1024
+
+# Training dataset — 90% of GSM8K train
+dataset:
+  _component_: torchtune.dev.grpo.gsm8k.gsm8k_dataset
+  partition: 1-9/10
+seed: 42
+shuffle: True
+
+# Eval dataset — GSM8K test split (1319 examples, subsample to 10)
+eval_dataset:
+  _component_: torchtune.dev.grpo.gsm8k.gsm8k_dataset
+  split: test
+eval_every_n_steps: 20
+eval_max_examples: 10
+eval_grpo_samples: 4
+
+# Model
+model:
+  _component_: torchtune.models.qwen2_5.qwen2_5_3b
+
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [
+    model-00001-of-00002.safetensors,
+    model-00002-of-00002.safetensors,
+  ]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: QWEN2
+
+ref_checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [
+    model-00001-of-00002.safetensors,
+    model-00002-of-00002.safetensors,
+  ]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}/ref
+  model_type: QWEN2
+
+resume_from_checkpoint: False
+save_every_n_epochs: 1
+save_every_n_steps: 100  # Now wrapped in try/except — will log error but not crash
+
+# GRPO parameters — aggressive for 3B
+batch_size: 1
+grpo_samples: 16
+forward_batch_size: 16
+max_generated_tokens: 512
+top_k: null
+temperature: 1.0
+
+ppo_epochs: 1
+gradient_accumulation_steps: 1
+
+num_steps: 200
+
+clip_grad_norm: 1.0
+
+epochs: 1
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 5e-6
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  num_warmup_steps: 10
+loss:
+  _component_: torchtune.dev.grpo.loss.GRPOSimpleLoss
+  kl_coeff: 0.05
+  epsilon: 0.2
+
+# XPU device
+device: xpu
+
+# Memory management
+enable_activation_checkpointing: True
+compile: False
+
+# Precision
+dtype: bf16
+
+reward_functions:
+    - _component_: torchtune.dev.rl.rewards.FormattedMathCorrectnessReward
+      answer_tag: answer
+      positive_reward: 10.0
+      negative_reward: 0.0
+    - _component_: torchtune.dev.rl.rewards.ThinkingAnswerFormattingReward
+      think_tag: think
+      answer_tag: answer
+      positive_reward: 1.0
+      negative_reward: 0.0
+
+# Logging
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+log_every_n_steps: 1
+log_peak_memory_stats: True
+
+# Profiler disabled
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: False
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: True
+  cuda: False
+  profile_memory: False
+  with_stack: False
+  record_shapes: False
+  with_flops: False
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1

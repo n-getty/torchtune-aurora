@@ -18,14 +18,14 @@
 # Usage (PBS submission):
 #   qsub recipes/dev/aurora_grpo_vllm_hsdp_multinode.sh
 #
-#PBS -l select=2:system=aurora
+#PBS -l select=2
 #PBS -l filesystems=home:flare
 #PBS -l walltime=1:00:00
 #PBS -q debug
-#PBS -A AuroraGPT
-#PBS -o /lus/flare/projects/ModCon/ngetty/torchtune/logs/grpo_vllm_hsdp_multinode.out
-#PBS -e /lus/flare/projects/ModCon/ngetty/torchtune/logs/grpo_vllm_hsdp_multinode.err
-#PBS -N grpo_vllm_hsdp
+#PBS -A ModCon
+#PBS -o /lus/flare/projects/ModCon/ngetty/torchtune/logs/grpo_32b_learning_run.out
+#PBS -e /lus/flare/projects/ModCon/ngetty/torchtune/logs/grpo_32b_learning_run.err
+#PBS -N grpo_32b_learn
 set -e
 
 TORCHTUNE_DIR="/lus/flare/projects/ModCon/ngetty/torchtune"
@@ -38,32 +38,33 @@ NGPUS_PER_NODE=${NGPUS_PER_NODE:-10}
 VLLM_TILES=${VLLM_TILES:-2}           # TP degree per node
 VLLM_PORT=${VLLM_PORT:-8001}
 VLLM_MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-2048}
-MODEL_SRC=${MODEL_SRC:-/lus/flare/projects/ModCon/ngetty/models/Qwen2.5-3B}
+MODEL_SRC=${MODEL_SRC:-/lus/flare/projects/ModCon/ngetty/models/Qwen3-32B}
 MODEL_PATH=${MODEL_PATH:-/tmp/torchtune/$(basename ${MODEL_SRC})}
-NSTEPS=${NSTEPS:-5}
-CONFIG=${CONFIG:-recipes/configs/dev/production/qwen3B_grpo_vllm_hsdp_multinode_xpu.yaml}
+NSTEPS=${NSTEPS:-35}
+CONFIG=${CONFIG:-recipes/configs/dev/production/qwen32B_grpo_learning_run.yaml}
 WRAPPER="${TORCHTUNE_DIR}/recipes/dev/aurora_grpo_vllm_wrapper.sh"
 
 # ============================================================
 # Environment setup
 # ============================================================
-module load frameworks 2>/dev/null || true
+module load frameworks/2025.2.0 2>/dev/null || true
 
 # Remove user virtualenv from PATH
 export PATH=$(echo "$PATH" | tr ':' '\n' | grep -v myenv | tr '\n' ':' | sed 's/:$//')
 unset VIRTUAL_ENV
 
-# CCL / XPU environment — MPI transport (official Aurora recommendation)
-# MPI transport uses topology-aware sub-communicator routing, giving ~2x
-# intra-node AllGather bandwidth vs ofi (4.5 GiB/s vs 2.4 GiB/s).
-# Requires: mpiexec --pmi=pmix AND mpi4py pre-init in Python.
+# CCL / XPU environment
+# OFI transport for multi-node: MPI transport deadlocks during XCCL
+# communicator creation on multi-node Aurora (only one rank's CCL proceeds
+# with env var init, others silently use incompatible KVS path).
+# OFI is ~2x slower for intra-node AllGather (2.4 vs 4.5 GiB/s) but
+# inter-node collectives (broadcast, allreduce) actually work.
+export CCL_TRANSPORT_OVERRIDE=${CCL_TRANSPORT_OVERRIDE:-ofi}
 export CCL_PROCESS_LAUNCHER=pmix
-export CCL_ATL_TRANSPORT=mpi
-export CCL_KVS_MODE=mpi
-export CCL_KVS_USE_MPI_RANKS=1
+export CCL_ATL_TRANSPORT=${CCL_TRANSPORT_OVERRIDE}
 export CCL_CONFIGURATION=cpu_gpu_dpcpp
 export CCL_KVS_CONNECTION_TIMEOUT=600
-export CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD=1024
+export CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD=4096
 export CCL_OP_SYNC=1
 export FI_PROVIDER=cxi
 # CRITICAL: CCL_WORKER_COUNT=4 causes 48x AllGather bandwidth degradation
@@ -153,7 +154,7 @@ WARM_CMD="
 export ZE_FLAT_DEVICE_HIERARCHY=FLAT
 export ZE_AFFINITY_MASK=${VLLM_TILE_START}
 export TORCH_COMPILE_DISABLE=1
-module load frameworks 2>/dev/null
+module load frameworks/2025.2.0 2>/dev/null
 export PATH=\$(echo \"\$PATH\" | tr ':' '\n' | grep -v myenv | tr '\n' ':' | sed 's/:\$//')
 export PYTHONPATH='${TORCHTUNE_DIR}:/flare/ModCon/ngetty/trl:${VLLM_CUSTOMIZATION}'
 export HF_DATASETS_OFFLINE=1
@@ -193,7 +194,7 @@ VLLM_PIDS=()
 #   This avoids CXI endpoint conflicts between vLLM's XCCL and training's XCCL.
 VLLM_ENV="
 cd ${TORCHTUNE_DIR}
-module load frameworks 2>/dev/null
+module load frameworks/2025.2.0 2>/dev/null
 export PATH=\$(echo \"\$PATH\" | tr ':' '\n' | grep -v myenv | tr '\n' ':' | sed 's/:\$//')
 unset VIRTUAL_ENV
 export ZE_FLAT_DEVICE_HIERARCHY=FLAT
@@ -226,14 +227,16 @@ python3 -m vllm.entrypoints.openai.api_server \
 "
 else
     VLLM_START_CMD="${VLLM_ENV}
-python3 recipes/dev/vllm_serve_xpu.py \
+export CCL_ATL_TRANSPORT=mpi
+export CCL_PROCESS_LAUNCHER=None
+python3 -m vllm.entrypoints.openai.api_server \
     --model '${MODEL_PATH}' \
-    --tensor_parallel_size 1 \
+    --tensor-parallel-size 1 \
     --port ${VLLM_PORT} \
-    --enforce_eager \
+    --enforce-eager \
     --dtype bfloat16 \
-    --gpu_memory_utilization 0.80 \
-    --max_model_len ${VLLM_MAX_MODEL_LEN} \
+    --gpu-memory-utilization 0.80 \
+    --max-model-len ${VLLM_MAX_MODEL_LEN} \
     > '${VLLM_LOG}' 2>&1
 "
 fi
@@ -292,6 +295,15 @@ echo "All vLLM servers ready."
 # vLLM launch section. Training ranks see all 12 tiles but use device_id=xpu:{LOCAL_RANK}.
 export USE_AFFINITY_MASK=${USE_AFFINITY_MASK:-training}
 
+# Build vLLM URL list: rank 0 dispatches to all nodes' vLLM servers.
+# Use localhost for rank 0's own node (HSN FQDN may not route to local vLLM),
+# use HSN FQDN for remote nodes (reachable via Slingshot fabric).
+VLLM_URLS="http://localhost:${VLLM_PORT}"
+for ((i=1; i<${#UNIQUE_NODES[@]}; i++)); do
+    VLLM_URLS="${VLLM_URLS},http://${UNIQUE_NODES[$i]}.hsn.cm.aurora.alcf.anl.gov:${VLLM_PORT}"
+done
+echo "vLLM URLs: ${VLLM_URLS}"
+
 echo ""
 echo "Starting HSDP GRPO training (${TOTAL_RANKS} ranks, USE_AFFINITY_MASK=${USE_AFFINITY_MASK})..."
 mpiexec \
@@ -306,8 +318,8 @@ mpiexec \
     "${CONFIG}" \
     "base_model_path=${MODEL_PATH}" \
     "num_steps=${NSTEPS}" \
-    "data_parallel_replicate_dim=${NUM_NODES}" \
-    "vllm_url=http://localhost:${VLLM_PORT}" \
+    "data_parallel_replicate_dim=1" \
+    "vllm_url=${VLLM_URLS}" \
     "vllm_weight_sync=false"
 
 echo "=== Training complete ==="
