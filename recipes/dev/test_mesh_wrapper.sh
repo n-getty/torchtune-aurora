@@ -3,6 +3,10 @@
 # Usage: bash test_mesh_wrapper.sh <script.py> [args...]
 set -e
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=recipes/dev/_aurora_paths.sh
+source "${SCRIPT_DIR}/_aurora_paths.sh"
+
 SCRIPT="${1:?Usage: test_mesh_wrapper.sh <script.py> [args...]}"
 shift
 
@@ -45,9 +49,7 @@ fi
 export CCL_CHUNK_SIZE=16777216
 export TORCH_COMPILE_DISABLE=1
 export PYTORCH_ALLOC_CONF=expandable_segments:True
-
-TORCHTUNE_DIR="/lus/flare/projects/ModCon/ngetty/torchtune"
-export PYTHONPATH="${TORCHTUNE_DIR}:/flare/ModCon/ngetty/trl"
+aurora_export_pythonpath "${TORCHTUNE_DIR}" "${TRL_DIR}"
 
 if [[ "${RANK}" == "0" ]]; then
     echo "[Rank 0] node=$(hostname) LOCAL_RANK=${LOCAL_RANK} WORLD_SIZE=${WORLD_SIZE}"

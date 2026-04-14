@@ -9,13 +9,17 @@
 #PBS -l walltime=1:00:00
 #PBS -q debug
 #PBS -A AuroraGPT
-#PBS -o /lus/flare/projects/ModCon/ngetty/torchtune/test_suite.out
-#PBS -e /lus/flare/projects/ModCon/ngetty/torchtune/test_suite.err
+#PBS -o logs/test_suite.out
+#PBS -e logs/test_suite.err
 #PBS -N grpo_test_suite
 
 # Do NOT use set -e — individual test failures should not abort the suite.
 # The run_test function captures exit codes.
-cd /lus/flare/projects/ModCon/ngetty/torchtune
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=recipes/dev/_aurora_paths.sh
+source "${SCRIPT_DIR}/_aurora_paths.sh"
+
+cd "${TORCHTUNE_DIR}"
 
 # Load environment
 module load frameworks 2>/dev/null || true
@@ -105,5 +109,5 @@ echo "=== All tests complete ===" | tee -a ${LOG}
 echo "End: $(date)" | tee -a ${LOG}
 
 # Copy results to persistent storage
-cp -r ${RESULTS} /lus/flare/projects/ModCon/ngetty/torchtune/test_results_$(date +%Y%m%d_%H%M%S)
-echo "Results saved to /lus/flare/projects/ModCon/ngetty/torchtune/test_results_*"
+cp -r ${RESULTS} "${TORCHTUNE_DIR}/test_results_$(date +%Y%m%d_%H%M%S)"
+echo "Results saved to ${TORCHTUNE_DIR}/test_results_*"

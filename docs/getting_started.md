@@ -12,12 +12,15 @@ This guide covers environment setup and running GRPO training on Aurora HPC (Int
 ### 1. Install (one-time, on a login node)
 
 ```bash
+cd /path/to/torchtune-aurora
 module load frameworks/2025.2.0    # IMPORTANT: 2025.3.1 has broken XCCL allreduce
 # Remove any user virtualenv that conflicts with frameworks
 export PATH=$(echo "$PATH" | tr ':' '\n' | grep -v myenv | tr '\n' ':' | sed 's/:$//')
 unset VIRTUAL_ENV
+# Optional if your TRL checkout is not at the Aurora default
+export TRL_DIR=/path/to/trl
 
-pip install -e /lus/flare/projects/ModCon/ngetty/torchtune
+pip install -e .
 ```
 
 `module load frameworks/2025.2.0` provides:
@@ -46,10 +49,10 @@ python -c "from torchtune.training import get_xpu_distributed_backend; print(get
 qsub -I -l select=1:system=aurora -l walltime=1:00:00 -l filesystems=home:flare -q debug -A AuroraGPT
 
 # On the compute node:
-cd /lus/flare/projects/ModCon/ngetty/torchtune
+cd /path/to/torchtune-aurora
 bash recipes/dev/run_grpo_vllm_xpu.sh 2 10 \
     /lus/flare/projects/ModCon/ngetty/models/Qwen3-32B 5 \
-    --config recipes/configs/dev/production/qwen32B_grpo_server_xpu.yaml
+    recipes/configs/dev/production/qwen32B_grpo_server_xpu.yaml
 ```
 
 This launches:
@@ -62,7 +65,7 @@ This launches:
 
 ```bash
 # On a compute node:
-cd /lus/flare/projects/ModCon/ngetty/torchtune
+cd /path/to/torchtune-aurora
 bash recipes/dev/run_gemma4_grpo_vllm.sh 2 10 5
 ```
 
@@ -101,13 +104,13 @@ Architecture per node:
 ```bash
 # 3B single-node with colocated vLLM
 bash recipes/dev/run_grpo_colocate_xpu.sh \
-    /lus/flare/projects/ModCon/ngetty/models/Qwen2.5-3B 5 \
-    --config recipes/configs/dev/production/qwen3B_grpo_colocate_xpu.yaml
+    12 /lus/flare/projects/ModCon/ngetty/models/Qwen2.5-3B 5 \
+    recipes/configs/dev/production/qwen3B_grpo_colocate_xpu.yaml
 
 # 8B single-node with colocated vLLM (12 tiles)
 bash recipes/dev/run_grpo_colocate_xpu.sh \
-    /lus/flare/projects/ModCon/ngetty/models/Qwen3-8B 5 \
-    --config recipes/configs/dev/production/qwen8B_grpo_colocate_xpu.yaml
+    12 /lus/flare/projects/ModCon/ngetty/models/Qwen3-8B 5 \
+    recipes/configs/dev/production/qwen8B_grpo_colocate_xpu.yaml
 ```
 
 ## Production Performance Summary
@@ -133,17 +136,18 @@ A100-40GB comparison: 32B+ models are **infeasible** on A100-40GB (OOM in all co
 #PBS -l walltime=1:00:00
 #PBS -q debug                        # or prod for longer runs
 #PBS -A AuroraGPT
-#PBS -o /lus/flare/projects/ModCon/ngetty/torchtune/logs/job.out
-#PBS -e /lus/flare/projects/ModCon/ngetty/torchtune/logs/job.err
+#PBS -o logs/job.out
+#PBS -e logs/job.err
 #PBS -N grpo_training
 set -e
 
-cd /lus/flare/projects/ModCon/ngetty/torchtune
+cd /path/to/torchtune-aurora
 
 # --- Environment ---
 module load frameworks/2025.2.0 2>/dev/null || true    # NOT 2025.3.1 (broken XCCL)
 export PATH=$(echo "$PATH" | tr ':' '\n' | grep -v myenv | tr '\n' ':' | sed 's/:$//')
 unset VIRTUAL_ENV
+export TRL_DIR=${TRL_DIR:-/flare/ModCon/ngetty/trl}
 
 # --- CCL Configuration (CRITICAL — do not omit) ---
 export CCL_PROCESS_LAUNCHER=pmix
@@ -170,7 +174,7 @@ unset PYTORCH_ALLOC_CONF
 export TORCH_COMPILE_DISABLE=1
 
 # --- Paths ---
-export PYTHONPATH="/lus/flare/projects/ModCon/ngetty/torchtune:/flare/ModCon/ngetty/trl:${PYTHONPATH}"
+export PYTHONPATH="$(pwd)${TRL_DIR:+:${TRL_DIR}}:${PYTHONPATH}"
 export HF_DATASETS_OFFLINE=1
 export HF_HUB_OFFLINE=1
 
@@ -207,8 +211,8 @@ MODEL_SRC=/path/to/model NSTEPS=20 NGPUS_PER_NODE=10 VLLM_TILES=2 \
     bash recipes/dev/aurora_grpo_vllm_hsdp_multinode.sh
 
 # Override config-level params:
-bash recipes/dev/aurora_grpo_vllm_hsdp_multinode.sh \
-    CONFIG=recipes/configs/dev/production/qwen32B_grpo_server_xpu.yaml
+CONFIG=recipes/configs/dev/production/qwen32B_grpo_server_xpu.yaml \
+    bash recipes/dev/aurora_grpo_vllm_hsdp_multinode.sh
 ```
 
 ## Syncing with Upstream TorchTune

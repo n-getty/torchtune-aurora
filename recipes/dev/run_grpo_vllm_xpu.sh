@@ -15,7 +15,11 @@
 #   Nearly doubles generation throughput for small models (3B).
 set -e
 
-cd /lus/flare/projects/ModCon/ngetty/torchtune
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=recipes/dev/_aurora_paths.sh
+source "${SCRIPT_DIR}/_aurora_paths.sh"
+
+cd "${TORCHTUNE_DIR}"
 
 # Load Aurora frameworks module — MUST use 2025.2.0 (2025.3.1 has broken XCCL allreduce)
 module load frameworks/2025.2.0 2>/dev/null || true
@@ -47,8 +51,8 @@ export PYTORCH_ALLOC_CONF=expandable_segments:True
 # single-node FSDP2 — they force the scheduler path which doesn't support
 # ReduceOp.AVG. Only needed for multi-node with large tensors.
 # usercustomize patch: disable transformers version check (hf-hub 1.7 vs <1.0)
-VLLM_CUSTOMIZATION=/lus/flare/projects/ModCon/ngetty/torchtune/recipes/dev/_usercustomize_vllm
-export PYTHONPATH=/lus/flare/projects/ModCon/ngetty/torchtune:/flare/ModCon/ngetty/trl:${VLLM_CUSTOMIZATION}:$PYTHONPATH
+VLLM_CUSTOMIZATION="${TORCHTUNE_DIR}/recipes/dev/_usercustomize_vllm"
+aurora_export_pythonpath "${TORCHTUNE_DIR}" "${TRL_DIR}" "${VLLM_CUSTOMIZATION}"
 export HF_DATASETS_OFFLINE=1
 export HF_HUB_OFFLINE=1
 

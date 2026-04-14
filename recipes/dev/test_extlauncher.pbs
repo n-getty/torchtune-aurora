@@ -4,9 +4,13 @@
 #PBS -l walltime=00:30:00
 #PBS -q debug
 #PBS -A ModCon
-#PBS -o /lus/flare/projects/ModCon/ngetty/torchtune/logs/test_extlauncher.out
-#PBS -e /lus/flare/projects/ModCon/ngetty/torchtune/logs/test_extlauncher.err
+#PBS -o logs/test_extlauncher.out
+#PBS -e logs/test_extlauncher.err
 #PBS -N test_extlauncher
 
-cd /lus/flare/projects/ModCon/ngetty/torchtune
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=recipes/dev/_aurora_paths.sh
+source "${SCRIPT_DIR}/_aurora_paths.sh"
+
+cd "${TORCHTUNE_DIR}"
 bash recipes/dev/run_test_external_launcher.sh 1
