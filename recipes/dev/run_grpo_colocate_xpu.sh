@@ -9,10 +9,14 @@
 # Default: 12 tiles, Qwen2.5-3B, 10 steps, Config A
 set -e
 
-cd /lus/flare/projects/ModCon/ngetty/torchtune
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=recipes/dev/_aurora_paths.sh
+source "${SCRIPT_DIR}/_aurora_paths.sh"
 
-# Load Aurora frameworks module (provides XPU-enabled PyTorch + python 3.12)
-module load frameworks 2>/dev/null || true
+cd "${TORCHTUNE_DIR}"
+
+# Load Aurora frameworks module — MUST use 2025.2.0 (2025.3.1 has broken XCCL allreduce)
+module load frameworks/2025.2.0 2>/dev/null || true
 
 # Remove user virtualenv from PATH so frameworks python is used
 export PATH=$(echo "$PATH" | tr ':' '\n' | grep -v myenv | tr '\n' ':' | sed 's/:$//')
@@ -43,8 +47,8 @@ export TORCH_COMPILE_DISABLE=1
 # Spawn method for vLLM workers (if TP > 1)
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 # usercustomize patch: disable transformers version check (hf-hub 1.7 vs <1.0)
-VLLM_CUSTOMIZATION=/lus/flare/projects/ModCon/ngetty/torchtune/recipes/dev/_usercustomize_vllm
-export PYTHONPATH=/lus/flare/projects/ModCon/ngetty/torchtune:/flare/ModCon/ngetty/trl:${VLLM_CUSTOMIZATION}:$PYTHONPATH
+VLLM_CUSTOMIZATION="${TORCHTUNE_DIR}/recipes/dev/_usercustomize_vllm"
+aurora_export_pythonpath "${TORCHTUNE_DIR}" "${TRL_DIR}" "${VLLM_CUSTOMIZATION}"
 export HF_DATASETS_OFFLINE=1
 export HF_HUB_OFFLINE=1
 

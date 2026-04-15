@@ -1,6 +1,6 @@
 #!/bin/bash
 # Polaris A100 GRPO benchmark launcher
-# Usage: ssh <polaris_compute_node> bash /lus/flare/projects/ModCon/ngetty/torchtune/recipes/dev/polaris_grpo.sh [model] [config]
+# Usage: ssh <polaris_compute_node> bash /path/to/torchtune-aurora/recipes/dev/polaris_grpo.sh [model] [config]
 #
 # Arguments:
 #   model:  8b (default) | 32b

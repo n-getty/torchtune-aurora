@@ -24,12 +24,15 @@
 #PBS -l walltime=0:30:00
 #PBS -q debug
 #PBS -A AuroraGPT
-#PBS -o /lus/flare/projects/ModCon/ngetty/torchtune/logs/fsdp2_multinode_bench.out
-#PBS -e /lus/flare/projects/ModCon/ngetty/torchtune/logs/fsdp2_multinode_bench.err
+#PBS -o logs/fsdp2_multinode_bench.out
+#PBS -e logs/fsdp2_multinode_bench.err
 #PBS -N fsdp2_bench
 # No set -e: we want all tests to run even if some fail
 
-TORCHTUNE_DIR="/lus/flare/projects/ModCon/ngetty/torchtune"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=recipes/dev/_aurora_paths.sh
+source "${SCRIPT_DIR}/_aurora_paths.sh"
+
 cd "${TORCHTUNE_DIR}"
 
 # ============================================================

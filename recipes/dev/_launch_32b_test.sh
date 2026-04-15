@@ -32,5 +32,9 @@ echo "PBS_JOBID=${PBS_JOBID}"
 echo "PBS_JOBCOOKIE=${PBS_JOBCOOKIE:0:8}..."
 echo "PBS_NODEFILE=${PBS_NODEFILE}"
 
-cd /lus/flare/projects/ModCon/ngetty/torchtune
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=recipes/dev/_aurora_paths.sh
+source "${SCRIPT_DIR}/_aurora_paths.sh"
+
+cd "${TORCHTUNE_DIR}"
 bash recipes/dev/aurora_grpo_vllm_hsdp_multinode.sh

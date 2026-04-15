@@ -11,7 +11,11 @@
 # Default: 2 vLLM tiles (TP=2), 10 training tiles, 5 steps
 set -e
 
-PROJDIR=/lus/flare/projects/ModCon/ngetty/torchtune
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=recipes/dev/_aurora_paths.sh
+source "${SCRIPT_DIR}/_aurora_paths.sh"
+
+PROJDIR="${TORCHTUNE_DIR}"
 cd ${PROJDIR}
 
 # Use 2025.2.0 — 2025.3.1 has broken XCCL allreduce (USM pointer validation)
@@ -41,7 +45,7 @@ unset PYTORCH_ALLOC_CONF
 # IMPORTANT: overlay dir must come FIRST so its usercustomize.py is loaded
 # (it includes all patches from _usercustomize_vllm plus Gemma4 registration)
 GEMMA4_OVERLAY=${PROJDIR}/recipes/dev/vllm_gemma4_overlay
-export PYTHONPATH=${GEMMA4_OVERLAY}:${PROJDIR}:/flare/ModCon/ngetty/trl:$PYTHONPATH
+aurora_export_pythonpath "${GEMMA4_OVERLAY}" "${PROJDIR}" "${TRL_DIR}"
 export HF_DATASETS_OFFLINE=1
 export HF_HUB_OFFLINE=1
 

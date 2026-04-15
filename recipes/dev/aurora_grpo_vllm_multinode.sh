@@ -6,7 +6,7 @@
 #PBS -q debug
 #PBS -N grpo_multinode
 #PBS -j oe
-#PBS -o /lus/flare/projects/ModCon/ngetty/torchtune/logs/grpo_multinode.out
+#PBS -o logs/grpo_multinode.out
 #
 # 2-node GRPO with vLLM server on Aurora XPU.
 #
@@ -22,7 +22,10 @@
 #
 set -e
 
-TORCHTUNE_DIR="/lus/flare/projects/ModCon/ngetty/torchtune"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=recipes/dev/_aurora_paths.sh
+source "${SCRIPT_DIR}/_aurora_paths.sh"
+
 cd "${TORCHTUNE_DIR}"
 
 # ============================================================
@@ -66,7 +69,8 @@ export TORCH_COMPILE_DISABLE=1
 
 # vLLM / HuggingFace
 VLLM_CUSTOMIZATION="${TORCHTUNE_DIR}/recipes/dev/_usercustomize_vllm"
-export PYTHONPATH="${TORCHTUNE_DIR}:/flare/ModCon/ngetty/trl:${VLLM_CUSTOMIZATION}:${PYTHONPATH}"
+VLLM_PYTHONPATH="$(aurora_pythonpath "${TORCHTUNE_DIR}" "${TRL_DIR}" "${VLLM_CUSTOMIZATION}")"
+export PYTHONPATH="${VLLM_PYTHONPATH}"
 export HF_DATASETS_OFFLINE=1
 export HF_HUB_OFFLINE=1
 export VLLM_WORKER_MULTIPROC_METHOD=spawn

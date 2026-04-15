@@ -2,6 +2,10 @@
 # Test vLLM TP=2 as a server (matching working Aurora-Inferencing pattern)
 set -e
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=recipes/dev/_aurora_paths.sh
+source "${SCRIPT_DIR}/_aurora_paths.sh"
+
 module load frameworks 2>/dev/null || true
 export PATH=$(echo "$PATH" | tr ':' '\n' | grep -v myenv | tr '\n' ':' | sed 's/:$//')
 unset VIRTUAL_ENV
@@ -17,7 +21,7 @@ export FI_MR_CACHE_MONITOR=userfaultfd
 export OMP_NUM_THREADS=16
 export HF_DATASETS_OFFLINE=1
 export HF_HUB_OFFLINE=1
-export PYTHONPATH=/lus/flare/projects/ModCon/ngetty/torchtune/recipes/dev/_usercustomize_vllm:$PYTHONPATH
+aurora_export_pythonpath "${TORCHTUNE_DIR}/recipes/dev/_usercustomize_vllm"
 
 TP=${2:-2}
 MODEL=${3:-/lus/flare/projects/ModCon/ngetty/models/Qwen2.5-3B}
