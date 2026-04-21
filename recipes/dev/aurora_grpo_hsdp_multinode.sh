@@ -6,7 +6,7 @@
 #PBS -q debug
 #PBS -N grpo_hsdp
 #PBS -j oe
-#PBS -o /lus/flare/projects/ModCon/ngetty/torchtune/logs/grpo_hsdp.out
+#PBS -o logs/grpo_hsdp.out
 #
 # 2-node HSDP GRPO on Aurora XPU (no vLLM — built-in generation).
 #
@@ -26,7 +26,10 @@
 #
 set -e
 
-TORCHTUNE_DIR="/lus/flare/projects/ModCon/ngetty/torchtune"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=recipes/dev/_aurora_paths.sh
+source "${SCRIPT_DIR}/_aurora_paths.sh"
+
 cd "${TORCHTUNE_DIR}"
 
 # ============================================================
@@ -67,7 +70,7 @@ export TORCH_COMPILE_DISABLE=1
 
 # Paths
 VLLM_CUSTOMIZATION="${TORCHTUNE_DIR}/recipes/dev/_usercustomize_vllm"
-export PYTHONPATH="${TORCHTUNE_DIR}:/flare/ModCon/ngetty/trl:${VLLM_CUSTOMIZATION}:${PYTHONPATH}"
+aurora_export_pythonpath "${TORCHTUNE_DIR}" "${TRL_DIR}" "${VLLM_CUSTOMIZATION}"
 export HF_DATASETS_OFFLINE=1
 export HF_HUB_OFFLINE=1
 

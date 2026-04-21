@@ -6,10 +6,14 @@
 #PBS -A ModCon
 #PBS -N grpo_32b_opt
 #PBS -j oe
-#PBS -o /lus/flare/projects/ModCon/ngetty/torchtune/logs/grpo_32b_opt.out
+#PBS -o logs/grpo_32b_opt.out
 
 # 32B GRPO optimization: test TP=2 and TP=4 with batched generation
-cd /lus/flare/projects/ModCon/ngetty/torchtune
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=recipes/dev/_aurora_paths.sh
+source "${SCRIPT_DIR}/_aurora_paths.sh"
+
+cd "${TORCHTUNE_DIR}"
 
 echo "=============================================="
 echo "Test 1: TP=2 vLLM (2 tiles) + 10 training tiles"

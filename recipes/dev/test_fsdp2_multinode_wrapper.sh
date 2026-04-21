@@ -20,6 +20,10 @@
 #                  Default: "ring"
 set -e
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=recipes/dev/_aurora_paths.sh
+source "${SCRIPT_DIR}/_aurora_paths.sh"
+
 SCRIPT="${1:?Usage: test_fsdp2_multinode_wrapper.sh <script.py> [args...]}"
 shift
 
@@ -151,6 +155,5 @@ fi
 # ============================================================
 # Run
 # ============================================================
-TORCHTUNE_DIR="/lus/flare/projects/ModCon/ngetty/torchtune"
 cd "${TORCHTUNE_DIR}"
 python -u "${SCRIPT}" "$@"

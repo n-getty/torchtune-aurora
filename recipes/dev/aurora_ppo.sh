@@ -18,6 +18,10 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=recipes/dev/_aurora_paths.sh
+source "${SCRIPT_DIR}/_aurora_paths.sh"
+
 # ============================================================
 # Configuration
 # ============================================================
@@ -25,7 +29,6 @@ NUM_NODES=${NUM_NODES:-1}
 NGPUS_PER_NODE=12                  # 12 tiles per node (FLAT mode)
 RECIPE="dev/ppo_full_finetune_distributed"
 CONFIG="dev/1B_ppo_distributed_xpu"
-TORCHTUNE_DIR="/lus/flare/projects/ModCon/ngetty/torchtune"
 WRAPPER="${TORCHTUNE_DIR}/recipes/dev/aurora_ppo_wrapper.sh"
 
 # ============================================================

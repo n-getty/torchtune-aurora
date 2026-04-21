@@ -23,12 +23,15 @@
 #PBS -l walltime=1:00:00
 #PBS -q debug
 #PBS -A ModCon
-#PBS -o /lus/flare/projects/ModCon/ngetty/torchtune/logs/grpo_32b_learning_run.out
-#PBS -e /lus/flare/projects/ModCon/ngetty/torchtune/logs/grpo_32b_learning_run.err
+#PBS -o logs/grpo_32b_learning_run.out
+#PBS -e logs/grpo_32b_learning_run.err
 #PBS -N grpo_32b_learn
 set -e
 
-TORCHTUNE_DIR="/lus/flare/projects/ModCon/ngetty/torchtune"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=recipes/dev/_aurora_paths.sh
+source "${SCRIPT_DIR}/_aurora_paths.sh"
+
 cd "${TORCHTUNE_DIR}"
 
 # ============================================================
@@ -84,7 +87,8 @@ export TORCH_COMPILE_DISABLE=1
 
 # Paths
 VLLM_CUSTOMIZATION="${TORCHTUNE_DIR}/recipes/dev/_usercustomize_vllm"
-export PYTHONPATH="${TORCHTUNE_DIR}:/flare/ModCon/ngetty/trl:${VLLM_CUSTOMIZATION}:${PYTHONPATH}"
+VLLM_PYTHONPATH="$(aurora_pythonpath "${TORCHTUNE_DIR}" "${TRL_DIR}" "${VLLM_CUSTOMIZATION}")"
+export PYTHONPATH="${VLLM_PYTHONPATH}"
 export HF_DATASETS_OFFLINE=1
 export HF_HUB_OFFLINE=1
 
@@ -156,7 +160,7 @@ export ZE_AFFINITY_MASK=${VLLM_TILE_START}
 export TORCH_COMPILE_DISABLE=1
 module load frameworks/2025.2.0 2>/dev/null
 export PATH=\$(echo \"\$PATH\" | tr ':' '\n' | grep -v myenv | tr '\n' ':' | sed 's/:\$//')
-export PYTHONPATH='${TORCHTUNE_DIR}:/flare/ModCon/ngetty/trl:${VLLM_CUSTOMIZATION}'
+export PYTHONPATH='${VLLM_PYTHONPATH}'
 export HF_DATASETS_OFFLINE=1
 export HF_HUB_OFFLINE=1
 python3 -c \"
@@ -202,7 +206,7 @@ export ZE_AFFINITY_MASK=${VLLM_MASK}
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export TORCH_COMPILE_DISABLE=1
 unset PYTORCH_ALLOC_CONF
-export PYTHONPATH='${TORCHTUNE_DIR}:/flare/ModCon/ngetty/trl:${VLLM_CUSTOMIZATION}'
+export PYTHONPATH='${VLLM_PYTHONPATH}'
 export HF_DATASETS_OFFLINE=1
 export HF_HUB_OFFLINE=1
 export CCL_PROCESS_LAUNCHER=none

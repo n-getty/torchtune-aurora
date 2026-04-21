@@ -9,6 +9,10 @@
 
 set -e
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=recipes/dev/_aurora_paths.sh
+source "${SCRIPT_DIR}/_aurora_paths.sh"
+
 RECIPE="${1:?Usage: aurora_grpo_vllm_wrapper.sh <RECIPE> <CONFIG> [args...]}"
 CONFIG="${2:?Usage: aurora_grpo_vllm_wrapper.sh <RECIPE> <CONFIG> [args...]}"
 shift 2
@@ -140,9 +144,8 @@ export PYTORCH_ALLOC_CONF=max_split_size_mb:512,garbage_collection_threshold:0.6
 export TORCH_COMPILE_DISABLE=1
 
 # Paths
-TORCHTUNE_DIR="/lus/flare/projects/ModCon/ngetty/torchtune"
 VLLM_CUSTOMIZATION="${TORCHTUNE_DIR}/recipes/dev/_usercustomize_vllm"
-export PYTHONPATH="${TORCHTUNE_DIR}:/flare/ModCon/ngetty/trl:${VLLM_CUSTOMIZATION}:${PYTHONPATH:-}"
+aurora_export_pythonpath "${TORCHTUNE_DIR}" "${TRL_DIR}" "${VLLM_CUSTOMIZATION}"
 export PATH=$(echo "$PATH" | tr ':' '\n' | grep -v myenv | tr '\n' ':' | sed 's/:$//')
 unset VIRTUAL_ENV 2>/dev/null; true
 export HF_DATASETS_OFFLINE=1

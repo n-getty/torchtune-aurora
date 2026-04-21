@@ -6,10 +6,13 @@
 #PBS -q debug
 #PBS -N ccl_test
 #PBS -j oe
-#PBS -o /lus/flare/projects/ModCon/ngetty/torchtune/logs/ccl_multinode_test.out
+#PBS -o logs/ccl_multinode_test.out
 set -e
 
-TORCHTUNE_DIR="/lus/flare/projects/ModCon/ngetty/torchtune"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=recipes/dev/_aurora_paths.sh
+source "${SCRIPT_DIR}/_aurora_paths.sh"
+
 cd "${TORCHTUNE_DIR}"
 
 module load frameworks 2>/dev/null || true

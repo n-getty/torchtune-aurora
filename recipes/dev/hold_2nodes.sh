@@ -4,8 +4,8 @@
 #PBS -l walltime=1:00:00
 #PBS -q debug
 #PBS -A AuroraGPT
-#PBS -o /lus/flare/projects/ModCon/ngetty/torchtune/hold_2nodes.out
-#PBS -e /lus/flare/projects/ModCon/ngetty/torchtune/hold_2nodes.err
+#PBS -o logs/hold_2nodes.out
+#PBS -e logs/hold_2nodes.err
 #PBS -N hold_2nodes
 
 echo "Nodes: $(cat $PBS_NODEFILE | sort -u | tr '\n' ' ')"

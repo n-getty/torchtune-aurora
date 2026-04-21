@@ -6,6 +6,10 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=recipes/dev/_aurora_paths.sh
+source "${SCRIPT_DIR}/_aurora_paths.sh"
+
 RECIPE="${1:?Usage: aurora_grpo_wrapper.sh <RECIPE> <CONFIG>}"
 CONFIG="${2:?Usage: aurora_grpo_wrapper.sh <RECIPE> <CONFIG>}"
 shift 2
@@ -29,8 +33,6 @@ export MASTER_PORT=${MASTER_PORT:-29500}
 # Module and paths
 # ============================================================
 module load frameworks 2>/dev/null || true
-
-TORCHTUNE_DIR="/lus/flare/projects/ModCon/ngetty/torchtune"
 
 # ============================================================
 # Log rank info

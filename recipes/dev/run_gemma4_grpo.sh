@@ -1,5 +1,9 @@
 #!/bin/bash
-PROJDIR=/lus/flare/projects/ModCon/ngetty/torchtune
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=recipes/dev/_aurora_paths.sh
+source "${SCRIPT_DIR}/_aurora_paths.sh"
+
+PROJDIR="${TORCHTUNE_DIR}"
 cd ${PROJDIR}
 # Use 2025.2.0 — 2025.3.1 has broken XCCL allreduce (USM pointer validation)
 module load frameworks/2025.2.0 2>/dev/null || true
@@ -16,7 +20,7 @@ export FI_CXI_OFLOW_BUF_SIZE=8388608
 export FI_CXI_DEFAULT_CQ_SIZE=131072
 export FI_MR_CACHE_MONITOR=userfaultfd
 export PYTORCH_ALLOC_CONF=expandable_segments:True
-export PYTHONPATH=${PROJDIR}:$PYTHONPATH
+aurora_export_pythonpath "${PROJDIR}"
 export HF_DATASETS_OFFLINE=1
 export HF_HUB_OFFLINE=1
 

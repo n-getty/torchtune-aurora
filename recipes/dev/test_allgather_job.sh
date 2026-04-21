@@ -4,12 +4,15 @@
 #PBS -l walltime=00:15:00
 #PBS -q debug
 #PBS -A AuroraGPT
-#PBS -o /lus/flare/projects/ModCon/ngetty/torchtune/logs/test_allgather.out
-#PBS -e /lus/flare/projects/ModCon/ngetty/torchtune/logs/test_allgather.err
+#PBS -o logs/test_allgather.out
+#PBS -e logs/test_allgather.err
 #PBS -N test_allgather
 
 set -e
-TORCHTUNE_DIR="/lus/flare/projects/ModCon/ngetty/torchtune"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=recipes/dev/_aurora_paths.sh
+source "${SCRIPT_DIR}/_aurora_paths.sh"
+
 cd "${TORCHTUNE_DIR}"
 
 UNIQUE_NODES=($(cut -d'.' -f1 "$PBS_NODEFILE" | awk '!seen[$0]++'))

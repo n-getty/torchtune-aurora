@@ -15,8 +15,11 @@
 #   Nearly doubles generation throughput for small models (3B).
 set -e
 
-PROJDIR=/lus/flare/projects/ModCon/ngetty/torchtune
-cd ${PROJDIR}
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=recipes/dev/_aurora_paths.sh
+source "${SCRIPT_DIR}/_aurora_paths.sh"
+
+cd "${TORCHTUNE_DIR}"
 
 # Load Aurora frameworks module — MUST use 2025.2.0 (2025.3.1 has broken XCCL allreduce)
 module load frameworks/2025.2.0 2>/dev/null || true
@@ -50,14 +53,14 @@ export CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD=65536
 # single-node FSDP2 — they force the scheduler path which doesn't support
 # ReduceOp.AVG. Only needed for multi-node with large tensors.
 # usercustomize patch: disable transformers version check (hf-hub 1.7 vs <1.0)
-VLLM_CUSTOMIZATION=/lus/flare/projects/ModCon/ngetty/torchtune/recipes/dev/_usercustomize_vllm
-VLLM_GEMMA4_OVERLAY=/lus/flare/projects/ModCon/ngetty/torchtune/recipes/dev/vllm_gemma4_overlay
+VLLM_CUSTOMIZATION="${TORCHTUNE_DIR}/recipes/dev/_usercustomize_vllm"
+VLLM_GEMMA4_OVERLAY="${TORCHTUNE_DIR}/recipes/dev/vllm_gemma4_overlay"
 # If VLLM_GEMMA4=1, use Gemma4 overlay usercustomize (registers gemma4 arch with vLLM)
 # instead of the standard one. The overlay's usercustomize.py includes all Aurora patches.
 if [ "${VLLM_GEMMA4:-0}" = "1" ]; then
-    VLLM_CUSTOMIZATION=${VLLM_GEMMA4_OVERLAY}
+    VLLM_CUSTOMIZATION="${VLLM_GEMMA4_OVERLAY}"
 fi
-export PYTHONPATH=/lus/flare/projects/ModCon/ngetty/torchtune:/flare/ModCon/ngetty/trl:${VLLM_CUSTOMIZATION}:$PYTHONPATH
+aurora_export_pythonpath "${TORCHTUNE_DIR}" "${TRL_DIR}" "${VLLM_CUSTOMIZATION}"
 export HF_DATASETS_OFFLINE=1
 export HF_HUB_OFFLINE=1
 
