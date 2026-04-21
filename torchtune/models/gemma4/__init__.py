@@ -6,14 +6,18 @@
 
 from ._component_builders import gemma4  # noqa
 from ._model_builders import (  # noqa
+    gemma4_26b_a4b,
     gemma4_31b,
     gemma4_tokenizer,
 )
+from ._parallelism import gemma4_ep_plan  # noqa
 from ._tokenizer import Gemma4Tokenizer  # noqa
 
 __all__ = [
     "Gemma4Tokenizer",
     "gemma4",
+    "gemma4_26b_a4b",
     "gemma4_31b",
+    "gemma4_ep_plan",
     "gemma4_tokenizer",
 ]

@@ -82,8 +82,9 @@ class GRPOLoss(nn.Module):
         )  # [B x G, L]
         policy_loss = rlhf.masked_mean(policy_loss, padding_masks)
 
+        _kl_diff = (ref_logprobs - pi_logprobs).clamp(max=20.0)  # prevent exp() overflow → Inf → NaN
         kl_loss = (
-            torch.exp(ref_logprobs - pi_logprobs) - (ref_logprobs - pi_logprobs) - 1
+            torch.exp(_kl_diff) - _kl_diff - 1
         )  # [B x G]
         kl_loss = rlhf.masked_mean(kl_loss, padding_masks)
 
@@ -168,8 +169,9 @@ class GRPOCompletionLoss(nn.Module):
         )  # [B x G]
         policy_loss = policy_loss.mean()  # scalar
 
+        _kl_diff = (ref_logprobs - pi_logprobs).clamp(max=20.0)  # prevent exp() overflow → Inf → NaN
         kl_loss = (
-            torch.exp(ref_logprobs - pi_logprobs) - (ref_logprobs - pi_logprobs) - 1
+            torch.exp(_kl_diff) - _kl_diff - 1
         )  # [B x G]
         kl_loss = rlhf.masked_mean(kl_loss, padding_masks)
 

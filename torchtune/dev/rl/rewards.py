@@ -267,6 +267,133 @@ def extract_tags(text: str) -> tuple[str, str]:
     return cot, potential_answer
 
 
+_GENE_STOP_WORDS = {
+    "THE", "AND", "FOR", "ARE", "BUT", "NOT", "YOU", "ALL", "CAN",
+    "HER", "WAS", "ONE", "OUR", "OUT", "DAY", "GET", "HAS", "HIM",
+    "HIS", "HOW", "ITS", "MAY", "NEW", "NOW", "OLD", "SEE", "TWO",
+    "WAY", "WHO", "BOY", "DID", "HIT", "LET", "MEN", "PUT", "SAY",
+    "SHE", "TOO", "USE", "LIST", "CORE", "GENE", "GENES", "INVOLVED",
+    "FOLLOWING", "NARRATIVE", "INCLUDE", "INCLUDING", "SUCH", "AS",
+    "IN", "OF", "TO", "IS", "IT", "BE", "AT", "BY", "AN", "OR",
+    "IF", "NO", "UP", "SO", "DO", "GO", "ME", "MY", "ON", "WE",
+    "DNA", "RNA", "ATP", "ADP", "ECM", "ROS", "TGF", "EGF",
+}
+_GENE_PATTERN = re.compile(r"\b([A-Z][A-Z0-9]{1,9})\b")
+_GENES_TAG_RE = re.compile(r"<genes>(.*?)</genes>", re.DOTALL | re.IGNORECASE)
+
+
+def _extract_genes(text: str) -> set:
+    """Extract gene symbols from text.
+
+    If the text contains a <genes>...</genes> tag (from the reasoning prompt
+    format), parse only the tag contents. Falls back to scanning the full
+    text during early training when the model hasn't learned the format yet.
+    """
+    m = _GENES_TAG_RE.search(text)
+    source = m.group(1) if m else text
+    candidates = _GENE_PATTERN.findall(source)
+    return {g for g in candidates if g not in _GENE_STOP_WORDS}
+
+
+def _gene_f1(predicted: set, reference: set) -> float:
+    if not predicted and not reference:
+        return 1.0
+    if not predicted or not reference:
+        return 0.0
+    tp = len(predicted & reference)
+    precision = tp / len(predicted)
+    recall = tp / len(reference)
+    if precision + recall == 0:
+        return 0.0
+    return 2 * precision * recall / (precision + recall)
+
+
+class GeneRecallReward(Reward):
+    """
+    Reward for gene recall tasks: F1 score between predicted and reference HGNC gene sets.
+
+    The model's completion is scanned for uppercase gene-symbol tokens (e.g. TP53, BRCA1).
+    The ``answer`` field contains the reference comma-separated gene list.
+
+    Args:
+        reward_metric (str): "f1" (default), "recall", or "jaccard"
+    """
+
+    def __init__(self, reward_metric: str = "f1"):
+        self.reward_metric = reward_metric
+
+    def _score(self, predicted: set, reference: set) -> float:
+        if self.reward_metric == "recall":
+            if not reference:
+                return 1.0
+            return len(predicted & reference) / len(reference)
+        if self.reward_metric == "jaccard":
+            union = predicted | reference
+            if not union:
+                return 1.0
+            return len(predicted & reference) / len(union)
+        return _gene_f1(predicted, reference)
+
+    def __call__(
+        self,
+        completion_ids: torch.Tensor,
+        completions: list[str],
+        answers: list[str],
+    ) -> RewardOutput:
+        rewards = []
+        for completion, answer in zip(completions, answers):
+            predicted = _extract_genes(completion)
+            reference = _extract_genes(answer)
+            rewards.append(self._score(predicted, reference))
+        rewards_t = torch.tensor(rewards, dtype=torch.float32)
+        return RewardOutput(
+            reward_base_name="gene_recall",
+            total_reward=rewards_t,
+            successes=(rewards_t >= 0.5).float(),
+            rewards={"f1": rewards_t},
+        )
+
+
+def gene_recall_batched_rewards(
+    tokenizer: Union[ModelTokenizer, HuggingFaceModelTokenizer],
+    completions: torch.Tensor,
+    answers: list[str],
+    device: torch.device,
+    reward_metric: str = "f1",
+) -> tuple[torch.Tensor, torch.Tensor, dict]:
+    """
+    Batched gene recall rewards for use in ``generate_trajectory``.
+
+    Returns tensors shaped [batch_size, grpo_size, 1] matching the interface
+    of ``batched_rewards``.
+    """
+    reward_fn = GeneRecallReward(reward_metric=reward_metric)
+
+    batch_size, grpo_size, _ = completions.shape
+
+    rewards_tensor = torch.zeros(
+        batch_size, grpo_size, 1, dtype=torch.float32, device=device
+    )
+    successes_tensor = torch.zeros(
+        batch_size, grpo_size, 1, dtype=torch.float32, device=device
+    )
+
+    for b in range(batch_size):
+        for g in range(grpo_size):
+            answer = answers[b]
+            text_completion = tokenizer.decode(completions[b, g].tolist())
+            out = reward_fn(
+                completion_ids=completions[b, g],
+                completions=[text_completion],
+                answers=[answer],
+            )
+            rewards_tensor[b, g, 0] = out.total_reward[0]
+            successes_tensor[b, g, 0] = out.successes[0]
+
+    metadata = {"func_names": ["gene_recall"]}
+    return rewards_tensor, successes_tensor, metadata
+
+
 def batched_rewards(
     tokenizer: Union[ModelTokenizer, HuggingFaceModelTokenizer],
     completions: torch.Tensor,

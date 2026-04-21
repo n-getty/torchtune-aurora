@@ -6,7 +6,7 @@
 
 from typing import Optional
 
-from torchtune.models.gemma4._component_builders import gemma4
+from torchtune.models.gemma4._component_builders import gemma4, gemma4_26b_a4b as _gemma4_26b_a4b
 from torchtune.models.gemma4._tokenizer import Gemma4Tokenizer
 from torchtune.modules import TransformerDecoder
 
@@ -38,6 +38,20 @@ def gemma4_31b() -> TransformerDecoder:
         norm_eps=1e-6,
         final_capping_value=30.0,
     )
+
+
+def gemma4_26b_a4b() -> TransformerDecoder:
+    """
+    Builder for the Gemma 4 26B-A4B MoE model.
+
+    25.2B total parameters, ~3.8B active per forward pass (top-8 of 128 experts).
+    30 layers with additive MoE blocks (dense MLP + MoE output summed per layer).
+    Same hybrid sliding/global attention as the 31B dense model.
+
+    Returns:
+        TransformerDecoder: Gemma 4 26B-A4B model with default hyperparameters.
+    """
+    return _gemma4_26b_a4b()
 
 
 def gemma4_tokenizer(

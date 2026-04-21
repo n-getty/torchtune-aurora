@@ -2165,3 +2165,374 @@ because Gemma4's native generation is slower (111s vs ~70s).
 1. **Tune Gemma4 GRPO hyperparams**: Lower lr, increase KL coefficient, test warmup
 2. **Test G=8/fbs=8**: Match the optimal Qwen3 config to validate projected throughput (~27s/step)
 3. **Multi-node HSDP**: Test 2-node HSDP with Gemma4 (should work identically to Qwen3)
+
+## Phase 14: Gemma 4 26B-A4B MoE — vLLM GRPO Baseline (2026-04-10)
+
+**Purpose**: Establish GRPO throughput for Gemma 4 26B-A4B (128-expert MoE, 8 active/token)
+on Aurora using the same vLLM server setup as the 31B dense baseline for a fair comparison.
+
+**System**: Aurora, single node (x43xxc...), 12 tiles/node, 24 GiB HBM per tile
+**Config**: `recipes/configs/dev/production/gemma4_26b_a4b_grpo_server_xpu.yaml`
+**Script**: `recipes/dev/aurora_grpo_26b_a4b.sh` (PBS job)
+**Setup**: 2 vLLM tiles (TP=2, tiles 10-11) + 10 training tiles (FSDP, tiles 0-9)
+
+### Model Architecture
+
+| Parameter | Value |
+|-----------|-------|
+| Total params | ~25.2B |
+| Layers | 30 (vs 31B's 60) |
+| Hidden size | 2816 (vs 31B's 5376) |
+| Dense FFN intermediate | 2112 |
+| MoE experts per layer | 128, top-8 active |
+| MoE intermediate per expert | 704 |
+| Attention pattern | 5× sliding + 1× global (same as 31B) |
+| KV heads (local/global) | 8 / 8 |
+| head_dim (local/global) | 256 / 512 |
+
+**Additive MoE**: each layer runs a dense MLP **plus** a MoE block; outputs are summed.
+Both run regardless of routing — dense MLP is always active.
+
+### vLLM Overlay: MoE Support
+
+The `vllm_gemma4_overlay` was extended with:
+- `Gemma4TextConfig`: added `enable_moe_block`, `num_experts`, `top_k_experts`, `moe_intermediate_size`
+- `Gemma4MoEBlock` class: router (scale → proj → per_expert_scale → sigmoid → topk) +
+  fused gate_up experts + down experts + dispatch/accumulate
+- `Gemma4DecoderLayer`: conditional MoE path (3 new norms: `pre_moe_norm`, `post_mlp_norm`, `post_moe_norm`)
+- `load_weights`: MoE weight remapping (HF key names → overlay attribute names)
+
+### Results — job 8430874 (before bmm fix, for-loop overlay)
+
+**GRPO config**: batch_size=1, grpo_samples=4, max_generated_tokens=128, BF16, ac=True
+
+| Step | Total | vLLM gen | Policy fwd | Ref fwd | GRPO step |
+|------|-------|----------|-----------|--------|-----------|
+| 0 (warmup) | 78.8 s | 39.3 s | 5.9 s | 1.3 s | 24.4 s |
+| 1 | 45.8 s | 38.0 s | 1.4 s | 1.4 s | 4.9 s |
+| 2 | 57.5 s | 49.6 s | 1.4 s | 1.4 s | 5.0 s |
+| 3 | 45.3 s | 38.2 s | 1.3 s | 1.3 s | 4.4 s |
+| 4 | vLLM OOM — crashed | | | | |
+
+Steady-state average (steps 1–3): **~49.5 s/step** — 2× slower than 31B dense.
+
+### Results — interactive test on x4311c0s0b0n0 (after bmm fix)
+
+Same config. `Gemma4MoEBlock.forward()` replaced with scatter→bmm→gather.
+
+| Step | Total | vLLM gen | Policy fwd | Ref fwd | GRPO step |
+|------|-------|----------|-----------|--------|-----------|
+| 0 (warmup) | 49.8 s | 17.8 s | 6.2 s | 1.3 s | 21.8 s |
+| 1 | **24.1 s** | 16.4 s | 1.4 s | 1.4 s | 4.8 s |
+| 2 | **24.3 s** | 16.3 s | 1.4 s | 1.4 s | 5.0 s |
+| 3 | vLLM OOM (KV cache exhausted at gpu_mem_util=0.75) | | | | |
+
+Steady-state average (steps 1–2): **~24.2 s/step**
+
+**The bmm fix cut vLLM generation from 38–50 s → 16.3–16.4 s (2.3–3.0× speedup).**
+
+**Training component (policy fwd + ref fwd + GRPO backward + optimizer)**: ~4.9–5.1 s/step.
+
+### Memory (training tiles, between-step)
+
+| Metric | Value |
+|--------|-------|
+| Allocated per tile (ranks 0–8) | 20.66 GiB |
+| Allocated per tile (rank 9, boundary shard) | 19.35 GiB |
+| Reserved (cached) | ~52.99 GiB |
+
+Uses system memory as buffer beyond the 24 GiB HBM — stable as long as reserved
+blocks are reused (no `empty_cache()` calls).
+
+`enable_activation_checkpointing: True` required — without it OOM on rank 8 during
+backward (30 MoE layers × padded expert activation tensors exceed 24 GiB).
+
+### Comparison: 26B-A4B vs 31B Dense (after bmm fix)
+
+Same config (grpo_samples=4, max_generated_tokens=128, TP=2 vLLM, 10+2 tiles):
+
+| Model | vLLM gen | Training | Total/step |
+|-------|----------|----------|-----------|
+| Gemma 4 31B dense | ~18 s | ~5 s | **~23 s** |
+| Gemma 4 26B-A4B MoE (before fix) | ~38–50 s | ~5 s | **~49 s** |
+| Gemma 4 26B-A4B MoE (after bmm fix) | ~16.3 s | ~5 s | **~24 s** |
+
+**After the bmm fix, 26B-A4B matches the 31B dense baseline (~24 s vs ~23 s/step).**
+The MoE model now generates *faster* than the dense model in vLLM (16.3 s vs ~18 s)
+because the 26B has fewer total tokens to process (30 layers vs 60, smaller hidden dim).
+
+### Root Cause Analysis: Why MoE is Slower in vLLM
+
+**1. Naive for-loop in the overlay (primary bottleneck)**
+
+The `Gemma4MoEBlock.forward()` in `vllm_gemma4_overlay/gemma4.py` iterates
+over all 128 experts in Python:
+
+```python
+for e in range(self.num_experts):   # 128 iterations × 30 layers = 3840 passes
+    mask = (flat_indices == e)
+    if not mask.any(): continue
+    toks = x[token_ids[mask]]       # gather
+    ...                             # 3 small matmuls
+    out.index_add_(...)             # scatter
+```
+
+This causes **3840 Python loop iterations** per prefill/decode step, each dispatching
+3–4 small GPU kernels. The training recipe had the same problem before the bmm_scatter
+fix brought forward time from ~seconds-per-expert to 1.4s total.
+
+For vLLM inference with sequence lengths of 64–128 tokens at batch_size=4, there
+are ~256–512 token dispatches across 128 experts, but the loop still runs 3840 times
+regardless — most iterations hit `if not mask.any(): continue` but still incur
+Python overhead and kernel launch latency.
+
+**Fix applied**: Replaced the Python for-loop with scatter→bmm→gather (same approach as
+`torchtune/modules/moe/experts.py`). New forward: argsort dispatch pairs by expert →
+scatter into `x_padded [E, max_T, H]` → 3 `torch.bmm` calls over all experts at once →
+gather back with `scatter_add_`. Eliminates 3840 Python iterations per prefill step.
+Expected to cut vLLM generation from 38–50 s to a fraction (same 4–7× seen in training).
+
+**2. Total FFN weight bytes: MoE > dense (counterintuitive)**
+
+Despite only 8 of 128 experts being active per token, vLLM must read weights for all
+experts that receive any tokens in the batch. For small batches with 4 sequences × 128
+tokens, the 128 experts may each receive only 0–4 tokens — but the router scores all
+128 to decide routing, requiring all `router.proj.weight [128, 2816]` to be read
+per layer.
+
+More importantly, the raw weight volume:
+- **Dense MLP per layer** (26B): 2816 × 2112 × 3 = ~17.8M params → ~35.6 MB (bf16)
+- **MoE per layer** (26B): 128 × (2816 × 704 × 3) = ~764M params → ~1,528 MB (bf16)
+- **Total FFN per layer**: ~1,564 MB
+- **Total FFN (30 layers)**: ~46.9 GB
+
+For comparison:
+- **31B dense FFN per layer**: 5376 × 21504 × 3 = ~346M params → ~692 MB (bf16)
+- **Total FFN (60 layers)**: ~41.5 GB
+
+The 26B MoE has **13% more FFN bytes** than 31B dense. With TP=2, each vLLM tile
+must still hold ~23.5 GB of expert weights alone — leaving almost no room for KV cache,
+which explains the OOM at step 4.
+
+**3. vLLM OOM at step 4**
+
+With `gpu_memory_utilization=0.80` on 24 GiB tiles:
+- Available for model+kvcache: ~19.2 GiB per tile
+- Expert weights per tile (TP=2, all 128 experts): ~15.7 GiB
+- Remaining for KV cache: ~3.5 GiB → exhausted after 3 round-trips of 4 sequences
+
+### Fix Plan
+
+**Short-term (overlay bmm fix)**:
+Replace the Python for-loop in `Gemma4MoEBlock.forward()` with the same
+scatter→bmm→gather pattern. Weight tensor layout `[E, 2*mid, H]` supports batched
+bmm directly after gather. Expected speedup: 5–10× on the dispatch loop.
+
+**Longer-term (TP=4)**:
+4 vLLM tiles (TP=4) splits all 128 experts across 4 tiles → ~5.9 GiB/tile for
+expert weights, leaving ~13 GiB for KV cache (vs ~3.5 GiB at TP=2). Eliminates OOM
+and nearly halves per-tile memory pressure.
+
+With TP=4 + 8 training tiles + overlay bmm fix, target: **20–30 s/step** (comparable to 31B).
+
+### vLLM Startup
+
+| Stage | Time |
+|-------|------|
+| Model staging to /tmp (from Lustre) | ~90 s (44.99 GiB) |
+| vLLM server ready | ~140 s from process start |
+| Model load reported by vLLM | 13.7 s (from /tmp, warm) |
+
+### Files Created/Modified
+
+| File | Action |
+|------|--------|
+| `recipes/dev/vllm_gemma4_overlay/vllm_gemma4_config.py` | Modified — added MoE params |
+| `recipes/dev/vllm_gemma4_overlay/gemma4.py` | Modified — `Gemma4MoEBlock`, MoE decoder path, weight remap |
+| `recipes/configs/dev/production/gemma4_26b_a4b_grpo_server_xpu.yaml` | Created |
+| `recipes/dev/aurora_grpo_26b_a4b.sh` | Created — PBS job script |
+
+---
+
+## Phase 14 Update: `CACHE_NUM_KV_HEADS` Fix + Confirmed Multi-Step Stability (2026-04-10)
+
+### Bug: Step 3 Crash Was Not KV Cache OOM
+
+After the bmm fix landed (~16.3 s vLLM gen, 24 s/step), the job crashed at step 3
+with a tensor shape error. Initial diagnosis suspected KV cache OOM; the real cause was
+a **hardcoded class constant** in the vLLM overlay.
+
+```
+RuntimeError: shape '[-1, 8, 256]' invalid for input of size 246784
+```
+
+**Root cause**: `Gemma4Attention.CACHE_NUM_KV_HEADS = 16` was hardcoded for the 31B
+dense model. The 26B-A4B MoE has **8 local KV heads** (not 16). With TP=2:
+
+- Old (wrong): `cache_num_kv_heads_tp = 16 // 2 = 8` → `k.view(-1, 8, 256)` requires
+  2048 elements/token, but k tensor has only `4 × 256 = 1024` elements/token → shape
+  error whenever total token count T is odd (T=241 in the failing step).
+- Fixed: `cache_num_kv_heads_tp = 8 // 2 = 4` → `k.view(-1, 4, 256)` = 1024
+  elements/token. Matches the actual k tensor size exactly.
+
+**KV cache allocation**: With wrong value (16 heads), vLLM over-allocated KV cache
+(fewer total slots → ~76,000 tokens). With correct value (8 heads), KV cache allocates
+~123,136 tokens — substantially more headroom. This is why the crash appeared only at
+step 3: the shape error only triggers when T is odd, which happened to be step 3's batch.
+
+### Fix Applied
+
+In `recipes/dev/vllm_gemma4_overlay/gemma4.py`, `Gemma4Attention.__init__()`:
+
+```python
+# Sliding layers define the uniform cache head count for ALL layers.
+# 31B dense: num_kv_heads=16 → CACHE_NUM_KV_HEADS=16 (unchanged)
+# 26B-A4B MoE: num_kv_heads=8 → CACHE_NUM_KV_HEADS=8 (fixed)
+if is_sliding:
+    Gemma4Attention.CACHE_NUM_KV_HEADS = num_kv_heads
+```
+
+The class constant `CACHE_NUM_KV_HEADS: int = 16` is now overridden at init time from
+the actual model config. The 31B model is unaffected (its sliding layers also have 16 KV
+heads, so the constant stays 16).
+
+### Confirmed Results: Clean 4-Step Run (job 8431046, node x4400c3s5b0n0)
+
+10 training tiles + 2 vLLM tiles (TP=2), grpo_samples=4, max_generated_tokens=128:
+
+| Step | Total | vLLM gen | GRPO | Notes |
+|------|-------|----------|------|-------|
+| 1 (warmup) | 37.1 s | 32.1 s | 4.9 s | compilation + first-batch overhead |
+| 2 | 24.9 s | **16.6 s** | 5.0 s | steady state |
+| 3 | 24.2 s | **16.5 s** | 4.5 s | no crash (was crashing here before fix) |
+| 4 | 24.4 s | **16.4 s** | 4.9 s | stable |
+
+**Run completed cleanly — no crash, no OOM.** vLLM KV cache usage peaked at ~1.0%
+(far below the previous session's OOM threshold).
+
+### Final Benchmark: Gemma 4 26B-A4B vLLM GRPO (all fixes applied)
+
+| Fix | vLLM gen | Total/step | Stability |
+|-----|----------|------------|-----------|
+| Baseline (for-loop MoE, wrong cache) | 38–50 s | ~49 s | crashes step 3 |
+| + bmm scatter/gather fix | ~16.3 s | ~24 s | crashes step 3 |
+| + CACHE_NUM_KV_HEADS fix | **~16.5 s** | **~24.5 s** | **stable, ≥4 steps** |
+
+**26B-A4B with both fixes = 24.5 s/step, matches 31B dense (23 s/step).** The MoE
+model generates faster in vLLM than the dense model (16.5 s vs ~18 s per step) because
+it has fewer layers (30 vs 60) and a smaller hidden dimension (2816 vs 7680).
+
+### Memory (unchanged from before)
+- Training tiles (ranks 0–8): 20.66 GiB allocated, 52.99 GiB reserved (system overflow)
+- Training tile rank 9: 19.35 GiB allocated, 49.52 GiB reserved
+- `enable_activation_checkpointing: True` required (30 MoE layers exceed 24 GiB HBM)
+- vLLM KV cache: ~123,136 total tokens (correct with 8-head fix), ~1% peak utilization
+
+### Files Modified
+
+| File | Action |
+|------|--------|
+| `recipes/dev/vllm_gemma4_overlay/gemma4.py` | Fixed `CACHE_NUM_KV_HEADS` — dynamic from model config |
+
+---
+
+## Phase 15: Gene Recall RL Training (2026-04-15)
+
+End-to-end GRPO RL training for cancer biology gene recall: given a narrative
+description, predict the HGNC gene set. Reward is F1 score between predicted
+and reference gene sets.
+
+### Qwen2.5-3B Gene Recall (Baseline)
+
+**Config**: `recipes/configs/dev/production/qwen3B_gene_recall_xpu.yaml`
+10 training tiles (FSDP) + 2 vLLM tiles (DP=2, TP=1), batch=2, G=8, max_gen=512.
+
+**Initial reward signal** (first 100 steps, lr=5e-6, kl_coeff=0.1):
+- Step 1: F1=0.104 (random baseline)
+- Step 100: F1~0.12-0.15 (early improvement visible, reward still noisy)
+- Step time: ~5-6s/step with 2 vLLM tiles DP=2
+
+### Gemma4 31B Gene Recall
+
+**Config**: `recipes/configs/dev/production/gemma4_31B_gene_recall_xpu.yaml`
+10 training tiles (FSDP2) + 2 vLLM tiles (TP=2), batch=1, G=4, max_gen=512.
+
+#### Bug: `_build_tune_to_hf_map` KeyError for `layer_scalar`
+
+Gemma4 decoder layers contain a `layer_scalar` buffer (`register_buffer`) that
+appears in `state_dict()` but not in `named_parameters()`. The weight sync code
+was trying to map it via Qwen2's `_FROM_HF` dict → `KeyError`.
+
+**Fix**: Dispatch on `self._checkpointer._model_type` (a `ModelType` enum) to
+import the correct model-specific `_FROM_HF` dict:
+
+```python
+if _model_type == ModelType.GEMMA4:
+    from torchtune.models.gemma4._convert_weights import _GEMMA4_FROM_HF as _FROM_HF
+```
+
+`_GEMMA4_FROM_HF` includes `"model.language_model.layers.{}.layer_scalar": "layers.{}.layer_scalar"`.
+
+#### Bug: KL Divergence Overflow
+
+With lr=5e-6, by step 3 `kl_loss` exploded (4e18) and `grad_norm` → ∞,
+corrupting all parameters. Root cause: `exp(ref_logprobs - pi_logprobs)` overflows
+when the policy diverges and the difference is large.
+
+**Fix** (`torchtune/dev/grpo/loss.py`):
+```python
+_kl_diff = (ref_logprobs - pi_logprobs).clamp(max=20.0)  # prevent exp() overflow
+kl_loss = torch.exp(_kl_diff) - _kl_diff - 1
+```
+Applied at both occurrences in `GRPOSimpleLoss.forward()`.
+
+Also reduced lr 5e-6 → 1e-6 and kl_coeff 0.1 → 0.01.
+
+**Result**: Training stable with kl_loss=3-5, grad_norm=200-4000 (no divergence).
+
+### Weight Sync: /tmp (NVMe) → /dev/shm (RAM)
+
+**Problem**: The file-based weight sync writes the full model (~62 GB BF16 for 31B)
+to `/tmp` (NVMe SSD) then vLLM reads it back. This takes **70-80s per step** — the
+dominant bottleneck (vs 23.6s baseline without weight sync).
+
+**Root cause**: NVMe I/O for 62 GB sequential write + read.
+
+**Fix**: Use `/dev/shm` (RAM-backed tmpfs) instead of `/tmp`. Aurora nodes have
+**504 GB `/dev/shm`** — writing and reading there is pure memory bandwidth, ~10-20×
+faster than NVMe for large files.
+
+**Implementation**:
+- `recipes/dev/grpo_full_finetune_distributed_xpu.py`: changed `_weight_sync_path`
+  from `/tmp/torchtune/weight_update.safetensors` to `/dev/shm/torchtune/weight_update.safetensors`
+- `recipes/dev/run_grpo_vllm_xpu.sh`: added `mkdir -p /dev/shm/torchtune` and cleanup
+  `rm -f /dev/shm/torchtune/weight_update.safetensors` in trap
+- Added per-phase timing logs: `gather=Xs write=Xs vllm_load=Xs`
+
+**Expected improvement**: 70-80s → ~5-10s for the write+read of 62 GB in RAM.
+The gather phase (FSDP2 `full_tensor()` all-gathers within shard group) is independent
+and unchanged.
+
+### Fast Validation Config: Qwen2.5-3B with vLLM
+
+`recipes/configs/dev/production/qwen3B_gene_recall_fast_xpu.yaml`
+
+3 tiles total (2 training + 1 vLLM), no FSDP sharding needed (3B model ~6 GB BF16
+fits on 1 tile). DDP only. Goal: ~2-4s/step for rapid hyperparameter validation.
+
+```bash
+VLLM_GEMMA4=0 bash recipes/dev/run_grpo_vllm_xpu.sh 1 2 \
+  /lus/flare/projects/ModCon/ngetty/models/Qwen2.5-3B 50 \
+  recipes/configs/dev/production/qwen3B_gene_recall_fast_xpu.yaml
+```
+
+### Files Modified
+
+| File | Change |
+|------|--------|
+| `recipes/dev/grpo_full_finetune_distributed_xpu.py` | `/dev/shm` weight sync path; `_build_tune_to_hf_map` ModelType dispatch; per-phase timing |
+| `torchtune/dev/grpo/loss.py` | `clamp(max=20.0)` before `exp()` in KL formula (both occurrences) |
+| `torchtune/dev/vllm_weight_sync_worker.py` | Added `time` import; per-phase timing in `load_weights_from_path` |
+| `recipes/dev/run_grpo_vllm_xpu.sh` | `/dev/shm/torchtune` mkdir + cleanup |
+| `recipes/configs/dev/production/gemma4_31B_gene_recall_xpu.yaml` | New config (lr=1e-6, kl_coeff=0.01, max_gen=512) |
+| `recipes/configs/dev/production/qwen3B_gene_recall_fast_xpu.yaml` | New fast validation config (2+1 tiles) |

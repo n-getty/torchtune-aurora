@@ -7,13 +7,15 @@ Ported from vLLM's gemma3.py with adaptations for Gemma4 architecture:
 - Per-layer scalar buffers
 - HF weight prefix model.language_model.
 
-Cache strategy: ALL layers use LOCAL dims (num_kv_heads=16, head_dim=256)
+Cache strategy: ALL layers use LOCAL dims (num_kv_heads from sliding layers, head_dim=256)
 for the vLLM Attention module and KV cache, ensuring uniform cache specs.
+- 31B dense: local num_kv_heads=16, global num_kv_heads=4
+- 26B-A4B MoE: local num_kv_heads=8, global num_kv_heads=4
 - Local layers: use vLLM Attention normally.
 - Global layers: bypass vLLM Attention for compute. Pack their real
-  (4 heads × 512 dim) KV data as (8 heads × 256 dim) into the first 8
-  of 16 cache head slots via reshape_and_cache_flash. Compute attention
-  with F.scaled_dot_product_attention at real dims (4 heads, 512 dim).
+  (4 heads × 512 dim) KV data as (cache_kv_heads × 256 dim) into the
+  cache via reshape_and_cache_flash. Compute attention with
+  F.scaled_dot_product_attention at real dims (4 heads, 512 dim).
   For decode, read from cache and unpack back to (4, 512).
 """
 from collections.abc import Iterable
@@ -119,14 +121,123 @@ class Gemma4MLP(nn.Module):
         return x
 
 
+class Gemma4MoEBlock(nn.Module):
+    """Gemma4 MoE block: router + 128 experts (top-8 routing).
+
+    The 26B-A4B model has an additive dense MLP + MoE block per layer.
+    This implements the MoE half: router selects top-k experts, each expert
+    is a gated MLP with gate_up_proj [E, 2*moe_intermediate, hidden] and
+    down_proj [E, hidden, moe_intermediate].
+
+    Batched bmm dispatch: scatter tokens into [E, max_T, H] padded buffer,
+    run 3 bmms across all experts simultaneously, gather back.
+    Avoids the 3 × num_experts Python loop iterations that dominate inference latency.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_experts: int,
+        top_k: int,
+        moe_intermediate_size: int,
+    ) -> None:
+        super().__init__()
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.hidden_size = hidden_size
+        self.moe_intermediate_size = moe_intermediate_size
+
+        # Router: scale → linear → per_expert_scale → sigmoid
+        # Note: the input to MoEBlock is already pre-normed (by pre_moe_norm / pre_feedforward_layernorm_2).
+        # The HF checkpoint has router.scale [H] and router.per_expert_scale [E], no router.norm weight.
+        self.router_scale = nn.Parameter(torch.ones(hidden_size))
+        self.router_proj = nn.Linear(hidden_size, num_experts, bias=False)
+        self.router_per_expert_scale = nn.Parameter(torch.ones(num_experts))
+
+        # Expert weights: fused gate_up [E, 2*moe_intermediate, hidden]
+        # and down [E, hidden, moe_intermediate]
+        # Stored as loaded from HF; transposed views used in forward for bmm.
+        self.experts_gate_up = nn.Parameter(
+            torch.empty(num_experts, 2 * moe_intermediate_size, hidden_size)
+        )
+        self.experts_down = nn.Parameter(
+            torch.empty(num_experts, hidden_size, moe_intermediate_size)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [T, H] — already pre-normed by pre_moe_norm outside
+        T, H = x.shape
+        mid = self.moe_intermediate_size
+        E = self.num_experts
+        K = self.top_k
+
+        # Router
+        logits = self.router_proj(x * self.router_scale)      # [T, E]
+        logits = logits * self.router_per_expert_scale        # [T, E]
+        scores = torch.sigmoid(logits.float()).to(x.dtype)    # [T, E]
+        top_scores, top_indices = torch.topk(scores, K, dim=-1)  # [T, K]
+
+        # Flatten dispatch pairs: each token appears K times
+        flat_indices = top_indices.reshape(-1)    # [T*K]  expert assignment
+        flat_scores = top_scores.reshape(-1)      # [T*K]
+        token_ids = torch.arange(T, device=x.device).unsqueeze(1).expand(T, K).reshape(-1)  # [T*K]
+
+        # Sort by expert so tokens destined for the same expert are contiguous
+        sort_order = torch.argsort(flat_indices, stable=True)   # [T*K]
+        sorted_expert = flat_indices[sort_order]    # [T*K], non-decreasing
+        sorted_token = token_ids[sort_order]        # [T*K]
+        sorted_scores = flat_scores[sort_order]     # [T*K]
+
+        # Count tokens per expert
+        num_tokens_per_expert = torch.zeros(E, dtype=torch.int64, device=x.device)
+        num_tokens_per_expert.scatter_add_(
+            0, sorted_expert, torch.ones(T * K, dtype=torch.int64, device=x.device)
+        )
+        max_t = int(num_tokens_per_expert.max().item())
+
+        # Compute within-expert position for each (sorted) dispatch slot
+        expert_starts = torch.zeros(E, dtype=torch.int64, device=x.device)
+        expert_starts[1:] = torch.cumsum(num_tokens_per_expert[:-1], dim=0)
+        pos_within_expert = (
+            torch.arange(T * K, device=x.device) - expert_starts[sorted_expert]
+        )  # [T*K]
+
+        # Scatter: x_padded[e, pos] = x[token]  shape: [E, max_T, H]
+        x_padded = x.new_zeros(E, max_t, H)
+        x_padded[sorted_expert, pos_within_expert] = x[sorted_token]
+
+        # 3 batched matmuls over all experts simultaneously
+        # experts_gate_up: [E, 2*mid, H] → transpose to [E, H, 2*mid] for bmm
+        gate_up_w = self.experts_gate_up.transpose(1, 2)   # [E, H, 2*mid]
+        gate_up_out = torch.bmm(x_padded, gate_up_w)       # [E, max_T, 2*mid]
+        gate_out = torch.nn.functional.gelu(gate_up_out[..., :mid], approximate="tanh")
+        up_out = gate_up_out[..., mid:]
+        h = gate_out * up_out                               # [E, max_T, mid]
+        # experts_down: [E, H, mid] → transpose to [E, mid, H] for bmm (down proj)
+        down_w = self.experts_down.transpose(1, 2)          # [E, mid, H]
+        out_padded = torch.bmm(h, down_w)                   # [E, max_T, H]
+
+        # Gather and accumulate with routing scores
+        expert_outs = out_padded[sorted_expert, pos_within_expert]  # [T*K, H]
+        expert_outs = expert_outs * sorted_scores.unsqueeze(-1)     # weight by score
+
+        # Unsort back to (token, expert_slot) order then sum over K slots per token
+        out = torch.zeros(T, H, dtype=x.dtype, device=x.device)
+        out.scatter_add_(0, sorted_token.unsqueeze(-1).expand(-1, H), expert_outs)
+        return out
+
+
 class Gemma4Attention(nn.Module):
     """Gemma4 attention with heterogeneous head dimensions.
 
-    Local (sliding) layers: head_dim=256, num_kv_heads=16
+    Local (sliding) layers: head_dim=256
+      - 31B dense: num_kv_heads=16
+      - 26B-A4B MoE: num_kv_heads=8
     Global (full) layers: head_dim=512, num_kv_heads=4, k_eq_v=True
 
-    Cache strategy: ALL layers use LOCAL dims (16 kv_heads, 256 head_dim)
+    Cache strategy: ALL layers use LOCAL dims (sliding-layer kv_heads, 256 head_dim)
     for the vLLM Attention module, ensuring uniform KV cache specs.
+    CACHE_NUM_KV_HEADS is set from the first sliding layer instantiated.
 
     Local layers: pass through to vLLM Attention normally (IPEX FlashAttention).
     Global layers: use a parallel KV cache with real dims (4 kv_heads, 512 head_dim)
@@ -136,8 +247,10 @@ class Gemma4Attention(nn.Module):
       The parallel cache reuses the same block_table from vLLM's block manager.
     """
 
-    # Cache dims used by ALL layers (local layer dims)
-    CACHE_NUM_KV_HEADS = 16  # before TP
+    # Cache dims used by ALL layers — local (sliding) layer dims define the uniform cache spec.
+    # Set as a class variable so global layers see the same value. Updated by the first
+    # sliding layer to be instantiated (which has the real local KV head count).
+    CACHE_NUM_KV_HEADS: int = 16  # updated from config — 31B=16, 26B-A4B=8
     CACHE_HEAD_DIM = 256
 
     def __init__(self,
@@ -165,6 +278,13 @@ class Gemma4Attention(nn.Module):
         self.real_head_dim = head_dim
         self.real_num_heads = num_heads
         self.real_num_kv_heads = num_kv_heads
+
+        # Sliding layers define the uniform cache head count for ALL layers.
+        # 31B dense: num_kv_heads=16 → CACHE_NUM_KV_HEADS=16
+        # 26B-A4B MoE: num_kv_heads=8 → CACHE_NUM_KV_HEADS=8
+        # This must be set before cache_num_kv_heads_tp is computed below.
+        if is_sliding:
+            Gemma4Attention.CACHE_NUM_KV_HEADS = num_kv_heads
 
         # TP partitioning for REAL dims
         assert num_heads % tp_size == 0
@@ -494,6 +614,23 @@ class Gemma4DecoderLayer(nn.Module):
         self.post_feedforward_layernorm = Gemma4RMSNorm(config.hidden_size,
                                                         eps=config.rms_norm_eps)
 
+        # MoE block (26B-A4B only — absent in 31B dense)
+        self.moe_block: Optional[Gemma4MoEBlock] = None
+        if getattr(config, "enable_moe_block", False):
+            self.moe_block = Gemma4MoEBlock(
+                hidden_size=config.hidden_size,
+                num_experts=config.num_experts,
+                top_k=config.top_k_experts,
+                moe_intermediate_size=config.moe_intermediate_size,
+            )
+            # Three extra norms for the additive MoE path
+            # Maps: pre_feedforward_layernorm_2 → pre_moe_norm (input to MoE router+experts)
+            #       post_feedforward_layernorm_1 → post_mlp_norm (after dense MLP)
+            #       post_feedforward_layernorm_2 → post_moe_norm (after MoE experts)
+            self.pre_moe_norm = Gemma4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.post_mlp_norm = Gemma4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.post_moe_norm = Gemma4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
         # Per-layer scalar (post-residual scaling, non-trainable)
         self.register_buffer(
             "layer_scalar",
@@ -530,10 +667,16 @@ class Gemma4DecoderLayer(nn.Module):
 
         # --- Feedforward block ---
         residual = hidden_states
-        hidden_states = self.pre_feedforward_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = self.post_feedforward_layernorm(hidden_states)
-        hidden_states = residual + hidden_states
+        pre_ff = self.pre_feedforward_layernorm(hidden_states)
+        if self.moe_block is not None:
+            # Additive dense MLP + MoE (26B-A4B)
+            dense_out = self.post_mlp_norm(self.mlp(pre_ff))
+            moe_out = self.post_moe_norm(self.moe_block(self.pre_moe_norm(hidden_states)))
+            combined = self.post_feedforward_layernorm(dense_out + moe_out)
+        else:
+            # Dense-only (31B)
+            combined = self.post_feedforward_layernorm(self.mlp(pre_ff))
+        hidden_states = residual + combined
 
         # Scale ENTIRE output (residual + attn + FFN) by per-layer scalar
         hidden_states = hidden_states * self.layer_scalar.to(hidden_states.dtype)
@@ -699,6 +842,29 @@ class Gemma4ForCausalLM(nn.Module, SupportsPP):
                 params_dict[bname] = buf
         loaded_params: set[str] = set()
 
+        # MoE expert weight remapping (HF has no moe_block prefix at layer level):
+        # HF: model.language_model.layers.N.experts.gate_up_proj [128, 1408, 2816] → model.layers.N.moe_block.experts_gate_up
+        # HF: model.language_model.layers.N.experts.down_proj    [128, 2816, 704]  → model.layers.N.moe_block.experts_down
+        # HF: model.language_model.layers.N.router.proj.weight   [128, 2816]       → model.layers.N.moe_block.router_proj.weight
+        # HF: model.language_model.layers.N.router.scale         [2816]            → model.layers.N.moe_block.router_scale
+        # HF: model.language_model.layers.N.router.per_expert_scale [128]          → model.layers.N.moe_block.router_per_expert_scale
+        # HF norms: pre_feedforward_layernorm_2 → pre_moe_norm
+        #           post_feedforward_layernorm_1 → post_mlp_norm
+        #           post_feedforward_layernorm_2 → post_moe_norm
+        moe_weight_remap = {
+            # Expert weights
+            ".experts.gate_up_proj": ".moe_block.experts_gate_up",
+            ".experts.down_proj": ".moe_block.experts_down",
+            # Router weights (no .router.norm — absorbed into pre_moe_norm)
+            ".router.proj.weight": ".moe_block.router_proj.weight",
+            ".router.scale": ".moe_block.router_scale",
+            ".router.per_expert_scale": ".moe_block.router_per_expert_scale",
+            # Extra norms (HF suffix → our attr name)
+            ".pre_feedforward_layernorm_2.": ".pre_moe_norm.",
+            ".post_feedforward_layernorm_1.": ".post_mlp_norm.",
+            ".post_feedforward_layernorm_2.": ".post_moe_norm.",
+        }
+
         skip_prefixes = [
             "model.vision_tower.", "model.multi_modal_projector.",
             "model.embed_vision.", "vision_tower.",
@@ -714,6 +880,12 @@ class Gemma4ForCausalLM(nn.Module, SupportsPP):
             # Skip vision/multimodal/lm_head weights
             if any(name.startswith(p) for p in skip_prefixes):
                 continue
+
+            # Remap MoE weight names
+            for hf_suffix, our_suffix in moe_weight_remap.items():
+                if hf_suffix in name:
+                    name = name.replace(hf_suffix, our_suffix)
+                    break
 
             # For k_eq_v global layers: v_proj doesn't exist in HF checkpoint.
             # Cache k_proj to copy into v shard after all weights loaded.

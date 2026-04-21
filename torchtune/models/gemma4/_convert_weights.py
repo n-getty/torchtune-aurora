@@ -4,6 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import re
+
 import torch
 
 from torchtune.models.convert_weights import get_mapped_key
@@ -37,6 +39,20 @@ _GEMMA4_FROM_HF = {
     "model.language_model.layers.{}.post_feedforward_layernorm.weight": "layers.{}.mlp_scale.scale",
     "model.language_model.layers.{}.layer_scalar": "layers.{}.layer_scalar",
     "model.language_model.norm.weight": "norm.rms_norm.scale",
+    # --- 26B-A4B MoE additions ---
+    # Extra per-layer norms for additive MoE path
+    "model.language_model.layers.{}.post_feedforward_layernorm_1.weight": "layers.{}.post_mlp_norm.scale",
+    "model.language_model.layers.{}.pre_feedforward_layernorm_2.weight": "layers.{}.pre_moe_norm.scale",
+    "model.language_model.layers.{}.post_feedforward_layernorm_2.weight": "layers.{}.post_moe_norm.scale",
+    # Router weights — HF stores directly under layer (no "moe_block." prefix)
+    # router.norm has no weight in HF checkpoint (with_scale=False); torchtune default (zeros=identity) is used.
+    "model.language_model.layers.{}.router.proj.weight": "layers.{}.moe_block.router.proj.weight",
+    "model.language_model.layers.{}.router.scale": "layers.{}.moe_block.router.scale",
+    "model.language_model.layers.{}.router.per_expert_scale": "layers.{}.moe_block.router.per_expert_scale",
+    # Expert down_proj: HF [E, hidden=2816, intermediate=704] → GroupedExperts [E, intermediate=704, hidden=2816]
+    # Transposed in gemma4_hf_to_tune(); entry here signals it should be converted (not skipped).
+    "model.language_model.layers.{}.experts.down_proj": "layers.{}.moe_block.experts.down_proj",
+    # experts.gate_up_proj is handled specially in gemma4_hf_to_tune() — no entry needed here.
 }
 
 # Keys to skip entirely (vision encoder, embedding projection, etc.)
@@ -81,6 +97,31 @@ def gemma4_hf_to_tune(
         # Skip rotary embedding inverse frequency
         if "rotary_emb.inv_freq" in key:
             continue
+
+        # Special case: fused gate_up_proj [E, 2*intermediate, hidden] → split + transpose
+        # HF key: "model.language_model.layers.N.experts.gate_up_proj" [128, 1408, 2816]
+        # GroupedExperts: gate_proj [E, hidden, moe_intermediate], up_proj [E, hidden, moe_intermediate]
+        if key.endswith(".experts.gate_up_proj"):
+            m = re.search(r"layers\.(\d+)\.", key)
+            if m is None:
+                raise ValueError(f"Could not extract layer index from key: {key}")
+            layer_idx = m.group(1)
+            gate_hf, up_hf = value.chunk(2, dim=1)   # each [E, moe_intermediate, hidden]
+            converted_state_dict[f"layers.{layer_idx}.moe_block.experts.gate_proj"] = gate_hf.transpose(1, 2).contiguous()
+            converted_state_dict[f"layers.{layer_idx}.moe_block.experts.up_proj"] = up_hf.transpose(1, 2).contiguous()
+            continue
+
+        # Special case: down_proj transpose
+        # HF: [E, hidden=2816, moe_intermediate=704] → GroupedExperts: [E, moe_intermediate=704, hidden=2816]
+        # (matmul in _forward_no_grouped_mm: h @ w2 where h=[T, moe_intermediate], w2=[moe_intermediate, hidden])
+        if key.endswith(".experts.down_proj"):
+            m = re.search(r"layers\.(\d+)\.", key)
+            if m is None:
+                raise ValueError(f"Could not extract layer index from key: {key}")
+            layer_idx = m.group(1)
+            converted_state_dict[f"layers.{layer_idx}.moe_block.experts.down_proj"] = value.transpose(1, 2).contiguous()
+            continue
+
         new_key = get_mapped_key(key, _GEMMA4_FROM_HF)
         converted_state_dict[new_key] = value
     return converted_state_dict
@@ -108,8 +149,39 @@ def gemma4_tune_to_hf(
     """
     converted_state_dict = {}
     inverted_mapping_dict = {v: k for k, v in _GEMMA4_FROM_HF.items() if v is not None}
+    # Remove the placeholder entry for down_proj (handled specially below)
+    inverted_mapping_dict.pop("layers.{}.moe_block.experts.down_proj", None)
 
     for key, value in state_dict.items():
+        # Special case: gate_proj + up_proj → re-fuse into HF gate_up_proj
+        if key.endswith(".moe_block.experts.gate_proj"):
+            m = re.search(r"layers\.(\d+)\.", key)
+            if m is None:
+                raise ValueError(f"Could not extract layer index from key: {key}")
+            layer_idx = m.group(1)
+            up_key = f"layers.{layer_idx}.moe_block.experts.up_proj"
+            if up_key not in state_dict:
+                raise ValueError(f"Missing {up_key} when inverting gate_proj for layer {layer_idx}")
+            gate = value.transpose(1, 2)              # [E, moe_intermediate, hidden]
+            up = state_dict[up_key].transpose(1, 2)  # [E, moe_intermediate, hidden]
+            gate_up = torch.cat([gate, up], dim=1)   # [E, 2*moe_intermediate, hidden]
+            hf_key = f"model.language_model.layers.{layer_idx}.experts.gate_up_proj"
+            converted_state_dict[hf_key] = gate_up.contiguous()
+            continue
+        if key.endswith(".moe_block.experts.up_proj"):
+            # Already handled above alongside gate_proj
+            continue
+
+        # Special case: down_proj inverse transpose
+        if key.endswith(".moe_block.experts.down_proj"):
+            m = re.search(r"layers\.(\d+)\.", key)
+            if m is None:
+                raise ValueError(f"Could not extract layer index from key: {key}")
+            layer_idx = m.group(1)
+            hf_key = f"model.language_model.layers.{layer_idx}.experts.down_proj"
+            converted_state_dict[hf_key] = value.transpose(1, 2).contiguous()
+            continue
+
         new_key = get_mapped_key(key, inverted_mapping_dict)
         converted_state_dict[new_key] = value
 

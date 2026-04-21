@@ -44,14 +44,17 @@ for p in sys.path:
 _original_import = builtins.__import__
 _registry_patched = False
 _xpu_worker_patched = False
+_gemma4_autoconfig_patched = False
 _gemma4_config_patched = False
 _gemma4_model_patched = False
+_gemma4_tokenizer_patched = False
 _in_hook = False
 
 
 def _combined_patching_import(name, *args, **kwargs):
     global _registry_patched, _xpu_worker_patched, _in_hook
-    global _gemma4_config_patched, _gemma4_model_patched
+    global _gemma4_autoconfig_patched, _gemma4_config_patched, _gemma4_model_patched
+    global _gemma4_tokenizer_patched
 
     mod = _original_import(name, *args, **kwargs)
 
@@ -60,6 +63,56 @@ def _combined_patching_import(name, *args, **kwargs):
     _in_hook = True
 
     try:
+        # Patch 0: Register Gemma4 with transformers.AutoConfig (lazy).
+        # Must fire AFTER ipex initializes XPU (so platform detection works),
+        # but BEFORE vLLM calls AutoConfig.from_pretrained("gemma4").
+        # Triggered when transformers.models.auto is imported by vLLM.
+        # NOT done eagerly at usercustomize time — that would run before ipex,
+        # causing vllm.platforms.resolve_current_platform() to cache
+        # UnspecifiedPlatform (no XPU yet), breaking the vLLM server startup.
+        if not _gemma4_autoconfig_patched:
+            _auto_mod = sys.modules.get("transformers.models.auto.configuration_auto")
+            if _auto_mod is not None and hasattr(_auto_mod, "AutoConfig"):
+                try:
+                    from vllm_gemma4_config import Gemma4TextConfig
+                    _auto_mod.AutoConfig.register("gemma4", Gemma4TextConfig)
+                    _gemma4_autoconfig_patched = True
+                    print(
+                        f"[gemma4_overlay] PID={_pid} Registered Gemma4TextConfig "
+                        "with AutoConfig (lazy, post-ipex)",
+                        flush=True,
+                    )
+                except Exception as _e:
+                    print(
+                        f"[gemma4_overlay] PID={_pid} AutoConfig.register failed: {_e}",
+                        flush=True,
+                    )
+
+        # Patch 1b: Fix Gemma4 tokenizer extra_special_tokens format.
+        # Gemma4 tokenizer_config.json has extra_special_tokens as a list,
+        # but transformers 4.57.6 _set_model_specific_special_tokens()
+        # calls special_tokens.keys() expecting a dict → AttributeError.
+        # Fix: skip the method body when special_tokens isn't a dict.
+        if not _gemma4_tokenizer_patched:
+            _tok_mod = sys.modules.get("transformers.tokenization_utils_base")
+            if _tok_mod is not None and hasattr(_tok_mod, "PreTrainedTokenizerBase"):
+                _cls = _tok_mod.PreTrainedTokenizerBase
+                _orig_set = getattr(_cls, "_set_model_specific_special_tokens", None)
+                if _orig_set is not None:
+                    def _safe_set_model_specific_special_tokens(self, special_tokens):
+                        if not isinstance(special_tokens, dict):
+                            return  # Gemma4: list format, no attribute names to add
+                        return _orig_set(self, special_tokens)
+                    _cls._set_model_specific_special_tokens = (
+                        _safe_set_model_specific_special_tokens
+                    )
+                    _gemma4_tokenizer_patched = True
+                    print(
+                        f"[gemma4_overlay] PID={_pid} Patched "
+                        "_set_model_specific_special_tokens for list format",
+                        flush=True,
+                    )
+
         # Patch 2: vLLM registry subprocess (from _usercustomize_vllm)
         if not _registry_patched:
             _reg = sys.modules.get("vllm.model_executor.models.registry")
@@ -116,6 +169,7 @@ def _combined_patching_import(name, *args, **kwargs):
 
         # Restore original import when all patches applied
         all_done = (_registry_patched and _xpu_worker_patched
+                    and _gemma4_autoconfig_patched and _gemma4_tokenizer_patched
                     and _gemma4_config_patched and _gemma4_model_patched)
         if all_done:
             builtins.__import__ = _original_import

@@ -15,7 +15,8 @@
 #   Nearly doubles generation throughput for small models (3B).
 set -e
 
-cd /lus/flare/projects/ModCon/ngetty/torchtune
+PROJDIR=/lus/flare/projects/ModCon/ngetty/torchtune
+cd ${PROJDIR}
 
 # Load Aurora frameworks module — MUST use 2025.2.0 (2025.3.1 has broken XCCL allreduce)
 module load frameworks/2025.2.0 2>/dev/null || true
@@ -43,11 +44,19 @@ export FI_CXI_DEFAULT_CQ_SIZE=131072
 export FI_MR_CACHE_MONITOR=userfaultfd
 # XPU memory allocator
 export PYTORCH_ALLOC_CONF=expandable_segments:True
+# Increase CCL IPC handle cache to suppress "mem handle cache limit reached" warnings
+export CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD=65536
 # NOTE: Do NOT set CCL_ALLREDUCE=ring / CCL_REDUCE_SCATTER=ring for
 # single-node FSDP2 — they force the scheduler path which doesn't support
 # ReduceOp.AVG. Only needed for multi-node with large tensors.
 # usercustomize patch: disable transformers version check (hf-hub 1.7 vs <1.0)
 VLLM_CUSTOMIZATION=/lus/flare/projects/ModCon/ngetty/torchtune/recipes/dev/_usercustomize_vllm
+VLLM_GEMMA4_OVERLAY=/lus/flare/projects/ModCon/ngetty/torchtune/recipes/dev/vllm_gemma4_overlay
+# If VLLM_GEMMA4=1, use Gemma4 overlay usercustomize (registers gemma4 arch with vLLM)
+# instead of the standard one. The overlay's usercustomize.py includes all Aurora patches.
+if [ "${VLLM_GEMMA4:-0}" = "1" ]; then
+    VLLM_CUSTOMIZATION=${VLLM_GEMMA4_OVERLAY}
+fi
 export PYTHONPATH=/lus/flare/projects/ModCon/ngetty/torchtune:/flare/ModCon/ngetty/trl:${VLLM_CUSTOMIZATION}:$PYTHONPATH
 export HF_DATASETS_OFFLINE=1
 export HF_HUB_OFFLINE=1
@@ -73,6 +82,9 @@ echo "Python: $(which python3)"
 echo "Model: ${MODEL_PATH}"
 
 mkdir -p /tmp/torchtune
+# Weight sync uses /dev/shm (RAM tmpfs, 504 GB on Aurora) for fast I/O.
+# Pre-create the directory so training ranks don't race to create it.
+mkdir -p /dev/shm/torchtune
 
 # --- Stage model to /tmp for fast loading ---
 LOCAL_MODEL=/tmp/torchtune/$(basename ${MODEL_PATH})
@@ -131,10 +143,13 @@ launch_vllm_replica() {
 
     echo "  Replica ${REPLICA}: tiles=${TILE_MASK}, port=${PORT}, log=${LOG}"
 
-    # Use vllm CLI serve for all cases.
-    # TRL's vllm_serve_xpu.py hits HF Hub snapshot_download bug with HF_HUB_OFFLINE=1.
+    # Use standard vLLM OpenAI API server with WeightSyncFromFileExtension.
+    # The extension adds load_weights_from_path() callable via /collective_rpc,
+    # which the training recipe calls after saving weights to /tmp as safetensors.
+    # This avoids XCCL communicator setup which SIGABRTs on XPU.
+    #
     # For TP>1: needs OFI transport and --distributed-executor-backend mp.
-    # For TP=1: use MPI transport to isolate from training's OFI/CXI.
+    # For TP=1: use MPI transport to isolate from training's OFI/CXI fabric.
     local EXTRA_VLLM_ARGS=""
     local VLLM_CCL_TRANSPORT="mpi"
     local VLLM_CCL_LAUNCHER="None"
@@ -154,6 +169,7 @@ launch_vllm_replica() {
         CCL_ATL_TRANSPORT=${VLLM_CCL_TRANSPORT} \
         FI_PROVIDER=cxi \
         CCL_KVS_IFACE=lo \
+        VLLM_SERVER_DEV_MODE=1 \
         python3 -m vllm.entrypoints.openai.api_server \
         --model "${MODEL_PATH}" \
         --tensor-parallel-size ${VLLM_TP} \
@@ -162,6 +178,7 @@ launch_vllm_replica() {
         --dtype bfloat16 \
         --gpu-memory-utilization 0.80 \
         --max-model-len ${VLLM_MAX_MODEL_LEN} \
+        --worker-extension-cls torchtune.dev.vllm_weight_sync_worker.WeightSyncFromFileExtension \
         ${EXTRA_VLLM_ARGS} \
         > "${LOG}" 2>&1 &
     VLLM_PIDS+=($!)
@@ -192,6 +209,8 @@ cleanup() {
         kill ${PID} 2>/dev/null || true
         wait ${PID} 2>/dev/null || true
     done
+    # Remove weight sync file from /dev/shm to free RAM (can be 60+ GB for 31B).
+    rm -f /dev/shm/torchtune/weight_update.safetensors 2>/dev/null || true
     sleep 1
 }
 trap cleanup EXIT

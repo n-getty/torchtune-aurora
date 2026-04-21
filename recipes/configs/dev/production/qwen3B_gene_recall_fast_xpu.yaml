@@ -1,0 +1,132 @@
+# GRPO gene recall — Qwen2.5-3B fast validation, vLLM server mode
+#
+# Fast iteration config: 2 training tiles (DDP, no FSDP sharding — 3B model
+# fits on a single tile at ~6 GB BF16) + 1 vLLM tile. Goal: ~2-4s/step so
+# hyperparameter and reward signal changes can be validated quickly.
+#
+# Tile layout: 2 training tiles (DDP) + 1 vLLM tile (TP=1)
+# Weight sync goes to /dev/shm (RAM) — trivially fast for 3B (~6 GB).
+#
+# Launch (3 tiles total: 2 train + 1 vLLM):
+#   VLLM_GEMMA4=0 bash recipes/dev/run_grpo_vllm_xpu.sh 1 2 \
+#     /lus/flare/projects/ModCon/ngetty/models/Qwen2.5-3B 50 \
+#     recipes/configs/dev/production/qwen3B_gene_recall_fast_xpu.yaml
+
+name: grpo_gene_recall_qwen3b_fast_xpu
+
+output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/outputs/gene_recall_qwen3b_fast
+base_model_path: /lus/flare/projects/ModCon/ngetty/models/Qwen2.5-3B
+data_dir: /lus/flare/projects/ModCon/ngetty/hackathon_rl/prepared_data
+
+# vLLM server (1 tile TP=1, managed by run_grpo_vllm_xpu.sh)
+vllm_url: "http://localhost:8001"
+vllm_group_port: 51216
+vllm_weight_sync: true
+
+# Tokenizer
+tokenizer:
+  _component_: torchtune.models.qwen2_5.qwen2_5_tokenizer
+  path: ${base_model_path}/vocab.json
+  merges_file: ${base_model_path}/merges.txt
+  max_seq_len: 512
+
+# Dataset — gene recall JSONL
+dataset:
+  _component_: torchtune.dev.grpo.gene_recall.gene_recall_dataset
+  data_files: ${data_dir}/gene_recall_train.jsonl
+  max_seq_len: 512
+seed: 42
+shuffle: True
+
+# Model — 3B fits on a single tile with DDP (no FSDP sharding needed)
+model:
+  _component_: torchtune.models.qwen2_5.qwen2_5_3b
+
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [
+    model-00001-of-00002.safetensors,
+    model-00002-of-00002.safetensors,
+  ]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: QWEN2
+
+ref_checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [
+    model-00001-of-00002.safetensors,
+    model-00002-of-00002.safetensors,
+  ]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}/ref
+  model_type: QWEN2
+
+resume_from_checkpoint: False
+save_every_n_epochs: 1
+
+# Reward
+reward_mode: gene_recall
+gene_reward_metric: f1
+
+# GRPO parameters — small batch for fast iteration
+batch_size: 1
+grpo_samples: 4
+forward_batch_size: 4
+max_generated_tokens: 256   # shorter for faster generation in early validation
+top_k: null
+temperature: 1.0
+
+ppo_epochs: 1
+gradient_accumulation_steps: 1
+
+epochs: 3
+num_steps: 50
+
+clip_grad_norm: 1.0
+
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 5e-6
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  num_warmup_steps: 5
+loss:
+  _component_: torchtune.dev.grpo.loss.GRPOSimpleLoss
+  kl_coeff: 0.1
+  epsilon: 0.2
+
+# XPU device
+device: xpu
+
+# Memory management — AC not needed for 3B with DDP, but keep for safety
+enable_activation_checkpointing: False
+compile: False
+
+# Precision
+dtype: bf16
+
+# Logging
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+log_every_n_steps: 1
+log_peak_memory_stats: True
+
+# Profiler disabled
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: False
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: True
+  cuda: False
+  profile_memory: False
+  with_stack: False
+  record_shapes: False
+  with_flops: False
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1

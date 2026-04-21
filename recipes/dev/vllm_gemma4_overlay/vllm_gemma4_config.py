@@ -8,11 +8,12 @@ fields nested inside text_config. This class flattens them.
 """
 import json
 import os
+from typing import Optional
 from transformers import PretrainedConfig
 
 
 class Gemma4TextConfig(PretrainedConfig):
-    model_type = "gemma4_text"
+    model_type = "gemma4"
 
     def __init__(
         self,
@@ -37,6 +38,11 @@ class Gemma4TextConfig(PretrainedConfig):
         tie_word_embeddings=True,
         layer_types=None,
         rope_parameters=None,
+        # MoE fields (present in 26B-A4B, absent/None in 31B dense)
+        enable_moe_block: bool = False,
+        num_experts: Optional[int] = None,
+        top_k_experts: Optional[int] = None,
+        moe_intermediate_size: Optional[int] = None,
         # Passthrough
         **kwargs,
     ):
@@ -67,6 +73,12 @@ class Gemma4TextConfig(PretrainedConfig):
             self.layer_types = pattern * 10
         else:
             self.layer_types = layer_types
+
+        # MoE fields (26B-A4B has these; 31B dense does not)
+        self.enable_moe_block = enable_moe_block
+        self.num_experts = num_experts
+        self.top_k_experts = top_k_experts
+        self.moe_intermediate_size = moe_intermediate_size
 
         # RoPE parameters (nested dict)
         if rope_parameters is None:

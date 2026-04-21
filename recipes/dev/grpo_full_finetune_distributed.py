@@ -56,6 +56,9 @@ class GRPOFullFinetuneRecipeDistributed(FTRecipeInterface):
         self.world_size, self.rank = utils.get_world_size_and_rank()
         self._is_rank_zero = self.rank == 0
 
+        # Expert Parallelism degree (1 = disabled). ep must equal dp_shard when > 1.
+        self._expert_parallel_degree = cfg.get("expert_parallel_degree", 1)
+
         # Training attributes
         self._resume_from_checkpoint = cfg.resume_from_checkpoint
         self._clip_grad_norm = cfg.get("clip_grad_norm", None)
@@ -129,6 +132,17 @@ class GRPOFullFinetuneRecipeDistributed(FTRecipeInterface):
         if self._is_rank_zero:
             self._metric_logger = config.instantiate(cfg.metric_logger)
             self._metric_logger.log_config(cfg)
+
+        # Build ParallelDims and EP mesh (ep reuses the dp_shard process group)
+        self._parallel_dims = training.ParallelDims(
+            dp_replicate=cfg.get("dp_replicate", 1),
+            dp_shard=cfg.get("dp_shard", -1),
+            tp=cfg.get("tp", 1),
+            cp=cfg.get("cp", 1),
+            ep=self._expert_parallel_degree,
+            world_size=self.world_size,
+        )
+        self._mesh = self._parallel_dims.build_mesh(device_type=self._device.type)
 
         # Setup model to train
         checkpoint_dict = self.load_checkpoint(cfg_checkpointer=cfg.checkpointer)
@@ -366,7 +380,34 @@ class GRPOFullFinetuneRecipeDistributed(FTRecipeInterface):
                 model, auto_wrap_policy={modules.TransformerSelfAttentionLayer}
             )
 
-        # For FSDP sharding
+        # Expert Parallelism: wire All-to-All hooks and pre-shard expert FSDP units.
+        # Must happen BEFORE shard_model() — FSDP2 requires inner units first.
+        if self._parallel_dims.ep_enabled:
+            from torch.distributed.tensor.parallel import parallelize_module
+            from torchtune.models.gemma4._parallelism import gemma4_ep_plan
+
+            ep_mesh = self._parallel_dims.ep_mesh
+            ep_plan = gemma4_ep_plan(model)
+            if ep_plan:
+                parallelize_module(model, ep_mesh, ep_plan)
+                utils.log_rank_zero(
+                    log,
+                    f"EP={self._parallel_dims.ep}: applied ExpertParallel to "
+                    f"{len(ep_plan) // 2} MoE layers on mesh {ep_mesh}",
+                )
+
+            n_sharded = training.shard_experts_for_ep(
+                model,
+                ep_mesh,
+                cpu_offload=fsdp_cpu_offload,
+                reshard_after_forward=reshard_after_forward,
+            )
+            utils.log_rank_zero(
+                log, f"EP: pre-sharded {n_sharded} expert modules on ep_mesh"
+            )
+
+        # For FSDP sharding of non-expert (and remaining) layers
+        dp_mesh = self._mesh["dp_shard"] if self._parallel_dims.dp_shard_enabled else None
         fsdp_shard_conditions = [
             partial(
                 training.get_shard_conditions,
@@ -382,6 +423,7 @@ class GRPOFullFinetuneRecipeDistributed(FTRecipeInterface):
             shard_conditions=fsdp_shard_conditions,
             cpu_offload=fsdp_cpu_offload,
             reshard_after_forward=reshard_after_forward,
+            dp_mesh=dp_mesh,
         )
 
         with training.set_default_dtype(self._dtype), self._device:

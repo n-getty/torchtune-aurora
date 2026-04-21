@@ -9,8 +9,11 @@
 # - Gradient accumulation with no_sync() for multi-node efficiency
 # - Production mode sync skipping (FSDP_PRODUCTION_MODE env var)
 
+import io
 import os
+import struct
 import sys
+import threading
 import time
 from functools import partial
 from typing import Any, Optional, Union
@@ -93,7 +96,7 @@ from torchtune import config, generation, modules, rlhf, training, utils
 from torchtune.config._utils import _get_component_from_path
 from torchtune.datasets import ConcatDataset
 from torchtune.dev.rl.generation import generate
-from torchtune.dev.rl.rewards import batched_rewards
+from torchtune.dev.rl.rewards import batched_rewards, gene_recall_batched_rewards
 from torchtune.dev.rl.types import GRPOStats, GRPOTrajectory
 from torchtune.modules import local_kv_cache
 from torchtune.recipe_interfaces import FTRecipeInterface
@@ -108,7 +111,51 @@ from torchtune.training import (
     supports_memory_stats,
 )
 from torchtune.training.lr_schedulers import get_lr
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+    checkpoint_wrapper as ptd_checkpoint_wrapper,
+    CheckpointImpl,
+)
+from torch.utils.checkpoint import checkpoint as _torch_checkpoint
 from tqdm import tqdm
+
+# Activation checkpointing wrapper.
+# Applied to full TransformerSelfAttentionLayer (includes MoE) for memory efficiency.
+#
+# v114: Reverted to use_reentrant=True due to AllToAll backward race condition.
+#   v112's interleaved expert assignment changes the pre-AllToAll permutation, creating
+#   new tensors at each AC recompute. This causes _XPUSyncAllToAll.apply() to register
+#   a new backward node per AC recompute call, so backward IS now invoked (unlike v108-v111
+#   where caching returned the original grad_fn). With use_reentrant=False, C++ backward
+#   threads can fire different layers' AllToAll backward simultaneously on different ranks
+#   → inconsistent XCCL splits (rank 6 sends 1004, rank 7 expects 3012) → buffer overflow
+#   → SIGSEGV at call#22. Python sequential backward (use_reentrant=True) ensures all
+#   ranks hit the same layer's AllToAll in lockstep.
+#   Memory cost: ~13 GiB more HBM vs use_reentrant=False. Offset by v112's interleaved
+#   assignment reducing peak from 55.25 GiB to 47.83 GiB. Estimated peak: ~60 GiB.
+#
+# v109: Reverted to use_reentrant=False — AllToAll caching (v108) made it safe:
+#   AC recompute returned cached output immediately, no XCCL communication during recompute.
+#   Memory savings: ~13 GiB less HBM.
+#
+# v107-v108: use_reentrant=True — fixed XCCL AllToAll deadlock by making backward
+#   synchronous (sequential layer ordering). v108 caching eliminated AllToAll during
+#   AC recompute, making synchronous backward unnecessary.
+#
+# MoE AC recompute non-determinism (resolved):
+#   torch.topk tie-breaking on XPU is non-deterministic → count_e could differ ±1 between
+#   the original forward and AC recompute → matmul shape mismatch.
+#   Fix (in ExpertParallel._token_dispatch via _fwd_step_counter + _is_reuse):
+#   Saves ntpe_group on first dispatch. AC recompute reuses the saved ntpe_group.
+#   Same AllToAll counts → same count_e → same expert tensor shapes → no crash.
+def _no_reentrant_ac_wrapper(module):
+    return ptd_checkpoint_wrapper(
+        module,
+        checkpoint_impl=CheckpointImpl.REENTRANT,
+        checkpoint_fn=_torch_checkpoint,
+        use_reentrant=True,  # v114: revert from False; see comment above
+        preserve_rng_state=False,
+        determinism_check="none",
+    )
 
 log = utils.get_logger("DEBUG")
 
@@ -139,6 +186,473 @@ try:
     log.info("Patched FSDP2 _get_gradient_divide_factors for XPU (force SUM reduction)")
 except Exception as e:
     log.warning("Failed to patch FSDP2 for XPU: %s", e)
+
+# -- FSDP2 XPU fix: ze_handle_manager "unknown memory type" in reduce_scatter --
+# CCL's reduce_scatter_tensor uses Level Zero IPC handles to share GPU memory
+# between ranks. On Aurora, PyTorch's XPU caching allocator allocates gradient
+# buffers that CCL's ze_handle_manager cannot identify ("unknown memory type"),
+# causing ze_handle_manager.cpp:226 get_ptr: EXCEPTION during FSDP2 backward.
+#
+# AllReduce (ring) works fine — it uses OFI fabric without IPC handles.
+# Reduce-scatter = AllReduce (sum all ranks) + local scatter (take our chunk).
+#
+# This patch replaces dist.reduce_scatter_tensor with an AllReduce-based
+# equivalent. Applied globally so it covers both non-expert FSDP2 (dp_replicate)
+# and any other reduce_scatter calls. Expert FSDP2 (1-rank solo) already has
+# reduce_grads=False so their reduce_scatter is skipped regardless.
+#
+# v54-v58: CPU AllReduce via gloo. XCCL groups only support XPU tensors.
+# We create gloo process groups (set in _init_distributed) mirroring both
+# dp_shard_pg and dp_replicate_pg, then use them to AllReduce CPU tensors.
+# Host memory OFI needs no XPU memory registration → no ze_handle_manager,
+# no OFI GPU-direct EPERM, for all grad-sync collectives.
+#
+# FSDP2 HSDP grad sync has TWO steps (both must be patched):
+#   1. reduce_scatter_tensor(grad_full, group=dp_shard_pg) → sums grad within 4 shard ranks
+#   2. all_reduce(grad_shard, group=dp_replicate_pg)       → averages across 3 replica ranks
+# Step 1 was patched in v44; step 2 was first patched in v57.
+# Without patching step 2, the dp_replicate all_reduce fires on fresh XPU grad_shard
+# tensors via XCCL ring → ze_handle_manager crash at first param in backward.
+#
+# v56 bug: used _GLOO_DP_REP_PG (dp_replicate, 3 ranks) for reduce_scatter which
+# is called with group=dp_shard_pg (4 ranks) — mismatched group dimensions.
+# v57 fix: _GLOO_DP_SHARD_PG for reduce_scatter, _GLOO_DP_REP_PG for all_reduce.
+# v57 failure: gloo preamble size mismatch — different EP groups ({0,1,2,3} and
+#   {4,5,6,7}) complete their dp_shard gloo AllReduces at slightly different times
+#   due to EP load imbalance. When they reach the dp_replicate gloo AllReduce,
+#   they're on different parameters → "op.preamble.length <= op.nbytes" SIGABRT.
+# v58 fix: add a global gloo barrier (all 12 ranks) just before the dp_replicate
+#   gloo AllReduce in _xpu_all_reduce_via_gloo. The barrier forces all EP groups to
+#   synchronize after their dp_shard AllReduces complete, ensuring all dp_replicate
+#   ranks are at the same parameter with the same tensor size before the AllReduce.
+#   Cost: 1 global gloo barrier per backward (only 1 all_reduce per FSDP group).
+# v58 failure: gloo preamble size mismatch STILL — the global barrier fires inside
+#   each AllReduce call, but different EP groups fire AllReduces for DIFFERENT params
+#   (backward execution order differs by EP load). Even with the barrier, rank 0
+#   (from EP group 0) may be AllReducing param N while rank 4 (from EP group 1) is
+#   at param N+1 → barrier can't help because they're in different AllReduce calls.
+# v59 fix: suppress reduce_grads on ALL FSDPParamGroups (not just expert).
+#   With reduce_grads=False on all groups, FSDP2 never calls reduce_scatter or
+#   all_reduce during backward for grad sync. Grads accumulate locally (param.grad).
+#   After backward completes, a single sequential post-backward pass iterates ALL
+#   params with gradients (D2H → gloo AllReduce → H2D), sequentially and synchronously.
+#   Sequential iteration ensures all 3 dp_rep ranks hit AllReduces in the same
+#   parameter order → no preamble mismatch. No global barrier needed.
+#   Cost: ~same total bytes transferred, but serialized (no backward overlap).
+_GLOO_DP_REP_PG = None    # gloo mirror of dp_replicate_pg (3 ranks); set in _init_distributed
+_GLOO_DP_SHARD_PG = None  # gloo mirror of dp_shard_pg (4 ranks); set in _init_distributed
+# v105: No gloo groups for AllToAll — XCCL used directly (keeps EP ranks in lockstep).
+# _XPU_A2A_FWD_GLOO_GROUP and _XPU_A2A_BWD_GLOO_GROUP remain None in _parallelism.
+_GLOO_GLOBAL_PG = None    # gloo global group (all ranks); barrier before post-backward AllReduce
+_XCCL_DP_REP_PG = None   # XCCL dp_replicate group (3 ranks, XPU fabric); set in _init_distributed
+_DP_REP_DEGREE = 1        # dp_replicate world size; set in _init_distributed
+_DP_SHARD_DEGREE = 1      # dp_shard world size; set in _init_distributed
+
+import torch.distributed as _tdist_patch
+_orig_reduce_scatter_tensor = _tdist_patch.reduce_scatter_tensor
+_orig_all_reduce = _tdist_patch.all_reduce
+_a2a_call_counter = 0  # v70: counts all_to_all_single calls for diagnostic tagging
+
+class _DoneWork:
+    """Fake Work object for synchronous ops masquerading as async."""
+    def wait(self): pass
+    def is_completed(self): return True
+    def get_future(self):
+        import torch.futures as _tf
+        f = _tf.Future()
+        f.set_result(None)
+        return f
+
+def _xpu_reduce_scatter_via_allreduce(output, input, op=None, group=None, async_op=False):
+    """AllReduce-based drop-in for reduce_scatter_tensor (v59: safety net only).
+
+    v59: With reduce_grads=False on ALL FSDPParamGroups, FSDP2 never calls
+    reduce_scatter_tensor during backward for grad sync. This patch is retained as
+    a safety net for any non-grad reduce_scatter calls (e.g. activation checkpointing).
+    In practice it should rarely fire during the grad sync phase.
+
+    Root cause of previous failures (v44-v58): CCL cannot access freshly sub-allocated
+    XPU tensors via ANY transport. v59 fixes this by suppressing FSDP2 reduce_scatter
+    entirely during backward, then doing post-backward gloo AllReduce manually.
+    """
+    import torch.distributed as _d
+    if op is None:
+        op = _d.ReduceOp.SUM
+    n = _d.get_world_size(group)
+    r = _d.get_rank(group)
+    if input.device.type != 'cpu':
+        # Select gloo group by group size to match the XCCL group dimension.
+        # reduce_scatter_tensor is called with group=dp_shard_pg (size=_DP_SHARD_DEGREE).
+        if n == _DP_SHARD_DEGREE and _GLOO_DP_SHARD_PG is not None:
+            gloo_pg = _GLOO_DP_SHARD_PG
+        elif n == _DP_REP_DEGREE and _GLOO_DP_REP_PG is not None:
+            gloo_pg = _GLOO_DP_REP_PG
+        else:
+            gloo_pg = None
+        if gloo_pg is not None:
+            input_cpu = input.contiguous().to('cpu')
+            _orig_all_reduce(input_cpu, op=op, group=gloo_pg)
+            input_sum = input_cpu.to(input.device)
+        else:
+            # Fallback: XCCL group (only safe for dp_replicate=1/dp_shard=world_size,
+            # i.e., non-EP mode without HSDP).
+            input_sum = input.clone()
+            _orig_all_reduce(input_sum, op=op, group=group)
+    else:
+        input_sum = input.clone()
+        _orig_all_reduce(input_sum, op=op, group=group)
+    # Scatter: each rank takes chunk r of the summed tensor.
+    chunk_numel = output.numel()
+    src_offset = r * chunk_numel
+    output.copy_(input_sum[src_offset : src_offset + chunk_numel])
+    if async_op:
+        return _DoneWork()
+
+_tdist_patch.reduce_scatter_tensor = _xpu_reduce_scatter_via_allreduce
+log.info("Patched dist.reduce_scatter_tensor → gloo CPU-AllReduce+scatter (XPU v57: dp_shard gloo)")
+
+# v59: dist.all_reduce is NOT patched.
+# With reduce_grads=False on all FSDPParamGroups, FSDP2 never calls dist.all_reduce
+# for grad sync during backward. Grad sync is done post-backward via _ep_post_backward_grad_sync().
+# dist.all_reduce is used only for: loss/metric CPU tensors (safe with XCCL ring),
+# grad norm (XPU scalar, handled via gloo explicitly in train()), optimizer barrier.
+log.info("dist.all_reduce NOT patched (v59: reduce_grads=False on all FSDP2 groups)")
+
+# v61: Patch dist.all_to_all_single for EP backward gradients.
+# v60 failure: gloo all_to_all_single with unequal splits → preamble size mismatch
+#   (gloo::EnforceNotMet pair.cc:456: op.preamble.length <= op.nbytes).
+#   Root cause: gloo's all_to_all_single sends total tensor size as preamble, but
+#   with unequal splits the receiver allocates based on its output_split_sizes[sender],
+#   which may not match the sender's input tensor total size.
+# v61 fix: implement AllToAll via gloo P2P (isend/irecv) instead of all_to_all_single.
+#   Each P2P message is sized exactly by its split size → no preamble ambiguity.
+#   Uses dist.batch_isend_irecv for efficiency (all sends and recvs issued in parallel).
+_orig_all_to_all_single = _tdist_patch.all_to_all_single
+
+
+def _gloo_all_to_all_via_allreduce(output_cpu, input_cpu, output_split_sizes, input_split_sizes, group,
+                                   _call_tag="fwd"):
+    """AllToAll via all_reduce split-matrix + sequential broadcasts (v65).
+
+    v64 bug: all_gather of split sizes caused deadlock when gloo queue order diverged
+    across ranks (different ranks at different AllToAll calls in the backward).
+    Specifically: n_src==0 caused `continue` (skipping broadcast) on some ranks but not
+    others → broadcast has too few participants → permanent deadlock.
+    Root cause: gloo all_gather is order-sensitive; backward AllToAll calls from different
+    MoE layers can reach the all_gather in different orders on different ranks.
+
+    v65 fix: replace all_gather with all_reduce(SUM) on a (ws×ws) int64 matrix.
+      - Each rank fills row `my_rank` with its input_split_sizes, zeros elsewhere.
+      - all_reduce(SUM) combines all rows → same matrix on all ranks (order-invariant).
+      - Buffer sizes derived from matrix (consistent → no n_src=0 mismatch between ranks).
+      - Broadcast participates ALL ranks every time (no `continue` before broadcast).
+
+    v70: Added diagnostic logging to identify "16 vs 4" crash source in backward.
+    """
+    import torch.distributed as _d
+    ws = _d.get_world_size(group)
+    my_rank = _d.get_rank(group)
+    global_rank = _d.get_rank()
+
+    # Step 1: share all ranks' input_split_sizes via all_reduce(SUM) on (ws×ws) matrix.
+    # Each rank contributes row my_rank; SUM gathers all rows → consistent on all ranks.
+    splits_matrix = torch.zeros(ws * ws, dtype=torch.int64)
+    splits_matrix[my_rank * ws : (my_rank + 1) * ws] = torch.tensor(
+        input_split_sizes, dtype=torch.int64
+    )
+    log.debug("Rank %d [%s]: a2a splits_matrix all_reduce: ws=%d my_rank=%d "
+              "input_shape=%s input_splits=%s output_splits=%s nbytes=%d",
+              global_rank, _call_tag, ws, my_rank, list(input_cpu.shape),
+              input_split_sizes, output_split_sizes, splits_matrix.nbytes)
+    try:
+        _d.all_reduce(splits_matrix, op=_d.ReduceOp.SUM, group=group)
+    except Exception as _e:
+        log.error("Rank %d [%s]: a2a splits_matrix all_reduce FAILED: %s | "
+                  "ws=%d nbytes=%d input_splits=%s",
+                  global_rank, _call_tag, _e, ws, splits_matrix.nbytes, input_split_sizes)
+        raise
+    splits_matrix = splits_matrix.view(ws, ws)
+    # splits_matrix[src][j] = src's input_split_sizes[j] = rows src sends to rank j
+
+    feat_shape = input_cpu.shape[1:]
+
+    # Build output offset table using local output_split_sizes
+    out_off = [0]
+    for s in output_split_sizes[:-1]:
+        out_off.append(out_off[-1] + s)
+
+    # Step 2+3+4: for each src, broadcast in a fixed loop (all ranks participate every time)
+    for src in range(ws):
+        n_src = int(splits_matrix[src].sum().item())  # total rows src sends (consistent)
+        n_rows = output_split_sizes[src]              # rows I expect from src (local)
+        global_src = _d.get_global_rank(group, src)
+
+        if n_src == 0:
+            # all_reduce ensures n_src is consistent across ranks → all skip together.
+            # (In v64 with all_gather, n_src could differ → asymmetric skip → deadlock.)
+            continue
+
+        # All ranks allocate exactly n_src rows (sender has actual data, receivers have zeros)
+        if src == my_rank:
+            data = input_cpu.contiguous()
+            # Validate: sender's data shape must match (n_src,) + feat_shape
+            expected_rows = sum(input_split_sizes)
+            if data.shape[0] != n_src:
+                log.error("Rank %d [%s]: a2a src=%d SENDER SHAPE MISMATCH: "
+                          "data.shape=%s n_src=%d (sum(input_splits)=%d) feat_shape=%s",
+                          global_rank, _call_tag, src, list(data.shape), n_src, expected_rows, feat_shape)
+        else:
+            data = input_cpu.new_zeros((n_src,) + feat_shape)
+
+        log.debug("Rank %d [%s]: a2a broadcast src=%d global_src=%d n_src=%d "
+                  "data.shape=%s data.nbytes=%d feat_shape=%s",
+                  global_rank, _call_tag, src, global_src, n_src,
+                  list(data.shape), data.nbytes, feat_shape)
+        try:
+            # Broadcast src's data to all ranks (equal-size buffers → no preamble mismatch)
+            _d.broadcast(data, src=global_src, group=group)
+        except Exception as _e:
+            log.error("Rank %d [%s]: a2a broadcast FAILED src=%d global_src=%d: %s | "
+                      "data.shape=%s data.nbytes=%d n_src=%d feat_shape=%s "
+                      "input_shape=%s input_splits=%s output_splits=%s",
+                      global_rank, _call_tag, src, global_src, _e,
+                      list(data.shape), data.nbytes, n_src, feat_shape,
+                      list(input_cpu.shape), input_split_sizes, output_split_sizes)
+            raise
+
+        if n_rows == 0:
+            continue
+
+        # Extract my slice: src puts rows for rank j at offset sum(input_split_sizes[:j])
+        src_offset = int(splits_matrix[src][:my_rank].sum().item())
+        n_rows = min(n_rows, max(0, n_src - src_offset))  # cap silently (wrong grads if triggered)
+
+        if n_rows > 0:
+            output_cpu[out_off[src]:out_off[src] + n_rows].copy_(
+                data[src_offset:src_offset + n_rows]
+            )
+
+
+def _xpu_all_to_all_via_gloo(output, input, output_split_sizes=None,
+                               input_split_sizes=None, group=None, async_op=False):
+    """Route EP all_to_all_single via XCCL directly (v80).
+
+    v65-v79: gloo TCP-based AllToAll (allreduce+broadcast on _GLOO_DP_SHARD_PG) caused
+    persistent 1800s timeout deadlocks at a2a#241 (first AllToAll of the backward pass).
+    Root cause: ep_ranks 2,3 (0 tokens due to routing imbalance) intermittently fail to
+    participate in gloo TCP collectives → ep_ranks 0,1 wait 1800s → gloo timeout.
+    All v65-v79 variants (gloo barriers, XCCL step-boundary syncs, pre-ref syncs) failed
+    because the gloo TCP path itself is the source of the deadlock.
+
+    v80 fix: remove gloo path entirely. Always use XCCL all_to_all_single directly.
+    _XPUSyncAllToAll already adds dist.barrier(group) for OFI CQ drain (added at v47).
+    XCCL was confirmed working end-to-end at v47. No TCP framing issues with XCCL.
+    """
+    global _a2a_call_counter
+    import torch.distributed as _d
+    if input.device.type == 'xpu' and group is not None:
+        n = _d.get_world_size(group)
+        if n == _DP_SHARD_DEGREE:
+            _a2a_call_counter += 1  # keep counter for diagnostics
+    return _orig_all_to_all_single(
+        output, input,
+        output_split_sizes=output_split_sizes,
+        input_split_sizes=input_split_sizes,
+        group=group,
+        async_op=async_op,
+    )
+
+_tdist_patch.all_to_all_single = _xpu_all_to_all_via_gloo
+log.info("Patched dist.all_to_all_single → XCCL all_to_all_single for XPU EP tensors (v80)")
+
+
+def _ep_post_backward_grad_sync(model: "nn.Module", dp_rep_degree: int) -> int:
+    """Post-backward gradient sync for EP training (v68).
+
+    With reduce_grads=False on all FSDPParamGroups, FSDP2 skips reduce_scatter during
+    backward. This function manually syncs ALL param gradients across dp_replicate after
+    backward completes.
+
+    v65 bug: `if param.grad is None: continue` caused asymmetric all_reduce participation.
+      Expert params on None-grad ranks (zero tokens routed) were skipped → different
+      dp_replicate ranks called all_reduce for different params → tensor size mismatch
+      → gloo::EnforceNotMet (SIGABRT).
+
+    v66/v67 bug: guessing the zero tensor shape from param.shape or param._local_tensor.shape
+      failed because the effective grad shape depends on FSDP2 internals:
+      - ZeRO-2 (reshard_after_forward=False): grad is the FULL gathered tensor (= param.shape)
+        but param._local_tensor is the shard (1/Nth size). Opposite mismatch to v66.
+      - ZeRO-3 (reshard_after_forward=True): grad is a sharded DTensor with _local_tensor.
+        param._local_tensor.shape matches, but then padding differences cause off-by-few bytes.
+      Both v66 "16 vs 4" (4:1 ratio = dp_shard=4) and v67 "1044874 vs 1044850" (24-byte
+      padding difference) confirmed this: shape cannot be reliably inferred from the param.
+
+    v68 fix: Two-phase approach:
+      Phase 1: For each param, compute effective_numel (numel of the grad tensor that will be
+               all_reduced — after _local_tensor extraction if applicable). None-grad ranks
+               contribute 0. One all_reduce(MAX) over all numels shares the canonical numel
+               from the non-None ranks to all ranks in the dp_replicate group.
+      Phase 2: All_reduce each param's grad using the canonical numel. None-grad ranks create
+               zeros of the canonical numel (guaranteed to match non-None ranks). All tensors
+               are flattened to 1D to avoid any shape interpretation issues.
+
+    This avoids all shape guessing — the canonical numel comes directly from the rank that
+    actually holds the grad. One extra all_reduce per backward (cheap: int64 per param).
+
+    Returns number of gradients synced (params with non-None grad on this rank).
+    """
+    if _GLOO_DP_REP_PG is None:
+        return 0
+
+    my_rank = torch.distributed.get_rank()
+
+    # Phase 1: collect effective grad tensors (already on CPU, flattened 1D).
+    param_list = list(model.parameters())
+    eff_grads = []   # CPU 1D tensor or None
+    eff_numels = []  # numel of eff_grad (0 if None)
+    eff_dtypes = []  # dtype of param (for zero tensor creation)
+
+    for param in param_list:
+        _g = param.grad
+        eff_dtypes.append(param.dtype)
+        if _g is not None:
+            if hasattr(_g, '_local_tensor'):
+                _g = _g._local_tensor
+            _g_cpu = _g.detach().contiguous().to('cpu').view(-1)
+            eff_grads.append(_g_cpu)
+            eff_numels.append(_g_cpu.numel())
+        else:
+            eff_grads.append(None)
+            eff_numels.append(0)
+
+    # One all_reduce(MAX) to share canonical numels.
+    numels_t = torch.tensor(eff_numels, dtype=torch.int64)
+    log.debug("Rank %d: grad_sync phase1 numel_exchange: %d params, numels_t.nbytes=%d",
+              my_rank, len(param_list), numels_t.nbytes)
+    try:
+        _orig_all_reduce(numels_t, op=torch.distributed.ReduceOp.MAX, group=_GLOO_DP_REP_PG)
+    except Exception as _e:
+        log.error("Rank %d: grad_sync PHASE1 all_reduce FAILED: %s | "
+                  "numels_t.shape=%s nbytes=%d",
+                  my_rank, _e, numels_t.shape, numels_t.nbytes)
+        raise
+    canonical_numels = numels_t.tolist()
+
+    # Log any discrepancy: non-None rank whose eff_numel != canonical (cross-replica mismatch)
+    for i in range(len(param_list)):
+        if eff_grads[i] is not None and eff_grads[i].numel() != int(canonical_numels[i]):
+            log.error("Rank %d: grad_sync param[%d] NUMEL MISMATCH: "
+                      "eff_numel=%d canonical=%d dtype=%s param_shape=%s grad_has_local=%s",
+                      my_rank, i, eff_grads[i].numel(), int(canonical_numels[i]),
+                      eff_dtypes[i], list(param_list[i].shape),
+                      hasattr(param_list[i].grad, '_local_tensor'))
+
+    # Phase 2: all_reduce each param's grad using canonical numel.
+    n_synced = 0
+    for i, param in enumerate(param_list):
+        numel = int(canonical_numels[i])
+        if numel == 0:
+            continue  # No rank in dp_replicate group has grad → skip entirely
+
+        _g_cpu = eff_grads[i]
+        if _g_cpu is not None:
+            _g_flat = _g_cpu  # already 1D
+            if _g_flat.numel() != numel:
+                # Numel mismatch between this rank and canonical — pad/truncate with warning.
+                log.error("Rank %d: grad_sync param[%d] numel mismatch: "
+                          "local=%d canonical=%d — padding to canonical",
+                          my_rank, i, _g_flat.numel(), numel)
+                if _g_flat.numel() < numel:
+                    _g_flat = torch.cat([_g_flat, _g_flat.new_zeros(numel - _g_flat.numel())])
+                else:
+                    _g_flat = _g_flat[:numel]
+        else:
+            _g_flat = torch.zeros(numel, dtype=eff_dtypes[i])
+
+        try:
+            _orig_all_reduce(_g_flat, op=torch.distributed.ReduceOp.SUM, group=_GLOO_DP_REP_PG)
+        except Exception as _e:
+            log.error("Rank %d: grad_sync param[%d] all_reduce FAILED: %s | "
+                      "numel=%d nbytes=%d dtype=%s canonical=%d eff_numel=%s param_shape=%s",
+                      my_rank, i, _e, _g_flat.numel(), _g_flat.nbytes, _g_flat.dtype,
+                      numel, eff_grads[i].numel() if eff_grads[i] is not None else "None",
+                      list(param.shape))
+            raise
+
+        if _g_cpu is not None:
+            _g_flat.div_(dp_rep_degree)
+            # Write back to device grad (reshape from 1D back to original shape).
+            _g = param.grad
+            if hasattr(_g, '_local_tensor'):
+                _g = _g._local_tensor
+            _g.copy_(_g_flat[:_g.numel()].view(_g.shape).to(_g.device))
+            n_synced += 1
+
+    return n_synced
+
+
+def _ep_post_backward_grad_sync_xccl(model: "nn.Module", dp_rep_degree: int) -> int:
+    """Post-backward gradient sync using XCCL dp_replicate group (v75).
+
+    v75 replaces the gloo-based _ep_post_backward_grad_sync with direct XCCL all_reduce
+    on XPU tensors via _orig_all_reduce (bypasses our monkey-patch).
+
+    Root cause of v71-v74 failures:
+      All attempted sync mechanisms (gloo global barrier, XCCL dist.barrier(), XCCL
+      _orig_all_reduce on all-12 ranks) deadlock because they require ALL 12 ranks to
+      participate simultaneously. When fast EP groups finish backward first and try to
+      sync, slow EP group ranks are still inside gloo SHARD AllToAll and cannot join the
+      12-rank sync. The 12-rank XCCL all_reduce (v74) then waits indefinitely for those
+      ranks, while gloo waits indefinitely for ranks that are stuck in the XCCL all_reduce
+      → mutual deadlock → 1800s timeout.
+
+    v75 key insight: dp_replicate TCP/XCCL pairs are DISJOINT from dp_shard pairs.
+      SHARD group {0,1,2,3}: pairs (0,1),(0,2),(0,3),(1,2),(1,3),(2,3)
+      REP   group {0,4,8}:   pairs (0,4),(0,8),(4,8)  ← no overlap with SHARD
+      XCCL uses the XPU Slingshot fabric. With disjoint rank pairs, the XCCL REP
+      all_reduce CAN run concurrently with gloo SHARD AllToAll without any interference.
+      No pre-sync barrier is needed — XCCL naturally waits for the 3 dp_rep ranks.
+
+    Implementation:
+      Iterate model.parameters() in order (same order on all dp_rep ranks). For each
+      param with a gradient, call _orig_all_reduce(grad, SUM, group=_XCCL_DP_REP_PG)
+      then divide by dp_rep_degree — no CPU copies, no numel exchange, no gloo.
+      (XCCL/oneCCL does not support ReduceOp.AVG; SUM + manual div is equivalent.)
+      Params with None grad are skipped (no asymmetry risk since all dp_rep ranks for
+      a given param either all have grad or all don't — same expert assignments).
+
+    Returns number of gradients synced.
+    """
+    if _XCCL_DP_REP_PG is None:
+        return 0
+
+    my_rank = torch.distributed.get_rank()
+    n_synced = 0
+
+    for param in model.parameters():
+        _g = param.grad
+        if _g is None:
+            continue
+
+        # Extract local shard if DTensor (ZeRO-3 style).
+        _g_local = _g._local_tensor if hasattr(_g, '_local_tensor') else _g
+
+        # all_reduce(SUM) on XPU tensor via XCCL — bypasses gloo monkey-patch.
+        # Note: XCCL (oneCCL) does not support ReduceOp.AVG; use SUM + manual div.
+        try:
+            _orig_all_reduce(_g_local, op=torch.distributed.ReduceOp.SUM,
+                             group=_XCCL_DP_REP_PG)
+        except Exception as _e:
+            log.error("Rank %d: XCCL grad_sync all_reduce FAILED: %s | "
+                      "param_shape=%s grad_shape=%s dtype=%s",
+                      my_rank, _e, list(param.shape), list(_g_local.shape), _g_local.dtype)
+            raise
+
+        _g_local.div_(dp_rep_degree)
+        n_synced += 1
+
+    return n_synced
+
 
 # Original device_empty_cache imported above. When colocated vLLM engines
 # are present, torch.xpu.empty_cache() can deadlock if called while another
@@ -231,6 +745,10 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
 
         # Initialize the distributed environment
         self.fsdp_cpu_offload = cfg.get("fsdp_cpu_offload", False)
+        # ref_cpu_offload: keep ref model on CPU, policy on GPU (needed for inline gen).
+        # Frees ~12 GiB XPU HBM by offloading ref model params to CPU; FSDP2 moves
+        # them to GPU on demand during ref forward passes only.
+        self._ref_cpu_offload = cfg.get("ref_cpu_offload", False)
         self._disable_prefetch = cfg.get("disable_prefetch", False)
         self._fsdp_diagnostics = cfg.get("fsdp_diagnostics", False)
         self._empty_cache_before_backward = cfg.get("empty_cache_before_backward", False)
@@ -335,6 +853,117 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             # Get shard PG for generation early-stopping all_reduce.
             # The shard group = ranks within same node (FSDP shards of same model).
             self._shard_pg = self._dp_mesh.get_group("dp_shard")
+            # v57: Create gloo process groups mirroring BOTH dp_replicate AND dp_shard.
+            # FSDP2 HSDP grad sync has two CCL steps that both need to be intercepted:
+            #   1. reduce_scatter_tensor(grad, group=dp_shard_pg) — our monkey-patch
+            #      converts to gloo AllReduce across dp_shard, then scatters.
+            #   2. all_reduce(grad_shard, group=dp_replicate_pg) — separate FSDP2 step
+            #      to average across replicas; also patched to use gloo.
+            # v56 bug: used _GLOO_DP_REP_PG (3 ranks) for step 1 which uses dp_shard (4 ranks).
+            # v57 fix: _GLOO_DP_SHARD_PG for step 1, _GLOO_DP_REP_PG for step 2.
+            # bound_device_id must be cleared (v56 fix) before any new_group(backend="gloo")
+            # to prevent PyTorch from trying pg._get_backend(xpu_device) on the gloo group.
+            global _GLOO_DP_REP_PG, _GLOO_DP_SHARD_PG, _GLOO_GLOBAL_PG, _XCCL_DP_REP_PG, _DP_REP_DEGREE, _DP_SHARD_DEGREE
+            _n_dp_rep = self._dp_replicate   # 3
+            _n_dp_shd = self._dp_shard       # 4 (= ep_degree)
+            _DP_REP_DEGREE = _n_dp_rep
+            _DP_SHARD_DEGREE = _n_dp_shd
+            import torch.distributed.distributed_c10d as _dc10d
+            _default_pg = _dc10d._get_default_group()
+            _orig_bound_device_id = _default_pg.bound_device_id
+            _default_pg.bound_device_id = None
+            try:
+                # dp_replicate gloo groups (3 ranks each, one per shard position):
+                # e.g. shard_idx=0: [0,4,8], shard_idx=1: [1,5,9], etc.
+                for _shard_idx in range(_n_dp_shd):
+                    _gloo_ranks = [_shard_idx + _n_dp_shd * j for j in range(_n_dp_rep)]
+                    _gloo_pg = torch.distributed.new_group(_gloo_ranks, backend="gloo")
+                    if self.rank in _gloo_ranks:
+                        _GLOO_DP_REP_PG = _gloo_pg
+                # dp_shard gloo groups (4 ranks each, one per replicate group):
+                # e.g. rep_idx=0: [0,1,2,3], rep_idx=1: [4,5,6,7], rep_idx=2: [8,9,10,11]
+                for _rep_idx in range(_n_dp_rep):
+                    _gloo_ranks = [_rep_idx * _n_dp_shd + j for j in range(_n_dp_shd)]
+                    _gloo_pg = torch.distributed.new_group(_gloo_ranks, backend="gloo")
+                    if self.rank in _gloo_ranks:
+                        _GLOO_DP_SHARD_PG = _gloo_pg
+                # v106: gloo CPU-bounce ONLY for no-grad (ref forward); XCCL for all else.
+                # One gloo FWD group per DP replica (4 ranks = EP ranks for that replica).
+                # Ref forward runs under torch.no_grad() → _XPUSyncAllToAll.forward checks
+                # torch.is_grad_enabled()==False → uses gloo CPU-bounce → avoids
+                # ze_handle_manager crash (cpu_offload freshly-allocated XPU buffers ≠ USM).
+                # Training forward + AC recompute: is_grad_enabled()==True → XCCL (lockstep).
+                # v116: Backward uses XCCL (reverted from v115 gloo BWD).
+                #   v115 hypothesis was wrong: use_reentrant=True serializes WITHIN a rank
+                #   but gloo P2P is NOT a collective — provides no cross-rank synchronization.
+                #   Different EP ranks can be at different backward layers → gloo size mismatch.
+                #   v114 crash (SIGSEGV call#27-30, consistent splits) was OOM, not FSDP2+XCCL
+                #   conflict. XCCL backward is safe: it IS a collective (forces lockstep).
+                #   v116 fix: keep XCCL backward + halve fbs (4→2) to reduce backward peak.
+                #   _XPU_A2A_BWD_GLOO_GROUP remains None → backward uses XCCL path.
+                # v127: Backward uses gloo CPU-bounce (same group as FWD).
+                #   v116-v126 XCCL backward crashes with SIGSEGV at call#0 (v122-v126) or
+                #   call#42 (v116-v119). All attempts to fix XCCL backward have failed:
+                #   IPC handle caching (v124), naive AllGather (v125), requires_grad_(False)
+                #   for ref (v126). The SIGSEGV is in XPU driver XCCL code, not Python.
+                #   v127 fix: force gloo CPU-bounce for backward AllToAll too.
+                #   Why v115 failed but v127 should work:
+                #     v115 attempted separate BWD gloo group (v101 implementation). This
+                #     deadlocked because AC recompute forward AllToAll and backward AllToAll
+                #     were concurrent on different TCP socket pairs.
+                #   v127 reuses the same FWD group for backward. This is safe because:
+                #     (1) AC recompute is CACHED (returns cached_output, no communication).
+                #         The FWD gloo group is completely idle during backward.
+                #     (2) With use_reentrant=True, backward is sequential per rank — all
+                #         12 ranks proceed in lockstep (same barrier discipline as forward).
+                #     (3) The same P2P send/recv split logic in backward (ctx.output_splits →
+                #         ctx.input_splits) is proven correct (v101 implementation).
+                #   Setting _XPU_A2A_BWD_GLOO_GROUP = FWD group activates gloo CPU-bounce
+                #   in _XPUSyncAllToAll.backward instead of XCCL all_to_all_single.
+                from torchtune.modules.moe import _parallelism as _moe_parallelism
+                # v129: SEPARATE FWD and BWD gloo groups.
+                # v127-v128 reused the same group for both FWD (ref-forward no-grad P2P)
+                # and BWD (gradient AllToAll P2P). Both failed with gloo::EnforceNotMet
+                # size mismatch even with a pre-barrier in v128.
+                # Hypothesis: the FWD group has residual TCP state from 60 ref-forward
+                # P2P ops. Fresh TCP connections (new group) avoid this state.
+                # Each group is created for all ranks simultaneously (required by
+                # torch.distributed.new_group) even though only self.rank's rank sets
+                # the module-level variable.
+                for _rep_idx in range(_n_dp_rep):
+                    _gloo_ranks = [_rep_idx * _n_dp_shd + j for j in range(_n_dp_shd)]
+                    _fwd_pg = torch.distributed.new_group(_gloo_ranks, backend="gloo")
+                    if self.rank in _gloo_ranks:
+                        _moe_parallelism._XPU_A2A_FWD_GLOO_GROUP = _fwd_pg
+                for _rep_idx in range(_n_dp_rep):
+                    _gloo_ranks = [_rep_idx * _n_dp_shd + j for j in range(_n_dp_shd)]
+                    _bwd_pg = torch.distributed.new_group(_gloo_ranks, backend="gloo")
+                    if self.rank in _gloo_ranks:
+                        _moe_parallelism._XPU_A2A_BWD_GLOO_GROUP = _bwd_pg
+                log.info("Rank %d: EP v129 — separate gloo FWD + BWD groups (fresh TCP, no state carryover)", self.rank)
+                # Global gloo group (all ranks): used for barrier before dp_replicate
+                # AllReduce to synchronize EP groups (v58 fix for gloo size mismatch).
+                _GLOO_GLOBAL_PG = torch.distributed.new_group(
+                    list(range(self.world_size)), backend="gloo"
+                )
+            finally:
+                _default_pg.bound_device_id = _orig_bound_device_id
+            # v75: Get the XCCL dp_replicate process group from the device mesh.
+            # This group uses the XPU Slingshot fabric (not gloo TCP) — pairs like (0,4),(0,8)
+            # are DISJOINT from SHARD pairs (within {0,1,2,3}), so XCCL REP all_reduce can
+            # coexist with concurrent gloo SHARD AllToAll without TCP interference.
+            _XCCL_DP_REP_PG = self._dp_mesh.get_group("dp_replicate")
+            log.info(
+                "Created gloo dp_replicate (%d-rank), dp_shard (%d-rank), "
+                "global gloo, FWD AllToAll gloo group, BWD AllToAll gloo group (v129, SEPARATE). "
+                "BWD uses separate gloo group (fresh TCP) to avoid FWD residual state. "
+                "dp_rep_pg=%s dp_shard_pg=%s global_pg=%s xccl_rep_pg=%s fwd_a2a_pg=%s bwd_a2a_pg=%s",
+                _n_dp_rep, _n_dp_shd,
+                _GLOO_DP_REP_PG, _GLOO_DP_SHARD_PG,
+                _GLOO_GLOBAL_PG, _XCCL_DP_REP_PG,
+                _moe_parallelism._XPU_A2A_FWD_GLOO_GROUP,
+                _moe_parallelism._XPU_A2A_BWD_GLOO_GROUP,
+            )
             # Shard group leader = local rank 0 within each shard group (= each node).
             # For replicated vLLM, each shard leader talks to its local vLLM.
             self._shard_rank = torch.distributed.get_rank(self._shard_pg)
@@ -353,6 +982,22 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             self._shard_pg = None
             self._shard_rank = self.rank
             self._is_shard_leader = self._is_rank_zero
+
+        # Expert Parallelism (reuses dp_shard process group — no new communicators)
+        self._expert_parallel_degree = cfg.get("expert_parallel_degree", 1)
+        self._expert_cpu_offload = cfg.get("expert_cpu_offload", False)
+        if self._expert_parallel_degree > 1:
+            assert self._dp_replicate > 1, (
+                "expert_parallel_degree > 1 requires data_parallel_replicate_dim > 1"
+            )
+            assert self._expert_parallel_degree == self._dp_shard, (
+                f"expert_parallel_degree={self._expert_parallel_degree} must equal "
+                f"dp_shard={self._dp_shard} (EP reuses the dp_shard process group)"
+            )
+            log.info(
+                "Expert Parallelism enabled: ep_degree=%d (reuses dp_shard group)",
+                self._expert_parallel_degree,
+            )
 
         # Gradient accumulation
         self._gradient_accumulation_steps = cfg.get("gradient_accumulation_steps", 1)
@@ -373,6 +1018,9 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         self._vllm_group_port = cfg.get("vllm_group_port", 51216)
         self._vllm_weight_sync = cfg.get("vllm_weight_sync", True)
         self._vllm_weight_sync_interval = cfg.get("vllm_weight_sync_interval", 1)
+        # Weight sync method: "raw_bytes" (file-based, default) or "shm" (POSIX shared memory,
+        # faster for large models — eliminates the file read step on the vLLM side).
+        self._vllm_weight_sync_method = cfg.get("vllm_weight_sync_method", "raw_bytes")
         self._vllm_clients = []  # initialized in setup() if vllm_mode == "server"
         self._vllm_client = None  # backward compat: first client
         # _vllm_llm may already be set by _init_vllm_early() for colocate mode
@@ -394,6 +1042,7 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
 
         # Step-based checkpointing
         self._save_every_n_steps = cfg.get("save_every_n_steps", None)
+        self._save_final_checkpoint = cfg.get("save_final_checkpoint", True)
 
         # Recipe state attributes
         self.seed = training.set_seed(seed=cfg.seed)
@@ -781,15 +1430,34 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         ref_checkpoint_dict = self.load_checkpoint(
             cfg_checkpointer=cfg.ref_checkpointer
         )
+        # ref model: use ref_cpu_offload if set (saves ~12 GiB XPU HBM).
+        # Policy model stays on GPU for inline generation; ref can live on CPU.
+        _ref_offload = self.fsdp_cpu_offload or self._ref_cpu_offload
         self._ref_model = self._setup_model(
             cfg_model=cfg.model,
             enable_activation_checkpointing=self._enable_activation_checkpointing,
             custom_sharded_layers=cfg.get("custom_sharded_layers", None),
-            fsdp_cpu_offload=self.fsdp_cpu_offload,
+            fsdp_cpu_offload=_ref_offload,
             model_sd=ref_checkpoint_dict[training.MODEL_KEY],
             eval_mode=True,
             reshard_after_forward=True,
         )
+        if _ref_offload and not getattr(self, "_ref_no_fsdp2", False):
+            # FSDP2 cpu_offload manages parameters only; registered buffers
+            # (layer_scalar, rope cache, etc.) are left on CPU after setup.
+            # Move them to XPU so they don't cause device mismatch against XPU
+            # inputs during ref forward passes. Params still live on CPU and are
+            # fetched to XPU on-demand by FSDP2's param-fetch hook.
+            # v120: skip for _ref_no_fsdp2 case — the whole model (params+buffers)
+            # is on CPU; generate_trajectory() does model.to(device) before fwd.
+            for _buf_name, _buf in self._ref_model.named_buffers():
+                if _buf is not None and _buf.device.type == "cpu":
+                    _buf.data = _buf.data.to(self._device)
+            if self._is_rank_zero:
+                log.info(
+                    "ref_cpu_offload: moved registered buffers to XPU "
+                    "(params remain on CPU for FSDP2 on-demand fetch)"
+                )
         # Skip barrier on multi-node (XCCL sub-communicator creation deadlocks
         # on 2D mesh). FSDP will implicitly sync during first forward pass.
         if not self._production_mode:
@@ -876,6 +1544,10 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         self.batch_size = cfg.batch_size
         self._forward_batch_size = cfg.forward_batch_size
 
+        # Reward mode: "math" (default) or "gene_recall"
+        self._reward_mode = cfg.get("reward_mode", "math")
+        self._gene_reward_metric = cfg.get("gene_reward_metric", "f1")
+
         # Sequence packing: bin-pack variable-length sequences to eliminate
         # padding waste in the training forward/backward pass.
         self._enable_packing = cfg.get("enable_packing", False)
@@ -935,7 +1607,7 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                 client = VLLMClient(
                     base_url=url,
                     group_port=self._vllm_group_port,
-                    connection_timeout=300.0,
+                    connection_timeout=900.0,
                 )
                 self._vllm_clients.append(client)
             self._vllm_client = self._vllm_clients[0]  # backward compat
@@ -945,9 +1617,18 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                 # alongside the training XCCL PG causes SIGABRT. Use file-based
                 # weight sync instead: save to /tmp, POST to vLLM to reload.
                 self._build_tune_to_hf_map()
-                self._weight_sync_path = "/tmp/torchtune/weight_update.safetensors"
+                # Use /dev/shm (RAM-backed tmpfs, 504 GB on Aurora) for fast I/O.
+                # Raw bytes format (.raw) replaces safetensors — uses memcpy at DDR5
+                # bandwidth instead of CPU serialization. For 62 GB BF16: ~2s vs ~47s.
+                # Async: gather is synchronous (FSDP collective), but save+HTTP runs
+                # in a background thread overlapping with the next generation step.
+                self._weight_sync_path = "/dev/shm/torchtune/weight_update.raw"
+                # Async sync state: event is set when no sync is in progress (safe to generate).
+                self._sync_done_event = threading.Event()
+                self._sync_done_event.set()  # initially clear (no sync running)
+                self._sync_error = None      # captured exception from background thread
                 log.info(
-                    "Rank %d: vLLM %d client(s) initialized: %s (%d params mapped, file-based sync via %s, interval=%d)",
+                    "Rank %d: vLLM %d client(s) initialized: %s (%d params mapped, async raw-bytes sync via %s, interval=%d)",
                     self.rank,
                     len(self._vllm_clients),
                     ",".join(self._vllm_urls),
@@ -995,15 +1676,35 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         call this function).
         """
         from torchtune.models.convert_weights import get_mapped_key
-        from torchtune.models.qwen2._convert_weights import _FROM_HF
+        from torchtune.training.checkpointing._utils import ModelType
 
+        # Select the model-specific _FROM_HF map based on checkpointer model_type.
+        # This avoids hardcoding Qwen2's map and works for Gemma4, etc.
+        _model_type = getattr(self._checkpointer, "_model_type", None)
+        if _model_type == ModelType.GEMMA4:
+            from torchtune.models.gemma4._convert_weights import _GEMMA4_FROM_HF as _FROM_HF
+        elif _model_type == ModelType.GEMMA2:
+            from torchtune.models.gemma2._convert_weights import _FROM_HF
+        elif _model_type in (None, ModelType.QWEN2):
+            from torchtune.models.qwen2._convert_weights import _FROM_HF
+        elif _model_type == ModelType.QWEN3:
+            from torchtune.models.qwen3._convert_weights import _FROM_HF
+        else:
+            # Fallback: use standard HF->tune mapping dict
+            from torchtune.models.qwen2._convert_weights import _FROM_HF
+            log.warning(
+                "Unknown model type %s for weight sync mapping, falling back to Qwen2 _FROM_HF",
+                _model_type,
+            )
         inverted = {v: k for k, v in _FROM_HF.items() if v is not None}
         self._tune_to_hf_map = {}
         for tune_name, _ in self._model.named_parameters():
-            # Strip FSDP and activation checkpoint wrapper prefixes for mapping
+            # Strip FSDP and activation checkpoint wrapper prefixes for mapping.
+            # state_dict() returns clean names, so key the map by clean name
+            # so lookups in _sync_weights_to_vllm hit correctly.
             clean_name = tune_name.replace("_fsdp_wrapped_module.", "")
             clean_name = clean_name.replace("_checkpoint_wrapped_module.", "")
-            self._tune_to_hf_map[tune_name] = get_mapped_key(
+            self._tune_to_hf_map[clean_name] = get_mapped_key(
                 clean_name, inverted
             )
 
@@ -1093,7 +1794,9 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         # FSDP2 FULL_SHARD across all ranks (no HSDP mesh) avoids the sub-PG deadlock.
         model_bytes = sum(v.numel() * v.element_size() for v in model_sd.values())
         model_gib = model_bytes / (1024 ** 3)
-        if self._dp_replicate > 1 and model_gib < 50.0:
+        # EP requires FSDP2: FSDP1 flattening is incompatible with post-load EP weight slicing.
+        _ep_active = self._expert_parallel_degree > 1 and self._dp_mesh is not None
+        if self._dp_replicate > 1 and model_gib < 50.0 and not _ep_active:
             self._use_fsdp1 = True
             return self._setup_model_fsdp1_hsdp(
                 cfg_model=cfg_model,
@@ -1103,10 +1806,11 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                 reshard_after_forward=reshard_after_forward,
             )
         elif self._dp_replicate > 1:
+            reason = "EP active" if _ep_active else f"model too large ({model_gib:.1f} GiB)"
             utils.log_rank_zero(
                 log,
-                f"Model too large for FSDP1 HSDP ({model_gib:.1f} GiB). "
-                f"Using FSDP2 with HSDP mesh (dp_replicate={self._dp_replicate} × dp_shard={self._dp_shard}).",
+                f"Using FSDP2 with HSDP mesh ({reason}): "
+                f"dp_replicate={self._dp_replicate} × dp_shard={self._dp_shard}.",
             )
 
         self._use_fsdp1 = False
@@ -1124,6 +1828,12 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             for p in model.parameters():
                 p.requires_grad = False
 
+        # v120: early-return path for ref model when EP active + ref_cpu_offload.
+        # At this point the model is on meta device with clean (pre-AC, pre-FSDP2) param names
+        # that match model_sd keys directly. We skip all EP/AC/FSDP2 wrapping and do a plain
+        # to_empty('cpu') + load_state_dict. The expert params in model_sd are pre-sliced later
+        # (below), but here we do it before the early return since we won't reach that code.
+        # Ref forward uses gloo AllToAll (no_grad path) — no EP FSDP2 needed.
         if self._compile:
             # Temporarily allow torch.compile (TORCH_COMPILE_DISABLE=1 set for vLLM)
             _saved_tcd = os.environ.pop("TORCH_COMPILE_DISABLE", None)
@@ -1133,42 +1843,322 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             if _saved_tcd is not None:
                 os.environ["TORCH_COMPILE_DISABLE"] = _saved_tcd
 
-        if enable_activation_checkpointing:
-            training.set_activation_checkpointing(
-                model, auto_wrap_policy={modules.TransformerSelfAttentionLayer}
+        # EP v42: Pre-shrink expert meta params BEFORE activation checkpointing wrapping.
+        # v41 bug: meta param shrinking was done AFTER set_activation_checkpointing, which
+        # inserts "_checkpoint_wrapped_module" into module names. model_sd uses clean names
+        # (e.g. "layers.0.moe_block.experts.gate_proj") but named_modules() after AC wrapping
+        # yields "layers.0._checkpoint_wrapped_module.moe_block.experts.gate_proj" → 0 keys
+        # matched in model_sd pre-slicing → full [128,...] tensors loaded into [32,...] params
+        # → "start (0) + length (128) exceeds dimension size (32)".
+        # v42 fix: shrink meta params BEFORE AC wrapping so names match model_sd keys.
+        _ep_active = self._expert_parallel_degree > 1 and self._dp_mesh is not None
+        _expert_param_names: set = set()  # expert param full names for model_sd pre-slicing
+        if _ep_active:
+            from torchtune.modules.moe.experts import GroupedExperts as _GE_pre
+            ep_mesh = self._dp_mesh["dp_shard"]  # 4-rank submesh per DP replica
+            _ep_rank = ep_mesh.get_local_rank()
+            _ep_degree = ep_mesh.shape[0]
+            # Collect expert param names and pre-shrink meta params from [128,...] → [32,...].
+            # At this point model has original (clean) module names matching model_sd keys.
+            for _ename, _emod in model.named_modules():
+                if not (_ename.endswith(".experts") and isinstance(_emod, _GE_pre)):
+                    continue
+                for _pname, _param in list(_emod.named_parameters(recurse=False)):
+                    _full_shape = _param.shape
+                    assert _full_shape[0] % _ep_degree == 0, (
+                        f"num_experts ({_full_shape[0]}) not divisible by ep_degree ({_ep_degree})"
+                    )
+                    _n_local = _full_shape[0] // _ep_degree
+                    _new_shape = torch.Size([_n_local] + list(_full_shape[1:]))
+                    setattr(_emod, _pname, nn.Parameter(
+                        torch.empty(_new_shape, dtype=_param.dtype, device="meta"),
+                        requires_grad=_param.requires_grad,
+                    ))
+                    _expert_param_names.add(f"{_ename}.{_pname}")
+            utils.log_rank_zero(
+                log,
+                f"EP v42: pre-shrunk {len(_expert_param_names)} expert meta params "
+                f"[{_full_shape[0]},...] → [{_n_local},...] "
+                f"(EP rank {_ep_rank}/{_ep_degree}, before AC wrapping)",
             )
 
-        # For FSDP sharding
-        fsdp_shard_conditions = [
-            partial(
-                training.get_shard_conditions,
-                names_to_match=custom_sharded_layers,
+        if enable_activation_checkpointing:
+            training.set_activation_checkpointing(
+                model,
+                auto_wrap_policy={modules.TransformerSelfAttentionLayer},
+                checkpoint_wrapper_fn=_no_reentrant_ac_wrapper,
             )
-        ]
+
+        # Expert Parallelism: install All-to-All dispatch/combine hooks on GroupedExperts.
+        # Must happen BEFORE shard_model so hooks are registered on the original modules.
+        if _ep_active:
+            from torch.distributed.tensor.parallel import parallelize_module
+            from torchtune.models.gemma4._parallelism import gemma4_ep_plan
+            from torchtune.modules.moe.experts import GroupedExperts
+            ep_plan = gemma4_ep_plan(model)
+            if ep_plan:
+                parallelize_module(model, ep_mesh, ep_plan)
+                utils.log_rank_zero(
+                    log,
+                    f"EP={self._expert_parallel_degree}: registered all-to-all hooks on "
+                    f"{len(ep_plan)} module(s)",
+                )
+
+        with training.set_default_dtype(self._dtype), self._device:
+            for m in model.modules():
+                if hasattr(m, "rope_init"):
+                    m.rope_init()
+
+        # Initialize here so it's defined even when _ep_active=False (EP=1 path).
+        _expert_cpu_offload = False
+
+        if _ep_active:
+            # EP model setup (v40: expert FSDP2 on dp_replicate, not ep_mesh):
+            # Expert params are EP-partitioned (32/rank). Previously we wrapped them
+            # with FSDP2 on ep_mesh (ep_pg, 4-rank). This caused:
+            # - v18-v31: OFI EPERM — AllToAll backward contaminates ep_pg's OFI CQ;
+            #   FSDP2 all_gather on same ep_pg reads stale error.
+            # - v32-v39: separate fsdp2_ep_pg (same 4 EP ranks, different CCL comm)
+            #   fixed EPERM but introduced DEADLOCK: FSDP2 all_gather (fsdp2_ep_pg)
+            #   and AllToAll backward (ep_pg) run concurrently over the same 4 ranks.
+            #   With CCL_WORKER_COUNT=1, different ranks advance at different speeds →
+            #   some call all_gather, others call AllToAll → both block → deadlock.
+            #
+            # Fix (v40): wrap experts with FSDP2 on dp_replicate (3-rank) instead.
+            # dp_replicate groups ({0,4,8}, {1,5,9}, etc.) are DISJOINT from ep_mesh
+            # groups ({0,1,2,3}, {4,5,6,7}, {8,9,10,11}).
+            # Expert FSDP2 all_gather and AllToAll can NEVER deadlock — they operate
+            # on different, non-overlapping sets of ranks.
+            # Expert FSDP2 semantics: each rank shards its 32-expert EP slice across
+            # 3 dp_replicate ranks (32/3 ≈ 10-11 per rank at rest). Before expert
+            # forward (dispatch+compute), FSDP2 all_gathers → each rank gets its full
+            # 32 experts. Expert compute is correct. Reduce_scatter after backward
+            # averages grads across 3 dp_replicate replicas — correct for DP.
+            # Wire EP dispatch/combine directly onto each MoE module.
+            # parallelize_module stores _ep_instance on GroupedExperts; wire_ep_to_moe_modules
+            # reads it and sets moe._ep_dispatch/_ep_combine as plain callables so that
+            # MoE.forward() calls them directly (no FSDP2 hooks needed).
+            from torchtune.modules.moe import wire_ep_to_moe_modules
+            n_ep_wired = wire_ep_to_moe_modules(model)
+            utils.log_rank_zero(
+                log,
+                f"EP: wired dispatch/combine callables on {n_ep_wired} MoE modules",
+            )
+            # v42: wrap expert modules with trivial 1-rank FSDP2 (no communication).
+            # Meta params were pre-shrunk to [32,...] BEFORE AC wrapping (above),
+            # so FSDPParam is initialized with the correct EP-local sizes.
+            # v123: skip for ref model (eval_mode=True). The ref model uses 1-rank solo FSDP2
+            # for the entire model (root shard_model call below), so separate expert FSDP2
+            # is not needed. Expert dispatch is wired by parallelize_module above.
+            if not eval_mode:
+                from torch.distributed._composable.fsdp import fully_shard as _fully_shard
+                from torchtune.modules.moe.experts import GroupedExperts as _GE
+                # Wrap with 1-rank solo FSDP2. FSDPParam sees [32,...] shapes.
+                # ALL ranks must call new_group for each 1-rank group (one per rank) in the
+                # same order. 12 new_group calls total (world_size), each of size 1.
+                _solo_groups = []
+                for _r in range(self.world_size):
+                    _sg = torch.distributed.new_group([_r])
+                    _solo_groups.append(_sg)
+                _my_solo_pg = _solo_groups[self.rank]
+                from torch.distributed.device_mesh import DeviceMesh as _DeviceMesh
+                _solo_mesh = _DeviceMesh.from_group(_my_solo_pg, "xpu")
+                # Use isinstance only (not name suffix) — after AC wrapping the module path
+                # contains "_checkpoint_wrapped_module" so endswith(".experts") would miss them.
+                _n_solo_wrapped = 0
+                _solo_wrapped_mods = []
+                for _ename, _emod in model.named_modules():
+                    if isinstance(_emod, _GE):
+                        # reshard_after_forward=False: no-op (1-rank group, nothing to gather)
+                        _fully_shard(_emod, mesh=_solo_mesh, reshard_after_forward=False)
+                        _solo_wrapped_mods.append(_emod)
+                        _n_solo_wrapped += 1
+                utils.log_rank_zero(
+                    log,
+                    f"EP v43: wrapped {_n_solo_wrapped} expert modules with trivial 1-rank FSDP2 "
+                    f"(no communication, excludes them from root dp_replicate FSDP2)",
+                )
+                # Suppress reduce_grads on expert 1-rank FSDP2 groups.
+                # CCL's reduce_scatter_tensor for 1-rank groups tries to register L0 IPC handles
+                # for the grad buffer → ze_handle_manager "unknown memory type" crash (v42).
+                # With reduce_grads=False, FSDP2 skips reduce_scatter in post_backward entirely;
+                # expert grads accumulate in param.grad for manual AllReduce in train().
+                # After _fully_shard(), each expert module is an FSDPModule — use ._get_fsdp_state()
+                # which is the stable public API on FSDPModule.
+                from torch.distributed.fsdp import FSDPModule as _FSDPModule
+                _n_grads_suppressed = 0
+                for _emod in _solo_wrapped_mods:
+                    if isinstance(_emod, _FSDPModule):
+                        _fsdp_state = _emod._get_fsdp_state()
+                        if _fsdp_state is not None and _fsdp_state._fsdp_param_group is not None:
+                            _fsdp_state._fsdp_param_group.reduce_grads = False
+                            _n_grads_suppressed += 1
+                utils.log_rank_zero(
+                    log,
+                    f"EP v43: suppressed reduce_grads on {_n_grads_suppressed} expert FSDPParamGroups "
+                    f"(prevents CCL ze_handle_manager crash for 1-rank reduce_scatter)",
+                )
+            else:
+                # Ref model (eval_mode=True): create NEW solo process groups for the root
+                # 1-rank FSDP2 (below). All 12 ranks must participate in all 12 new_group
+                # calls (PyTorch collective constraint). Store as instance attr so
+                # shard_model() sees it via fsdp2_mesh.
+                # v123: using 1-rank solo mesh for root FSDP2 instead of dp_replicate.
+                from torch.distributed.device_mesh import DeviceMesh as _DeviceMeshRef
+                _ref_root_solo_groups = []
+                for _r in range(self.world_size):
+                    _ref_root_sg = torch.distributed.new_group([_r])
+                    _ref_root_solo_groups.append(_ref_root_sg)
+                self._ref_root_solo_mesh = _DeviceMeshRef.from_group(
+                    _ref_root_solo_groups[self.rank], "xpu"
+                )
+                utils.log_rank_zero(
+                    log, "EP v123: created 1-rank solo mesh for ref root FSDP2 (no dp_replicate all-gather)"
+                )
+
+        # Standard shard conditions — solo-wrapped experts are already FSDP2-wrapped;
+        # shard_model will skip them (inner FSDP units are opaque to outer).
+        fsdp_shard_conditions = [partial(training.get_shard_conditions, names_to_match=custom_sharded_layers)]
 
         # Policy doesn't reshard after forward for faster generation.
         # Reference net reshards after forward because it never calls .backward()
-        # Use HSDP mesh for all models. FSDP2 with 2D DeviceMesh reuses cached
-        # ProcessGroups from init_device_mesh (no new XCCL communicators per-module).
-        # DeviceMesh uses new_group() (not split()) on XPU since torch.cuda.is_available()=False.
-        fsdp2_mesh = self._dp_mesh
+        # EP-mode: use dp_replicate (3-rank) mesh for non-expert FSDP2 instead of the
+        # EP+FSDP2 communicator conflict fix:
+        # XCCL cannot handle concurrent collectives from different process groups on the
+        # same OFI fabric. In EP mode, the EP AllToAll backward (on ep_mesh/dp_shard
+        # 4-rank group) fires concurrently with FSDP2's pre_backward all-gather (on
+        # dp_replicate 3-rank group) → OFI EPERM (err=265) → allgatherv EXCEPTION.
+        #
+        # Root cause: FSDP2 reshard_after_forward=True causes each layer to reshard
+        # after forward, then re-all-gather during backward (pre_backward hook). This
+        # all-gather collides with EP AllToAll backward at the same time.
+        #
+        # Fix: Use reshard_after_forward=False (ZeRO-2 style) for non-expert params
+        # in EP mode. Parameters stay gathered (not resharded) after forward, so there
+        # is NO all-gather during backward — only reduce-scatter (post_backward).
+        # Reduce-scatter runs AFTER backward completes, when EP AllToAll is already done.
+        # Cost: ~2× more memory for non-expert params vs reshard_after_forward=True.
+        # At 12.96 GiB alloc with 24 GiB HBM, this is acceptable.
+        #
+        # Without EP: use full dp_mesh (HSDP) with standard reshard_after_forward.
+        # FSDP2 mesh and reshard strategy:
+        # - Policy (eval_mode=False, EP active): dp_replicate (3-rank) mesh, ZeRO-2
+        #   (reshard_after_forward=False) — params stay gathered after fwd, no all-gather
+        #   during bwd (prevents XCCL conflict with EP AllToAll backward).
+        # - Ref (eval_mode=True, EP active): 1-rank solo mesh, ZeRO-3 (reshard_after_forward=True)
+        #   + cpu_offload=True. Each layer's params are fetched CPU→XPU individually during fwd
+        #   via simple memory copy (no XCCL, no IPC handles). Released back to CPU after each layer.
+        #   v123 rationale:
+        #     v118: ZeRO-3 on dp_replicate + cpu_offload=True → FSDP2 bug: 14.94 GiB stays in
+        #       XPU allocated after reshard (XCCL IPC handle cache holds reference).
+        #     v120-v122: .to(device)/.cpu() approach → XCCL IPC handle corruption → SIGSEGV.
+        #     v123: 1-rank solo mesh → no inter-rank communication → no XCCL IPC handles
+        #       involved in ref FSDP2 all-gather. Pure CPU→XPU memory copy per layer.
+        #       Pre-bwd: 12.23 + 15.57 ≈ 27.8 GiB. Peak backward: 27.8 + 16.18 ≈ 44 GiB << 64.
+        if _ep_active and self._dp_mesh.ndim > 1:
+            if eval_mode:
+                # Ref model: 1-rank solo FSDP2 (created in EP block above).
+                fsdp2_mesh = self._ref_root_solo_mesh
+                fsdp2_raf = True  # reshard after each layer → CPU→XPU→CPU per layer
+                # v126: set requires_grad=False on all ref model params BEFORE FSDP2 wrapping.
+                # With 1-rank solo FSDP2, FSDPParams inherit requires_grad from original params.
+                # If requires_grad=True (default), FSDP2 registers AccumulateGrad hooks on
+                # FSDPParams → pre_backward unshard hooks fire at policy backward() start →
+                # try to all-gather CPU ref params back to XPU → crash (state machine conflict
+                # or null pointer in FSDP2 C++ hook since no gradient flows through ref model).
+                # With requires_grad=False: NO AccumulateGrad hooks → NO FSDP2 backward hooks
+                # registered → ref model FSDP2 is transparent to policy backward.
+                # Forward (unshard + compute + reshard) still works — hooks are module-level
+                # (forward hooks), not gradient-level.
+                model.requires_grad_(False)
+                log.info(
+                    "EP v126: ref model requires_grad_(False) before FSDP2 wrapping — "
+                    "prevents FSDP2 backward hooks from firing during policy backward."
+                )
+                log.info(
+                    "EP v123: ref model using 1-rank solo FSDP2 mesh + cpu_offload=True + "
+                    "reshard_after_forward=True. Per-layer CPU→XPU copy, no XCCL."
+                )
+            else:
+                # Policy model: dp_replicate ZeRO-2.
+                fsdp2_mesh = self._dp_mesh["dp_replicate"]
+                fsdp2_raf = False
+                log.info(
+                    "EP active: using reshard_after_forward=False (ZeRO-2) for non-expert "
+                    "FSDP2 on dp_replicate mesh to prevent XCCL conflict with EP AllToAll."
+                )
+        else:
+            fsdp2_mesh = self._dp_mesh
+            fsdp2_raf = reshard_after_forward
+
         training.shard_model(
             model=model,
             shard_conditions=fsdp_shard_conditions,
             cpu_offload=fsdp_cpu_offload,
-            reshard_after_forward=reshard_after_forward,
+            reshard_after_forward=fsdp2_raf,
             dp_mesh=fsdp2_mesh,
             disable_prefetch=self._disable_prefetch,
         )
 
-        with training.set_default_dtype(self._dtype), self._device:
-            for m in model.modules():
-                # RoPE is not covered in state dict
-                if hasattr(m, "rope_init"):
-                    m.rope_init()
+        # Disable FSDP2 backward prefetch for ALL wrapped modules when EP is active.
+        # v40: expert FSDP2 is on dp_replicate (disjoint from ep_pg) — backward prefetch
+        # would fire async all_gathers on dp_replicate during AllToAll backward. While
+        # these are on different groups (no deadlock possible), disabling prefetch ensures
+        # sequential unshard → AllToAll → next layer, matching the backward graph order.
+        # Disabling prefetch also avoids the pre-v40 issue where prefetch triggered
+        # expert all_gathers on ep_pg during AllToAll backward → OFI EPERM.
+        if _ep_active:
+            training.disable_fsdp2_backward_prefetch(model)
 
-        # This method will convert the full model state dict into a sharded state
-        # dict and load into the model
+        # v59: Suppress reduce_grads on ALL FSDPParamGroups when EP is active.
+        # Expert groups already have reduce_grads=False (set above, v43).
+        # Non-expert groups (on dp_replicate 1D mesh) still fire reduce_scatter_tensor
+        # during backward, which goes through _xpu_reduce_scatter_via_allreduce and
+        # calls gloo AllReduce on _GLOO_DP_REP_PG. But different EP replica groups
+        # ({0,4,8}, {1,5,9}, ...) may be at different params when the AllReduce fires
+        # (EP load imbalance → different backward execution order per replica group) →
+        # gloo preamble size mismatch → SIGABRT.
+        # Fix: suppress reduce_grads=False on ALL FSDPParamGroups. FSDP2 then skips
+        # reduce_scatter entirely during backward. Grads accumulate in param.grad locally.
+        # Post-backward: _ep_post_backward_grad_sync() iterates all params sequentially
+        # and does gloo AllReduce in a fixed parameter order — no ordering race possible.
+        if _ep_active:
+            from torch.distributed.fsdp import FSDPModule as _FSDPModuleV59
+            _n_all_suppressed = 0
+            for _mod in model.modules():
+                if isinstance(_mod, _FSDPModuleV59):
+                    _fsdp_state = _mod._get_fsdp_state()
+                    if _fsdp_state is not None and _fsdp_state._fsdp_param_group is not None:
+                        if _fsdp_state._fsdp_param_group.reduce_grads:
+                            _fsdp_state._fsdp_param_group.reduce_grads = False
+                            _n_all_suppressed += 1
+            utils.log_rank_zero(
+                log,
+                f"EP v59: suppressed reduce_grads on {_n_all_suppressed} additional "
+                f"non-expert FSDPParamGroups (post-backward manual gloo AllReduce instead)",
+            )
+
+        # Load checkpoint.
+        # v41: expert meta params were pre-shrunk to [32,...] before fully_shard, so
+        # FSDPParam expects [32,...] tensors. Pre-slice model_sd expert params here so
+        # load_from_full_model_state_dict copies the correct [32,...] EP shard.
+        # Non-expert params: FSDP2 DTensors on dp_replicate (3-rank), auto-sliced.
+        if _ep_active:
+            _n_sd_sliced = 0
+            for _sd_name in list(model_sd.keys()):
+                if _sd_name in _expert_param_names:
+                    _ft = model_sd[_sd_name]
+                    assert _ft.shape[0] % _ep_degree == 0, (
+                        f"Expert param {_sd_name}: shape[0]={_ft.shape[0]} not divisible by ep_degree={_ep_degree}"
+                    )
+                    _n_local = _ft.shape[0] // _ep_degree
+                    model_sd[_sd_name] = _ft[_ep_rank * _n_local : (_ep_rank + 1) * _n_local].contiguous()
+                    _n_sd_sliced += 1
+            utils.log_rank_zero(
+                log,
+                f"EP v41: pre-sliced {_n_sd_sliced} expert params in model_sd "
+                f"(full [128,...] → [{_n_local},...] for EP rank {_ep_rank}/{_ep_degree})",
+            )
         training.load_from_full_model_state_dict(
             model,
             model_sd,
@@ -1176,6 +2166,8 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             strict=True,
             cpu_offload=fsdp_cpu_offload,
         )
+        # v41: EP weight slicing was done via model_sd pre-slicing above.
+        # apply_ep_weight_sharding is no longer called post-load.
 
         # Ensure no params and buffers are on meta device
         training.validate_no_params_on_meta_device(model)
@@ -1221,6 +2213,12 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             self._layer_mem_hooks = []
 
         disable_dropout(model)
+
+        # v40: no manual FSDP2 param group tracking needed.
+        # Non-expert: FSDP2 reduce_scatter on dp_replicate handles grad sync natively.
+        # Expert: 1-rank solo FSDP2 (no-op); manual AllReduce in train() after grpo_step.
+        self._expert_fsdp_modules = []
+        self._fsdp2_param_groups_meta = []  # empty — no manual sync needed in v40
 
         return model
 
@@ -1284,7 +2282,9 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
 
         if enable_activation_checkpointing:
             training.set_activation_checkpointing(
-                model, auto_wrap_policy={modules.TransformerSelfAttentionLayer}
+                model,
+                auto_wrap_policy={modules.TransformerSelfAttentionLayer},
+                checkpoint_wrapper_fn=_no_reentrant_ac_wrapper,
             )
 
         # Mixed precision policy
@@ -1764,25 +2764,126 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             self.rank, n_synced, time.perf_counter() - t0,
         )
 
-    def _sync_weights_to_vllm(self) -> None:
-        """Gather sharded params and push to vLLM server.
+    @staticmethod
+    def _save_raw_bytes(state_dict: dict, path: str) -> int:
+        """Write tensors as raw bytes with a simple JSON header.
 
-        Uses file-based sync: saves weights as safetensors to /tmp, then
-        POSTs to vLLM's /load_weights_from_path/ endpoint. This avoids
-        creating a second XCCL process group which SIGABRTs on XPU.
+        Format: [8-byte header_len][JSON header][raw tensor bytes...]
 
-        FSDP2: all ranks participate in ``full_tensor()``, shard leader saves.
-        FSDP1 (HSDP): uses FSDP.state_dict() which gathers on all ranks in
-        the shard group, shard leader saves.
+        BF16 tensors are stored as int16 bytes (same bit pattern, no conversion)
+        and tagged with dtype "torch.bfloat16" in the header so the reader can
+        reinterpret correctly.
 
-        For HSDP: each shard leader syncs to its local vLLM independently.
+        This is ~40× faster than safetensors for large models:
+        - safetensors: ~1.3 GB/s (CPU serialization bottleneck)
+        - raw bytes: view(int16).numpy().tobytes() = memcpy at DDR5 bandwidth (~50 GB/s)
+        - For 62 GB BF16: ~2s vs ~47s
+
+        Returns number of params written.
         """
+        import json
+
+        header_entries = []
+        np_arrays = []
+        offset = 0
+
+        for name, tensor in state_dict.items():
+            dtype_str = str(tensor.dtype)  # e.g. "torch.bfloat16"
+            shape = list(tensor.shape)
+
+            # BF16 not supported by numpy — view as int16 (same bits, just reinterpreted).
+            if tensor.dtype == torch.bfloat16:
+                np_arr = tensor.view(torch.int16).numpy()
+            else:
+                np_arr = tensor.numpy()
+
+            # Ensure contiguous layout so buffer protocol write is a single memcpy.
+            if not np_arr.flags['C_CONTIGUOUS']:
+                import numpy as _np
+                np_arr = _np.ascontiguousarray(np_arr)
+
+            nbytes = np_arr.nbytes
+
+            header_entries.append({
+                "name": name,
+                "shape": shape,
+                "dtype": dtype_str,
+                "offset": offset,
+                "nbytes": nbytes,
+            })
+            np_arrays.append(np_arr)  # zero-copy view — no tobytes() allocation
+            offset += nbytes
+
+        header_json = json.dumps(header_entries).encode("utf-8")
+        header_len_bytes = struct.pack("<Q", len(header_json))
+
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(header_len_bytes)
+            f.write(header_json)
+            for arr in np_arrays:
+                f.write(arr)  # buffer protocol: kernel copies directly from numpy memory
+
+        return len(header_entries)
+
+    def _post_weights_to_vllm(self, save_path: str, n_params: int, t_gather: float, t0: float) -> None:
+        """POST to all vLLM replicas to reload from /dev/shm raw bytes file.
+
+        Called from background thread — runs while next step's generation proceeds.
+        Uses load_weights_from_raw endpoint (fast frombuffer path).
+        Falls back to load_weights_from_path (safetensors) if raw not available.
+        """
+        import requests
+
+        t_http0 = time.perf_counter()
+        for url in self._vllm_urls:
+            try:
+                r = requests.post(
+                    f"{url}/collective_rpc",
+                    json={"method": "load_weights_from_raw", "args": [save_path]},
+                    timeout=300,
+                )
+                if r.status_code != 200:
+                    log.warning("vLLM weight reload (raw) failed (%s): %s %s", url, r.status_code, r.text[:200])
+                else:
+                    result = r.json()
+                    results = result.get("results", [{}])
+                    first = results[0] if results else {}
+                    if isinstance(first, dict) and first.get("status") != "ok":
+                        log.warning("vLLM weight reload (raw) error (%s): %s", url, first)
+            except Exception as e:
+                log.error("vLLM weight reload HTTP error (%s): %s", url, e)
+        t_http = time.perf_counter() - t_http0
+
+        for client in self._vllm_clients:
+            client.reset_prefix_cache()
+
+        log.info(
+            "Rank %d: weight sync %d vLLM replica(s): %d params %.1fs total "
+            "(gather=%.1fs [sync] save=%.1fs http=%.1fs) [async raw-bytes: %s]",
+            self.rank, len(self._vllm_urls), n_params, time.perf_counter() - t0,
+            t_gather, time.perf_counter() - t0 - t_gather - t_http, t_http, save_path,
+        )
+
+    def _sync_weights_to_vllm(self) -> None:
+        """Dispatch weight sync to the configured method (raw_bytes or shm).
+
+        Dispatches to:
+          raw_bytes — file-based /dev/shm write + HTTP POST (default, ~9s for 3B)
+          shm       — POSIX shared memory, zero-copy on vLLM side (~5s for 3B, ~3s for 31B)
+
+        Both methods are async: Phase 1 (FSDP gather) is synchronous across all ranks,
+        Phase 2 (copy + POST) runs in a background thread overlapping with generation.
+        Call _wait_for_sync_complete() before generate_trajectory().
+        """
+        if getattr(self, "_vllm_weight_sync_method", "raw_bytes") == "shm":
+            return self._sync_weights_to_vllm_shm()
+        # raw_bytes path below:
         t0 = time.perf_counter()
         hf_state_dict = {}
 
         if getattr(self, '_use_fsdp1', False) and self._dp_replicate > 1:
             # FSDP1 path: state_dict() handles gathering within shard group.
-            # All ranks in the shard group participate.
             from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, StateDictType
             with FSDP.state_dict_type(self._model, StateDictType.FULL_STATE_DICT):
                 full_sd = self._model.state_dict()
@@ -1792,9 +2893,7 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                     hf_state_dict[hf_name] = param.cpu()
             del full_sd
         else:
-            # FSDP2 path: gather DTensor -> full tensor.
-            # With HSDP 2D mesh, full_tensor() all-gathers within shard group only
-            # (dp_shard dim). Each shard leader gets a full copy independently.
+            # FSDP2 path: gather DTensor → full tensor.
             sharded_sd = self._model.state_dict()
             for param_name, param in sharded_sd.items():
                 if param.is_cpu:
@@ -1806,40 +2905,261 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                     hf_state_dict[hf_name] = param.cpu()
             del sharded_sd
 
-        # Barrier: ensure all ranks finished full_tensor() before saving
+        # Barrier: all ranks finish full_tensor() before shard leader saves
         if not self._production_mode:
             torch.distributed.barrier()
 
+        t_gather = time.perf_counter() - t0
+
         if self._is_shard_leader:
-            from safetensors.torch import save_file
-
-            n_params = len(hf_state_dict)
             save_path = self._weight_sync_path
-            os.makedirs(os.path.dirname(save_path), exist_ok=True)
-            save_file(hf_state_dict, save_path)
-            del hf_state_dict
+            n_params = len(hf_state_dict)
 
-            # Tell vLLM to reload from file
-            import requests
-            r = requests.post(
-                f"{self._vllm_url}/load_weights_from_path/",
-                json={"path": save_path},
-                timeout=120,
-            )
-            if r.status_code != 200:
-                log.warning("vLLM weight reload failed: %s %s", r.status_code, r.text)
-            else:
-                result = r.json()
-                if result.get("status") != "ok":
-                    log.warning("vLLM weight reload error: %s", result)
+            # Mark sync in-progress BEFORE spawning thread (prevent race with
+            # _wait_for_sync_complete checking the event).
+            self._sync_done_event.clear()
+            self._sync_error = None
 
-            self._vllm_client.reset_prefix_cache()
+            def _bg_save_and_post(state_dict=hf_state_dict):
+                try:
+                    t_save0 = time.perf_counter()
+                    self._save_raw_bytes(state_dict, save_path)
+                    t_save = time.perf_counter() - t_save0
+                    del state_dict  # free ~62 GB as soon as written
+                    log.info(
+                        "Rank %d: async sync save done: %d params in %.1fs (%.1f GB/s) → %s",
+                        self.rank, n_params, t_save,
+                        (n_params and os.path.getsize(save_path) / 1024**3 / t_save if t_save > 0 else 0),
+                        save_path,
+                    )
+                    self._post_weights_to_vllm(save_path, n_params, t_gather, t0)
+                except Exception as e:
+                    log.error("Rank %d: async weight sync failed: %s", self.rank, e, exc_info=True)
+                    self._sync_error = e
+                finally:
+                    self._sync_done_event.set()
+
+            t = threading.Thread(target=_bg_save_and_post, daemon=True, name="weight_sync")
+            t.start()
             log.info(
-                "Rank %d: weight sync to vLLM: %d params in %.1fs (file-based)",
-                self.rank, n_params, time.perf_counter() - t0,
+                "Rank %d: weight sync gather done in %.1fs, async save+POST started (%d params → %s)",
+                self.rank, t_gather, n_params, save_path,
             )
 
         device_empty_cache(self._device)
+
+    def _sync_weights_to_vllm_shm(self) -> None:
+        """Gather sharded params then async-dispatch to vLLM via POSIX shared memory.
+
+        Faster alternative to _sync_weights_to_vllm (raw bytes file) for large models:
+
+          Phase 1 (synchronous): FSDP full_tensor() gather — same as raw bytes path.
+          Phase 2 (async, shard leader only):
+            - Allocate a single SharedMemory block (one mmap, one OS call).
+            - Copy all tensors in via ctypes.memmove (DDR5 bandwidth, ~0.2s for 6 GB,
+              ~1.8s for 62 GB). No Python object allocation — avoids GC pressure.
+            - Write metadata JSON (tensor names/shapes/offsets) to /dev/shm.
+            - POST metadata path to vLLM load_weights_from_shm.
+            - vLLM maps the SAME physical RAM pages zero-copy via frombuffer(shm.buf).
+            - After vLLM confirms, unlink the SHM block.
+
+        Total for 62 GB BF16 model:
+          Raw bytes: write=24s + HTTP(read=6s+load=?s) = 30s+
+          SHM:       copy=1.8s + HTTP(map=0s+to_xpu=1.2s+load=?s) = 3s+
+          Savings: ~27s per sync for 31B.
+
+        Enable with config: vllm_weight_sync_method: shm
+        """
+        import ctypes
+        import json
+        from multiprocessing.shared_memory import SharedMemory
+
+        t0 = time.perf_counter()
+        hf_state_dict = {}
+
+        # Phase 1: FSDP gather (same as raw bytes path)
+        if getattr(self, '_use_fsdp1', False) and self._dp_replicate > 1:
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, StateDictType
+            with FSDP.state_dict_type(self._model, StateDictType.FULL_STATE_DICT):
+                full_sd = self._model.state_dict()
+            if self._is_shard_leader:
+                for param_name, param in full_sd.items():
+                    hf_name = self._tune_to_hf_map.get(param_name, param_name)
+                    hf_state_dict[hf_name] = param.cpu()
+            del full_sd
+        else:
+            sharded_sd = self._model.state_dict()
+            for param_name, param in sharded_sd.items():
+                if param.is_cpu:
+                    param = param.to(self._device)
+                if hasattr(param, "_local_tensor"):
+                    param = param.full_tensor()
+                if self._is_shard_leader:
+                    hf_name = self._tune_to_hf_map.get(param_name, param_name)
+                    hf_state_dict[hf_name] = param.cpu()
+            del sharded_sd
+
+        if not self._production_mode:
+            torch.distributed.barrier()
+
+        t_gather = time.perf_counter() - t0
+
+        if self._is_shard_leader:
+            n_params = len(hf_state_dict)
+            meta_path = "/dev/shm/torchtune/wsync_meta.json"
+
+            self._sync_done_event.clear()
+            self._sync_error = None
+
+            def _bg_shm_and_post(state_dict=hf_state_dict):
+                try:
+                    import numpy as _np
+
+                    # Compute total bytes and build numpy views
+                    tensors_meta = []
+                    np_arrays = []
+                    total_bytes = 0
+                    for hf_name, tensor in state_dict.items():
+                        if tensor.dtype == torch.bfloat16:
+                            np_arr = tensor.view(torch.int16).numpy()
+                        else:
+                            np_arr = tensor.numpy()
+                        if not np_arr.flags['C_CONTIGUOUS']:
+                            np_arr = _np.ascontiguousarray(np_arr)
+                        nbytes = np_arr.nbytes
+                        tensors_meta.append({
+                            "name": hf_name,
+                            "shape": list(tensor.shape),
+                            "dtype": str(tensor.dtype),
+                            "offset": total_bytes,
+                            "nbytes": nbytes,
+                        })
+                        np_arrays.append(np_arr)
+                        total_bytes += nbytes
+
+                    del state_dict  # free gathered tensors ASAP
+
+                    # Reuse the persistent SHM block if size matches — avoids page-fault
+                    # overhead (~4s for 6 GB) caused by OS demand-paging fresh SHM pages.
+                    # On first call or size change, allocate a new block and warm it up.
+                    shm_name = "torchtune_weights"
+                    existing = getattr(self, '_shm_block', None)
+                    if existing is not None and existing.size == total_bytes:
+                        shm = existing
+                        is_new = False
+                    else:
+                        # Clean up old block (size change or first run)
+                        if existing is not None:
+                            try:
+                                existing.close()
+                                existing.unlink()
+                            except Exception:
+                                pass
+                        # Also clean up any stale SHM from a previous process
+                        try:
+                            stale = SharedMemory(name=shm_name, create=False)
+                            stale.close()
+                            stale.unlink()
+                        except FileNotFoundError:
+                            pass
+                        shm = SharedMemory(name=shm_name, create=True, size=max(total_bytes, 1))
+                        self._shm_block = shm
+                        is_new = True
+
+                    # Copy tensors into SHM via ctypes.memmove — no Python object allocation.
+                    # On reused blocks, pages are already faulted → DDR5 bandwidth (~30 GB/s).
+                    # On new blocks, first-touch faults limit to ~1-2 GB/s (one-time cost).
+                    t_copy0 = time.perf_counter()
+                    for arr, entry in zip(np_arrays, tensors_meta):
+                        dst = ctypes.addressof(ctypes.c_char.from_buffer(shm.buf, entry["offset"]))
+                        src = arr.ctypes.data
+                        ctypes.memmove(dst, src, entry["nbytes"])
+                    del np_arrays
+                    t_copy = time.perf_counter() - t_copy0
+
+                    gb = total_bytes / 1024**3
+                    log.info(
+                        "Rank %d: shm copy done: %d params %.2f GiB in %.1fs (%.1f GB/s) → shm:%s%s",
+                        self.rank, n_params, gb, t_copy, gb / t_copy if t_copy > 0 else 0,
+                        shm_name, " [new block, page-fault warmup]" if is_new else " [reused]",
+                    )
+
+                    # Build and POST metadata to vLLM
+                    meta_json = json.dumps({
+                        "shm_name": shm_name,
+                        "total_bytes": total_bytes,
+                        "tensors": tensors_meta,
+                    })
+
+                    import requests
+                    t_http0 = time.perf_counter()
+                    for url in self._vllm_urls:
+                        try:
+                            r = requests.post(
+                                f"{url}/collective_rpc",
+                                json={"method": "load_weights_from_shm", "args": [meta_json]},
+                                timeout=300,
+                            )
+                            if r.status_code != 200:
+                                log.warning("vLLM shm reload failed (%s): %s %s", url, r.status_code, r.text[:200])
+                            else:
+                                result = r.json()
+                                results = result.get("results", [{}])
+                                first = results[0] if results else {}
+                                if isinstance(first, dict) and first.get("status") != "ok":
+                                    log.warning("vLLM shm reload error (%s): %s", url, first)
+                        except Exception as e:
+                            log.error("vLLM shm reload HTTP error (%s): %s", url, e)
+                    t_http = time.perf_counter() - t_http0
+
+                    for client in self._vllm_clients:
+                        client.reset_prefix_cache()
+
+                    log.info(
+                        "Rank %d: weight sync shm %d vLLM replica(s): %d params %.1fs total "
+                        "(gather=%.1fs [sync] copy=%.1fs http=%.1fs) [shm:%s]",
+                        self.rank, len(self._vllm_urls), n_params, time.perf_counter() - t0,
+                        t_gather, t_copy, t_http, shm_name,
+                    )
+
+                except Exception as e:
+                    log.error("Rank %d: shm weight sync failed: %s", self.rank, e, exc_info=True)
+                    self._sync_error = e
+                finally:
+                    # SHM block is kept alive (self._shm_block) for reuse next step.
+                    # Cleanup happens in teardown() or on size change above.
+                    self._sync_done_event.set()
+
+            t = threading.Thread(target=_bg_shm_and_post, daemon=True, name="weight_sync_shm")
+            t.start()
+            log.info(
+                "Rank %d: weight sync (shm) gather done in %.1fs, async copy+POST started (%d params)",
+                self.rank, t_gather, n_params,
+            )
+
+        device_empty_cache(self._device)
+
+    def _wait_for_sync_complete(self) -> None:
+        """Block until the background weight sync thread finishes.
+
+        Call this immediately before generate_trajectory() to ensure vLLM has
+        up-to-date weights. If sync finishes before generation is ready to start,
+        wait time is zero. If sync takes longer than the inter-step gap, we wait
+        only the remaining time.
+        """
+        if not self._vllm_weight_sync or not self._is_shard_leader:
+            return
+        if not hasattr(self, "_sync_done_event"):
+            return
+        if not self._sync_done_event.is_set():
+            t_wait0 = time.perf_counter()
+            self._sync_done_event.wait()
+            waited = time.perf_counter() - t_wait0
+            if waited > 0.05:
+                log.info("Rank %d: waited %.1fs for async weight sync to complete", self.rank, waited)
+        if self._sync_error is not None:
+            log.error("Rank %d: previous async weight sync had an error: %s", self.rank, self._sync_error)
+            self._sync_error = None  # reset so training continues
 
     def generate_trajectory(
         self, input_ids: torch.Tensor, answers: list[str]
@@ -2048,8 +3368,27 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         # multi-node to avoid CCL broadcast_scaleout failures.
         _ref_fwd_t0 = time.perf_counter()
         log.info("Rank %d: pre-ref forward", self.rank)
-        # FSDP AllGather in ref forward provides implicit sync
-        if not self._production_mode:
+        # v79: XCCL SHARD barrier before ref forward (EP case).
+        # Root cause of v78 a2a#241 deadlock: after the post-optimizer XCCL SHARD
+        # sync (v78), all SHARD members start step N+1 generate() together. But
+        # policy fwd has 60 gloo AllToAlls — when token routing imbalance causes
+        # ep_rank 0 to process 32k tokens vs ep_ranks 1-3 processing ~0, the 60
+        # policy fwd AllToAlls finish but the TRANSITION to ref fwd has no sync
+        # in production mode. Fast ep_ranks (1-3) enter ref fwd and start
+        # a2a#241 (first ref fwd AllToAll). ep_rank 0 is still processing its
+        # policy fwd tokens → never calls a2a#241 → 1800s timeout.
+        # Fix: XCCL SHARD all_reduce before ref forward. Forces all 4 SHARD
+        # members to rendezvous between policy fwd and ref fwd. ep_ranks 1-3
+        # wait here for ep_rank 0 to finish policy fwd before any rank starts
+        # ref fwd AllToAlls. No XCCL SHARD collision: the only other XCCL SHARD
+        # op in this step (post-optimizer, v78) fired in the PREVIOUS step and
+        # is fully complete. Zero gloo AllToAlls are active when this fires.
+        if self._expert_parallel_degree > 1 and self._shard_pg is not None:
+            _pre_ref_sync = torch.zeros(1, dtype=torch.float32, device=self._device)
+            _orig_all_reduce(_pre_ref_sync, op=torch.distributed.ReduceOp.SUM,
+                             group=self._shard_pg)
+            log.info("Rank %d: EP v79 pre-ref XCCL SHARD sync done", self.rank)
+        elif not self._production_mode:
             torch.distributed.barrier()
         if fwd_bs >= num_seqs:
             log.info("Rank %d: ref forward start", self.rank)
@@ -2083,6 +3422,13 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         device_empty_cache(self._device)
         if self._device.type == "xpu":
             torch.xpu.synchronize()
+        if self._is_rank_zero:
+            _alloc_after_ref = torch.xpu.memory_allocated(self._device) / 1e9
+            _resv_after_ref = torch.xpu.memory_reserved(self._device) / 1e9
+            log.info(
+                "Rank 0: post-ref-fwd alloc=%.2f GiB resv=%.2f GiB",
+                _alloc_after_ref, _resv_after_ref,
+            )
         _ref_fwd_time = time.perf_counter() - _ref_fwd_t0
 
         log.info(
@@ -2100,9 +3446,15 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
 
         # Compute rewards
         responses = responses.reshape(batch_size, grpo_size, -1)
-        rewards, successes, metadata = batched_rewards(
-            self._tokenizer, responses, answers, device=self._device
-        )
+        if self._reward_mode == "gene_recall":
+            rewards, successes, metadata = gene_recall_batched_rewards(
+                self._tokenizer, responses, answers, device=self._device,
+                reward_metric=self._gene_reward_metric,
+            )
+        else:
+            rewards, successes, metadata = batched_rewards(
+                self._tokenizer, responses, answers, device=self._device
+            )
         rewards = rewards.to(self._device)
         successes = successes.to(self._device)
 
@@ -2136,8 +3488,9 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         device_empty_cache(self._device)
 
         # step 6. mask out all the invalid values in the trajectory due to padding tokens
-        logprobs[response_padding_masks] = 1.0
-        ref_logprobs[response_padding_masks] = 1.0
+        # Use masked_fill_ to avoid boolean index L0 sub-allocation (UR:40 risk).
+        logprobs.masked_fill_(response_padding_masks, 1.0)
+        ref_logprobs.masked_fill_(response_padding_masks, 1.0)
 
         return GRPOTrajectory(
             query_responses=query_responses,
@@ -2240,91 +3593,231 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             )
             del packed_logits
         else:
-            log.info("Rank %d: grpo_step policy forward start", self.rank)
-            pi_logits = self._model(
-                trajectory.query_responses,
-                input_pos=trajectory.position_ids,
-                mask=trajectory.masks,
+            # Chunked training forward+backward: process self._forward_batch_size
+            # sequences at a time. Each chunk gets its own backward() call so
+            # autograd only holds one chunk's activation graph in memory at once.
+            # Gradients accumulate across chunks before the optimizer step.
+            # Mathematically equivalent to a single forward+backward over all seqs.
+            total_seqs = trajectory.query_responses.shape[0]
+            fwd_bs = self._forward_batch_size
+            num_fwd_chunks = (total_seqs + fwd_bs - 1) // fwd_bs
+            grad_scale = num_fwd_chunks * max(1, self._gradient_accumulation_steps)
+
+            # FSDP2 reduce-scatter suppression for multi-chunk backward.
+            # With num_fwd_chunks > 1, each backward() call would normally
+            # fire reduce-scatter (AllReduce for FSDP1). That's num_fwd_chunks×
+            # the communication cost. Suppress for all but the final chunk:
+            # gradients accumulate locally on each rank; final chunk fires once.
+            # Use set_requires_gradient_sync() for FSDP2, no_sync() for FSDP1.
+            _use_fsdp2_grad_sync = (
+                num_fwd_chunks > 1
+                and hasattr(self._model, 'set_requires_gradient_sync')
+                and not self._use_fsdp1
+            )
+            _use_fsdp1_no_sync = (
+                num_fwd_chunks > 1
+                and self._use_fsdp1
+                and hasattr(self._model, 'no_sync')
             )
 
-        if self._device.type == "xpu":
-            torch.xpu.synchronize()
-        _fwd_time = time.perf_counter() - _fwd_t0
-        log.info("Rank %d: grpo_step forward=%.1fs", self.rank, _fwd_time)
+            _chunk_losses, _chunk_policy_losses, _chunk_kl_losses = [], [], []
+            _chunk_ratios, _chunk_clipfracs, _chunk_pi_logprobs = [], [], []
+            _bwd_total = 0.0
 
-        pi_logits = rlhf.truncate_sequence_for_logprobs(pi_logits, context_length)
-
-        if self._use_chunked_loss:
-            # Chunked loss: pass raw logits directly to loss function.
-            # The loss computes logprobs internally per chunk, avoiding
-            # materializing the full [B*G, seq, vocab] fp32 logit tensor.
-            targets = trajectory.query_responses[:, context_length:]
-            num_chunks = self._loss_fn.num_output_chunks
-            pi_logit_chunks = list(pi_logits.chunk(num_chunks, dim=1))
-            del pi_logits
-            if self._device.type == "xpu":
-                torch.xpu.synchronize()
-
-            loss, policy_loss, kl_loss, ratios, clipfrac, pi_logprobs = (
-                self._loss_fn(
-                    pi_logit_chunks,
-                    targets,
-                    trajectory.ref_logprobs,
-                    trajectory.advantages,
-                    padding_masks=~trajectory.response_padding_masks,
+            for _cs in range(0, total_seqs, fwd_bs):
+                _is_last_chunk = (_cs + fwd_bs >= total_seqs)
+                _ce = min(_cs + fwd_bs, total_seqs)
+                if self._device.type == "xpu" and self._is_rank_zero:
+                    _pre_fwd_alloc = torch.xpu.memory_allocated() / 1024**3
+                    _pre_fwd_resv = torch.xpu.memory_reserved() / 1024**3
+                    log.info(
+                        "Rank 0: PRE-train-fwd[%d:%d] alloc=%.2f GiB, resv=%.2f GiB",
+                        _cs, _ce, _pre_fwd_alloc, _pre_fwd_resv,
+                    )
+                log.info("Rank %d: grpo_step chunk[%d:%d] fwd", self.rank, _cs, _ce)
+                # v111: advance ExpertParallel step counter before each training forward.
+                # Ensures AC recompute (same step) reuses cached AllToAll output, while
+                # the NEXT chunk's forward computes fresh splits. Without this call,
+                # _fwd_step_counter stays at 0 → step N+1 wrongly reuses step N's cache.
+                if self._expert_parallel_degree > 1:
+                    from torchtune.modules.moe._parallelism import ExpertParallel as _EP
+                    _EP.advance_fwd_step()
+                _c_logits = self._model(
+                    trajectory.query_responses[_cs:_ce],
+                    input_pos=trajectory.position_ids[_cs:_ce],
+                    mask=trajectory.masks[_cs:_ce],
                 )
-            )
-            pi_logprobs[trajectory.response_padding_masks] = 1.0
-        else:
-            # Standard loss: convert logits to logprobs first
-            pi_logprobs = rlhf.batched_logits_to_logprobs(
-                pi_logits,
-                trajectory.query_responses[:, context_length:],
-                self._temperature,
-                chunk_size=1,
-            )
-            pi_logprobs[trajectory.response_padding_masks] = 1.0
+                _c_logits = rlhf.truncate_sequence_for_logprobs(_c_logits, context_length)
+                _c_pi_lp = rlhf.batched_logits_to_logprobs(
+                    _c_logits,
+                    trajectory.query_responses[_cs:_ce, context_length:],
+                    self._temperature,
+                    chunk_size=1,
+                )
+                # Use masked_fill_ instead of boolean index assignment.
+                # Boolean indexing triggers L0 sub-allocation (gather/scatter)
+                # while FSDP storage is live, causing UR:40 handle exhaustion.
+                _c_pi_lp.masked_fill_(trajectory.response_padding_masks[_cs:_ce], 1.0)
+                del _c_logits
+                if self._device.type == "xpu":
+                    torch.xpu.synchronize()
+                if self._device.type == "xpu" and self._is_rank_zero:
+                    _post_fwd_alloc = torch.xpu.memory_allocated() / 1024**3
+                    _post_fwd_resv = torch.xpu.memory_reserved() / 1024**3
+                    log.info(
+                        "Rank 0: POST-train-fwd[%d:%d] alloc=%.2f GiB, resv=%.2f GiB",
+                        _cs, _ce, _post_fwd_alloc, _post_fwd_resv,
+                    )
 
-            del pi_logits
+                _c_loss, _c_pol, _c_kl, _c_rat, _c_clip = self._loss_fn(
+                    trajectory.logprobs[_cs:_ce],
+                    _c_pi_lp,
+                    trajectory.ref_logprobs[_cs:_ce],
+                    trajectory.advantages[_cs:_ce],
+                    padding_masks=~trajectory.response_padding_masks[_cs:_ce],
+                )
+
+                # Pre-backward memory logging (no empty_cache — leaks UR handles).
+                # With expert_cpu_offload=True, base resv is ~1.2 GiB so no
+                # need to return cached blocks to L0 before backward.
+                if _cs == 0 and self._device.type == "xpu":
+                    torch.xpu.synchronize()
+                    if self._is_rank_zero:
+                        _pre_bwd_alloc = torch.xpu.memory_allocated() / 1024**3
+                        _pre_bwd_resv = torch.xpu.memory_reserved() / 1024**3
+                        log.info(
+                            "Rank 0: pre-bwd (no empty_cache): alloc=%.2f GiB, resv=%.2f GiB",
+                            _pre_bwd_alloc, _pre_bwd_resv,
+                        )
+                elif self._device.type == "xpu" and self._is_rank_zero:
+                    _pre_bwd_alloc = torch.xpu.memory_allocated() / 1024**3
+                    _pre_bwd_resv = torch.xpu.memory_reserved() / 1024**3
+                    log.info(
+                        "Rank 0: PRE-backward[%d:%d] alloc=%.2f GiB, resv=%.2f GiB",
+                        _cs, _ce, _pre_bwd_alloc, _pre_bwd_resv,
+                    )
+                # v84: CPU-bounce AllToAll (via gloo) bypasses XCCL/OFI/ze_handle_manager.
+                # v83 pre-backward XCCL sync removed — CCL worker drain no longer needed
+                # since AllToAll no longer uses XCCL at all.
+                log.info("Rank %d: chunk[%d:%d] backward start", self.rank, _cs, _ce)
+                _bwd_chunk_t0 = time.perf_counter()
+                # v111 diag: log token dispatch counts for all ranks (first step only).
+                # _ep_dispatch is partial(ep_instance._token_dispatch, ...) — access ep_instance
+                # via _ep_dispatch.func.__self__ (bound method's __self__).
+                if self._steps_run == 0 and _cs == 0 and self._expert_parallel_degree > 1:
+                    from torchtune.modules.moe.moe import MoE as _MoE
+                    _total_recv = 0
+                    _total_send = 0
+                    _n_layers_found = 0
+                    for _m in self._model.modules():
+                        if not isinstance(_m, _MoE):
+                            continue
+                        _ep_disp = getattr(_m, '_ep_dispatch', None)
+                        if _ep_disp is None:
+                            continue
+                        # partial.func = bound method; .func.__self__ = ExpertParallel instance
+                        _ep_inst = getattr(getattr(_ep_disp, 'func', None), '__self__', None)
+                        if _ep_inst is None:
+                            continue
+                        _splits_out = getattr(_ep_inst, '_output_splits', None)
+                        _splits_in = getattr(_ep_inst, '_input_splits', None)
+                        if _splits_out is not None:
+                            _total_recv += sum(_splits_out)
+                            _n_layers_found += 1
+                        if _splits_in is not None:
+                            _total_send += sum(_splits_in)
+                    log.info(
+                        "Rank %d: EP TOKEN LOAD step=0 total_recv=%d total_send=%d "
+                        "layers=%d (via _ep_dispatch.func.__self__)",
+                        self.rank, _total_recv, _total_send, _n_layers_found,
+                    )
+                # v59: EP mode — all FSDPParamGroups have reduce_grads=False permanently.
+                # Do NOT call set_requires_gradient_sync: it would re-enable reduce_grads
+                # on the last chunk, undoing our v59 suppression and triggering XCCL.
+                # Post-backward gloo AllReduce in _ep_post_backward_grad_sync handles sync.
+                # Non-EP path: standard grad accumulation (suppress all but last chunk).
+                if not self._fsdp2_param_groups_meta and _use_fsdp2_grad_sync and \
+                        self._expert_parallel_degree <= 1:
+                    # Non-EP FSDP2: standard grad accumulation (suppress all but last chunk).
+                    self._model.set_requires_gradient_sync(_is_last_chunk)
+                if _use_fsdp1_no_sync and not _is_last_chunk:
+                    with self._model.no_sync():
+                        (_c_loss / grad_scale).backward()
+                else:
+                    (_c_loss / grad_scale).backward()
+                # v110 diag: log immediately after backward() returns (before xpu.sync).
+                log.info(
+                    "Rank %d: chunk[%d:%d] backward() returned (pre-sync), elapsed=%.1fs",
+                    self.rank, _cs, _ce, time.perf_counter() - _bwd_chunk_t0,
+                )
+                if self._device.type == "xpu":
+                    torch.xpu.synchronize()
+                _bwd_total += time.perf_counter() - _bwd_chunk_t0
+
+                _chunk_losses.append(_c_loss.detach())
+                _chunk_policy_losses.append(_c_pol.detach() if torch.is_tensor(_c_pol) else _c_pol)
+                _chunk_kl_losses.append(_c_kl.detach() if torch.is_tensor(_c_kl) else _c_kl)
+                _chunk_ratios.append(_c_rat.detach())
+                _chunk_clipfracs.append(_c_clip.detach() if torch.is_tensor(_c_clip) else _c_clip)
+                _chunk_pi_logprobs.append(_c_pi_lp.detach())
+
             if self._device.type == "xpu":
                 torch.xpu.synchronize()
 
-            loss, policy_loss, kl_loss, ratios, clipfrac = self._loss_fn(
-                trajectory.logprobs,
-                pi_logprobs,
-                trajectory.ref_logprobs,
-                trajectory.advantages,
-                padding_masks=~trajectory.response_padding_masks,
+            # EP v75 post-backward grad sync via XCCL dp_replicate group.
+            # With reduce_grads=False on all FSDPParamGroups, FSDP2 did NOT fire
+            # reduce_scatter during backward. All param grads are local. Now sync
+            # all param grads across dp_replicate via XCCL all_reduce (AVG).
+            #
+            # v71-v74 all failed because any sync requiring ALL 12 ranks deadlocks:
+            #   fast EP groups finish backward first → their ranks try to sync →
+            #   slow EP group ranks are still in gloo SHARD AllToAll → can't join
+            #   the 12-rank sync → mutual deadlock → 1800s timeout.
+            #
+            # v75 fix: use XCCL all_reduce on dp_replicate group (3 ranks) only.
+            #   dp_replicate pairs (e.g. (0,4),(0,8),(4,8)) are DISJOINT from
+            #   dp_shard/SHARD pairs (within {0,1,2,3},{4,5,6,7},{8,9,10,11}).
+            #   XCCL REP all_reduce operates on a different rank-pair set than
+            #   gloo SHARD AllToAll → zero interference, no pre-sync needed.
+            #   When slow EP group {0,1,2,3} finishes backward, ranks 0,1,2,3
+            #   each call XCCL all_reduce on their respective REP groups:
+            #     rank 0 → REP {0,4,8}  (pairs (0,4),(0,8) — disjoint from SHARD)
+            #     rank 1 → REP {1,5,9}  (pairs (1,5),(1,9) — disjoint from SHARD)
+            #   Since fast ranks 4,8 (etc.) are already waiting in their XCCL
+            #   all_reduce for this call, the all_reduce completes immediately.
+            if self._expert_parallel_degree > 1 and self._dp_replicate > 1:
+                _grad_sync_t0 = time.perf_counter()
+                _n_synced = _ep_post_backward_grad_sync_xccl(
+                    self._model, self._dp_replicate
+                )
+                _grad_sync_time = time.perf_counter() - _grad_sync_t0
+                log.info(
+                    "Rank %d: EP v75 XCCL post-bwd grad sync: %d params in %.2fs",
+                    self.rank, _n_synced, _grad_sync_time,
+                )
+
+            _fwd_time = time.perf_counter() - _fwd_t0 - _bwd_total
+            log.info("Rank %d: grpo_step forward=%.1fs", self.rank, _fwd_time)
+            log.info("Rank %d: backward=%.1fs", self.rank, _bwd_total)
+
+            loss = torch.stack(_chunk_losses).mean()
+            policy_loss = (
+                torch.stack(_chunk_policy_losses).mean()
+                if torch.is_tensor(_chunk_policy_losses[0])
+                else sum(_chunk_policy_losses) / len(_chunk_policy_losses)
             )
-
-        # Scale loss for gradient accumulation
-        if self._gradient_accumulation_steps > 1:
-            loss = loss / self._gradient_accumulation_steps
-
-        if self._fsdp_diagnostics and self._is_rank_zero:
-            training.log_fsdp_memory_per_phase(self._device, "post_forward", log=log)
-            # Reset peak to measure backward peak separately
-            if self._device.type == "xpu":
-                torch.xpu.reset_peak_memory_stats()
-
-        # NOTE: Pre-backward empty_cache() removed. Each empty_cache() call on
-        # XPU leaks UR handles in Level Zero, causing GPU segfaults after ~4 calls.
-        # Instead, rely on between-step empty_cache (1 call/step) + aggressive
-        # GC threshold (0.4) to keep fragmentation manageable.
-        if self._fsdp_diagnostics and self._is_rank_zero and self._device.type == "xpu":
-            log.info(
-                "[PRE_BACKWARD] alloc=%.2f GiB, resv=%.2f GiB (no defrag)",
-                torch.xpu.memory_allocated(self._device) / (1024**3),
-                torch.xpu.memory_reserved(self._device) / (1024**3),
+            kl_loss = (
+                torch.stack(_chunk_kl_losses).mean()
+                if torch.is_tensor(_chunk_kl_losses[0])
+                else sum(_chunk_kl_losses) / len(_chunk_kl_losses)
             )
-
-        _bwd_t0 = time.perf_counter()
-        log.info("Rank %d: backward start", self.rank)
-        loss.backward()
-        if self._device.type == "xpu":
-            torch.xpu.synchronize()
-        _bwd_time = time.perf_counter() - _bwd_t0
-        log.info("Rank %d: backward=%.1fs", self.rank, _bwd_time)
+            ratios = torch.stack(_chunk_ratios).mean()
+            clipfrac = (
+                torch.stack(_chunk_clipfracs).mean()
+                if torch.is_tensor(_chunk_clipfracs[0])
+                else sum(_chunk_clipfracs) / len(_chunk_clipfracs)
+            )
+            pi_logprobs = torch.cat(_chunk_pi_logprobs, dim=0)
 
         if self._fsdp_diagnostics and self._is_rank_zero:
             training.log_fsdp_memory_per_phase(self._device, "post_backward", log=log)
@@ -2335,7 +3828,7 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             ).mean()
 
         return GRPOStats(
-            loss * self._gradient_accumulation_steps,  # Report unscaled loss
+            loss,  # already unscaled (chunks averaged, not summed)
             policy_loss,
             kl_loss,
             ratios,
@@ -2350,6 +3843,39 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         """
         # clean up before training begins
         training.cleanup_before_training()
+
+        # v86b: Pre-register XPU L0 root blocks with CCL ze_handle_manager before training.
+        #
+        # v86 finding: 64 MiB × ~576 chunks hit UR_RESULT_ERROR_OUT_OF_RESOURCES (UR:40) —
+        # too many concurrent L0 memory objects. Fix: use 2 GiB chunks (~18 total), one
+        # XCCL all_reduce per chunk to register each root block individually.
+        #
+        # Root cause of SIGABRT: At peak HBM during AC recompute backward, FSDP2 AllGather
+        # for expert params forces a NEW L0 root block allocation (beyond pool). CCL's
+        # ze_handle_manager doesn't know about new root blocks → ZE_MEMORY_TYPE_UNKNOWN → crash.
+        #
+        # Fix: allocate 2 GiB chunks until pool is at expected peak (~50.5 GiB target),
+        # run one XCCL all_reduce on a VIEW of each chunk (same memory → same root block)
+        # to register each root block with ze_handle_manager, then free all chunks.
+        # During training, no new root blocks needed → no crash.
+        if self._device.type == "xpu" and self._expert_parallel_degree > 1:
+            # v95: No XPU warmup needed — CPU-bounce AllToAll (gloo P2P) eliminates
+            # ze_handle_manager by removing all XPU AllToAll calls entirely.
+            #
+            # v87-v92 warmup history (all exhausted):
+            #   v87: 50.50 GiB pool → +3.38 GiB during gen → crash at backward
+            #   v90: 53.50 GiB pool → +3.38 GiB during gen → crash at backward
+            #   v91: 58.00 GiB pool → +3.38 GiB during gen → crash at backward
+            #   v92: 57.35 GiB (ONE 45 GiB chunk) → +3.38 GiB during gen → crash at backward
+            # Root cause: CCL's AllToAll internal workspace is CCL-internal (not pre-registerable).
+            # v93: XCCL doesn't support CPU tensors — failed.
+            # v94: gloo all_to_all list-API not supported — failed.
+            # v95: gloo P2P (batch_isend_irecv) — correct approach.
+            log.info(
+                "Rank %d: v95 — gloo P2P CPU-bounce AllToAll active, no XPU warmup needed. "
+                "cur_resv=%.2f GiB",
+                self.rank, torch.xpu.memory_reserved() / 1024**3,
+            )
 
         # zero out the gradients before starting training
         self._optimizer.zero_grad()
@@ -2389,6 +3915,12 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                     log.info("Rank 0: PRE-STEP %d memory: allocated=%.2f GiB, reserved=%.2f GiB",
                              self._steps_run, _alloc, _resv)
 
+                # Wait for the previous step's async weight sync to complete before
+                # generating — ensures vLLM has up-to-date weights. If sync finished
+                # during the previous step's compute/gather (typical case), wait=0.
+                if self._vllm_mode == "server" and self._vllm_weight_sync:
+                    self._wait_for_sync_complete()
+
                 _step_t0 = time.perf_counter()
                 trajectory = self.generate_trajectory_batched(tokens, answers)
                 if self._device.type == "xpu":
@@ -2396,6 +3928,14 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                 _gen_time = time.perf_counter() - _step_t0
                 if not self._production_mode:
                     torch.distributed.barrier()
+
+                if self._device.type == "xpu" and self._is_rank_zero:
+                    _alloc = torch.xpu.memory_allocated() / 1024**3
+                    _resv = torch.xpu.memory_reserved() / 1024**3
+                    log.info(
+                        "Rank 0: post-gen memory: alloc=%.2f GiB, resv=%.2f GiB",
+                        _alloc, _resv,
+                    )
 
                 grpo_stats: list[GRPOStats] = []
                 _grpo_t0 = time.perf_counter()
@@ -2441,7 +3981,12 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                                 import gc
                                 gc.collect()
                     else:
-                        # No gradient accumulation — single step
+                        # No gradient accumulation — single step.
+                        # NOTE: empty_cache() is now called INSIDE grpo_step before
+                        # the first backward chunk (after training forward). This is
+                        # more effective because the training forward itself pushes
+                        # resv from 11.9 → 18.3 GiB, and we need to reclaim that
+                        # before backward can allocate recompute + AllGather buffers.
                         step_stats = self.grpo_step(trajectory, context_length)
                         grpo_stats.append(step_stats)
 
@@ -2450,12 +3995,83 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                         torch.xpu.synchronize()
                     _grpo_time = time.perf_counter() - _grpo_t0
 
+                    # v59: ALL grad averaging (expert + non-expert) is now done inside
+                    # grpo_step() via _ep_post_backward_grad_sync() using gloo AllReduce.
+                    # reduce_grads=False on all FSDPParamGroups prevents FSDP2 from firing
+                    # reduce_scatter during backward. The post-backward pass does a single
+                    # sequential gloo AllReduce over all params in model.parameters() order,
+                    # ensuring consistent ordering across dp_replicate ranks.
+                    # No separate expert grad averaging needed here.
+
                     _clip_t0 = time.perf_counter()
                     if self._clip_grad_norm is not None:
-                        grad_norm = torch.nn.utils.clip_grad_norm_(
-                            self._model.parameters(),
-                            max_norm=float(self._clip_grad_norm),
-                        )
+                        if self._expert_parallel_degree > 1:
+                            # EP mixes two DTensor meshes: non-expert params on dp_mesh
+                            # (2D: dp_replicate×dp_shard) and expert params on ep_mesh
+                            # (1D: dp_shard). torch.nn.utils.clip_grad_norm_ calls
+                            # torch.stack on per-param norm DTensors, which fails when
+                            # the tensors have different meshes.
+                            #
+                            # v77: compute both non-EP and EP norms purely locally.
+                            # v76 root cause: clip_grad_norm_(_non_ep_params, inf) on FSDP2
+                            # DTensor params triggers an XCCL all_reduce on self._shard_pg
+                            # internally (for DTensor norm aggregation). The subsequent
+                            # explicit _orig_all_reduce(_ep_norm_sq_xpu, group=self._shard_pg)
+                            # is then a SECOND XCCL collective on the same communicator.
+                            # With token routing imbalance (ep_rank 0: 32k tokens, ep_ranks 2,3:
+                            # 0 tokens), SHARD groups finish backward at different times → the
+                            # two sequential XCCL ops on shard_pg arrive at different clock offsets
+                            # across the 4 ranks → communicator sequence mismatch → 1800s timeout.
+                            # Fix: compute all norms manually (local tensors only, no distributed
+                            # collectives in the norm computation). Each rank computes its local
+                            # approximation of the global norm and applies clip_coef locally.
+                            # This is already a valid approximation for FSDP2 sharded grads.
+                            from torchtune.modules.moe.experts import GroupedExperts
+                            _ep_param_ids = set()
+                            _ep_params = []
+                            for _mn, _mm in self._model.named_modules():
+                                if _mn.endswith(".experts") and isinstance(_mm, GroupedExperts):
+                                    for _p in _mm.parameters(recurse=False):
+                                        _ep_param_ids.add(id(_p))
+                                        _ep_params.append(_p)
+                            _non_ep_params = [
+                                _p for _p in self._model.parameters()
+                                if id(_p) not in _ep_param_ids
+                            ]
+                            # Compute local norm_sq for non-EP params (no XCCL, no DTensor norm).
+                            _non_ep_norm_sq_val = 0.0
+                            for _p in _non_ep_params:
+                                if _p.grad is not None:
+                                    _g = _p.grad
+                                    if hasattr(_g, '_local_tensor'):
+                                        _g = _g._local_tensor
+                                    _non_ep_norm_sq_val += float(_g.float().norm().item() ** 2)
+                            # Compute local norm_sq for EP params.
+                            _ep_norm_sq_val = 0.0
+                            for _p in _ep_params:
+                                if _p.grad is not None:
+                                    _g = _p.grad
+                                    if hasattr(_g, '_local_tensor'):
+                                        _g = _g._local_tensor
+                                    _ep_norm_sq_val += float(_g.float().norm().item() ** 2)
+                            # Local total norm (no cross-rank all_reduce — see v77 comment above).
+                            _total_norm_f = (_non_ep_norm_sq_val + _ep_norm_sq_val) ** 0.5
+                            _max_norm_f = float(self._clip_grad_norm)
+                            _clip_coef = _max_norm_f / max(_total_norm_f, 1e-6)
+                            if _clip_coef < 1.0:
+                                for _p in self._model.parameters():
+                                    if _p.grad is not None:
+                                        _g = _p.grad
+                                        if hasattr(_g, '_local_tensor'):
+                                            _g._local_tensor.detach().mul_(_clip_coef)
+                                        else:
+                                            _g.detach().mul_(_clip_coef)
+                            grad_norm = torch.tensor(_total_norm_f, device=self._device)
+                        else:
+                            grad_norm = torch.nn.utils.clip_grad_norm_(
+                                self._model.parameters(),
+                                max_norm=float(self._clip_grad_norm),
+                            )
                     if self._device.type == "xpu":
                         torch.xpu.synchronize()
                     _clip_time = time.perf_counter() - _clip_t0
@@ -2488,8 +4104,41 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                         log.info("Removed per-layer memory hooks after step 0")
                         self._layer_mem_hooks = []
 
-                    if not self._production_mode:
-                        torch.distributed.barrier()
+                    if not self._production_mode or self._expert_parallel_degree > 1:
+                        # With EP, ranks finish optimizer at different times (ep_mesh
+                        # AllGather costs differ by replica group). Without this barrier,
+                        # rank 0 exits the training loop and starts Python teardown of
+                        # FSDP2/ZE objects while other ranks are still in optimizer.step(),
+                        # causing L0 use-after-free (SIGABRT in drm_neo.cpp:426).
+                        #
+                        # v78: replace dist.barrier() with XCCL SHARD all_reduce.
+                        # dist.barrier() on the default (12-rank) gloo PG shares TCP
+                        # pairs with SHARD gloo AllToAll → concurrent ops → deadlock
+                        # (same root cause as v72 gloo global barrier deadlock).
+                        #
+                        # Root cause of v77 step-boundary deadlock:
+                        #   EP token routing imbalance: ep_rank 0 (ranks 0,4,8) processes
+                        #   ~32k tokens → backward takes 20+ seconds longer than ep_ranks
+                        #   1-3 (~0-500 tokens). After XCCL REP grad_sync, fast ep_ranks
+                        #   (1-3) finish optimizer and start step N+1 forward → call gloo
+                        #   SHARD AllToAll at a2a#241. ep_rank 0 is still in optimizer →
+                        #   never calls a2a#241 gloo AllToAll → 1800s timeout.
+                        #
+                        # Fix: XCCL SHARD all_reduce (4-rank) after optimizer.
+                        #   - Uses self._shard_pg (XCCL, Slingshot fabric — not TCP).
+                        #   - Forces all 4 SHARD members to meet here before step N+1.
+                        #   - Safe: v77 removed all other XCCL SHARD calls post-backward,
+                        #     so this is the ONLY XCCL SHARD collective in this phase.
+                        #     No sequence mismatch possible.
+                        #   - ep_ranks 1,2,3 wait for ep_rank 0 here → all proceed
+                        #     to step N+1 generate() together → synchronized → no race.
+                        if self._expert_parallel_degree > 1 and self._shard_pg is not None:
+                            _ep_sync_t = torch.zeros(1, dtype=torch.float32, device=self._device)
+                            _orig_all_reduce(_ep_sync_t, op=torch.distributed.ReduceOp.SUM,
+                                             group=self._shard_pg)
+                            log.info("Rank %d: EP v78 post-optimizer XCCL SHARD sync done", self.rank)
+                        else:
+                            torch.distributed.barrier()
 
                     self.global_step += 1
 
@@ -2591,14 +4240,15 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                     if (self._eval_enabled and
                             self._steps_run % self._eval_every_n_steps != 0):
                         self.run_eval()
-                    try:
-                        self.save_checkpoint(curr_epoch)
-                    except Exception as e:
-                        utils.log_rank_zero(
-                            log,
-                            f"WARNING: Final checkpoint save failed: {e}. "
-                            "Training results are still valid.",
-                        )
+                    if self._save_final_checkpoint:
+                        try:
+                            self.save_checkpoint(curr_epoch)
+                        except Exception as e:
+                            utils.log_rank_zero(
+                                log,
+                                f"WARNING: Final checkpoint save failed: {e}. "
+                                "Training results are still valid.",
+                            )
                     training_completed = True
                     break
 
@@ -2613,6 +4263,15 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                         "Continuing training.",
                     )
             if training_completed:
+                if self._expert_parallel_degree > 1:
+                    # Sync all ranks before teardown. Without this, fast ranks may start
+                    # Python GC of FSDP2/ZE objects while slow ranks are still in
+                    # train(), causing L0 use-after-free (SIGABRT in drm_neo.cpp:426).
+                    # NOTE: destroy_process_group() doesn't help — nested ep_mesh/dp_mesh
+                    # groups fail when the world group is destroyed first. The SIGABRT
+                    # is a known L0 driver issue with simultaneous ZE context destruction
+                    # by 12 processes; it's cosmetic (METRICS are always logged first).
+                    torch.distributed.barrier()
                 return
 
         self._profiler.stop()
@@ -2733,12 +4392,18 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
 
                 # Compute rewards
                 responses_reshaped = responses.reshape(1, eval_grpo_samples, -1)
-                rewards, successes, _ = batched_rewards(
-                    self._tokenizer, responses_reshaped, answers, device=self._device
-                )
+                if self._reward_mode == "gene_recall":
+                    rewards, successes, _ = gene_recall_batched_rewards(
+                        self._tokenizer, responses_reshaped, answers, device=self._device,
+                        reward_metric=self._gene_reward_metric,
+                    )
+                else:
+                    rewards, successes, _ = batched_rewards(
+                        self._tokenizer, responses_reshaped, answers, device=self._device
+                    )
                 # Sum across reward functions, mean across samples
                 rewards = rewards.sum(dim=-1).mean().item()
-                successes_mean = successes[:, :, -1].mean().item()  # math_response_correct is last
+                successes_mean = successes[:, :, -1].mean().item()
 
                 all_rewards.append(rewards)
                 all_successes.append(successes_mean)
@@ -2779,6 +4444,15 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         if self._vllm_llm is not None:
             del self._vllm_llm
             self._vllm_llm = None
+        # Release persistent SHM block allocated by _sync_weights_to_vllm_shm()
+        shm_block = getattr(self, "_shm_block", None)
+        if shm_block is not None:
+            try:
+                shm_block.close()
+                shm_block.unlink()
+            except Exception:
+                pass
+            self._shm_block = None
         if self._is_rank_zero:
             self._metric_logger.close()
         destroy_process_group()

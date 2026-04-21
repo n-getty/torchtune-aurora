@@ -1,0 +1,128 @@
+# GRPO with vLLM server mode on Intel XPU (Aurora HPC) — Gemma 4 26B-A4B (MoE)
+# Config G=16: grpo_samples=16, forward_batch_size=4 (chunked backward, 4 chunks)
+# Target: match A100 Config B (grpo_samples=16, max_gen=512) and beat dense 31B.
+#
+# Memory argument:
+#   Dense 31B: 25.6 GiB at grpo_samples=4 → cannot run grpo_samples=16 on 24 GiB HBM
+#   MoE 26B:   20.66 GiB at grpo_samples=4 → 3.34 GiB headroom → grpo_samples=16 fits
+#   Chunked backward (fbs=4): only 4 seqs' activations in memory at once; peak ≈ grpo_samples=4
+#
+# Throughput argument (vs dense 31B at grpo_samples=4, 23.5s/step):
+#   Dense 31B: 4/23.5 = 0.17 samples/s
+#   MoE 26B G=16: est. 16 samples / ~55s = 0.29 samples/s → +71% throughput
+#   (vLLM gen batches 16 seqs efficiently; 16 samples not 4× more time)
+
+name: grpo_server_gemma4_26b_a4b_g16_xpu
+
+output_dir: /tmp/torchtune/grpo_server_gemma4_26b_a4b_g16
+base_model_path: /lus/flare/projects/ModCon/ngetty/models/gemma-4-26B-A4B
+
+vllm_url: "http://localhost:8001"
+vllm_group_port: 51216
+vllm_weight_sync: false
+
+tokenizer:
+  _component_: torchtune.models.gemma4.gemma4_tokenizer
+  tokenizer_json_path: ${base_model_path}/tokenizer.json
+  tokenizer_config_json_path: ${base_model_path}/tokenizer_config.json
+  max_seq_len: 512
+
+dataset:
+  _component_: torchtune.dev.grpo.gsm8k.gsm8k_dataset
+  partition: 1-9/10
+seed: 42
+shuffle: False
+
+model:
+  _component_: torchtune.models.gemma4.gemma4_26b_a4b
+
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [
+    model-00001-of-00002.safetensors,
+    model-00002-of-00002.safetensors,
+  ]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: GEMMA4
+
+ref_checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [
+    model-00001-of-00002.safetensors,
+    model-00002-of-00002.safetensors,
+  ]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}/ref
+  model_type: GEMMA4
+
+resume_from_checkpoint: False
+save_every_n_epochs: 100
+save_final_checkpoint: false
+
+# G=16: 4× grpo_samples vs 31B baseline
+# Chunked backward (4 chunks of 4) keeps memory at grpo_samples=4 level
+batch_size: 1
+grpo_samples: 16
+forward_batch_size: 4
+max_generated_tokens: 128
+top_k: null
+temperature: 1.0
+
+ppo_epochs: 1
+gradient_accumulation_steps: 1
+
+num_steps: 5
+
+clip_grad_norm: 1.0
+
+epochs: 1
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 5e-6
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  num_warmup_steps: 2
+loss:
+  _component_: torchtune.dev.grpo.loss.GRPOSimpleLoss
+  kl_coeff: 0.01
+  epsilon: 0.2
+
+device: xpu
+enable_activation_checkpointing: True
+compile: False
+dtype: bf16
+
+reward_functions:
+    - _component_: torchtune.dev.rl.rewards.FormattedMathCorrectnessReward
+      answer_tag: answer
+      positive_reward: 10.0
+      negative_reward: 0.0
+    - _component_: torchtune.dev.rl.rewards.ThinkingAnswerFormattingReward
+      think_tag: think
+      answer_tag: answer
+      positive_reward: 1.0
+      negative_reward: 0.0
+
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+log_every_n_steps: 1
+log_peak_memory_stats: True
+
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: False
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: True
+  cuda: False
+  profile_memory: False
+  with_stack: False
+  record_shapes: False
+  with_flops: False
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1

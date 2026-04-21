@@ -65,6 +65,7 @@ class ParallelDims:
     tp: int
     cp: int
     world_size: int
+    ep: int = 1
 
     def __post_init__(self):
         self._validate()
@@ -89,6 +90,14 @@ class ParallelDims:
             f"tp({tp}) != WORLD_SIZE({self.world_size})"
         )
 
+        assert self.ep >= 1, "ep must be >= 1"
+        if self.ep > 1:
+            assert self.ep == self.dp_shard, (
+                f"ep={self.ep} must equal dp_shard={self.dp_shard}. "
+                "Expert Parallelism reuses the dp_shard process group. "
+                "For EP=4 on 12 tiles use dp_replicate=3, dp_shard=4, ep=4."
+            )
+
     def build_mesh(self, device_type):
         dims = []
         names = []
@@ -102,6 +111,7 @@ class ParallelDims:
 
         names = tuple(names)
         mesh = init_device_mesh(device_type, dims, mesh_dim_names=names)
+        self._mesh = mesh
 
         # Create all the submesh here to ensure all required process groups are
         # initialized:
@@ -131,7 +141,24 @@ class ParallelDims:
         if dp_cp_mesh_dim_names != []:
             mesh[tuple(dp_cp_mesh_dim_names)]._flatten(mesh_dim_name="dp_cp")
 
+        # EP mesh reuses the dp_shard process group (same 4-rank group handles both
+        # FSDP of non-expert params and All-to-All of expert tokens).
+        if self.ep_enabled and self.dp_shard_enabled:
+            # Force creation of the dp_shard process group if not already done
+            _ = mesh["dp_shard"]
+
         return mesh
+
+    @property
+    def ep_mesh(self) -> Optional[DeviceMesh]:
+        """Return the EP DeviceMesh (same as dp_shard submesh).
+
+        Only valid after ``build_mesh()`` has been called.
+        Returns None if EP is disabled (ep == 1).
+        """
+        if not self.ep_enabled:
+            return None
+        return self._mesh["dp_shard"]
 
     @property
     def cp_enabled(self):
@@ -152,6 +179,10 @@ class ParallelDims:
     @property
     def tp_enabled(self):
         return self.tp > 1
+
+    @property
+    def ep_enabled(self):
+        return self.ep > 1
 
     @cached_property
     def non_data_parallel_size(self):
@@ -783,6 +814,143 @@ def shard_model(
         except (TypeError, ValueError):
             root_kwargs["reshard_after_forward"] = False
     fully_shard(model, **root_kwargs)
+
+
+def shard_experts_for_ep(
+    model: nn.Module,
+    ep_mesh: DeviceMesh,
+    *,
+    cpu_offload: bool,
+    reshard_after_forward: bool,
+) -> int:
+    """Pre-shard MoE expert modules with FSDP on the EP mesh.
+
+    Must be called **before** ``shard_model()`` because FSDP2 requires inner FSDP
+    units to be wrapped before outer ones.
+
+    Expert weights are already EP-partitioned by ``ExpertParallel._partition_fn``
+    (via ``parallelize_module``). This wraps those partitioned expert modules with
+    FSDP2 on the ``ep_mesh`` to handle gradient synchronization within the EP group.
+
+    Handles Gemma4's ``moe_block.experts`` path and Llama4-style ``moe.experts`` path.
+
+    Args:
+        model: Model whose expert modules should be pre-sharded.
+        ep_mesh: DeviceMesh for the EP group (typically the ``dp_shard`` submesh).
+        cpu_offload: If True, enable FSDP CPU offload for expert parameters.
+        reshard_after_forward: Passed to ``fully_shard`` for expert modules.
+
+    Returns:
+        Number of expert modules wrapped.
+    """
+    from torchtune.modules.moe.experts import GroupedExperts
+
+    fsdp_kwargs: dict = {"reshard_after_forward": reshard_after_forward, "mesh": ep_mesh}
+    if cpu_offload:
+        fsdp_kwargs["offload_policy"] = CPUOffloadPolicy()
+
+    num_sharded = 0
+    for name, module in model.named_modules():
+        # Match Gemma4: layers.i.moe_block.experts
+        # Match Llama4-style: layers.i.moe.experts
+        if name.endswith(".experts") and isinstance(module, GroupedExperts):
+            if cpu_offload:
+                # CPUOffloadPolicy requires params to be on CPU before fully_shard.
+                # EP slicing leaves params on XPU (or meta during initial model build).
+                # Skip meta tensors — FSDP2 handles meta→CPU during set_model_state_dict.
+                for param in module.parameters(recurse=False):
+                    if not param.is_meta and param.device.type != "cpu":
+                        param.data = param.data.cpu()
+            fully_shard(module, **fsdp_kwargs)
+            num_sharded += 1
+            _log.debug(f"EP: pre-sharded expert module '{name}' on ep_mesh")
+            # Disable FSDP2 backward prefetch for expert modules on ep_mesh.
+            #
+            # Root cause: FSDP2 _backward_prefetch fires an async all-gather on ep_mesh
+            # during _pre_backward for the NEXT expert layer while the CURRENT layer's
+            # EP AllToAll backward is running. On Aurora Slingshot-11 (OFI/CXI), the
+            # all-gather immediately fails with EPERM (err=265) because the OFI endpoint
+            # retains state from the EP AllToAll operation. xpu.synchronize() drains
+            # XPU stream fences but NOT OFI transport-level endpoint state.
+            #
+            # Fix: monkey-patch _backward_prefetch → no-op, forcing lazy (just-in-time)
+            # unshard. Layer N's params are gathered synchronously in pre_backward BEFORE
+            # Layer N's EP AllToAll backward runs — sequential, no OFI state conflict.
+            try:
+                fsdp_state = module._get_fsdp_state()  # FSDPModule method
+                if (
+                    fsdp_state is not None
+                    and hasattr(fsdp_state, "_fsdp_param_group")
+                    and fsdp_state._fsdp_param_group is not None
+                ):
+                    fsdp_state._fsdp_param_group._backward_prefetch = lambda: None
+                    _log.debug(
+                        f"EP: disabled backward prefetch for expert '{name}' (OFI EPERM fix)"
+                    )
+            except Exception as e:
+                _log.warning(
+                    f"EP: could not disable backward prefetch for '{name}': {e} "
+                    "(non-fatal, backward may fail on Aurora with OFI EPERM)"
+                )
+
+    return num_sharded
+
+
+def disable_fsdp2_backward_prefetch(model: nn.Module) -> int:
+    """Disable FSDP2 backward prefetch for ALL wrapped modules in ``model``.
+
+    Must be called **after** both ``shard_experts_for_ep()`` and ``shard_model()``
+    so that all FSDP2 state is fully initialized.
+
+    On Aurora Slingshot-11 (OFI/CXI), FSDP2's async backward prefetch all-gather
+    on ep_mesh fails with EPERM (err=265) when an EP AllToAll operation left residual
+    state on the OFI endpoint. The crash is NOT in expert modules' own ``_backward_prefetch``
+    but in NON-expert modules' ``_backward_prefetch``, which calls
+    ``_prefetch_unshard(expert_param_group, ...)`` → ``expert_pg.unshard()`` → EPERM.
+
+    Patching only expert modules (as in v24) is insufficient — the trigger is always a
+    non-expert module. Patching ALL ``FSDPParamGroup._backward_prefetch`` to no-op prevents
+    any backward prefetch from firing, forcing lazy (synchronous) unshard instead.
+    Cost: loss of prefetch overlap (minor perf hit). Benefit: correct backward.
+
+    Args:
+        model: FSDP2-wrapped model (after ``shard_model`` + ``shard_experts_for_ep``).
+
+    Returns:
+        Number of FSDPParamGroup instances patched.
+    """
+    try:
+        from torch.distributed.fsdp._fully_shard._fully_shard import FSDPModule
+        from torch.distributed.fsdp._fully_shard._fsdp_state import _get_module_fsdp_state
+    except ImportError:
+        _log.warning(
+            "disable_fsdp2_backward_prefetch: cannot import FSDP2 internals, skipping."
+        )
+        return 0
+
+    n_patched = 0
+    seen_param_groups: set = set()
+    for _name, module in model.named_modules():
+        if not isinstance(module, FSDPModule):
+            continue
+        try:
+            fsdp_state = _get_module_fsdp_state(module)
+            if fsdp_state is None:
+                continue
+            pg = getattr(fsdp_state, "_fsdp_param_group", None)
+            if pg is None or id(pg) in seen_param_groups:
+                continue
+            seen_param_groups.add(id(pg))
+            pg._backward_prefetch = lambda: None
+            n_patched += 1
+        except Exception as e:
+            _log.debug(f"disable_fsdp2_backward_prefetch: skipping '{_name}': {e}")
+
+    _log.info(
+        f"EP: disabled backward prefetch on {n_patched} FSDPParamGroup(s) "
+        "(OFI EPERM fix: forces lazy unshard, prevents ep_mesh all-gather conflict)"
+    )
+    return n_patched
 
 
 def _get_fsdp_state(module: nn.Module):
