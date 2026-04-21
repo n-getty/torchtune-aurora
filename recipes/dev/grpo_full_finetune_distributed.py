@@ -34,6 +34,18 @@ log = utils.get_logger("DEBUG")
 
 class GRPOFullFinetuneRecipeDistributed(FTRecipeInterface):
     def __init__(self, cfg: DictConfig) -> None:
+        # Register USM caching allocator before any XPU init if requested.
+        # Fixes oneCCL incompatibility with expandable_segments virtual memory
+        # (both the type-check failure and the IPC/DMA page-fault for large tensors).
+        # Set XPU_USM_ALLOC_SO=/path/to/usm_caching_alloc.so in the launcher.
+        import os
+        _usm_so = os.environ.get("XPU_USM_ALLOC_SO")
+        if _usm_so:
+            from torch.xpu.memory import XPUPluggableAllocator, change_current_allocator
+            _usm_alloc = XPUPluggableAllocator(_usm_so, "xpu_usm_malloc", "xpu_usm_free")
+            change_current_allocator(_usm_alloc)
+            log.info(f"USM caching allocator registered: {_usm_so}")
+
         self._device = utils.get_device(device=cfg.device)
         self._dtype = training.get_dtype(cfg.dtype, device=self._device)
         self._output_dir = cfg.output_dir

@@ -21,8 +21,8 @@ source "${SCRIPT_DIR}/_aurora_paths.sh"
 
 cd "${TORCHTUNE_DIR}"
 
-# Load Aurora frameworks module — MUST use 2025.2.0 (2025.3.1 has broken XCCL allreduce)
-module load frameworks/2025.2.0 2>/dev/null || true
+# Load Aurora frameworks module
+module load frameworks/2025.3.1 2>/dev/null || true
 
 # Remove user virtualenv from PATH so frameworks python is used
 export PATH=$(echo "$PATH" | tr ':' '\n' | grep -v myenv | tr '\n' ':' | sed 's/:$//')
@@ -45,8 +45,18 @@ export FI_CXI_RX_MATCH_MODE=hybrid
 export FI_CXI_OFLOW_BUF_SIZE=8388608
 export FI_CXI_DEFAULT_CQ_SIZE=131072
 export FI_MR_CACHE_MONITOR=userfaultfd
-# XPU memory allocator
-export PYTORCH_ALLOC_CONF=expandable_segments:True
+# XPU memory allocator — coalescing arena allocator to fix oneCCL incompatibility
+# AND reduce driver-level fragmentation.
+# expandable_segments:True is incompatible with oneCCL (two failure modes: USM type
+# check + L0 IPC page fault for large tensors). See docs/intel_ccl_expandable_segments_bug.md.
+# usm_arena_alloc uses sycl::malloc_device (ZE_MEMORY_TYPE_DEVICE) with a coalescing
+# arena: large allocations sub-allocated from 4 GiB slabs, freed blocks coalesce with
+# neighbors so mixed-size patterns don't fragment at the driver level.
+# Supercedes usm_caching_alloc (size-class only, no coalescing).
+# Build: icpx -shared -fPIC -fsycl -O2 -o recipes/dev/usm_arena_alloc.so recipes/dev/usm_arena_alloc.cpp
+unset PYTORCH_ALLOC_CONF
+unset PYTORCH_CUDA_ALLOC_CONF
+export XPU_USM_ALLOC_SO="${TORCHTUNE_DIR}/recipes/dev/usm_arena_alloc.so"
 # Increase CCL IPC handle cache to suppress "mem handle cache limit reached" warnings
 export CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD=65536
 # NOTE: Do NOT set CCL_ALLREDUCE=ring / CCL_REDUCE_SCATTER=ring for
@@ -156,18 +166,15 @@ launch_vllm_replica() {
     local EXTRA_VLLM_ARGS=""
     local VLLM_CCL_TRANSPORT="mpi"
     local VLLM_CCL_LAUNCHER="None"
-    local VLLM_ALLOC_CONF="${PYTORCH_ALLOC_CONF}"
     if [ ${VLLM_TP} -gt 1 ]; then
         EXTRA_VLLM_ARGS="--distributed-executor-backend mp"
         VLLM_CCL_TRANSPORT="ofi"
         VLLM_CCL_LAUNCHER="none"
-        VLLM_ALLOC_CONF=""  # expandable_segments breaks CCL RDMA for TP>1
     fi
 
     ZE_AFFINITY_MASK=${TILE_MASK} \
         VLLM_WORKER_MULTIPROC_METHOD=spawn \
         TORCH_COMPILE_DISABLE=1 \
-        PYTORCH_ALLOC_CONF=${VLLM_ALLOC_CONF} \
         CCL_PROCESS_LAUNCHER=${VLLM_CCL_LAUNCHER} \
         CCL_ATL_TRANSPORT=${VLLM_CCL_TRANSPORT} \
         FI_PROVIDER=cxi \
@@ -250,6 +257,7 @@ python3 -m torch.distributed.run --standalone --nproc_per_node=${TRAIN_TILES} \
     recipes/dev/grpo_full_finetune_distributed_xpu.py \
     --config ${CONFIG} \
     base_model_path=${MODEL_PATH} \
-    num_steps=${NSTEPS} ${VLLM_URL_OVERRIDE} ${EXTRA_ARGS}
+    num_steps=${NSTEPS} ${VLLM_URL_OVERRIDE} \
+    vllm_tensor_parallel_size=${VLLM_TP} ${EXTRA_ARGS}
 
 echo "=== Training complete ==="
