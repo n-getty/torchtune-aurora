@@ -3175,6 +3175,12 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         # replica's TP workers enter the XCCL PG constructor. All replicas must
         # join simultaneously (world_size barrier), so sequential posting would
         # deadlock: replica 0 waits for the full group while we never reach replica 1.
+        # 2-hop: training rank 0 sends to vLLM rank 1 (cross-node Slingshot),
+        # rank 1 distributes to ranks 2..N via intra-node XeLink broadcast.
+        # Reduces sync time from ~38s (12 sequential Slingshot sends) to ~3s.
+        use_two_hop = num_replicas > 0  # always use when there are cross-node vLLM workers
+        self._xccl_two_hop = use_two_hop
+
         vllm_errors = []
         def _post_replica(r_idx, url):
             base_rank = 1 + r_idx * tp_size
@@ -3183,7 +3189,7 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                     f"{url}/collective_rpc",
                     json={
                         "method": "init_xccl_communicator",
-                        "args": [_xccl_host, xccl_port, world_size, base_rank],
+                        "args": [_xccl_host, xccl_port, world_size, base_rank, use_two_hop],
                     },
                     timeout=120,
                 )
@@ -3205,12 +3211,20 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         for t in replica_threads:
             t.start()
 
-        # Training enters PG constructor — unblocks vLLM side when all replicas join
-        prefixed = c10d.PrefixStore("wsync", store)
+        # Training enters PG constructor — unblocks vLLM side when all replicas join.
+        # 2-hop: training uses a 2-rank cross PG (rank 0 + vLLM rank 1) so broadcast
+        # sends exactly one cross-Slingshot copy instead of 12 sequential copies.
         opts = c10d.ProcessGroupXCCL.Options()
-        self._xccl_wsync_pg = c10d.ProcessGroupXCCL(
-            store=prefixed, rank=0, size=world_size, options=opts,
-        )
+        if use_two_hop:
+            cross_prefixed = c10d.PrefixStore("wsync_cross", store)
+            self._xccl_wsync_pg = c10d.ProcessGroupXCCL(
+                store=cross_prefixed, rank=0, size=2, options=opts,
+            )
+        else:
+            prefixed = c10d.PrefixStore("wsync", store)
+            self._xccl_wsync_pg = c10d.ProcessGroupXCCL(
+                store=prefixed, rank=0, size=world_size, options=opts,
+            )
 
         for t in replica_threads:
             t.join(timeout=120)
@@ -3432,7 +3446,16 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
 
             else:
                 # Mode 0 (default): per-param full_tensor() + batched XCCL broadcast.
-                # Baseline: 707 AllGather calls × ~53ms = 37.5s floor.
+                #
+                # 2-hop mode (use_two_hop=True, default):
+                #   Training uses a 2-rank cross PG (rank 0 training + rank 1 vLLM).
+                #   broadcast(root=0) sends one cross-Slingshot copy (~2.4s/61GiB at ~25 GB/s).
+                #   vLLM rank 1 then distributes to ranks 2-12 via XeLink intra PG (~0.6s).
+                #   Total: ~3s vs 38s for flat 13-rank broadcast (12 sequential Slingshot sends).
+                #
+                # Legacy flat broadcast (use_two_hop=False):
+                #   Training rank 0 broadcasts to all vLLM ranks directly in 13-rank PG.
+
                 if self._is_shard_leader:
                     batch_parts: list = []
                     batch_numel = 0

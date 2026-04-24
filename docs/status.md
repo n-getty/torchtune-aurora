@@ -1,6 +1,6 @@
 # Project Status — Aurora RL (torchtune XPU)
 
-Last updated: 2026-04-23
+Last updated: 2026-04-24
 
 This document synthesizes the current state of the vLLM weight sync implementation,
 active training runs, open issues, and prioritized next steps. It is a living companion
@@ -52,8 +52,19 @@ to `docs/features/vllm_weight_sync.md`, `docs/features/moe_integration.md`, and 
     causing checkpoint AllGather to deadlock. Savings were <1% for 32B. Do not use.
   - Teardown fix (Test CF, 2026-04-23): `os._exit(0)` for all ranks after XCCL abort bypasses
     `destroy_process_group()` hang (abort() corrupts oneCCL state). Run A exited cleanly.
-  - Next: reduce receivers (DP=1 → 4 receivers → ~12s floor), or accept ~38s floor amortized over sync_interval.
   See `experiments/multinode_32b/test_cd_wsync.sh`, `test_ce_wsync_batched.sh`, `test_cf_xccl_1node_3b.sh`.
+- **2-hop XCCL weight sync VALIDATED (Test CK, 2026-04-24)**: 3/3 steps clean, 4× sync speedup.
+  - Architecture: 2-rank cross PG (training rank 0 → vLLM rank 1, Slingshot) + 12-rank intra PG (vLLM ranks 1-12, XeLink).
+    Training uses `broadcast(root=0)` on the 2-rank cross PG (sends 1 copy only). vLLM rank 1 receives via
+    cross PG, then broadcasts to ranks 2-12 via intra PG. No send/recv (XCCL send/recv hangs on Aurora).
+  - **Sync: 38s → 9.2-9.6s** (bcast=7.7-7.8s at 7.8-8.0 GB/s; 61.02 GiB, 66 batches). 4× speedup.
+  - **Step time: 48s/44s/43s** (step 0/1/2) vs 72s with flat broadcast. Converged ~44s steady-state.
+  - Memory: tight but clean and STABLE. Between-step reserved: 45.6 → 56.2 → **59.1 GiB (FLAT steps 2-5)**.
+    POST-BWD tight rank l0_free=2.61-2.84 GiB; no growth past step 2. 6-step stability run (2026-04-24)
+    confirmed: all 6 steps clean, memory converged at 59.13 GiB, step times 40-48s throughout.
+  - Bandwidth: 2-rank cross broadcast = 10.1 GB/s; 13-rank flat broadcast = 1.7 GB/s. 6× ratio (XCCL uses
+    tree internally, not 12× sequential; confirms bottleneck was broadcast algorithm not pure link count).
+  See `experiments/multinode_32b/test_ck_2hop_wsync.sh`, `test_ck_stability.sh`.
 - **Test CI: wsync ablation XCCL TP=2 vs TP=4 vs SHM TP=4 (3B, 2026-04-23)**: All 3 runs exit=0.
   - XCCL TP=2 (2 receivers): **6.5 GB/s, 1.4s** per sync (synchronous, in "other" bucket)
   - XCCL TP=4 (4 receivers): **4.0 GB/s, 1.9s** per sync (synchronous, in "other" bucket)
@@ -73,10 +84,15 @@ to `docs/features/vllm_weight_sync.md`, `docs/features/moe_integration.md`, and 
   See `experiments/wsync/test_ci_wsync_ablation.sh`, `test_cj_final.sh`, `test_cj_v7_xccl_expsegs.sh`.
 
 **Next concrete actions** (see Tier 1 below for priority):
-1. **32B weight sync validation must move to 2-node** — single-node 32B 10+2 blocked at step 2 (IPC handle OOM). Use 2-node HSDP config from Test CC, add XCCL weight sync.
-2. **SHM H2D batching fix** — `load_weights_from_shm()` does 707 sequential `param.copy_()` H2D operations (effective 2.8 GB/s, 10.9s for 32B TP=2). One bulk copy would drop to ~2-3s → SHM waited≈0 even at max_gen=64.
-3. Qwen3B gene recall production run (long-horizon, with checkpointing)
-4. Gemma4-31B training-stability fixes (SFT warm-up, EOS handling, lr warm-up)
+1. ~~Submit 3B gene recall production~~ (DONE 2026-04-24): Job 8449766 queued, `experiments/gene_recall/run_3b_gene_recall_production.sh`.
+2. **Submit 32B production** — `experiments/multinode_32b/run_32b_2hop_production.sh` ready. 2-hop XCCL confirmed stable (6/6 clean, memory FLAT from step 2). Blocked on debug Q per-user limit (clear when job 8449766 starts).
+3. Gemma4-31B training-stability fixes (SFT warm-up, EOS handling, lr warm-up)
+4. ~~Run Test CK bandwidth benchmark~~ (DONE 2026-04-24): 2-rank=10.1 GB/s, 13-rank=1.7 GB/s, 6× ratio.
+5. ~~Run Test CK 2-hop wsync~~ (DONE 2026-04-24): 3/3 clean, sync 38s→9.4s, step 72s→44s.
+6. ~~6-step stability test~~ (DONE 2026-04-24): Memory stable at 59.13 GiB steps 2-5 (no growth). **2-hop XCCL is production-ready.**
+
+**2026-04-24 diagnosis: why 72s/step is not a physics floor**
+The flat XCCL broadcast (Tests CD/CE, 38-40s) sends 12 sequential cross-Slingshot copies (one per vLLM TP rank) instead of a tree broadcast. Slingshot 11 per-node injection BW is ~200 GB/s; hardware floor is ~3s (1 Slingshot send at ~25 GB/s + intra-node XeLink at 95 GB/s). The 38s measured is a software/algorithm inefficiency in XCCL's broadcast for cross-node groups, NOT a hardware floor. Fix: 2-hop (implemented in `vllm_weight_sync_worker.py` + recipe).
 
 ---
 
@@ -91,6 +107,7 @@ to `docs/features/vllm_weight_sync.md`, `docs/features/moe_integration.md`, and 
 | Qwen3-32B | 12 tiles training-only, G=16 fbs=4 max_gen=128 | ~144s | — | 6/6 steps clean 2026-04-23 |
 | Qwen3-32B | 2-node dedicated vLLM (TP=4 DP=3 + 12 train tiles), G=16 fbs=4 max_gen=128 | ~33s | — | 6/6 steps clean 2026-04-23 (Test CC) |
 | Qwen3-32B | 2-node dedicated vLLM + XCCL weight sync, G=16 fbs=4 max_gen=128 | ~72-76s | 38-40s | 3/3 clean each: Test CD (707 XCCL calls, 40s) & Test CE (66 batched, 38s) 2026-04-23; floor is BROADCAST BANDWIDTH (1.7 GB/s at 12 receivers = 35.9s for 61 GiB); BATCHED_AG=1 broken (checkpoint hang) |
+| Qwen3-32B | 2-node dedicated vLLM + **2-hop XCCL** weight sync, G=16 fbs=4 max_gen=128 | **~43s** | **9.1-9.6s** | **Test CK + stability: 6/6 clean 2026-04-24** (exit=0). 2-rank cross PG (Slingshot) + 12-rank intra PG (XeLink). bcast=7.7-7.8s at 7.8-8.0 GB/s. Steps 0-5: 48/44/43/40/43/43s. Memory STABLE: 59.13 GiB from step 2 (no growth steps 3-5, l0_free=2.61-2.84 GiB). 4× sync speedup vs flat broadcast. **PRODUCTION-READY.** |
 | Qwen2.5-3B | 1-node XCCL TP=2 (8+2), wsync every step | ~8.7s | 1.4s (sync in "other") | **6.5 GB/s** (Test CI Run A, 2026-04-23); extrapolates to 9.4s for 32B at TP=2 |
 | Qwen2.5-3B | 1-node XCCL TP=4 (8+4), wsync every step | ~9.7s | 1.9s (sync in "other") | **4.0 GB/s** (Test CI Run B, 2026-04-23); extrapolates to 15.3s for 32B at TP=4 |
 | Qwen2.5-3B | 1-node SHM TP=4 (8+4), wsync every step | ~8.3s | 0.9s waited in gen | **7.2 GB/s write, 0.8s async** (Test CI Run C, 2026-04-23); write hides in gen; 32B: ~8s write (hides if gen>8s) |

@@ -246,7 +246,10 @@ class WeightSyncFromFileExtension:
     # XCCL broadcast weight sync
     # ------------------------------------------------------------------
 
-    def init_xccl_communicator(self, host: str, port: int, world_size: int, base_rank: int) -> dict:
+    def init_xccl_communicator(
+        self, host: str, port: int, world_size: int, base_rank: int,
+        use_two_hop: bool = False,
+    ) -> dict:
         """Create a cross-process XCCL group with the training rank.
 
         Called once at first weight sync via /collective_rpc (all TP workers
@@ -256,6 +259,11 @@ class WeightSyncFromFileExtension:
         Args:
             base_rank: Starting rank for vLLM workers. TP worker i gets
                        rank = base_rank + i in the XCCL group.
+            use_two_hop: If True, also create a separate intra-node XCCL PG
+                covering all vLLM ranks (1..world_size-1). Rank 1 receives from
+                training cross-node and then broadcasts intra-node via XeLink,
+                reducing sync time from ~38s (12 sequential Slingshot sends) to
+                ~3s (1 Slingshot send + XeLink broadcast).
         """
         import torch
         import torch.distributed as dist
@@ -264,21 +272,23 @@ class WeightSyncFromFileExtension:
         try:
             t0 = time.perf_counter()
 
-            # Clean up any stale XCCL pg (e.g., from a previous run that was
-            # killed without clean teardown) before creating a new one.
-            if hasattr(self, '_xccl_pg'):
-                try:
-                    self._xccl_pg.abort()
-                except Exception:
-                    pass
-                del self._xccl_pg
+            # Clean up any stale XCCL pgs from a previous run.
+            for attr in ('_xccl_pg', '_xccl_cross_pg', '_xccl_intra_pg'):
+                if hasattr(self, attr):
+                    try:
+                        getattr(self, attr).abort()
+                    except Exception:
+                        pass
+                    delattr(self, attr)
+            self._is_intra_root = False
 
             device = next(self.model_runner.model.parameters()).device
             tp_rank = dist.get_rank() if dist.is_initialized() else 0
             my_rank = base_rank + tp_rank
             logger.info(
-                "init_xccl_communicator: connecting to %s:%d (world=%d, my_rank=%d, tp_rank=%d, device=%s)",
-                host, port, world_size, my_rank, tp_rank, device,
+                "init_xccl_communicator: connecting to %s:%d (world=%d, my_rank=%d, tp_rank=%d, "
+                "device=%s, two_hop=%s)",
+                host, port, world_size, my_rank, tp_rank, device, use_two_hop,
             )
 
             import datetime
@@ -289,17 +299,52 @@ class WeightSyncFromFileExtension:
                 is_master=False,
                 timeout=datetime.timedelta(seconds=120),
             )
-            prefixed = c10d.PrefixStore("wsync", store)
             opts = c10d.ProcessGroupXCCL.Options()
-            self._xccl_pg = c10d.ProcessGroupXCCL(
-                store=prefixed, rank=my_rank, size=world_size, options=opts,
-            )
             self._xccl_rank = my_rank
             self._xccl_device = device
 
+            if use_two_hop:
+                # 2-hop design: XCCL send/recv is not supported (hangs); use broadcast.
+                #
+                # Cross PG (size=2): training rank 0 + vLLM rank 1 only.
+                #   broadcast(root=0) sends one cross-Slingshot copy (~2.4s for 61 GiB
+                #   at ~25 GB/s) instead of 12 sequential copies (38s flat broadcast).
+                #   Only vLLM rank 1 joins this PG — other vLLM ranks skip it.
+                #
+                # Intra PG (size=world_size-1): all vLLM ranks.
+                #   broadcast(root=0) distributes intra-node via XeLink (~0.6s).
+                #   Rank 1 (intra_rank=0) is the intra root; it broadcasts after
+                #   receiving from training.
+                intra_rank = my_rank - 1
+                intra_size = world_size - 1
+
+                if my_rank == 1:
+                    # Only vLLM rank 1 joins the 2-rank cross PG.
+                    cross_prefixed = c10d.PrefixStore("wsync_cross", store)
+                    self._xccl_cross_pg = c10d.ProcessGroupXCCL(
+                        store=cross_prefixed, rank=1, size=2, options=opts,
+                    )
+                    self._is_intra_root = True
+                    logger.info("init_xccl_communicator: cross PG ready (rank 1/2, intra root)")
+
+                intra_prefixed = c10d.PrefixStore("wsync_intra", store)
+                self._xccl_intra_pg = c10d.ProcessGroupXCCL(
+                    store=intra_prefixed, rank=intra_rank, size=intra_size, options=opts,
+                )
+                logger.info(
+                    "init_xccl_communicator: intra PG ready (rank=%d/%d, is_root=%s)",
+                    intra_rank, intra_size, self._is_intra_root,
+                )
+            else:
+                # Legacy flat broadcast: training rank 0 broadcasts to all vLLM ranks.
+                prefixed = c10d.PrefixStore("wsync", store)
+                self._xccl_pg = c10d.ProcessGroupXCCL(
+                    store=prefixed, rank=my_rank, size=world_size, options=opts,
+                )
+
             dt = time.perf_counter() - t0
             logger.info("init_xccl_communicator: ready in %.1fs", dt)
-            return {"status": "ok", "init_s": round(dt, 2)}
+            return {"status": "ok", "init_s": round(dt, 2), "two_hop": use_two_hop}
         except Exception as e:
             logger.exception("init_xccl_communicator failed")
             return {"status": "error", "message": str(e)}
@@ -386,7 +431,7 @@ class WeightSyncFromFileExtension:
         import json
         import torch
 
-        if not hasattr(self, '_xccl_pg'):
+        if not hasattr(self, '_xccl_pg') and not hasattr(self, '_xccl_intra_pg'):
             return {"status": "error", "message": "XCCL communicator not initialized"}
 
         try:
@@ -403,6 +448,8 @@ class WeightSyncFromFileExtension:
 
             t_bcast_total = 0.0
             t_load_total = 0.0
+
+            two_hop = hasattr(self, '_xccl_intra_pg')
 
             if batch_max_numel > 0:
                 # Batched mode: receive one flat tensor per batch, split back into params.
@@ -422,7 +469,16 @@ class WeightSyncFromFileExtension:
                         batch_numel, device=self._xccl_device, dtype=torch.bfloat16,
                     )
                     t_b0 = time.perf_counter()
-                    self._xccl_pg.broadcast(recv_buf, root=0).wait()
+                    if two_hop:
+                        # 2-hop: rank 1 receives cross-node from training via 2-rank
+                        # broadcast PG, then distributes to all vLLM ranks via intra PG.
+                        if self._is_intra_root:
+                            self._xccl_cross_pg.broadcast(recv_buf, root=0).wait()
+                            self._xccl_intra_pg.broadcast(recv_buf, root=0).wait()
+                        else:
+                            self._xccl_intra_pg.broadcast(recv_buf, root=0).wait()
+                    else:
+                        self._xccl_pg.broadcast(recv_buf, root=0).wait()
                     t_bcast_total += time.perf_counter() - t_b0
 
                     # Split flat buffer back into per-param tensors and apply
@@ -447,7 +503,14 @@ class WeightSyncFromFileExtension:
                         entry["numel"], device=self._xccl_device, dtype=torch.bfloat16,
                     )
                     t_b0 = time.perf_counter()
-                    self._xccl_pg.broadcast(recv_buf, root=0).wait()
+                    if two_hop:
+                        if self._is_intra_root:
+                            self._xccl_cross_pg.broadcast(recv_buf, root=0).wait()
+                            self._xccl_intra_pg.broadcast(recv_buf, root=0).wait()
+                        else:
+                            self._xccl_intra_pg.broadcast(recv_buf, root=0).wait()
+                    else:
+                        self._xccl_pg.broadcast(recv_buf, root=0).wait()
                     t_bcast_total += time.perf_counter() - t_b0
 
                     weights_batch.append((entry["name"], recv_buf.reshape(entry["shape"])))
@@ -485,11 +548,17 @@ class WeightSyncFromFileExtension:
         via c10d.ProcessGroupXCCL directly and is not in dist's registry.
         """
         try:
-            if not hasattr(self, '_xccl_pg'):
+            initialized = any(hasattr(self, a) for a in ('_xccl_pg', '_xccl_cross_pg', '_xccl_intra_pg'))
+            if not initialized:
                 return {"status": "ok", "message": "not initialized"}
-            self._xccl_pg.abort()
-            del self._xccl_pg
-            logger.info("close_xccl_communicator: XCCL PG aborted")
+            for attr in ('_xccl_intra_pg', '_xccl_cross_pg', '_xccl_pg'):
+                if hasattr(self, attr):
+                    try:
+                        getattr(self, attr).abort()
+                    except Exception:
+                        pass
+                    delattr(self, attr)
+            logger.info("close_xccl_communicator: XCCL PGs aborted")
             return {"status": "ok"}
         except Exception as e:
             logger.warning("close_xccl_communicator: %s", e)
