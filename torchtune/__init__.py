@@ -11,16 +11,19 @@ import os
 import sys
 import warnings
 
-# Avoid memory fragmentation and peak reserved memory increasing over time
-# To overwrite, set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False
-if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
-    if "torch" in sys.modules:
-        warnings.warn(
-            "The 'torch' module has already been imported. "
-            "Setting PYTORCH_CUDA_ALLOC_CONF may not have an effect."
-            "For best results, set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True before importing 'torch'."
-        )
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+# Avoid memory fragmentation and peak reserved memory increasing over time.
+# Skip on XPU: expandable_segments is incompatible with oneCCL (USM pointer
+# type "unknown" causes allreduce failure). See docs/bugs/intel_ccl_expandable_segments_bug.md
+_is_xpu = hasattr(__import__("torch"), "xpu") and __import__("torch").xpu.is_available() if "torch" in sys.modules else os.environ.get("ZE_FLAT_DEVICE_HIERARCHY") is not None
+if not _is_xpu:
+    if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+        if "torch" in sys.modules:
+            warnings.warn(
+                "The 'torch' module has already been imported. "
+                "Setting PYTORCH_CUDA_ALLOC_CONF may not have an effect."
+                "For best results, set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True before importing 'torch'."
+            )
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 
 # Check at the top-level that torchao is installed.

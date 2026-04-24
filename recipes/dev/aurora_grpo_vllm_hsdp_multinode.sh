@@ -50,7 +50,7 @@ WRAPPER="${TORCHTUNE_DIR}/recipes/dev/aurora_grpo_vllm_wrapper.sh"
 # ============================================================
 # Environment setup
 # ============================================================
-module load frameworks/2025.2.0 2>/dev/null || true
+module load frameworks/2025.3.1 2>/dev/null || true
 
 # Remove user virtualenv from PATH
 export PATH=$(echo "$PATH" | tr ':' '\n' | grep -v myenv | tr '\n' ':' | sed 's/:$//')
@@ -67,7 +67,7 @@ export CCL_PROCESS_LAUNCHER=pmix
 export CCL_ATL_TRANSPORT=${CCL_TRANSPORT_OVERRIDE}
 export CCL_CONFIGURATION=cpu_gpu_dpcpp
 export CCL_KVS_CONNECTION_TIMEOUT=600
-export CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD=4096
+export CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD=65536
 export CCL_OP_SYNC=1
 export FI_PROVIDER=cxi
 # CRITICAL: CCL_WORKER_COUNT=4 causes 48x AllGather bandwidth degradation
@@ -82,7 +82,7 @@ export FI_CXI_OFLOW_BUF_SIZE=8388608
 export FI_CXI_DEFAULT_CQ_SIZE=131072
 export FI_MR_CACHE_MONITOR=disabled
 export ZE_FLAT_DEVICE_HIERARCHY=FLAT
-export PYTORCH_ALLOC_CONF=expandable_segments:True
+unset PYTORCH_ALLOC_CONF
 export TORCH_COMPILE_DISABLE=1
 
 # Paths
@@ -158,7 +158,7 @@ WARM_CMD="
 export ZE_FLAT_DEVICE_HIERARCHY=FLAT
 export ZE_AFFINITY_MASK=${VLLM_TILE_START}
 export TORCH_COMPILE_DISABLE=1
-module load frameworks/2025.2.0 2>/dev/null
+module load frameworks/2025.3.1 2>/dev/null
 export PATH=\$(echo \"\$PATH\" | tr ':' '\n' | grep -v myenv | tr '\n' ':' | sed 's/:\$//')
 export PYTHONPATH='${VLLM_PYTHONPATH}'
 export HF_DATASETS_OFFLINE=1
@@ -198,7 +198,7 @@ VLLM_PIDS=()
 #   This avoids CXI endpoint conflicts between vLLM's XCCL and training's XCCL.
 VLLM_ENV="
 cd ${TORCHTUNE_DIR}
-module load frameworks/2025.2.0 2>/dev/null
+module load frameworks/2025.3.1 2>/dev/null
 export PATH=\$(echo \"\$PATH\" | tr ':' '\n' | grep -v myenv | tr '\n' ':' | sed 's/:\$//')
 unset VIRTUAL_ENV
 export ZE_FLAT_DEVICE_HIERARCHY=FLAT

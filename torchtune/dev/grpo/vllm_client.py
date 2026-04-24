@@ -203,6 +203,9 @@ class VLLMClient:
                 f"vLLM /v1/completions failed: {r.status_code} {r.text}"
             )
         data = r.json()
+        if "choices" not in data:
+            error_msg = data.get("error", data.get("message", str(data)))
+            raise RuntimeError(f"vLLM returned error response: {error_msg}")
 
         all_completion_ids = []
         texts_to_tokenize = []

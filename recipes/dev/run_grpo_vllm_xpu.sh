@@ -48,7 +48,7 @@ export FI_MR_CACHE_MONITOR=userfaultfd
 # XPU memory allocator — coalescing arena allocator to fix oneCCL incompatibility
 # AND reduce driver-level fragmentation.
 # expandable_segments:True is incompatible with oneCCL (two failure modes: USM type
-# check + L0 IPC page fault for large tensors). See docs/intel_ccl_expandable_segments_bug.md.
+# check + L0 IPC page fault for large tensors). See docs/bugs/intel_ccl_expandable_segments_bug.md.
 # usm_arena_alloc uses sycl::malloc_device (ZE_MEMORY_TYPE_DEVICE) with a coalescing
 # arena: large allocations sub-allocated from 4 GiB slabs, freed blocks coalesce with
 # neighbors so mixed-size patterns don't fragment at the driver level.
@@ -56,7 +56,16 @@ export FI_MR_CACHE_MONITOR=userfaultfd
 # Build: icpx -shared -fPIC -fsycl -O2 -o recipes/dev/usm_arena_alloc.so recipes/dev/usm_arena_alloc.cpp
 unset PYTORCH_ALLOC_CONF
 unset PYTORCH_CUDA_ALLOC_CONF
-export XPU_USM_ALLOC_SO="${TORCHTUNE_DIR}/recipes/dev/usm_arena_alloc.so"
+# CONFIRMED: arena allocator causes GPU segfault during FSDP allgather at 32B scale.
+# Arena sub-allocates from 4 GiB slabs; CCL IPC handles can't resolve sub-allocated
+# pointers (same root cause as expandable_segments). Works at 3B scale because per-layer
+# allgather buffers are small enough for CCL's non-IPC path.
+# export XPU_USM_ALLOC_SO="${TORCHTUNE_DIR}/recipes/dev/usm_arena_alloc.so"
+#
+# Caller may override (e.g. usm_pending_alloc.so for FSDP recordStream fix). If unset,
+# fall back to default XPU allocator (recipe constructor at line 727 will skip wiring).
+: "${XPU_USM_ALLOC_SO:=}"
+export XPU_USM_ALLOC_SO
 # Increase CCL IPC handle cache to suppress "mem handle cache limit reached" warnings
 export CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD=65536
 # NOTE: Do NOT set CCL_ALLREDUCE=ring / CCL_REDUCE_SCATTER=ring for
@@ -144,6 +153,10 @@ echo ""
 #
 # DP>1: launch multiple independent vLLM instances on separate tiles/ports.
 # Each replica gets TP tiles. Round-robin dispatch in the training recipe.
+
+# Kill any stale vLLM processes from previous runs
+pkill -f "vllm.entrypoints.openai.api_server" 2>/dev/null || true
+sleep 1
 
 VLLM_PIDS=()
 VLLM_URLS=""

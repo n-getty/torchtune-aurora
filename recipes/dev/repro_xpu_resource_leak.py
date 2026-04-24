@@ -52,7 +52,7 @@ Crash signature:
   Segmentation fault from GPU at 0xff000004XXXXXXXX, ctx_id: 1 (CCS)
     type: 0 (NotPresent), level: 1 (PDE), access: 1 (Write), banned: 1, aborting.
 
-See docs/intel_xpu_resource_leak_bug_report.md for full analysis.
+See docs/bugs/intel_xpu_resource_leak_bug_report.md for full analysis.
 """
 
 import argparse

@@ -38,7 +38,7 @@ This documents all monkeypatches applied at runtime to make GRPO training work o
 
 **Used by**: All XPU training (always active).
 
-**How to verify still needed**: Run GRPO for 100+ steps with `torch.xpu.empty_cache()` re-enabled. If training crashes with UR resource errors, the patch is still needed. See `docs/intel_xpu_resource_leak_bug_report.md` for full analysis.
+**How to verify still needed**: Run GRPO for 100+ steps with `torch.xpu.empty_cache()` re-enabled. If training crashes with UR resource errors, the patch is still needed. See `docs/bugs/intel_xpu_resource_leak_bug_report.md` for full analysis.
 
 ### 4. Transformers version check bypass
 

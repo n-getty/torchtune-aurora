@@ -63,14 +63,14 @@ export CCL_KVS_IFACE=hsn0
 export CCL_WORKER_COUNT=1
 export CCL_ALLREDUCE=ring
 export CCL_CHUNK_SIZE=16777216
+# Prevent IPC handle cache eviction at step 2+ (default=1000 causes banned:1 GPU fault)
+export CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD=65536
 export FI_CXI_RX_MATCH_MODE=hybrid
 export FI_CXI_OFLOW_BUF_SIZE=8388608
 export FI_CXI_DEFAULT_CQ_SIZE=131072
 export FI_MR_CACHE_MONITOR=disabled
 export ZE_FLAT_DEVICE_HIERARCHY=FLAT
-# NOTE: expandable_segments:True is INCOMPATIBLE with oneCCL RDMA (CXI fabric).
-# max_split_size_mb prevents splintering of FSDP AllGather blocks by small requests.
-export PYTORCH_ALLOC_CONF=max_split_size_mb:512,garbage_collection_threshold:0.6
+unset PYTORCH_ALLOC_CONF
 export TORCH_COMPILE_DISABLE=1
 
 VLLM_CUSTOMIZATION="${TORCHTUNE_DIR}/recipes/dev/_usercustomize_vllm"
@@ -264,15 +264,38 @@ for train_node in "${TRAIN_NODES[@]}"; do
     done
 done
 
-export USE_AFFINITY_MASK=training
+export USE_AFFINITY_MASK=${USE_AFFINITY_MASK:-1}
+
+# Pluggable allocator with working recordStream (per-queue pending list). Validated
+# 8 steps Qwen3-32B 10-rank FSDP at 3.5 s/step. Default Python pluggable allocator
+# has a no-op recordStream (torch/xpu/memory.py never wires set_record_stream_fn),
+# which causes FSDP2 cross-stream AllGather buffers to be recycled mid-collective
+# and surfaces as UR:40 (UR_RESULT_ERROR_OUT_OF_RESOURCES) at first backward.
+export XPU_USM_ALLOC_SO=${XPU_USM_ALLOC_SO:-${TORCHTUNE_DIR}/experiments/arena_ipc/usm_pending_alloc.so}
+
 export NUM_NODES=${NUM_TRAIN_NODES}
 export WORLD_SIZE=${TOTAL_TRAIN_TILES}
 export NGPUS_PER_NODE=${TRAIN_TILES_PER_NODE}
 
 echo ""
 echo "Starting training on ${NUM_TRAIN_NODES} nodes (${TOTAL_TRAIN_TILES} tiles)..."
+
+EXTRA_TUNE_ARGS=()
+[[ -n "${FORWARD_BATCH_SIZE:-}" ]] && EXTRA_TUNE_ARGS+=("forward_batch_size=${FORWARD_BATCH_SIZE}")
+[[ -n "${MAX_SEQ_LEN:-}" ]]        && EXTRA_TUNE_ARGS+=("max_seq_len=${MAX_SEQ_LEN}")
+[[ -n "${MAX_GEN_TOKENS:-}" ]]     && EXTRA_TUNE_ARGS+=("max_generated_tokens=${MAX_GEN_TOKENS}")
+[[ -n "${DP_REPLICATE_DIM:-}" ]]   && EXTRA_TUNE_ARGS+=("data_parallel_replicate_dim=${DP_REPLICATE_DIM}")
+
 mpiexec \
     --pmi=pmix \
+    --envall \
+    --env USE_AFFINITY_MASK="${USE_AFFINITY_MASK}" \
+    --env CCL_TRANSPORT_OVERRIDE="${CCL_TRANSPORT_OVERRIDE:-ofi}" \
+    --env DP_REPLICATE_DIM="${DP_REPLICATE_DIM:-1}" \
+    --env FORWARD_BATCH_SIZE="${FORWARD_BATCH_SIZE:-}" \
+    --env MAX_SEQ_LEN="${MAX_SEQ_LEN:-}" \
+    --env MAX_GEN_TOKENS="${MAX_GEN_TOKENS:-}" \
+    --env XPU_USM_ALLOC_SO="${XPU_USM_ALLOC_SO}" \
     --hostfile "${TRAIN_HOSTFILE}" \
     -n "${TOTAL_TRAIN_TILES}" \
     -ppn "${TRAIN_TILES_PER_NODE}" \
@@ -285,7 +308,8 @@ mpiexec \
     "num_steps=${NSTEPS}" \
     "grpo_samples=${GRPO_SAMPLES}" \
     "vllm_url=${VLLM_URLS}" \
-    "vllm_weight_sync=false"
+    "vllm_weight_sync=false" \
+    "${EXTRA_TUNE_ARGS[@]}"
 
 rm -f "${TRAIN_HOSTFILE}"
 echo "=== Training complete ==="

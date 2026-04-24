@@ -86,12 +86,14 @@ export CCL_WORKER_COUNT=1
 export CCL_ALLREDUCE=ring
 # NOTE: Do NOT set CCL_REDUCE_SCATTER=ring — causes 63x regression
 export CCL_CHUNK_SIZE=16777216
+# Prevent IPC handle cache eviction at step 2+ (default=1000 causes banned:1 GPU fault)
+export CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD=65536
 export FI_CXI_RX_MATCH_MODE=hybrid
 export FI_CXI_OFLOW_BUF_SIZE=8388608
 export FI_CXI_DEFAULT_CQ_SIZE=131072
 export FI_MR_CACHE_MONITOR=disabled
 export ZE_FLAT_DEVICE_HIERARCHY=FLAT
-export PYTORCH_ALLOC_CONF=expandable_segments:True
+unset PYTORCH_ALLOC_CONF
 export TORCH_COMPILE_DISABLE=1
 
 # Paths
@@ -219,7 +221,7 @@ export ZE_FLAT_DEVICE_HIERARCHY=FLAT
 export ZE_AFFINITY_MASK=${TILE_MASK}
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export TORCH_COMPILE_DISABLE=1
-export PYTORCH_ALLOC_CONF=expandable_segments:True
+unset PYTORCH_ALLOC_CONF
 export PYTHONPATH='${VLLM_PYTHONPATH}'
 export HF_DATASETS_OFFLINE=1
 export HF_HUB_OFFLINE=1

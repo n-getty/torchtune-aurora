@@ -95,7 +95,7 @@ export PATH=\$(echo \"\$PATH\" | tr ':' '\n' | grep -v myenv | tr '\n' ':' | sed
 unset VIRTUAL_ENV 2>/dev/null
 export ZE_FLAT_DEVICE_HIERARCHY=FLAT
 export ZE_AFFINITY_MASK=\$(seq -s, 0 $((NGPUS - 1)))
-export PYTORCH_ALLOC_CONF=expandable_segments:True
+unset PYTORCH_ALLOC_CONF
 export TORCH_COMPILE_DISABLE=1
 export MODEL_SIZE=${MODEL_SIZE}
 export SEQ_LEN=${SEQ_LEN}

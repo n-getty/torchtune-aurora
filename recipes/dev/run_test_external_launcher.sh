@@ -27,7 +27,7 @@ export FI_CXI_RX_MATCH_MODE=hybrid
 export FI_CXI_OFLOW_BUF_SIZE=8388608
 export FI_CXI_DEFAULT_CQ_SIZE=131072
 export FI_MR_CACHE_MONITOR=userfaultfd
-export PYTORCH_ALLOC_CONF=expandable_segments:True
+unset PYTORCH_ALLOC_CONF
 aurora_export_pythonpath "${TORCHTUNE_DIR}"
 
 TP=${1:-1}

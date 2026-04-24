@@ -173,9 +173,12 @@ class MoE(nn.Module):
             routed_input = torch.vstack((routed_input, routed_input.new_zeros((dim))))
             routed_input = routed_input[permuted_indices, :]
 
-        # EP dispatch: route tokens to expert-owning ranks via All-to-All.
+        # EP dispatch: route tokens to expert-owning ranks via AllGather.
         # _ep_dispatch is set by setup code (not hooks — FSDP2 fully_shard drops
         # hooks registered on GroupedExperts by parallelize_module).
+        # v159: dispatch returns (routed_input, num_tokens_per_expert) and
+        # caches s_local + gather_idx on the ExpertParallel instance for
+        # combine to read back. (Reverts v158 ctx-threading.)
         if self._ep_dispatch is not None:
             routed_input, num_tokens_per_expert = self._ep_dispatch(
                 routed_input, num_tokens_per_expert
@@ -184,7 +187,7 @@ class MoE(nn.Module):
         # shape (bs*slen*top_k, dim)
         routed_output = self.experts(routed_input, num_tokens_per_expert)
 
-        # EP combine: reverse All-to-All to return outputs to originating ranks.
+        # EP combine: reverse to return outputs to originating ranks.
         if self._ep_combine is not None:
             routed_output = self._ep_combine(routed_output)
 

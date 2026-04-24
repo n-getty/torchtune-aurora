@@ -1,10 +1,82 @@
 # Project Status — Aurora RL (torchtune XPU)
 
-Last updated: 2026-04-21
+Last updated: 2026-04-23
 
 This document synthesizes the current state of the vLLM weight sync implementation,
 active training runs, open issues, and prioritized next steps. It is a living companion
-to `docs/vllm_weight_sync.md` and `docs/aurora_rl_baselines.md`.
+to `docs/features/vllm_weight_sync.md`, `docs/features/moe_integration.md`, and `docs/experiments/aurora_rl_baselines.md`.
+
+## Where we are (one-page stock-take)
+
+- **Production-ready paths**: Qwen2.5-3B (10+2 tiles, 21s/step), Qwen3-32B (10+2 tiles
+  server mode 25.6s; 2-node HSDP 19.4s; 12 tiles training-only ~144s/step),
+  Gemma4-26B-A4B EP=1 (24s/step). Use these now.
+- **Weight sync**: SHM transport stable (3B fully hidden, 31B 13s waited, addressable).
+  XCCL broadcast prototype validated for direct GPU→GPU sync (3.1s for 5.75 GiB) — could
+  replace SHM if needed; currently optional.
+- **Framework**: `frameworks/2025.3.1` is production-ready with `unset PYTORCH_ALLOC_CONF`.
+  `expandable_segments:True` is an Intel oneCCL bug (USM pointer rejection) — file
+  upstream; works but unusable with collectives.
+- **Expert Parallelism (EP=4/DP=3 for Gemma4 26B-A4B)**: not production-ready.
+  Forward works end-to-end; backward fails deterministically at op #259. v153 ruled
+  out the CXI-NIC-contamination hypothesis and exposed a per-rank autograd ordering
+  bug: ranks within an EP group execute backward ops in different orders, causing
+  gloo collective mismatch. See `docs/features/moe_integration.md` for the v141–v153 saga.
+- **Training stability (Gemma4-31B gene recall)**: KL explodes at step 4 — root cause
+  is task-level (no SFT warm-up, no EOS in 512 tokens), not infrastructure. Must fix
+  before any meaningful Gemma4 RL run.
+- **32B GRPO backward regression (2026-04-23, FIXED)**: Commit acdc7c9f introduced a
+  per-chunk fwd+bwd loop that caused +44 GiB OOM at step 0 backward (FSDP2 unsharded
+  grads kept live across chunks). Fix: `TORCHTUNE_USE_CHUNKED_LOSS=1` gate for
+  single-backward path. The gloo reduce_scatter patch (added for EP) also added 130s
+  to non-EP backward (2s/layer × 64 layers via D2H+gloo+H2D); fix: bypass-restore
+  `_orig_reduce_scatter_tensor` around `loss.backward()`. See
+  `experiments/multinode_32b/test_{w,z,zz,bb,cc}_*.sh` and
+  `memory/project_chunked_loop_regression.md` for full test history.
+- **32B dedicated-vLLM 2-node (RESTORED 2026-04-23)**: Test CC validated
+  `TORCHTUNE_USE_CHUNKED_LOSS=1` at the exact crash config (G=16 fbs=4 max_gen=128,
+  6/6 steps clean). Backward 9-13s, memory stable from step 2 (resv=59.13 GiB FLAT,
+  tightest rank 0.93 GiB free). Step time ~33s with dedicated vLLM vs ~144s
+  training-only — 4.4× speedup from offloading generation to the vLLM node.
+- **32B XCCL weight sync end-to-end (VALIDATED 2026-04-23)**: Tests CD + CE confirmed streaming
+  XCCL weight sync works for 32B 2-node dedicated-vLLM (3/3 steps clean each). XCCL communicator
+  initializes correctly (world=13: 1 training + 3×4 vLLM TP ranks), weight sync completes without OOM.
+  - Test CD (707 per-param XCCL calls): 40s/sync at 1.6 GB/s
+  - Test CE (66 batched XCCL calls, 512M numel/batch): **38s/sync at 1.7 GB/s** — only 2s improvement
+  - **Real bottleneck identified (Test CF, 2026-04-23)**: XCCL **broadcast bandwidth** (1.7 GB/s at
+    12 receivers = 35.9s for 61 GiB), NOT AllGather overhead. AllGather per param: <0.12ms for 3B,
+    ~0.8ms for 32B (negligible). The earlier "53ms × 707 = 37.5s AllGather floor" was WRONG.
+  - **37-40s sync floor** is a BROADCAST BANDWIDTH floor: 61 GiB × (1/1.7 GB/s) = 35.9s regardless of call count.
+  - Batching XCCL calls (707→66) saved only ~2s (call overhead reduction), not the data transfer time.
+  - BATCHED_AG=1 (batched all_gather_into_tensor) is BROKEN: leaves FSDP2 shard state inconsistent,
+    causing checkpoint AllGather to deadlock. Savings were <1% for 32B. Do not use.
+  - Teardown fix (Test CF, 2026-04-23): `os._exit(0)` for all ranks after XCCL abort bypasses
+    `destroy_process_group()` hang (abort() corrupts oneCCL state). Run A exited cleanly.
+  - Next: reduce receivers (DP=1 → 4 receivers → ~12s floor), or accept ~38s floor amortized over sync_interval.
+  See `experiments/multinode_32b/test_cd_wsync.sh`, `test_ce_wsync_batched.sh`, `test_cf_xccl_1node_3b.sh`.
+- **Test CI: wsync ablation XCCL TP=2 vs TP=4 vs SHM TP=4 (3B, 2026-04-23)**: All 3 runs exit=0.
+  - XCCL TP=2 (2 receivers): **6.5 GB/s, 1.4s** per sync (synchronous, in "other" bucket)
+  - XCCL TP=4 (4 receivers): **4.0 GB/s, 1.9s** per sync (synchronous, in "other" bucket)
+  - SHM  TP=4: **7.2 GB/s write, 0.8s async write** + **0.9s vLLM H2D wait** (page-fault warmup 4.0s first sync only)
+  - Key finding: fewer XCCL receivers → proportionally higher bandwidth (TP=2 = 1.625× TP=4)
+  - 32B projections at TP=2: **9.4s XCCL** (synchronous) vs **~8s SHM write** (async, hides in gen if gen>8s)
+  - SHM is async and write hides in gen; for 32B with gen>15s, SHM overhead ≈ 0; XCCL always costs 9.4s
+  - **Tests CJ Final + CJ v7 (2026-04-23)**: 32B XCCL TP=2 on 10+2 single-node COMPLETED — reveals structural limitation.
+    - XCCL sync timing CONFIRMED: step 0 = 11.2s (bcast=9.5s at 6.4 GB/s), step 1 = 10.5s (bcast=9.3s at 6.6 GB/s). CI extrapolation was accurate.
+    - SHM TP=2 timing CONFIRMED: step 0 waited=49.8s (new SHM block, 1.4 GB/s); step 1 waited=12.1s (reused block, 9.8 GB/s).
+    - **STRUCTURAL BLOCKER (both methods crash at step 2)**: oneCCL IPC handle accumulation.
+      - Root cause: FSDP2 AllReduce across 10 training ranks caches ~6000 IPC handle mappings (707 params × 9 peers). By end of step 1 backward, **10.85 GiB** of L0 external memory consumed by cached handles, leaving only **5.64 GiB** l0_free. Insufficient for step 2.
+      - With threshold=1000 (default): handles evicted → stale VA → banned:1 (Steps CJ v1–v4).
+      - With threshold=65536 (fix): no eviction but full 10.85 GiB accumulation → OOM at step 2 (CJ Final, CJ v7).
+      - `expandable_segments` setting makes NO DIFFERENCE (tried both True and False — identical memory profiles).
+    - **Fix: use 2-node HSDP** — Test CC (6/6 clean at G=16) uses HSDP where within-node AllReduce only covers 5 peers per rank (not 9), dramatically reducing IPC handle memory. Cross-node uses Slingshot, not IPC.
+  See `experiments/wsync/test_ci_wsync_ablation.sh`, `test_cj_final.sh`, `test_cj_v7_xccl_expsegs.sh`.
+
+**Next concrete actions** (see Tier 1 below for priority):
+1. **32B weight sync validation must move to 2-node** — single-node 32B 10+2 blocked at step 2 (IPC handle OOM). Use 2-node HSDP config from Test CC, add XCCL weight sync.
+2. **SHM H2D batching fix** — `load_weights_from_shm()` does 707 sequential `param.copy_()` H2D operations (effective 2.8 GB/s, 10.9s for 32B TP=2). One bulk copy would drop to ~2-3s → SHM waited≈0 even at max_gen=64.
+3. Qwen3B gene recall production run (long-horizon, with checkpointing)
+4. Gemma4-31B training-stability fixes (SFT warm-up, EOS handling, lr warm-up)
 
 ---
 
@@ -16,6 +88,12 @@ to `docs/vllm_weight_sync.md` and `docs/aurora_rl_baselines.md`.
 | Gemma4-31B | 10+2 tiles, SHM sync | ~83s | 12.9–13.5s | Sync stable; training unstable |
 | Qwen3-32B | 10+2 tiles, server mode | ~25.6s | HTTP | Stable baseline |
 | Qwen3-32B | 2-node HSDP | ~19.4s | — | Near-linear scaling |
+| Qwen3-32B | 12 tiles training-only, G=16 fbs=4 max_gen=128 | ~144s | — | 6/6 steps clean 2026-04-23 |
+| Qwen3-32B | 2-node dedicated vLLM (TP=4 DP=3 + 12 train tiles), G=16 fbs=4 max_gen=128 | ~33s | — | 6/6 steps clean 2026-04-23 (Test CC) |
+| Qwen3-32B | 2-node dedicated vLLM + XCCL weight sync, G=16 fbs=4 max_gen=128 | ~72-76s | 38-40s | 3/3 clean each: Test CD (707 XCCL calls, 40s) & Test CE (66 batched, 38s) 2026-04-23; floor is BROADCAST BANDWIDTH (1.7 GB/s at 12 receivers = 35.9s for 61 GiB); BATCHED_AG=1 broken (checkpoint hang) |
+| Qwen2.5-3B | 1-node XCCL TP=2 (8+2), wsync every step | ~8.7s | 1.4s (sync in "other") | **6.5 GB/s** (Test CI Run A, 2026-04-23); extrapolates to 9.4s for 32B at TP=2 |
+| Qwen2.5-3B | 1-node XCCL TP=4 (8+4), wsync every step | ~9.7s | 1.9s (sync in "other") | **4.0 GB/s** (Test CI Run B, 2026-04-23); extrapolates to 15.3s for 32B at TP=4 |
+| Qwen2.5-3B | 1-node SHM TP=4 (8+4), wsync every step | ~8.3s | 0.9s waited in gen | **7.2 GB/s write, 0.8s async** (Test CI Run C, 2026-04-23); write hides in gen; 32B: ~8s write (hides if gen>8s) |
 | H100 NVL (8×) | torchtune+vLLM 32B | ~15.3s | — | External reference |
 
 ---
@@ -58,7 +136,7 @@ weight sync stability, not training stability. These are separate concerns.
 
 ---
 
-## Issues in `docs/vllm_weight_sync.md`
+## Issues in `docs/features/vllm_weight_sync.md`
 
 ### Issue 1: "Sync fully hidden" is overstated for 3B
 
@@ -189,9 +267,11 @@ constraint), but the SHM/IPC path we built is the XPU analog.
 
 ---
 
-## Expert Parallelism Status (as of April 14, 2026)
+## Expert Parallelism Status (as of April 22, 2026)
 
-EP=4/DP=3 for Gemma4 26B-A4B went through 133 versions across two weeks. Current state:
+EP=4/DP=3 for Gemma4 26B-A4B is now at v153. The dispatch algorithm was reformulated
+from AllToAll (v18–v136, persistent XCCL SIGSEGV) to **AllGather + ReduceScatter**
+(v141+, Mula paper arXiv 2604.00785). Forward unblocked; backward still blocked.
 
 | Component | Status |
 |-----------|--------|
@@ -200,13 +280,48 @@ EP=4/DP=3 for Gemma4 26B-A4B went through 133 versions across two weeks. Current
 | Routing imbalance | Fixed (v112: interleaved assignment) |
 | FSDP2+EP communicator conflict | Fixed (v40: 1-rank solo FSDP2 for experts) |
 | OFI CQ contamination (EPERM) | Fixed (v40: separate fsdp2_ep_pg) |
-| Backward AllToAll — XCCL SIGSEGV | Unresolved |
-| Backward AllToAll — gloo (current approach) | Testing v133 |
+| AllToAll backward XCCL SIGSEGV | Bypassed by switching to AllGather + ReduceScatter |
+| FWD pass (AG+RS, gloo CPU-bounce) | Working — all 180 forward EP ops complete |
+| Dedicated `_GLOO_EP_PG` (separate from FSDP2) | Fixed (v152) |
+| `GLOO_SOCKET_IFNAME=lo` (bypass CXI NIC) | Fixed (v153) — ranks now reach op #259 |
+| **BWD pass desync at op #259** | **Unresolved** — autograd-ordering bug |
 
-v133 uses gloo all_reduce (ws+1 calls) to implement backward AllToAll, after finding
-gloo P2P, all_gather, and all_to_all_single all broken on Aurora+Slingshot-11.
+### v152 → v153 finding (April 22)
 
-**Benchmark (April 11, EP=1 vs EP=4 at batch=1):**
+The op #259 RS-BWD deadlock is **not** a transport issue. v153 added per-rank
+logging and revealed that ranks within an EP group **execute backward ops in
+different orders**. At op #258, ranks 0/2/3/4/6/7/8/10/11 are doing `AG-BWD` while
+ranks **1, 5, 9** (the local-index-1 rank in each EP group) are doing `AG-FWD`
+recompute of the next layer — they are exactly one op behind their peers.
+
+Gloo matches collectives by call order, so once one rank in a group is out of step,
+every subsequent collective in that group references a different layer. After ~19
+"lucky" matched ops the mismatch becomes fatal: in v152 the desynced rank never
+arrives (gloo TCP timeout); in v153 with loopback transport the rank crashes hard
+mid-collective (rank 8 exitcode 1, "Connection closed by peer [127.0.0.1]" cascades
+to peers).
+
+Root cause is PyTorch autograd's hook scheduling under AC + `use_reentrant=True`:
+the MoE forward hook registration order interacts with autograd's topological sort
+in a rank-dependent way, producing different per-rank backward execution orders
+even with identical inputs and weights.
+
+Full analysis in `docs/features/moe_integration.md` ("Backward Dispatch Saga (v141–v153)").
+
+### Path forward (revised)
+
+The fix requires decoupling EP collectives from autograd scheduling. Options ranked
+by cost/risk:
+
+1. **Move EP dispatch outside autograd** (preferred): rewrite `_token_dispatch` /
+   `_token_combine` as side-effecting operations with manual gradient handling.
+   Cleanest fix, reusable for any MoE+AC combination.
+2. **Disable AC on the 30 MoE layers**: removes the ordering-sensitive recompute.
+   Memory cost may force G=2 — worth measuring.
+3. **Tag collectives explicitly**: gloo doesn't support tagging well; would need a
+   custom barrier per op, killing throughput.
+
+**Benchmark (April 11, EP=1 vs EP=4 at batch=1, before BWD blocker resurfaced):**
 
 | Phase | EP=1 | EP=4 |
 |-------|------|------|
@@ -215,14 +330,13 @@ gloo P2P, all_gather, and all_to_all_single all broken on Aurora+Slingshot-11.
 | opt | 1.6s | 39s (24×, CPU AdamW) |
 | total | 93s | 246s (2.6×) |
 
-EP=4 is strictly worse at small batch sizes. EP benefit requires large enough batches
-for expert GEMM to dominate AllToAll latency. With vLLM offloading generation, the
-grpo phase is the remaining bottleneck — EP would need grpo batch ≥ ~8× current to
-break even.
+EP=4 was strictly worse at G=1 even before the BWD desync was understood. EP benefit
+requires large enough batches for expert GEMM to dominate dispatch latency.
 
-**Recommendation**: EP is blocked on backward AllToAll and requires 8× larger batch
-to become beneficial. Deprioritize EP; focus on production training runs with
-server-mode vLLM.
+**Recommendation**: EP remains a research effort. Production training continues with
+EP=1 (replicated experts) using the proven 12-tile single-node or 2-node HSDP recipes.
+Pursue option 1 (EP dispatch outside autograd) as the next concrete experiment if EP
+is reprioritized.
 
 ---
 
@@ -236,7 +350,15 @@ server-mode vLLM.
 - Monitor: reward plateau, KL spikes, checkpoint integrity
 - Expected: continue the 0% → 50% success trajectory from the 1h run
 
-**2. Gemma4 31B gene recall — fix training stability first**
+**2. 32B dedicated-vLLM 2-node (Test CC)**
+- Apply `TORCHTUNE_USE_CHUNKED_LOSS=1` + XCCL bypass to the 2-node mpiexec launcher
+- Note: mpiexec launchers must keep pmix CCL vars; the XCCL bypass is safe with XCCL reduce_scatter on any launcher
+- The gloo reduce_scatter patch is still needed for EP mode (EP sub-communicators)
+- Config: G=16 fbs=4 max_gen=128 with dedicated vLLM on second node (2 nodes total)
+- Expected: ~30-40s/step (vs 144s training-only — vLLM handles generation)
+- Script template: `experiments/multinode_32b/test_bb_production.sh` with vllm_url active
+
+**3. Gemma4 31B gene recall — fix training stability first**
 - Root cause 1: no SFT warm-up for `<genes>` format → add 5–10 SFT examples as prompt prefix, or cold-start with supervised fine-tuning on 20 examples
 - Root cause 2: max_generated_tokens=512 causes all responses to be truncated → reduce to 256, or better: fix EOS generation by adjusting stop tokens config
 - Root cause 3: lr too high for warm-up — step 2 grad_norm=3968 suggests initial lr is too aggressive; try linear warm-up over 20 steps
@@ -244,29 +366,29 @@ server-mode vLLM.
 
 ### Tier 2: Infrastructure improvements
 
-**3. Single large memmove for 31B**
+**5. Single large memmove for 31B**
 - Replace 832 individual memmove calls with one flat-buffer bulk copy
 - Expected: reduce 31s copy time from 7s to ~2s (3.5×)
 - Estimated effort: 30 lines in `_sync_weights_to_vllm_shm()`
 
-**4. Document multi-node weight sync assumption**
+**6. Document multi-node weight sync assumption**
 - Add assertion in launcher that vLLM tiles are on node 0 (same node as rank 0)
 - Add comment in recipe that SHM is node-local
 - Design cross-node sync before scaling vLLM+2-node training
 
-**5. Test XCCL broadcast as SHM replacement**
+**7. Test XCCL broadcast as SHM replacement**
 - 2-process test: process 0 creates XCCL PG, process 1 is vLLM worker, both call init_process_group for a second PG
 - If no SIGABRT: broadcast 1 GB tensor and measure bandwidth
 - If successful: implement as `vllm_weight_sync_method: xccl` — would eliminate SHM entirely
 
 ### Tier 3: Research / deferred
 
-**6. 1-step gather overlap** (reduce 31B waited from 13s to ~7s)
+**8. 1-step gather overlap** (reduce 31B waited from 13s to ~7s)
 - Restructure training loop to start gather immediately after optimizer step
 - Feed gathered weights to vLLM during GRPO forward of the SAME step
 - 1-step weight lag is standard in RL — no algorithmic concern
 
-**7. EP backward AllToAll resolution** (deferred)
+**9. EP backward AllToAll resolution** (deferred)
 - v133 (gloo all_reduce) result pending
 - If v133 fails: consider abandoning gloo entirely; pre-allocate fixed XPU buffers and use XCCL with static tensor shapes (avoids variable-shape AllToAll entirely)
 - Only pursue if EP at large batch sizes shows > 30% throughput improvement
@@ -323,7 +445,9 @@ fragmentation on XPU in torch 2.10:
 Without ES, each larger allocation roughly doubles the reserved gap (buddy allocator
 fragmentation). With ES, segments expand in-place — the gap stays tight. At production
 scale (multi-GB FSDP shards), this could recover **several GiB** of fragmented memory
-per tile, potentially enabling G=16 (currently OOMs at step 3-4 with UR_RESULT_ERROR_OUT_OF_RESOURCES).
+per tile. Note: G=16 OOM was caused by the per-chunk fwd+bwd loop regression (commit acdc7c9f),
+not fragmentation — now fixed with `TORCHTUNE_USE_CHUNKED_LOSS=1`. G=16 fbs=4 max_gen=128
+runs 6/6 steps clean on a single node with the fix applied.
 
 **The problem is strictly in oneCCL's USM validation.** `expandable_segments` uses
 `zeVirtualMemReserve` + `zeVirtualMemMap` which produces pointers that `zeMemGetAllocProperties`

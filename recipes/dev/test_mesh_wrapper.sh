@@ -48,7 +48,7 @@ else
 fi
 export CCL_CHUNK_SIZE=16777216
 export TORCH_COMPILE_DISABLE=1
-export PYTORCH_ALLOC_CONF=expandable_segments:True
+unset PYTORCH_ALLOC_CONF
 aurora_export_pythonpath "${TORCHTUNE_DIR}" "${TRL_DIR}"
 
 if [[ "${RANK}" == "0" ]]; then

@@ -48,6 +48,8 @@ NSTEPS=${NSTEPS:-5}
 GRPO_SAMPLES=${GRPO_SAMPLES:-16}
 CONFIG=${CONFIG:-recipes/configs/dev/experimental/qwen32B_grpo_dedicated_vllm_xpu.yaml}
 WRAPPER="${TORCHTUNE_DIR}/recipes/dev/aurora_grpo_vllm_wrapper.sh"
+XCCL_PORT=${XCCL_PORT:-51217}
+WORKER_EXT="torchtune.dev.vllm_weight_sync_worker.WeightSyncFromFileExtension"
 
 # Validate: TP * DP must equal 12
 TOTAL_VLLM_TILES=$((VLLM_TP * VLLM_DP))
@@ -75,12 +77,14 @@ export CCL_WORKER_COUNT=1
 export CCL_ALLREDUCE=ring
 # NOTE: Do NOT set CCL_REDUCE_SCATTER=ring — causes 63x regression
 export CCL_CHUNK_SIZE=16777216
+# Prevent IPC handle cache eviction at step 2+ (default=1000 causes banned:1 GPU fault)
+export CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD=65536
 export FI_CXI_RX_MATCH_MODE=hybrid
 export FI_CXI_OFLOW_BUF_SIZE=8388608
 export FI_CXI_DEFAULT_CQ_SIZE=131072
 export FI_MR_CACHE_MONITOR=disabled
 export ZE_FLAT_DEVICE_HIERARCHY=FLAT
-export PYTORCH_ALLOC_CONF=expandable_segments:True
+unset PYTORCH_ALLOC_CONF
 export TORCH_COMPILE_DISABLE=1
 
 # Paths
@@ -116,6 +120,15 @@ VLLM_NODE_IP=$(ssh "${VLLM_NODE}" "hostname -i" 2>/dev/null | head -1)
 if [[ -z "${VLLM_NODE_IP}" ]]; then
     echo "ERROR: Could not resolve IP for ${VLLM_NODE}"
     exit 1
+fi
+
+# Get training node's HSN IP — needed for XCCL weight sync so vLLM (on Node 0)
+# can reach the TCPStore master on the training node.  --standalone overrides
+# MASTER_ADDR to 127.0.0.1 internally, so we must pass the real HSN address.
+TRAIN_NODE_HSN_IP=$(ssh "${TRAIN_NODE}" "ip -4 addr show hsn0 2>/dev/null | grep 'inet ' | awk '{print \$2}' | cut -d'/' -f1 | head -1")
+if [[ -z "${TRAIN_NODE_HSN_IP}" ]]; then
+    TRAIN_NODE_HSN_IP="${TRAIN_NODE_HSN}"
+    echo "WARNING: Could not get hsn0 IP for ${TRAIN_NODE}; falling back to ${TRAIN_NODE_HSN_IP}"
 fi
 
 # Bypass HTTP proxy for internal cluster traffic
@@ -204,7 +217,7 @@ export ZE_FLAT_DEVICE_HIERARCHY=FLAT
 export ZE_AFFINITY_MASK=${TILE_MASK}
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export TORCH_COMPILE_DISABLE=1
-export PYTORCH_ALLOC_CONF=expandable_segments:True
+unset PYTORCH_ALLOC_CONF
 export PYTHONPATH='${VLLM_PYTHONPATH}'
 export HF_DATASETS_OFFLINE=1
 export HF_HUB_OFFLINE=1
@@ -212,6 +225,8 @@ export CCL_PROCESS_LAUNCHER=none
 export CCL_ATL_TRANSPORT=ofi
 export FI_PROVIDER=cxi
 export CCL_KVS_IFACE=lo
+# Required to expose /collective_rpc and /reset_prefix_cache HTTP endpoints
+export VLLM_SERVER_DEV_MODE=1
 mkdir -p /tmp/torchtune
 python3 -m vllm.entrypoints.openai.api_server \
     --model '${MODEL_PATH}' \
@@ -223,6 +238,7 @@ python3 -m vllm.entrypoints.openai.api_server \
     --gpu-memory-utilization 0.80 \
     --max-model-len ${VLLM_MAX_MODEL_LEN} \
     --distributed-executor-backend mp \
+    --worker-extension-cls ${WORKER_EXT} \
     > '${VLLM_LOG}' 2>&1
 " &
     VLLM_PIDS+=($!)
@@ -285,8 +301,19 @@ done
 # ============================================================
 # Training uses single-node FSDP (no HSDP, no data_parallel_replicate_dim).
 # No vLLM on training node, so all 12 tiles are for training.
-# Unset ZE_AFFINITY_MASK so CCL can discover all device UUIDs for topology routing.
-export USE_AFFINITY_MASK=0
+# Default to per-rank affinity (USE_AFFINITY_MASK=1 -> ZE_AFFINITY_MASK=$LOCAL_RANK).
+# Without affinity, the L0 driver materializes all 12 tile contexts per process
+# (~29 GiB/tile overhead), driving same-card tiles (e.g. 10/11) into OOM during
+# FSDP backward. Per-rank affinity reduces this to ~5 GiB/tile (validated in v12
+# stress test). Override via `USE_AFFINITY_MASK=0|training` env if needed.
+export USE_AFFINITY_MASK=${USE_AFFINITY_MASK:-1}
+
+# Pluggable allocator with working recordStream (per-queue pending list). Validated
+# 8 steps Qwen3-32B 10-rank FSDP at 3.5 s/step. Default Python pluggable allocator
+# has a no-op recordStream (torch/xpu/memory.py never wires set_record_stream_fn),
+# which causes FSDP2 cross-stream AllGather buffers to be recycled mid-collective
+# and surfaces as UR:40 (UR_RESULT_ERROR_OUT_OF_RESOURCES) at first backward.
+export XPU_USM_ALLOC_SO=${XPU_USM_ALLOC_SO:-${TORCHTUNE_DIR}/experiments/arena_ipc/usm_pending_alloc.so}
 
 # CRITICAL: Export WORLD_SIZE and NUM_NODES so the wrapper can set them correctly.
 # PALS_NRANKS/PMI_SIZE are not always set when using a custom hostfile.
@@ -297,11 +324,38 @@ export NGPUS_PER_NODE=${TRAIN_TILES}
 export no_proxy="*"
 export NO_PROXY="*"
 
+# XCCL weight sync: training node HSN IP so vLLM (on Node 0) can reach the TCPStore
+# master on the training node. --standalone overrides MASTER_ADDR to 127.0.0.1; this
+# takes priority. Forwarded to all training ranks via --envall.
+export TORCHTUNE_XCCL_HOST="${TRAIN_NODE_HSN_IP}"
+
+# RC1 fix: single backward (LinearGRPOLoss) instead of per-chunk fwd+bwd loop.
+# The per-chunk loop with FSDP2 grad-sync suppression keeps unsharded grads live
+# across chunks → OOM at 32B/G=16. Single backward fits at 64 GiB/tile (validated
+# Test BB: 6/6 clean; Test CC+CD+CE: all clean).
+export TORCHTUNE_USE_CHUNKED_LOSS=1
+
 echo ""
 echo "Starting training on ${TRAIN_NODE} (${TRAIN_TILES} ranks, FSDP)..."
 echo "vLLM URLs: ${VLLM_URLS}"
+echo "XCCL host: ${TRAIN_NODE_HSN_IP} (training node HSN IP for weight sync)"
+
+# Optional config overrides (forward_batch_size, max_seq_len, etc.) via PBS env.
+EXTRA_TUNE_ARGS=()
+[[ -n "${FORWARD_BATCH_SIZE:-}" ]] && EXTRA_TUNE_ARGS+=("forward_batch_size=${FORWARD_BATCH_SIZE}")
+[[ -n "${MAX_SEQ_LEN:-}" ]]        && EXTRA_TUNE_ARGS+=("max_seq_len=${MAX_SEQ_LEN}")
+[[ -n "${MAX_GEN_TOKENS:-}" ]]     && EXTRA_TUNE_ARGS+=("max_generated_tokens=${MAX_GEN_TOKENS}")
+
 mpiexec \
     --pmi=pmix \
+    --envall \
+    --env USE_AFFINITY_MASK="${USE_AFFINITY_MASK}" \
+    --env CCL_TRANSPORT_OVERRIDE="${CCL_TRANSPORT_OVERRIDE:-ofi}" \
+    --env DP_REPLICATE_DIM="${DP_REPLICATE_DIM:-1}" \
+    --env FORWARD_BATCH_SIZE="${FORWARD_BATCH_SIZE:-}" \
+    --env MAX_SEQ_LEN="${MAX_SEQ_LEN:-}" \
+    --env MAX_GEN_TOKENS="${MAX_GEN_TOKENS:-}" \
+    --env XPU_USM_ALLOC_SO="${XPU_USM_ALLOC_SO}" \
     --hostfile "${TRAIN_HOSTFILE}" \
     -n "${TRAIN_TILES}" \
     -ppn "${TRAIN_TILES}" \
@@ -314,7 +368,11 @@ mpiexec \
     "num_steps=${NSTEPS}" \
     "grpo_samples=${GRPO_SAMPLES}" \
     "vllm_url=${VLLM_URLS}" \
-    "vllm_weight_sync=false"
+    "vllm_weight_sync=true" \
+    "vllm_weight_sync_method=xccl" \
+    "vllm_tensor_parallel_size=${VLLM_TP}" \
+    "vllm_xccl_port=${XCCL_PORT}" \
+    "${EXTRA_TUNE_ARGS[@]}"
 
 rm -f "${TRAIN_HOSTFILE}"
 echo "=== Training complete ==="

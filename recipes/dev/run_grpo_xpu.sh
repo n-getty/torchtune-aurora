@@ -28,8 +28,9 @@ export FI_CXI_RX_MATCH_MODE=hybrid
 export FI_CXI_OFLOW_BUF_SIZE=8388608
 export FI_CXI_DEFAULT_CQ_SIZE=131072
 export FI_MR_CACHE_MONITOR=userfaultfd
-# XPU memory allocator
-export PYTORCH_ALLOC_CONF=expandable_segments:True
+# Prevent IPC handle cache eviction at step 2+ (default=1000 causes banned:1 GPU fault)
+export CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD=65536
+unset PYTORCH_ALLOC_CONF
 # NOTE: CCL_ALLREDUCE=ring / CCL_REDUCE_SCATTER=ring are NOT set for
 # single-node FSDP2 — they force the scheduler path which doesn't support
 # ReduceOp.AVG. These are only needed for multi-node with large tensors.

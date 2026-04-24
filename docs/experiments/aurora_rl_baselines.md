@@ -12,7 +12,7 @@ torchtune RL recipes on Aurora HPC (Intel Max 1550 GPUs).
 | Memory | 64 GB HBM2e per tile |
 | Interconnect | Slingshot-11 (HSN, 200+ Gb/s) |
 | Backend | oneCCL / XCCL |
-| PyTorch | via `module load frameworks/2025.2.0` (2025.3.1 has broken XCCL allreduce) |
+| PyTorch | via `module load frameworks/2025.3.1` (torch 2.10, Python 3.12) |
 | Precision | BF16 |
 
 ## Phase 0: XPU Utility Module
@@ -603,7 +603,7 @@ all tile counts to get fair A100 comparisons.
 
 4. **TP=2 vLLM**: Works via `api_server` but not via `LLM()` API. No throughput advantage for GRPO batch sizes.
 
-5. **~~UR resource leak~~ SOLVED (2026-03-30)**: `torch.xpu.empty_cache()` combined with FSDP's `storage.resize_()` cycle leaks UR handles in Level Zero, causing `UR_RESULT_ERROR_OUT_OF_RESOURCES` after ~70 iterations. **Root cause**: `empty_cache()` forces the caching allocator to return blocks to Level Zero (`zeMemFree`); when FSDP re-acquires them (`zeMemAllocDevice`), each cycle leaks a UR handle. **Fix**: Remove all `empty_cache()` calls from FSDP training loops — the caching allocator reuses blocks from its free pool without touching Level Zero. Tradeoff: higher peak memory (cached blocks not returned to device). Verified stable at 200+ iterations (repro script) and 20+ training steps (full GRPO recipe). See `docs/intel_xpu_resource_leak_bug_report.md` for full analysis and reproduction scripts.
+5. **~~UR resource leak~~ SOLVED (2026-03-30)**: `torch.xpu.empty_cache()` combined with FSDP's `storage.resize_()` cycle leaks UR handles in Level Zero, causing `UR_RESULT_ERROR_OUT_OF_RESOURCES` after ~70 iterations. **Root cause**: `empty_cache()` forces the caching allocator to return blocks to Level Zero (`zeMemFree`); when FSDP re-acquires them (`zeMemAllocDevice`), each cycle leaks a UR handle. **Fix**: Remove all `empty_cache()` calls from FSDP training loops — the caching allocator reuses blocks from its free pool without touching Level Zero. Tradeoff: higher peak memory (cached blocks not returned to device). Verified stable at 200+ iterations (repro script) and 20+ training steps (full GRPO recipe). See `docs/bugs/intel_xpu_resource_leak_bug_report.md` for full analysis and reproduction scripts.
 
 ### Multi-Node Scaling
 
@@ -1935,7 +1935,7 @@ architecture-agnostic rather than model-specific.
 
 ### Challenge: No vLLM Support for Gemma 4
 
-vLLM 0.10.1 (the latest XPU-compatible version in `frameworks/2025.2.0`) has no
+vLLM 0.10.1 (the latest XPU-compatible version in `frameworks/2025.3.1`) has no
 Gemma 4 model. Upstream Gemma 4 support requires vLLM 0.18+, which cannot run on
 Aurora XPU. Upgrading vLLM system-wide would break the entire stack.
 
@@ -2152,8 +2152,8 @@ because Gemma4's native generation is slower (111s vs ~70s).
    usage and OOM. Fix: `fuser -k /dev/dri/renderD12{8,9} /dev/dri/renderD13{0..9}`
    before each run.
 
-2. **frameworks/2025.2.0 required**: 2025.3.1 has broken XCCL allreduce (USM pointer
-   validation failure).
+2. **Do NOT set `expandable_segments:True`**: Causes oneCCL USM pointer validation
+   failure. See `docs/bugs/intel_ccl_expandable_segments_bug.md`.
 
 3. **Training loss diverges**: The current config (`lr=5e-6`, `kl_coeff=0.01`) shows
    loss divergence after step 3 (`grad_norm → inf`). This is a hyperparameter tuning

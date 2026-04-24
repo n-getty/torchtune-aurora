@@ -14,7 +14,7 @@ set -e
 PROJDIR=/lus/flare/projects/ModCon/ngetty/torchtune
 cd ${PROJDIR}
 
-module load frameworks/2025.2.0 2>/dev/null || true
+module load frameworks/2025.3.1 2>/dev/null || true
 export PATH=$(echo "$PATH" | tr ':' '\n' | grep -v myenv | tr '\n' ':' | sed 's/:$//')
 unset VIRTUAL_ENV
 
@@ -28,6 +28,8 @@ export FI_CXI_RX_MATCH_MODE=hybrid
 export FI_CXI_OFLOW_BUF_SIZE=8388608
 export FI_CXI_DEFAULT_CQ_SIZE=131072
 export FI_MR_CACHE_MONITOR=userfaultfd
+# Prevent IPC handle cache eviction at step 2+ (default=1000 causes banned:1 GPU fault)
+export CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD=65536
 unset PYTORCH_ALLOC_CONF
 
 GEMMA4_OVERLAY=${PROJDIR}/recipes/dev/vllm_gemma4_overlay

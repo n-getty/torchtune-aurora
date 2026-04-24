@@ -11,13 +11,16 @@ TRAIN_TILES=12
 
 cd $REPO
 
-module load frameworks/2025.2.0 2>/dev/null || true
+module load frameworks/2025.3.1 2>/dev/null || true
 export PATH=$(echo "$PATH" | tr ':' '\n' | grep -v myenv | tr '\n' ':' | sed 's/:$//')
 
 GEMMA4_OVERLAY=${REPO}/recipes/dev/vllm_gemma4_overlay
 export PYTHONPATH=${GEMMA4_OVERLAY}:${REPO}:/flare/ModCon/ngetty/trl:${PYTHONPATH:-}
 export HF_DATASETS_OFFLINE=1
 export HF_HUB_OFFLINE=1
+
+unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy ftp_proxy
+export no_proxy="*"
 
 export CCL_PROCESS_LAUNCHER=none
 export CCL_ATL_TRANSPORT=ofi

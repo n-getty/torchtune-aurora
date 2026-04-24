@@ -2,7 +2,6 @@
 # GRPO with vLLM-accelerated generation on Aurora XPU — Gemma 4 31B
 #
 # Uses the vllm_gemma4_overlay to add Gemma4 model support to vLLM 0.10.1.
-# MUST use frameworks/2025.2.0 (2025.3.1 has broken XCCL allreduce).
 #
 # Usage:
 #   bash recipes/dev/run_gemma4_grpo_vllm.sh [vllm_tiles] [train_tiles] [num_steps] [extra_args...]
@@ -18,8 +17,7 @@ source "${SCRIPT_DIR}/_aurora_paths.sh"
 PROJDIR="${TORCHTUNE_DIR}"
 cd ${PROJDIR}
 
-# Use 2025.2.0 — 2025.3.1 has broken XCCL allreduce (USM pointer validation)
-module load frameworks/2025.2.0 2>/dev/null || true
+module load frameworks/2025.3.1 2>/dev/null || true
 
 # Remove user virtualenv from PATH so frameworks python is used
 export PATH=$(echo "$PATH" | tr ':' '\n' | grep -v myenv | tr '\n' ':' | sed 's/:$//')

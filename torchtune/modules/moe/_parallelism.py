@@ -24,353 +24,189 @@ from torch.distributed.tensor.parallel.style import ParallelStyle
 from torch.distributed.tensor.placement_types import Placement
 
 
-# v109: use_reentrant=False AC restored (safe now — no AllToAll during AC recompute due to caching).
-# v108: AllToAll output caching — cached_dispatch_output/cached_combine_output returned during AC recompute.
-# v107: use_reentrant=True AC fixes AllToAll deadlock (all ranks process backward in lockstep).
-# v106: gloo CPU-bounce ONLY for no-grad contexts (ref forward); XCCL for all others.
+# AllGather + ReduceScatter EP dispatch (Mula paper, arXiv 2604.00785).
 #
-# v105 crash: ze_handle_manager.cpp:226 get_ptr: EXCEPTION: unknown memory type
-#   XCCL AllToAll crashed during REF forward (ref_cpu_offload=True: params fetched from
-#   CPU → freshly allocated XPU buffers not registered in ze_handle_manager as the right
-#   memory type). Policy forward (FSDP2 pre-loaded USM buffers) worked fine.
+# Replaces AllToAll token dispatch which deadlocked or SIGSEGV'd on Aurora XPU
+# + Slingshot-11 (v18-v136 saga):
+#   AllToAll forward: OFI CQ contamination → FSDP2 EPERM (v18-v39)
+#   AllToAll backward: XCCL SIGSEGV (v40-v133), shape mismatch due to caching bug (v134),
+#                      deadlock even after caching removal (v136)
 #
-# v99-v104 failure: all gloo P2P approaches deadlock during AC recompute.
-#   Root cause: AllToAll requires ALL EP ranks to exchange data for the SAME layer.
-#   With use_reentrant=False AC, ranks can be at different layers' AC recomputes
-#   simultaneously. Any "wait for peer" operation (all_reduce, barrier, irecv) deadlocks.
-#   Only XCCL AllToAll (collective) keeps ranks in lockstep → no deadlock.
+# AllGather and ReduceScatter are natively optimized in oneCCL for Aurora (topology-aware,
+# L0 IPC) and are used by FSDP2 without issues. Their backward is standard PyTorch autograd:
+#   AllGather backward = ReduceScatter
+#   ReduceScatter backward = AllGather
+# No custom split tracking, no OFI CQ drain barriers needed.
 #
-# v106 fix: use torch.is_grad_enabled() to select the AllToAll transport:
-#   - is_grad_enabled() == False (ref forward, torch.no_grad()): gloo CPU-bounce.
-#     Ref forward is sequential (all ranks at same layer), so gloo P2P won't deadlock.
-#     Avoids ze_handle_manager crash from cpu_offload tensors.
-#   - is_grad_enabled() == True (policy forward, GRPO step forward, AC recompute):
-#     XCCL AllToAll. Collective → keeps all EP ranks in lockstep → no deadlock.
-#     Policy model uses FSDP2 pre-loaded USM buffers → no ze_handle_manager crash.
+# v141: Use native XCCL reduce_scatter_tensor, bypassing the recipe's gloo monkey-patch.
 #
-# Backward: always XCCL. Ref forward runs under no_grad → backward never called for it.
-# Training forward and AC recompute use XCCL forward → backward in lockstep → XCCL safe.
-_XPU_A2A_FWD_GLOO_GROUP: Optional[dist.ProcessGroup] = None  # forward AllToAll gloo group
-_XPU_A2A_BWD_GLOO_GROUP: Optional[dist.ProcessGroup] = None  # backward AllToAll gloo group (SEPARATE from FWD in v129)
-_XCCL_BWD_CALL_COUNT: int = 0  # v110 diag: count XCCL backward AllToAll calls per rank
-_GLOO_BWD_CALL_COUNT: int = 0  # v129 diag: count gloo backward AllToAll calls per rank
+# The recipe patches dist.reduce_scatter_tensor → gloo CPU AllReduce+slice to work around
+# CCL's ze_handle_manager crash on freshly sub-allocated FSDP2 grad tensors.
+# But the monkey-patch only replaces the torch.distributed module attribute — the original
+# function is still accessible at torch.distributed.distributed_c10d.reduce_scatter_tensor.
+#
+# EP tensors are explicitly allocated (new_empty, clone, contiguous) — not FSDP2's
+# sub-allocated grad buffers — so they should not trigger the IPC handle bug.
+#
+# v138-v140 used AllReduce+slice which sends 4× more data than needed and deadlocked/stalled
+# after ~60 operations during backward (CCL progress-engine stall or resource exhaustion).
+#
+# v142: Add xpu.synchronize() + dist.barrier(group) after each EP AllGather/ReduceScatter.
+#   Result: HUNG for 23 minutes in backward. xpu.synchronize() waits for ALL pending GPU
+#   work (not just the collective), causing ~30s/op slowdown × 39 ops ≈ 20 minutes, then
+#   op #40 still hung. Cause confirmed: xpu.synchronize() unnecessary and harmful.
+#
+# v143: Diagnose precise EP backward hang location.
+#   - Kept dist.barrier(group) for OFI CQ drain; removed xpu.synchronize().
+#   - Added 3-phase per-op logging (ENTER/COLL-DONE/EXIT) to all ep_pg ops.
+#   - Result (2026-04-22): ALL 260+ ops completed (ENTER→COLL-DONE→EXIT) with no hang.
+#     Backward ops (AG-BWD, RS-BWD) all exited cleanly. Job killed by PBS walltime, not hang.
+#   - Conclusion: dist.barrier(group) after each EP collective drains the OFI CQ.
+#     v141 hung at backward op #40 because without barriers, the OFI CQ accumulates
+#     stale entries across 100+ ops and deadlocks on op ~100 (last backward op).
+#
+# v144: Production-ready version — barriers kept, diagnostic logging removed. FAILED.
+# v145: sleep(10ms) after barrier only. FAILED.
+# v146: sleep(50ms) pre+post barrier. FAILED.
+# v147: sleep(50ms) pre+post + NTPE sleep. FAILED.
+#   All sleep-based approaches failed: backward hangs at first EP collective consistently.
+#   sleep() yields CPU but the OFI hang mechanism is not about CPU time.
+#
+# v149 (FAILED, 2026-04-22): gloo EP-group barrier (4 ranks TCP) after each XCCL collective.
+#   v148 (XCCL barrier + prints) hung at op #259. v149 (gloo barrier + prints) ALSO hung at #259.
+#   The 6 ENTER RS-BWD lines (0 COLL-DONE) show the XCCL collective itself deadlocks.
+#   Per-EP-group gloo barrier (4 ranks) cannot prevent concurrent XCCL between EP groups.
+#
+# v150: Global 12-rank gloo barrier (all tiles) before + after each XCCL EP collective.
+#   Hypothesis: all 3 DP replicas (3 EP groups) run concurrent XCCL EP collectives on
+#   the SAME OFI endpoint (oneCCL uses one OFI endpoint per node, shared across all
+#   process groups). At op #259, all 3 EP groups converge on RS-BWD simultaneously.
+#   Their OFI CQ events cross-contaminate each other's CCL progress engines → deadlock.
+#   Per-EP-group gloo barriers (v149) don't prevent this — they only serialize within a
+#   group. Only a GLOBAL barrier (all 12 ranks) can prevent concurrent XCCL EP ops.
+#
+# Root cause: oneCCL OFI collective → Slingshot-11 CXI NIC generates CQ entries.
+#   CCL progress thread polls CQ during active collectives but may leave residual entries
+#   after completion. Subsequent collectives start while stale entries remain → deadlock.
+#   XCCL dist.barrier(ep_pg) adds MORE OFI CQ entries rather than draining existing ones.
+#   time.sleep() does not help: it doesn't trigger OFI CQ polling in the CCL worker.
+#
+# v149 fix: Use gloo TCP barrier (not OFI) after each EP collective.
+#   _GLOO_EP_PG: set from recipe after _GLOO_DP_SHARD_PG is created — same 4 EP ranks,
+#   but uses TCP sockets (not Slingshot-11 OFI). Provides user-level synchronization
+#   without adding more OFI CQ entries. The TCP poll in gloo's barrier forces the kernel
+#   to process pending network events, which may include OFI CQ events that the CCL
+#   progress thread missed. This avoids the deadlock without adding more CQ events.
+#
+#   If gloo barrier alone fails: try gloo barrier + XCCL barrier (belt-and-suspenders),
+#   or switch CCL_ATL_TRANSPORT=mpi which has stronger OFI CQ completion guarantees.
+import sys
+from torch.distributed.distributed_c10d import reduce_scatter_tensor as _c10d_reduce_scatter
+
+_EP_OP_N = 0
+_GLOO_EP_PG = None      # 4-rank gloo EP group; set from recipe (_GLOO_DP_SHARD_PG mirror).
+_GLOO_GLOBAL_PG = None  # 12-rank global gloo group; set from recipe (v150 — failed).
 
 
-def _cpu_bounce_all_to_all(
-    cpu_input: "Tensor",
-    input_splits: list,
-    output_splits: list,
-    gloo_group: "dist.ProcessGroup",
-    feat_shape: tuple,
-) -> "Tensor":
-    """AllToAll via gloo P2P batch_isend_irecv on CPU tensors. No all_reduce.
+def _ep_reduce_scatter(input: Tensor, group: dist.ProcessGroup, label: str = "RS") -> Tensor:
+    """EP ReduceScatter via gloo CPU-bounce (v151).
 
-    v103: Removed the gloo all_reduce from forward AllToAll (was causing AC recompute
-    deadlocks across v99-v102). The all_reduce was originally added in v97 to fix
-    output_splits inconsistency, but output_splits is ALREADY consistent because
-    _token_dispatch computes it from all_gather_tensor(num_tokens_per_expert) via XCCL
-    before calling this function. The XCCL all-gather ensures:
-      output_splits_A[B] = ntpe_matrix[B, A_experts].sum()
-                         = input_splits_B[A]  (by construction)
-    So output_splits IS consistent — no gloo all_reduce needed.
+    Replaces XCCL reduce_scatter_tensor with gloo all_reduce (SUM) + local slice.
+    Bypasses XCCL/OFI entirely for EP dispatch — eliminates the OFI CQ deadlock at op #259
+    that persisted through v144-v150 (XCCL barriers, gloo barriers, global barrier all failed).
+    Uses _GLOO_EP_PG (same gloo group as _GLOO_DP_SHARD_PG, already used for FSDP2 grad sync).
+    Cost: 4× more bandwidth (all_reduce on full buffer vs native reduce_scatter), but no deadlock.
 
-    Deadlock root cause (v99-v102): gloo all_reduce is a collective requiring all 4 EP
-    ranks to arrive simultaneously. With use_reentrant=False AC, PyTorch's C++ autograd
-    threads release the GIL inside dist.all_reduce, allowing other threads to increment
-    the pool counter. Different ranks' threads can be at different layers' AC recomputes
-    simultaneously, so different ranks enter different pool[N]'s all_reduce → deadlock.
-
-    v103 fix: Remove all_reduce. Use output_splits directly for recv buffer sizing.
-    Only P2P + barrier remain. P2P isend/irecv are asynchronous — sends queue in socket
-    buffers, irecvs wait until the message arrives. The final barrier ensures all P2P
-    ops complete before returning. Different layers' AC recomputes share the same gloo
-    group but cannot deadlock: each P2P send is addressed to a specific peer and the
-    message waits in the buffer. The barrier ensures completion without requiring all
-    ranks to be at exactly the same point simultaneously.
-
-    Args:
-        cpu_input: CPU tensor, shape (sum(input_splits), *feat_shape)
-        input_splits: how many rows to send to each rank (from XCCL all-gather, consistent)
-        output_splits: how many rows to receive from each rank (from XCCL all-gather, consistent)
-        gloo_group: gloo ProcessGroup (backend=gloo) for the EP shard group
-        feat_shape: non-batch dimensions of token features
-    Returns:
-        (cpu_output, output_splits) — output tensor and recv sizes (same as input output_splits)
+    Forward (RS-FWD): partial_out(ep_degree×s_local, dim) → all_reduce → slice → (s_local, dim)
+    Backward (RS-BWD): same path on grad_output from AG-FWD.
     """
-    ws = dist.get_world_size(gloo_group)
-    my_rank = dist.get_rank(gloo_group)
+    global _EP_OP_N
+    n = _EP_OP_N; _EP_OP_N += 1
+    r = dist.get_rank()
+    print(f"[rank{r}] EP-OP #{n} ENTER {label}", flush=True)
+    ep_degree = dist.get_world_size(group)
+    ep_rank = dist.get_rank(group)
+    out_rows = input.shape[0] // ep_degree
 
-    # output_splits is already consistent with each sender's input_splits[my_rank]
-    # (guaranteed by the XCCL all-gather in _token_dispatch). No all_reduce needed.
-    recv_sizes = output_splits  # direct use, no cross-rank negotiation
+    if input.device.type == "xpu" and _GLOO_EP_PG is not None:
+        # gloo CPU-bounce: XPU → CPU → gloo all_reduce(SUM) → slice → XPU
+        input_cpu = input.contiguous().cpu()  # (ep_degree * s_local, dim)
+        dist.all_reduce(input_cpu, op=dist.ReduceOp.SUM, group=_GLOO_EP_PG)
+        out_cpu = input_cpu[ep_rank * out_rows : (ep_rank + 1) * out_rows].contiguous()
+        out = out_cpu.to(input.device)
+    else:
+        # Fallback: native XCCL reduce_scatter (non-XPU or no gloo group configured)
+        out = input.new_empty(out_rows, *input.shape[1:])
+        _c10d_reduce_scatter(out, input.contiguous(), op=dist.ReduceOp.SUM, group=group)
 
-    cpu_output = torch.empty((sum(recv_sizes),) + feat_shape, dtype=cpu_input.dtype)
-
-    ops = []
-    send_off = 0
-    for dst in range(ws):
-        n = input_splits[dst]
-        if dst != my_rank and n > 0:
-            dst_global = dist.get_global_rank(gloo_group, dst)
-            ops.append(dist.P2POp(dist.isend,
-                                  cpu_input[send_off:send_off + n].contiguous(),
-                                  dst_global, group=gloo_group))
-        send_off += n
-
-    recv_off = 0
-    for src in range(ws):
-        n = recv_sizes[src]
-        if src != my_rank and n > 0:
-            src_global = dist.get_global_rank(gloo_group, src)
-            ops.append(dist.P2POp(dist.irecv,
-                                  cpu_output[recv_off:recv_off + n],
-                                  src_global, group=gloo_group))
-        recv_off += n
-
-    # Self-copy (no network)
-    my_send_off = sum(input_splits[:my_rank])
-    my_recv_off = sum(recv_sizes[:my_rank])
-    n_self = input_splits[my_rank]
-    if n_self > 0:
-        cpu_output[my_recv_off:my_recv_off + n_self].copy_(
-            cpu_input[my_send_off:my_send_off + n_self]
-        )
-
-    if ops:
-        reqs = dist.batch_isend_irecv(ops)
-        for req in reqs:
-            req.wait()
-    # No barrier: req.wait() guarantees all sends/recvs complete. dist.barrier would
-    # require all 4 EP ranks simultaneously, deadlocking when AC recomputes fire at
-    # different times across ranks (v104 fix — same root cause as the all_reduce).
-    # Gloo TCP FIFO ordering + tag-matched P2P handles correctness without a barrier.
-
-    return cpu_output, recv_sizes
+    print(f"[rank{r}] EP-OP #{n} COLL-DONE {label}", flush=True)
+    print(f"[rank{r}] EP-OP #{n} EXIT {label}", flush=True)
+    return out
 
 
-class _XPUSyncAllToAll(torch.autograd.Function):
-    """AllToAll with XPU-safe transport in both forward and backward.
+def _ep_all_gather(out: Tensor, input: Tensor, group: dist.ProcessGroup, label: str = "AG") -> None:
+    """EP AllGather via gloo CPU-bounce (v151).
 
-    v95: CPU-bounce via gloo P2P batch_isend_irecv when _XPU_A2A_GLOO_GROUP is set.
-    Copies input XPU→CPU, runs gloo P2P AllToAll (no preamble, no collective sync,
-    zero-token ranks issue no ops), copies output CPU→XPU. Fixes ze_handle_manager.
+    Replaces XCCL all_gather_into_tensor with gloo all_gather_into_tensor on CPU tensors.
+    Uses _GLOO_EP_PG (same gloo group already used for FSDP2 grad sync via monkey-patch).
 
-    v94 failed: gloo does not support all_to_all (list API) at all.
-    v93 failed: XCCL backend doesn't support CPU tensors.
-    v84 failed: gloo all_to_all_single preamble mismatch on unequal splits (v60).
-    v65-v79 failed: gloo broadcast/allreduce AllToAll → zero-token rank deadlock.
-    v87-v92 warmup failed: CCL workspace is CCL-internal, not pre-registerable.
-
-    Non-XPU path or _XPU_A2A_GLOO_GROUP=None: direct XCCL (original behavior).
+    Forward (AG-FWD): (s_local, dim) → all_gather → (ep_degree×s_local, dim)
+    Backward (AG-BWD): same path on grad_output from RS-FWD.
     """
+    global _EP_OP_N
+    n = _EP_OP_N; _EP_OP_N += 1
+    r = dist.get_rank()
+    print(f"[rank{r}] EP-OP #{n} ENTER {label}", flush=True)
+
+    if input.device.type == "xpu" and _GLOO_EP_PG is not None:
+        # gloo CPU-bounce: XPU → CPU → gloo all_gather_into_tensor → XPU
+        input_cpu = input.contiguous().cpu()  # (s_local, dim)
+        out_cpu = torch.zeros(out.shape, dtype=out.dtype, device="cpu")
+        dist.all_gather_into_tensor(out_cpu, input_cpu, group=_GLOO_EP_PG)
+        out.copy_(out_cpu.to(input.device))
+    else:
+        # Fallback: native XCCL all_gather (non-XPU or no gloo group configured)
+        dist.all_gather_into_tensor(out, input.contiguous(), group=group)
+
+    print(f"[rank{r}] EP-OP #{n} COLL-DONE {label}", flush=True)
+    print(f"[rank{r}] EP-OP #{n} EXIT {label}", flush=True)
+
+
+class _AllGatherRS(torch.autograd.Function):
+    """AllGather in forward, ReduceScatter in backward."""
 
     @staticmethod
-    def forward(
-        ctx,
-        input: Tensor,
-        output_splits: list,
-        input_splits: list,
-        group: dist.ProcessGroup,
-        cached_output: Optional[Tensor] = None,
-    ) -> Tensor:
-        ctx.output_splits = output_splits
-        ctx.input_splits = input_splits
+    def forward(ctx, input: Tensor, group: dist.ProcessGroup) -> Tensor:
         ctx.group = group
-        ctx.is_xpu = (input.device.type == "xpu")
-        ctx.feat_shape = tuple(input.shape[1:])
-
-        if cached_output is not None:
-            # v108: AC recompute path — skip AllToAll entirely, use cached output.
-            # ExpertParallel caches the AllToAll output from the first forward and passes
-            # it here during AC recompute. This avoids any XCCL/gloo communication during
-            # the backward phase (AC recompute), eliminating the deadlock between AC recompute
-            # AllToAll and FSDP2 gloo reduce_scatter that blocked v99-v107.
-            # Gradient correctness: _XPUSyncAllToAll.backward is still registered and will
-            # run the reverse AllToAll on the gradient during the actual backward pass.
-            # ctx is set so backward knows the correct splits for the gradient AllToAll.
-            return cached_output
-
-        if ctx.is_xpu and _XPU_A2A_FWD_GLOO_GROUP is not None and not torch.is_grad_enabled():
-            # v106: gloo CPU-bounce ONLY when grad is disabled (ref forward under no_grad).
-            # Ref forward is sequential: all ranks at same layer → gloo P2P won't deadlock.
-            # Avoids ze_handle_manager crash: cpu_offload tensors (freshly allocated XPU
-            # buffers from CPU→XPU fetch) are not registered as USM → XCCL crashes on them.
-            # torch.is_grad_enabled()==True means training forward or AC recompute → use XCCL.
-            torch.xpu.synchronize()
-            cpu_in = input.cpu().contiguous()
-            cpu_out, actual_recv_splits = _cpu_bounce_all_to_all(
-                cpu_in, input_splits, output_splits, _XPU_A2A_FWD_GLOO_GROUP, ctx.feat_shape
-            )
-            ctx.output_splits = actual_recv_splits
-            return cpu_out.to(input.device)
-        else:
-            out = input.new_empty(sum(output_splits), *input.shape[1:])
-            dist.all_to_all_single(out, input, output_splits, input_splits, group=group)
-            if ctx.is_xpu:
-                torch.xpu.synchronize()
-                # v105: OFI CQ drain after XCCL AllToAll.
-                # XCCL all_to_all_single forces all EP ranks to synchronize (collective).
-                # After it returns, all ranks are at the same layer — the barrier is
-                # trivially satisfied and drains the OFI CQ of residual NIC events.
-                dist.barrier(group=group)
-            return out
+        ctx.ep_degree = dist.get_world_size(group)
+        out = input.new_empty(ctx.ep_degree * input.shape[0], *input.shape[1:])
+        _ep_all_gather(out, input, group, label="AG-FWD")
+        return out
 
     @staticmethod
     def backward(ctx, grad_output: Tensor):
-        grad_output = grad_output.contiguous()
-
-        if False and ctx.is_xpu and _XPU_A2A_BWD_GLOO_GROUP is not None:  # v134: disabled — all gloo collectives return corrupt values on Aurora XPU + Slingshot-11
-            # v131: gloo all_gather-based AllToAll for backward.
-            #
-            # v127-v130 failure history (all gloo-based):
-            #   v127: manual P2P (reused FWD group)         → size mismatch
-            #   v128: manual P2P + pre-barrier (reused)     → same mismatch
-            #   v129: manual P2P + pre-barrier (sep group)  → same mismatch @ call#39
-            #   v130: all_to_all_single (gloo)              → immediate size mismatch
-            #
-            # Root cause of v127-v129 (from diagnostics):
-            #   At call#39, gloo_rank=1 is at a different backward op than gloo_rank=0,2,3.
-            #   The barrier syncs by counter# but ranks have drifted: one rank has
-            #   processed one extra AllToAll backward somewhere before call#39.
-            #   The drift origin is unknown (same autograd graph, same expert count).
-            #
-            # Root cause of v130:
-            #   gloo's all_to_all_single is broken for unequal splits — preamble mismatch
-            #   fires immediately at call#1. Same failure as v60 (forward path).
-            #   gloo's TCP transport doesn't negotiate sizes correctly in all_to_all_single.
-            #
-            # v131 fix: implement AllToAll via two gloo all_gather calls.
-            #   all_gather works correctly on gloo (equal-size tensors, no preamble issues).
-            #   The AllToAll is decomposed as:
-            #     1. all_gather(send_splits) → each rank knows all ranks' send sizes
-            #        (needed for offset computation into gathered gradient tensors)
-            #     2. Pad each rank's gradient to max_total size (equal shapes for all_gather)
-            #     3. all_gather(padded_gradient) → each rank holds all ranks' gradients
-            #     4. Each rank extracts slices: for each src, take recv_splits[src] tokens
-            #        starting at the correct offset within src's padded contribution
-            #   Both all_gather calls are proper collectives → true lockstep enforced.
-            #   If one rank drifts to a different backward op, the all_gather blocks.
-            #   Cost: ~10-30% overhead vs direct AllToAll (max-padding in step 2).
-            torch.xpu.synchronize()
-            cpu_grad = grad_output.cpu().contiguous()
-
-            gloo_group = _XPU_A2A_BWD_GLOO_GROUP
-            ws = dist.get_world_size(gloo_group)
-            my_rank = dist.get_rank(gloo_group)
-            send_splits = ctx.output_splits   # tokens to send to each EP rank
-            recv_splits = ctx.input_splits    # tokens to receive from each EP rank
-
-            # v133: AllToAll via gloo all_reduce (avoids all_gather which returns corrupt values).
-            #
-            # v131-v132 failure analysis:
-            #   v131: all_gather(send_splits) returned inconsistent values → extraction bounds error
-            #   v132: all_gather(send_splits) returns values where sum(gathered[src][my_rank])
-            #         ≠ sum(recv_splits) for ALL ranks (off by ~12000 tokens), violating
-            #         AllToAll conservation. Root cause: gloo all_gather on Aurora XPU +
-            #         Slingshot-11 returns WRONG VALUES (not just ordering issues).
-            #         sum(got) = 32128 constant across all EP groups, sum(expected) ≈ 44000+.
-            #   gloo all_gather is fundamentally unreliable on this platform.
-            #   gloo all_to_all_single: broken (preamble mismatch, v130 = v60).
-            #   gloo P2P (batch_isend_irecv): broken (size mismatch, v127-v129).
-            #   gloo all_reduce: NOT YET TESTED — may work (simpler collective).
-            #   XCCL backward: driver SIGSEGV on freshly-allocated gradient XPU tensors
-            #     (not OOM — confirmed at v122-v126 with expert_cpu_offload=True, call#0).
-            #
-            # v133 approach: AllToAll via ws all_reduce calls on gloo.
-            #   Step 1: exchange send_splits using a ws×ws all_reduce.
-            #           Each rank fills row my_rank of a ws×ws matrix; others are 0.
-            #           After SUM all_reduce: all ranks have the full matrix.
-            #   Step 2: use send_splits matrix to compute max_total for padding.
-            #   Step 3: for each src rank, one all_reduce of the padded gradient:
-            #           Only src fills in its cpu_grad; others contribute zeros.
-            #           After SUM all_reduce: all ranks have src's full cpu_grad.
-            #           Each rank extracts the slice destined for my_rank.
-            #
-            # Cost: ws all_reduce calls for gradients (each of size max_total × hidden_dim),
-            #   plus 1 all_reduce for the splits matrix.
-            #   Transfer = ws × max_total × hidden_dim × ws bytes (ws copies broadcast).
-            #   vs all_gather: ws × max_total × hidden_dim total (1 copy broadcast to all).
-            #   all_reduce costs ~ws× more bandwidth than all_gather, but all_reduce is
-            #   the ONLY gloo collective proven not to cause silent corruption here.
-            #
-            # Correctness: all_reduce (SUM) is a ring-based collective — all ranks must
-            #   participate simultaneously. No P2P, no preamble, no unequal-split issues.
-            #   Ranks are guaranteed to be at the same operation (ring blocks until all arrive).
-
-            # Step 1: exchange send_splits via a ws×ws all_reduce.
-            splits_mat = torch.zeros(ws, ws, dtype=torch.int64)
-            splits_mat[my_rank] = torch.tensor(send_splits, dtype=torch.int64)
-            dist.all_reduce(splits_mat, op=dist.ReduceOp.SUM, group=gloo_group)
-            # splits_mat[src][dst] = tokens src sends to dst in this backward AllToAll
-
-            # Step 2: compute recv counts (authoritative from all_reduce, not stale ctx).
-            recv_from = [int(splits_mat[src][my_rank].item()) for src in range(ws)]
-            my_total = sum(send_splits)
-            max_total = max(int(splits_mat[src].sum().item()) for src in range(ws))
-
-            # Step 3: for each source rank, broadcast its cpu_grad via all_reduce,
-            #   then extract the slice destined for my_rank.
-            cpu_out = cpu_grad.new_zeros((sum(recv_from),) + ctx.feat_shape)
-            out_off = 0
-            for src in range(ws):
-                src_total = int(splits_mat[src].sum().item())
-                buf = cpu_grad.new_zeros((max(max_total, 1),) + ctx.feat_shape)
-                if my_rank == src and my_total > 0:
-                    buf[:my_total].copy_(cpu_grad)
-                dist.all_reduce(buf, op=dist.ReduceOp.SUM, group=gloo_group)
-                # buf now contains src's cpu_grad (padded to max_total)
-                src_off = int(splits_mat[src][:my_rank].sum().item())
-                n = recv_from[src]
-                if n > 0:
-                    cpu_out[out_off:out_off + n].copy_(buf[src_off:src_off + n])
-                out_off += n
-
-            return cpu_out.to(grad_output.device), None, None, None, None
-        else:
-            global _XCCL_BWD_CALL_COUNT
-            _XCCL_BWD_CALL_COUNT += 1
-            _call_n = _XCCL_BWD_CALL_COUNT
-            import logging as _logging
-            _bwd_log = _logging.getLogger(__name__)
-            # v111: print() to bypass SSH pipe buffering — log.info may be lost for hanging ranks
-            print(
-                f"[v111-BWD-A2A] rank={dist.get_rank()} call#{_call_n} "
-                f"grad_output.shape={tuple(grad_output.shape)} "
-                f"in_splits={ctx.input_splits} out_splits={ctx.output_splits}",
-                flush=True,
-            )
-            _bwd_log.info(
-                "Rank %d: XCCL bwd AllToAll #%d PRE in_splits=%s out_splits=%s",
-                dist.get_rank(), _call_n, ctx.input_splits, ctx.output_splits,
-            )
-            grad_input = grad_output.new_empty(sum(ctx.input_splits), *grad_output.shape[1:])
-            dist.all_to_all_single(
-                grad_input, grad_output,
-                ctx.input_splits, ctx.output_splits,
-                group=ctx.group,
-            )
-            if ctx.is_xpu:
-                torch.xpu.synchronize()
-                _bwd_log.info("Rank %d: XCCL bwd AllToAll #%d POST-sync, calling barrier", dist.get_rank(), _call_n)
-                dist.barrier(group=ctx.group)  # v105: OFI CQ drain (same as forward)
-                _bwd_log.info("Rank %d: XCCL bwd AllToAll #%d BARRIER done", dist.get_rank(), _call_n)
-            return grad_input, None, None, None, None
+        # v153 diagnostic: confirm rank is about to call RS-BWD (op _EP_OP_N).
+        # If a rank prints COLL-DONE for AG-BWD but never prints this, it crashed between them.
+        print(f"[rank{dist.get_rank()}] PRE-RS-BWD ep_op={_EP_OP_N}", flush=True)
+        return _ep_reduce_scatter(grad_output, ctx.group, label="RS-BWD"), None
 
 
-def _xpu_sync_all_to_all(
-    input: Tensor,
-    output_splits: list,
-    input_splits: list,
-    group: dist.ProcessGroup,
-    cached_output: Optional[Tensor] = None,
-) -> Tensor:
-    """Drop-in replacement for ``all_to_all_single_autograd`` with XPU sync.
+class _ReduceScatterAG(torch.autograd.Function):
+    """ReduceScatter in forward, AllGather in backward."""
 
-    Args:
-        cached_output: If provided (AC recompute), skip the AllToAll and return
-            this tensor directly. The backward AllToAll is still registered.
-    """
-    return _XPUSyncAllToAll.apply(input, output_splits, input_splits, group, cached_output)
+    @staticmethod
+    def forward(ctx, input: Tensor, group: dist.ProcessGroup) -> Tensor:
+        ctx.group = group
+        ctx.ep_degree = dist.get_world_size(group)
+        return _ep_reduce_scatter(input, group, label="RS-FWD")
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor):
+        out = grad_output.new_empty(
+            ctx.ep_degree * grad_output.shape[0], *grad_output.shape[1:]
+        )
+        _ep_all_gather(out, grad_output, ctx.group, label="AG-BWD")
+        return out, None
 
 
 # implementation of Tensor Parallel on the non-shared experts in MoE
@@ -593,74 +429,52 @@ class PrepareModuleInputOutput(ParallelStyle):
 
 
 class ExpertParallel(ParallelStyle):
-    """Expert Parallelism for MoE layers via All-to-All token dispatch.
+    """Expert Parallelism for MoE layers via AllGather + ReduceScatter.
 
-    Each EP rank owns ``num_experts // ep_degree`` expert weight matrices (sharded on
-    dim 0). Tokens are dispatched to expert-owning ranks via ``_xpu_sync_all_to_all``
-    and combined after local expert computation via a reverse All-to-All.
+    Implements the FastSparseMoE algorithm from Mula (arXiv 2604.00785), adapted
+    for Aurora/XPU where AllToAll deadlocks or SIGSEGVs in the backward pass.
 
-    Gradient flow is via ``_XPUSyncAllToAll``, a custom autograd Function that calls
-    ``xpu.synchronize()`` in both forward and backward to prevent FSDP2 backward
-    prefetch all-gathers from overlapping with the EP AllToAll on Aurora's OFI fabric.
+    Algorithm (per MoE layer):
+      Forward:
+        1. AllGather routed_input across EP ranks → every rank sees all T=EP*S tokens
+        2. Each rank selects tokens for its local experts (interleaved assignment)
+        3. Local expert computation on selected tokens
+        4. Scatter expert outputs into full (T, dim) partial buffer
+        5. ReduceScatter → each rank receives its local S tokens' complete outputs
 
-    Compatible with XCCL 25.190.0+ (frameworks/2025.2.0) on Aurora/XPU.
-    Uses ``_permute``/``_unpermute`` from ``torchtune.modules.moe.utils`` (pure torch,
-    no Triton) — compatible with XPU's loop-based expert path.
+      Backward (automatic via PyTorch autograd):
+        AllGather backward = ReduceScatter
+        ReduceScatter backward = AllGather
+
+    No AllToAll, no split tracking, no OFI CQ drain. AllGather/ReduceScatter are
+    natively optimized in oneCCL (topology-aware, L0 IPC) and used by FSDP2 on Aurora.
 
     Usage::
 
         from torch.distributed.tensor.parallel import parallelize_module
         ep_plan = {"layers.0.moe_block.experts": ExpertParallel()}
         parallelize_module(model, ep_mesh, ep_plan)
-
-    AC recompute non-determinism fix:
-        router top_k on XPU may be non-deterministic (tie-breaking) → count_e can differ
-        between the original forward and AC recompute → backward matmul shape mismatch.
-        Fix: ``advance_fwd_step()`` is called by the recipe before each model forward to
-        increment ``ExpertParallel._fwd_step_counter``. Splits saved during forward at
-        step N are reused during the AC recompute (also step N). The next forward
-        increments the counter → fresh splits.
     """
-
-    # Class-level forward step counter. Increment before each model forward so
-    # AC recompute (same step) reuses saved splits while the next forward gets fresh ones.
-    _fwd_step_counter: int = 0
-
-    @classmethod
-    def advance_fwd_step(cls) -> None:
-        """Call before each model forward that may be AC-checkpointed (training forwards).
-        Ensures the next dispatch computes fresh splits, while the AC recompute reuses them.
-        """
-        cls._fwd_step_counter += 1
 
     def __init__(self) -> None:
         super().__init__()
-        self._input_splits: Optional[list[int]] = None
-        self._output_splits: Optional[list[int]] = None
-        self._perm: Optional[Tensor] = None
-        self._total_dispatched: Optional[int] = None
-        self._ntpe_group: Optional[Tensor] = None  # saved for AC recompute
-        self._saved_at_step: int = -1  # _fwd_step_counter value when splits were saved
-        # v108: Cache AllToAll outputs from first forward for AC recompute.
-        # AC recompute returns cached tensors instead of re-running AllToAll.
-        # This eliminates XCCL/gloo communication during backward (AC recompute),
-        # preventing deadlock with FSDP2 reduce_scatter in the backward phase.
-        self._cached_dispatch_output: Optional[Tensor] = None
-        self._cached_combine_output: Optional[Tensor] = None
-        self._combine_saved_at_step: int = -1  # step when _cached_combine_output was set
-        # v112: Pre-AllToAll permutation index (expert-sorted → rank-sorted).
-        # Interleaved expert assignment requires tokens to be grouped by dest rank
-        # before AllToAll. Saved for AC recompute to avoid recomputation.
-        self._pre_a2a_perm: Optional[Tensor] = None
-        self._inv_pre_a2a_perm: Optional[Tensor] = None  # inverse, for combine reverse
+        # v159: revert v158 ctx-threading. Instance-cache gather_idx + s_local
+        # (one ExpertParallel per layer, so no cross-layer aliasing in practice).
+        # v161: also cache all_ri so combine can keep the autograd chain alive
+        # back to AllGather output even when GroupedExperts short-circuits on
+        # an empty dispatch (rank-1/5/9 #237→#238 deadlock root cause).
+        self._ag_gather_idx: Optional[Tensor] = None
+        self._ag_s_local: Optional[int] = None
+        self._ag_all_ri: Optional[Tensor] = None
 
     def _partition_fn(
         self, name: str, mod: nn.Module, device_mesh: DeviceMesh
     ) -> None:
         """Shard expert weight matrices on dim 0 (num_experts) across EP ranks.
 
-        Uses plain tensor slicing (not DTensor) to avoid FSDP2 mesh-dimension
-        conflicts when the EP mesh is a submesh of the FSDP mesh.
+        Interleaved assignment: rank r owns experts {r, r+ep_degree, r+2*ep_degree, ...}.
+        This distributes hot experts (typically clustered at low indices for pretrained
+        routers) evenly across all ranks.
         """
         ep_rank = device_mesh.get_local_rank()
         ep_degree = device_mesh.shape[0]
@@ -669,7 +483,6 @@ class ExpertParallel(ParallelStyle):
             assert full_data.shape[0] % ep_degree == 0, (
                 f"num_experts ({full_data.shape[0]}) must be divisible by ep_degree ({ep_degree})"
             )
-            # v112: Interleaved expert assignment — rank r owns experts r, r+ep_degree, ...
             local_data = full_data[ep_rank::ep_degree].contiguous()
             mod.register_parameter(param_name, nn.Parameter(local_data))
 
@@ -681,141 +494,123 @@ class ExpertParallel(ParallelStyle):
         *,
         device_mesh: DeviceMesh,
     ) -> tuple[Tensor, Tensor]:
-        """All-to-All dispatch: route tokens to the ranks that own their experts.
-
-        Called directly from ``MoE.forward()`` via the ``_ep_dispatch`` callable
-        (bypassing the broken hook mechanism — FSDP2 fully_shard drops EP hooks).
+        """AllGather dispatch: every rank gets all tokens, selects tokens for local experts.
 
         Args:
-            mod: The ``GroupedExperts`` module (retained for API consistency but unused).
-            routed_input: Shape ``(bs*slen*top_k, dim)``.
-            num_tokens_per_expert: Shape ``(num_experts,)``.
+            mod: ``GroupedExperts`` module (unused; retained for API consistency).
+            routed_input: Pre-weighted tokens in expert-sorted order, shape ``(S, dim)``
+                where ``S = bs * slen * top_k``. Same shape on all EP ranks.
+            num_tokens_per_expert: Token counts per global expert, shape ``(num_experts,)``.
             device_mesh: EP mesh of shape ``(ep_degree,)``.
 
         Returns:
-            ``(dispatched_tokens, local_ntpe)`` for this rank's local experts.
+            ``(dispatched_tokens, local_ntpe)`` where dispatched_tokens is in
+            expert-major order for the local experts, shape ``(total_local, dim)``.
         """
-        from torch.distributed._functional_collectives import all_gather_tensor
-        from torchtune.modules.moe.utils import _permute
-
         ep_degree = device_mesh.shape[0]
-        num_local_experts = num_tokens_per_expert.shape[0] // ep_degree
         ep_rank = device_mesh.get_local_rank()
+        num_experts = num_tokens_per_expert.shape[0]
+        num_local_experts = num_experts // ep_degree
+        group = device_mesh.get_group()
+        s_local = routed_input.shape[0]  # S = bs*slen*top_k (same on all EP ranks)
 
-        current_step = ExpertParallel._fwd_step_counter
-        _is_reuse = (self._saved_at_step == current_step and self._ntpe_group is not None)
-        if _is_reuse:
-            # AC recompute: same _fwd_step_counter value as when splits were saved.
-            ntpe_group = self._ntpe_group
+        # Stage 1: AllGather all tokens across EP ranks (gradient-tracked).
+        # all_ri[r*s_local : (r+1)*s_local] = rank r's routed_input (expert-sorted).
+        # Backward: ReduceScatter (via _AllGatherRS.backward).
+        all_ri = _AllGatherRS.apply(routed_input.contiguous(), group)
+
+        # AllGather num_tokens_per_expert (no grad needed).
+        # all_ntpe[r, e] = tokens rank r routes to global expert e.
+        all_ntpe_flat = torch.zeros(
+            ep_degree * num_experts, dtype=torch.long, device=routed_input.device
+        )
+        # v153: gloo CPU-bounce for NTPE AllGather (was XCCL).
+        # XCCL uses OFI/CXI NIC. After 256+ EP gloo ops, the CXI NIC may have residual
+        # OFI CQ entries that contaminate gloo TCP (which also goes through CXI on Aurora).
+        # Replacing with gloo CPU-bounce isolates NTPE from the OFI/CXI stack.
+        # The GLOO_SOCKET_IFNAME=lo env var forces gloo to use loopback (not CXI).
+        if routed_input.device.type == "xpu" and _GLOO_EP_PG is not None:
+            ntpe_cpu = num_tokens_per_expert.to(torch.long).contiguous().cpu()
+            all_ntpe_cpu = torch.zeros(ep_degree * num_experts, dtype=torch.long, device="cpu")
+            dist.all_gather_into_tensor(all_ntpe_cpu, ntpe_cpu, group=_GLOO_EP_PG)
+            all_ntpe_flat.copy_(all_ntpe_cpu)
         else:
-            # Fresh forward (new step or generation): compute splits from router output.
-            with torch.no_grad():
-                # All-gather each rank's full num_tokens_per_expert histogram.
-                # ntpe_matrix[r, e] = tokens rank r routes to expert e (global expert index)
-                ntpe_all = all_gather_tensor(
-                    num_tokens_per_expert, gather_dim=0, group=device_mesh.get_group()
-                )
-                ntpe_all = torch.ops._c10d_functional.wait_tensor(ntpe_all)
-                ntpe_matrix = ntpe_all.view(ep_degree, -1)  # (ep_degree, num_experts)
+            dist.all_gather_into_tensor(
+                all_ntpe_flat, num_tokens_per_expert.to(torch.long), group=group
+            )
+        all_ntpe = all_ntpe_flat.view(ep_degree, num_experts)
 
-                # v112: Interleaved expert assignment — rank r owns global experts
-                # {r, r+ep_degree, r+2*ep_degree, ...} (stride=ep_degree).
-                # Contiguous assignment (v0-v111) caused extreme routing imbalance:
-                # rank 0 owned experts 0-31 (all hot), ranks 2-3 owned experts 64-127 (cold).
-                # Interleaved distributes hot experts evenly across all ranks.
+        # Cumulative token offsets within each rank's expert-sorted section.
+        # all_ntpe_cumsum[r, g] = number of tokens rank r sends to experts 0..g-1
+        #                       = start index of expert g in rank r's slice of all_ri.
+        all_ntpe_cumsum = torch.zeros(
+            ep_degree, num_experts + 1, dtype=torch.long, device=routed_input.device
+        )
+        all_ntpe_cumsum[:, 1:] = torch.cumsum(all_ntpe, dim=1)
 
-                num_experts = num_tokens_per_expert.shape[0]
-                ntpe_int = num_tokens_per_expert.to(torch.long)
+        # Stage 2-3: Build gather indices for local experts (interleaved assignment).
+        # Rank ep_rank owns global experts: ep_rank, ep_rank+ep_degree, ..., ep_rank+(NLE-1)*ep_degree.
+        # For each local expert g, collect its token positions from all EP ranks.
+        with torch.no_grad():
+            local_exp_indices: list[Tensor] = []
+            local_ntpe_list: list[int] = []
 
-                # input_splits[i] = tokens this rank sends to rank i
-                # = tokens this rank routes to experts owned by rank i
-                # = num_tokens_per_expert[i::ep_degree].sum()
-                self._input_splits = [
-                    int(ntpe_int[i::ep_degree].sum().item())
-                    for i in range(ep_degree)
-                ]
-
-                # output_splits[i] = tokens this rank receives from rank i
-                # = tokens rank i routes to my experts (ep_rank, ep_rank+ep_degree, ...)
-                # = ntpe_matrix[i, ep_rank::ep_degree].sum()
-                ntpe_int_matrix = ntpe_matrix.to(torch.long)
-                self._output_splits = [
-                    int(ntpe_int_matrix[i, ep_rank::ep_degree].sum().item())
-                    for i in range(ep_degree)
-                ]
-
-                # ntpe_group[ep_r * num_local_experts + local_exp] = tokens from rank ep_r
-                # to my local expert local_exp (= global expert ep_rank + local_exp * ep_degree).
-                # ntpe_matrix[:, ep_rank::ep_degree] has shape (ep_degree, num_local_experts).
-                # Row-major view gives source-rank-major order expected by _permute.
-                ntpe_group = ntpe_int_matrix[:, ep_rank::ep_degree].contiguous().view(-1)
-                self._ntpe_group = ntpe_group  # save for AC recompute at same step
-
-                # Build pre-AllToAll permutation: expert-sorted → rank-sorted.
-                # routed_input arrives expert-sorted (exp0 tokens, exp1 tokens, ...).
-                # AllToAll requires rank-sorted (rank0's tokens, rank1's tokens, ...).
-                # With interleaved assignment, rank i's experts are i, i+ep, i+2*ep, ...
-                # So rank-sorted = [exp0, exp{ep}, ..., exp1, exp{1+ep}, ..., ...]
-                offsets_per_expert = torch.zeros(
-                    num_experts + 1, dtype=torch.long, device=routed_input.device
-                )
-                offsets_per_expert[1:] = torch.cumsum(ntpe_int, dim=0)
-                perm_parts = []
-                for rank_i in range(ep_degree):
-                    for local_exp in range(num_local_experts):
-                        global_exp = rank_i + local_exp * ep_degree
-                        start = int(offsets_per_expert[global_exp].item())
-                        count = int(ntpe_int[global_exp].item())
-                        if count > 0:
-                            perm_parts.append(
-                                torch.arange(start, start + count, dtype=torch.long,
-                                             device=routed_input.device)
+            for local_exp_idx in range(num_local_experts):
+                g = ep_rank + local_exp_idx * ep_degree  # global expert index (interleaved)
+                parts: list[Tensor] = []
+                count_total = 0
+                for r in range(ep_degree):
+                    count = int(all_ntpe[r, g].item())
+                    if count > 0:
+                        start_in_r = int(all_ntpe_cumsum[r, g].item())
+                        abs_start = r * s_local + start_in_r
+                        parts.append(
+                            torch.arange(
+                                abs_start, abs_start + count,
+                                dtype=torch.long, device=routed_input.device,
                             )
-                if perm_parts:
-                    self._pre_a2a_perm = torch.cat(perm_parts)
-                else:
-                    self._pre_a2a_perm = torch.zeros(0, dtype=torch.long,
-                                                     device=routed_input.device)
-                # Inverse permutation for combine side (rank-sorted → expert-sorted)
-                total_toks = routed_input.shape[0]
-                if total_toks > 0 and self._pre_a2a_perm.numel() > 0:
-                    inv = torch.empty_like(self._pre_a2a_perm)
-                    inv[self._pre_a2a_perm] = torch.arange(
-                        total_toks, dtype=torch.long, device=routed_input.device
-                    )
-                    self._inv_pre_a2a_perm = inv
-                else:
-                    self._inv_pre_a2a_perm = torch.zeros(0, dtype=torch.long,
-                                                         device=routed_input.device)
-            self._saved_at_step = current_step
+                        )
+                        count_total += count
+                local_exp_indices.append(
+                    torch.cat(parts) if parts else
+                    torch.zeros(0, dtype=torch.long, device=routed_input.device)
+                )
+                local_ntpe_list.append(count_total)
 
-        # v112: Apply pre-AllToAll permutation (expert-sorted → rank-sorted).
-        # Required for interleaved assignment so AllToAll input_splits are contiguous.
-        if self._pre_a2a_perm is not None and self._pre_a2a_perm.numel() > 0:
-            routed_input = routed_input[self._pre_a2a_perm]
+            # Concatenate in expert-major order (exp0 tokens, exp1 tokens, ...).
+            # Empty expert tensors (numel=0) are handled correctly by torch.cat.
+            gather_idx = torch.cat(local_exp_indices)
+            local_ntpe = torch.tensor(
+                local_ntpe_list, dtype=all_ntpe.dtype, device=routed_input.device
+            )
 
-        # Dispatch: send tokens to expert-owning ranks (gradient-tracked).
-        # v108: On AC recompute (_is_reuse=True), pass cached_dispatch_output so
-        # _XPUSyncAllToAll.forward skips the actual AllToAll communication and returns
-        # the cached tensor. The backward AllToAll is still registered in the graph.
-        routed_input = _xpu_sync_all_to_all(
-            routed_input,
-            self._output_splits,
-            self._input_splits,
-            device_mesh.get_group(),
-            cached_output=self._cached_dispatch_output if _is_reuse else None,
-        )
-        if not _is_reuse:
-            # First forward: cache the AllToAll output for AC recompute.
-            self._cached_dispatch_output = routed_input
+        # Stage 4: Gather tokens for local experts (gradient flows through indexing).
+        # v160: always go through index-gather (even with empty gather_idx) to
+        # keep an autograd link to all_ri. Without this, an empty-dispatch rank
+        # detaches its entire dispatch op from the loss graph → engine skips
+        # _AllGatherRS.backward → asymmetric early-exit deadlock at next AG-BWD.
+        # all_ri[empty_tensor] returns shape (0, dim) WITH a grad-fn (IndexBackward).
+        dispatched = all_ri[gather_idx]
 
-        self._total_dispatched = routed_input.shape[0]
-
-        # Reorder from source-rank-major to local-expert-major order
-        routed_input, local_ntpe, self._perm = _permute(
-            routed_input, ntpe_group, ep_degree, num_local_experts
-        )
-        return routed_input, local_ntpe
+        # v159: cache on the ExpertParallel instance for retrieval in combine.
+        # v161: also cache all_ri so combine can re-bind partial_out's autograd
+        # to all_ri (and thus _AllGatherRS), preventing rank-1 from skipping
+        # backward when expert local count is 0.
+        self._ag_gather_idx = gather_idx
+        self._ag_s_local = s_local
+        self._ag_all_ri = all_ri
+        # Per-layer instrumentation: which layer index has empty dispatch on
+        # which rank. Cheap (12 ranks * 30 layers * 2 chunks * 4 mb = ~3k lines).
+        try:
+            r = dist.get_rank()
+            n_local = int(gather_idx.shape[0])
+            print(
+                f"[rank{r}] EP-DISPATCH n_local={n_local} s_local={s_local} dispatched.shape={tuple(dispatched.shape)} requires_grad={dispatched.requires_grad} grad_fn={type(dispatched.grad_fn).__name__ if dispatched.grad_fn is not None else 'None'}",
+                flush=True,
+            )
+        except Exception:
+            pass
+        return dispatched, local_ntpe
 
     def _token_combine(
         self,
@@ -824,49 +619,64 @@ class ExpertParallel(ParallelStyle):
         *,
         device_mesh: DeviceMesh,
     ) -> Tensor:
-        """Reverse All-to-All: return expert outputs to originating ranks.
+        """ReduceScatter combine: accumulate local expert outputs and return local slice.
 
         Args:
-            mod: The ``GroupedExperts`` module (retained for API consistency but unused).
-            routed_output: Expert outputs in local-expert-major order,
-                shape ``(num_processed_tokens, dim)``.
+            mod: ``GroupedExperts`` module (unused; retained for API consistency).
+            routed_output: Expert outputs in expert-major order, shape ``(total_local, dim)``.
             device_mesh: EP mesh of shape ``(ep_degree,)``.
 
         Returns:
-            Tensor in original token order, shape ``(bs*slen*top_k, dim)``.
+            Combined output in original routed_input order, shape ``(S, dim)``
+            where ``S = bs * slen * top_k``.
         """
-        from torchtune.modules.moe.utils import _unpermute
+        ep_degree = device_mesh.shape[0]
+        group = device_mesh.get_group()
+        # v159: read indices off the ExpertParallel instance (set in _token_dispatch).
+        s_local = self._ag_s_local
+        gather_idx = self._ag_gather_idx
+        all_ri = self._ag_all_ri  # v161: AllGather output, kept alive for autograd binding.
 
-        # Reverse permutation: local-expert order → source-rank-major order
-        routed_output = _unpermute(routed_output, self._perm, self._total_dispatched)
+        # Stage 5a: Scatter expert outputs back to their positions in the full (T, dim) buffer.
+        # partial_out[i] = expert output for the token that was at all_ri[i].
+        # Positions not owned by this rank's local experts remain zero.
+        # Since the pre-weighted tokens are already scaled, no extra weighting needed here.
+        partial_out = routed_output.new_zeros(ep_degree * s_local, routed_output.shape[-1])
+        # v160: ALWAYS run scatter_add (even with empty gather_idx) so partial_out
+        # carries an autograd link back to routed_output. With empty gather_idx,
+        # scatter_add is a no-op on values but still emits a grad-fn — that
+        # grad-fn is what keeps the EP backward chain connected. Without it,
+        # _ReduceScatterAG.backward gets skipped on the empty-dispatch rank →
+        # asymmetric early-exit deadlock at next AG-BWD (v158/v159 reproduced).
+        idx_exp = gather_idx.unsqueeze(1).expand_as(routed_output)
+        partial_out = partial_out.scatter_add(0, idx_exp, routed_output)
+        # v161: HARD AUTOGRAD ANCHOR. Even with the v160 scatter_add grad-fn,
+        # an empty-dispatch rank's _AllGatherRS.backward never fires because
+        # downstream gradients arrive at routed_output as zero (no expert
+        # produced anything) and the chain back to all_ri only goes via the
+        # gather index. By adding 0.0 * all_ri we force partial_out to depend
+        # on all_ri at the autograd-graph level — the engine will then ALWAYS
+        # call _AllGatherRS.backward (which feeds RS-BWD), keeping rank-1 in
+        # lockstep with peers at #237 RS-BWD AND #238 AG-BWD.
+        if all_ri is not None and all_ri.requires_grad:
+            partial_out = partial_out + all_ri.sum(dim=0, keepdim=True).expand_as(partial_out) * 0.0
+        # Diagnostic: confirm partial_out has a grad-fn that reaches AllGather.
+        try:
+            r = dist.get_rank()
+            print(
+                f"[rank{r}] EP-COMBINE partial_out.shape={tuple(partial_out.shape)} requires_grad={partial_out.requires_grad} grad_fn={type(partial_out.grad_fn).__name__ if partial_out.grad_fn is not None else 'None'} n_local={int(gather_idx.shape[0])}",
+                flush=True,
+            )
+        except Exception:
+            pass
 
-        # Reverse All-to-All: swap send/receive split sizes.
-        # v108: detect AC recompute by matching combine's own saved step counter.
-        # _combine_saved_at_step is set when _cached_combine_output is stored on the
-        # FIRST forward of a given step. AC recompute for that step has the same counter.
-        current_step = ExpertParallel._fwd_step_counter
-        _is_reuse_combine = (
-            self._combine_saved_at_step == current_step
-            and self._cached_combine_output is not None
-        )
-        routed_output = _xpu_sync_all_to_all(
-            routed_output,
-            self._input_splits,   # receive: original tokens from each rank
-            self._output_splits,  # send: processed tokens back to each rank
-            device_mesh.get_group(),
-            cached_output=self._cached_combine_output if _is_reuse_combine else None,
-        )
-        if not _is_reuse_combine:
-            # First forward: cache the combine AllToAll output for AC recompute.
-            self._cached_combine_output = routed_output
-            self._combine_saved_at_step = current_step
-
-        # v112: Apply inverse pre-AllToAll permutation (rank-sorted → expert-sorted).
-        # Restores the original expert-sorted token order expected by scatter_add in MoE.forward.
-        if self._inv_pre_a2a_perm is not None and self._inv_pre_a2a_perm.numel() > 0:
-            routed_output = routed_output[self._inv_pre_a2a_perm]
-
-        return routed_output
+        # Stage 5b: ReduceScatter — sum partial outputs across EP ranks.
+        # Rank r receives partial_out[r*s_local:(r+1)*s_local] summed over all EP ranks.
+        # Each position has exactly one non-zero contributor (its expert's owning rank),
+        # so the sum is that rank's expert output.
+        # Backward: AllGather (via _ReduceScatterAG.backward).
+        out = _ReduceScatterAG.apply(partial_out, group)  # (s_local, dim)
+        return out
 
     def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
         """Register All-to-All dispatch/combine on the expert module.

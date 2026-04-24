@@ -39,12 +39,14 @@ export CCL_WORKER_COUNT=1  # was 4; 4 causes 48x AllGather regression
 export CCL_ALLREDUCE=ring
 # CCL_REDUCE_SCATTER=ring causes 63x regression on multi-node. Do NOT set.
 export CCL_CHUNK_SIZE=16777216
+# Prevent IPC handle cache eviction at step 2+ (default=1000 causes banned:1 GPU fault)
+export CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD=65536
 export FI_CXI_RX_MATCH_MODE=hybrid
 export FI_CXI_OFLOW_BUF_SIZE=8388608
 export FI_CXI_DEFAULT_CQ_SIZE=131072
 export FI_MR_CACHE_MONITOR=userfaultfd
 export ZE_FLAT_DEVICE_HIERARCHY=FLAT
-export PYTORCH_ALLOC_CONF=expandable_segments:True
+unset PYTORCH_ALLOC_CONF
 export TORCH_COMPILE_DISABLE=1
 
 aurora_export_pythonpath "${TORCHTUNE_DIR}" "${TRL_DIR}"

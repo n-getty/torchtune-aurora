@@ -92,7 +92,27 @@ class GroupedExperts(nn.Module):
                 flush=True,
             )
         if total == 0:
-            return x.new_empty(0, self.dim)
+            # v161: keep an autograd link back to x AND to all expert weights so
+            # _AllGatherRS.backward fires on this rank. Returning a bare
+            # new_empty pinches off the graph → empty-dispatch rank silently
+            # exits backward early → asymmetric #238 deadlock (v158-v160 root
+            # cause). Use a no-op gather+sum+broadcast: 0 tokens means 0 cost
+            # but the grad-fn chain stays alive.
+            try:
+                _r = dist.get_rank() if dist.is_initialized() else -1
+            except Exception:
+                _r = -1
+            print(f"[v161-EXPERT-EMPTY] rank={_r} call#={_call_n} total=0", flush=True)
+            x_zero = x.reshape(0, self.dim) if x.numel() == 0 else x.new_empty(0, self.dim)
+            # Anchor: 0.0 * (gate_proj.sum() + down_proj.sum() + up_proj.sum()).
+            # Adding a 0-d tensor of value 0 broadcast to (0, dim) is a no-op on
+            # values but registers a grad-fn dependency on the expert weights.
+            anchor = (self.gate_proj.sum() + self.down_proj.sum() + self.up_proj.sum()) * 0.0
+            x_anchor = (x.sum(dim=0, keepdim=False) * 0.0) if x.requires_grad else None
+            if x_anchor is not None:
+                anchor = anchor + x_anchor.sum()
+            # Broadcast scalar anchor onto (0, dim) — empty add is well-defined.
+            return x_zero + anchor
 
         # Round before int conversion to guard against float32 rounding (e.g. 44.9999 → 45).
         counts = num_tokens_per_expert.round().to(torch.int64)

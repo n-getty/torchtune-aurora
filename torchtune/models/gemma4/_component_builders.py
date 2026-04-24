@@ -66,6 +66,30 @@ class Gemma4TransformerLayer(TransformerSelfAttentionLayer):
         self.pre_moe_norm = pre_moe_norm
         self.post_moe_norm = post_moe_norm
         self.post_mlp_norm = post_mlp_norm
+        # v158: when True, attention+dense run inside an explicit non-reentrant
+        # checkpoint and MoE runs OUTSIDE it. Set by the recipe in lieu of
+        # apply_activation_checkpointing for MoE-bearing layers, so the router
+        # is never recomputed (recompute would re-derive a different
+        # num_tokens_per_expert under tie-flips → ScatterAddBackward0 mismatch).
+        self._ac_enabled = False
+
+    def _attn_and_dense(
+        self,
+        x: torch.Tensor,
+        mask: Optional[_MaskType],
+        input_pos: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        h = self.sa_norm(x)
+        if self.mask_mod is not None:
+            bsz, seq_len, *_ = h.shape
+            mask = self.mask_mod(mask=mask, bsz=bsz, seq_len=seq_len)
+        attn_out = self.attn(h, h, mask=mask, input_pos=input_pos)
+        h = self.sa_scale(attn_out) + x
+        if self.moe_block is not None:
+            dense_part = self.post_mlp_norm(self.mlp(self.mlp_norm(h)))
+        else:
+            dense_part = self.mlp(self.mlp_norm(h))
+        return h, dense_part
 
     def forward(
         self,
@@ -75,23 +99,23 @@ class Gemma4TransformerLayer(TransformerSelfAttentionLayer):
         input_pos: Optional[torch.Tensor] = None,
         **kwargs: dict,
     ) -> torch.Tensor:
-        # Attention block (same as TransformerSelfAttentionLayer)
-        h = self.sa_norm(x)
-        if self.mask_mod is not None:
-            bsz, seq_len, *_ = h.shape
-            mask = self.mask_mod(mask=mask, bsz=bsz, seq_len=seq_len)
-        attn_out = self.attn(h, h, mask=mask, input_pos=input_pos)
-        h = self.sa_scale(attn_out) + x
+        if self._ac_enabled:
+            h, dense_part = torch.utils.checkpoint.checkpoint(
+                self._attn_and_dense,
+                x,
+                mask,
+                input_pos,
+                use_reentrant=False,
+                preserve_rng_state=False,
+            )
+        else:
+            h, dense_part = self._attn_and_dense(x, mask, input_pos)
 
-        # FFN block
-        mlp_out = self.mlp(self.mlp_norm(h))
         if self.moe_block is not None:
-            # Additive MoE: norm both outputs separately, then sum
-            dense_part = self.post_mlp_norm(mlp_out)
             moe_part = self.post_moe_norm(self.moe_block(self.pre_moe_norm(h)))
             out = h + self.mlp_scale(dense_part + moe_part)
         else:
-            out = h + self.mlp_scale(mlp_out)
+            out = h + self.mlp_scale(dense_part)
 
         out = out * self.layer_scalar.to(out.device)
         return out

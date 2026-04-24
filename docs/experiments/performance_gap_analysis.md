@@ -2,7 +2,7 @@
 
 Quantitative analysis of GRPO throughput gaps between Aurora XPU (Intel Max 1550)
 and NVIDIA NeMo-RL on H100 GPUs. Based on published NeMo-RL benchmarks and measured
-Aurora results from `docs/aurora_rl_baselines.md`.
+Aurora results from `docs/experiments/aurora_rl_baselines.md`.
 
 ## NeMo-RL Reference Numbers
 

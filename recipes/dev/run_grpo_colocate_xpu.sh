@@ -15,8 +15,8 @@ source "${SCRIPT_DIR}/_aurora_paths.sh"
 
 cd "${TORCHTUNE_DIR}"
 
-# Load Aurora frameworks module — MUST use 2025.2.0 (2025.3.1 has broken XCCL allreduce)
-module load frameworks/2025.2.0 2>/dev/null || true
+# Load Aurora frameworks module
+module load frameworks/2025.3.1 2>/dev/null || true
 
 # Remove user virtualenv from PATH so frameworks python is used
 export PATH=$(echo "$PATH" | tr ':' '\n' | grep -v myenv | tr '\n' ':' | sed 's/:$//')
@@ -36,8 +36,7 @@ export FI_CXI_RX_MATCH_MODE=hybrid
 export FI_CXI_OFLOW_BUF_SIZE=8388608
 export FI_CXI_DEFAULT_CQ_SIZE=131072
 export FI_MR_CACHE_MONITOR=userfaultfd
-# XPU memory allocator
-export PYTORCH_ALLOC_CONF=expandable_segments:True
+unset PYTORCH_ALLOC_CONF
 # Disable torch.compile globally (vLLM not viable on XPU with compile).
 # The recipe will temporarily unset this when it needs to compile the training model.
 export TORCH_COMPILE_DISABLE=1

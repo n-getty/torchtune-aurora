@@ -76,12 +76,24 @@ export MASTER_PORT=${MASTER_PORT:-29500}
 # ============================================================
 # Module and environment
 # ============================================================
-module load frameworks/2025.2.0 >/dev/null 2>&1 || true
+module load frameworks/2025.3.1 >/dev/null 2>&1 || true
 
-# Ensure MPI library is in LD_LIBRARY_PATH (CCL MPI transport needs libmpi.so.12)
+# Ensure MPI library is in LD_LIBRARY_PATH (CCL MPI transport needs libmpi.so.12).
+# Only do this when MPI transport is actually selected — the 25.190.0 oneapi tree
+# also contains libsycl.so.8 with an older ABI that breaks framework 2025.3.1's
+# libtorch-xpu-ops-sycltla-mha_fwd.so. With OFI transport, MPI lib injection is
+# unnecessary and actively harmful (poisons libsycl resolution).
 MPI_LIB_DIR="/opt/aurora/25.190.0/oneapi/2025.2/lib"
-if [[ -d "${MPI_LIB_DIR}" ]] && [[ ":${LD_LIBRARY_PATH:-}:" != *":${MPI_LIB_DIR}:"* ]]; then
-    export LD_LIBRARY_PATH="${MPI_LIB_DIR}:${LD_LIBRARY_PATH:-}"
+if [[ "${CCL_TRANSPORT_OVERRIDE:-mpi}" == "mpi" ]]; then
+    if [[ -d "${MPI_LIB_DIR}" ]] && [[ ":${LD_LIBRARY_PATH:-}:" != *":${MPI_LIB_DIR}:"* ]]; then
+        export LD_LIBRARY_PATH="${MPI_LIB_DIR}:${LD_LIBRARY_PATH:-}"
+    fi
+else
+    # Defensive: strip any inherited reference to the old oneapi tree to keep
+    # libsycl resolution on the 26.26.0/2025.3.1 path.
+    if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
+        export LD_LIBRARY_PATH=$(echo "${LD_LIBRARY_PATH}" | tr ':' '\n' | grep -v '/opt/aurora/25\.' | tr '\n' ':' | sed 's/:$//')
+    fi
 fi
 
 # CRITICAL: Re-export CCL env vars AFTER module load.
@@ -107,7 +119,7 @@ fi
 export CCL_CONFIGURATION_PATH=""
 export CCL_CONFIGURATION=cpu_gpu_dpcpp
 export CCL_KVS_CONNECTION_TIMEOUT=600
-export CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD=4096
+export CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD=65536
 export CCL_OP_SYNC=1
 export FI_PROVIDER=cxi
 # CRITICAL: CCL_WORKER_COUNT=4 causes 48x AllGather bandwidth degradation
