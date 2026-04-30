@@ -95,6 +95,45 @@ def test_warning_emitted_when_no_pending_sync(caplog):
     ), "expected warning when wait is called with no pending sync"
 
 
+def test_failed_sync_does_not_bump_version():
+    """A failed background sync (e.g. POST/broadcast raised) must NOT bump
+    the version counter. Without this guard, telemetry and the async producer
+    would believe vLLM holds new weights when the broadcast never landed.
+    """
+    recipe = _FakeRecipe()
+    recipe.dispatch_sync()
+    recipe.signal_sync_done()
+    recipe._sync_error = RuntimeError("simulated bcast failure")
+    _wait_for_sync_complete(recipe)
+    assert recipe._weight_versions.version == 0, (
+        "failed sync must not bump the weight version"
+    )
+    assert recipe._pending_sync_id == 1, (
+        "_pending_sync_id must be retained on failure so a successful retry "
+        "can still bump"
+    )
+    assert recipe._sync_error is None, "error flag must be reset for next step"
+
+
+def test_failed_then_successful_sync_bumps_once():
+    """After a failed sync, a subsequent successful sync (same _pending_sync_id
+    or a new dispatch) bumps the version exactly once.
+    """
+    recipe = _FakeRecipe()
+    recipe.dispatch_sync()
+    recipe.signal_sync_done()
+    recipe._sync_error = RuntimeError("first attempt failed")
+    _wait_for_sync_complete(recipe)
+    assert recipe._weight_versions.version == 0
+
+    # Retry: clear the event, re-signal completion, no new dispatch needed.
+    recipe._sync_done_event.clear()
+    recipe.signal_sync_done()
+    _wait_for_sync_complete(recipe)
+    assert recipe._weight_versions.version == 1
+    assert recipe._pending_sync_id is None
+
+
 def test_noop_when_vllm_weight_sync_disabled():
     recipe = _FakeRecipe()
     recipe._vllm_weight_sync = False

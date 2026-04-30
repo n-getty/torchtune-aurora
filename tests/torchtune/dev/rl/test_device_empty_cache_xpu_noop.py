@@ -18,7 +18,6 @@ from torchtune.dev.rl.distributed import device_empty_cache
 
 
 def test_xpu_device_empty_cache_does_not_call_torch_xpu_empty_cache():
-    fake_xpu = type(torch).__call__  # placeholder to satisfy linters
     with patch("torch.xpu.empty_cache") as xpu_empty:
         device_empty_cache(torch.device("xpu", 0))
     assert xpu_empty.call_count == 0, (

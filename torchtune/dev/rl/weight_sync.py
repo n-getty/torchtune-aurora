@@ -2033,26 +2033,38 @@ def _wait_for_sync_complete(self) -> None:
         waited = time.perf_counter() - t_wait0
         if waited > 0.05:
             log.info("Rank %d: waited %.1fs for async weight sync to complete", self.rank, waited)
-    # Bump the weight version ONLY if a sync was actually dispatched since the
-    # last bump. Without _pending_sync_id this used to bump on every call (event
-    # starts set()), inflating the "version" telemetry and confusing the
-    # async producer about which weights generated a rollout.
+    # Bump the weight version ONLY if (a) a sync was actually dispatched since
+    # the last bump AND (b) the background sync did not error. Without the
+    # _sync_error gate, a failed sync still inflated the version counter and
+    # cleared _pending_sync_id, telling downstream telemetry/producers that
+    # vLLM held new weights when in fact the broadcast never landed.
+    sync_failed = self._sync_error is not None
+    if sync_failed:
+        log.error(
+            "Rank %d: previous async weight sync had an error: %s — NOT bumping weight version",
+            self.rank, self._sync_error,
+        )
+        self._sync_error = None  # reset so training continues
     if self._is_rank_zero and getattr(self, "_weight_versions", None) is not None:
-        if getattr(self, "_pending_sync_id", None) is not None:
+        if getattr(self, "_pending_sync_id", None) is None:
+            log.warning(
+                "Rank 0: _wait_for_sync_complete called with no pending sync — "
+                "skipping version bump (telemetry guard)"
+            )
+        elif sync_failed:
+            # Keep _pending_sync_id set so the next successful retry can bump.
+            log.warning(
+                "Rank 0: sync_id=%d failed — version stays at %d, pending sync retained",
+                self._pending_sync_id,
+                self._weight_versions.version,
+            )
+        else:
             new_v = self._weight_versions.bump()
             log.info(
                 "Rank 0: weight version bumped → %d (sync_id=%d)",
                 new_v, self._pending_sync_id,
             )
             self._pending_sync_id = None
-        else:
-            log.warning(
-                "Rank 0: _wait_for_sync_complete called with no pending sync — "
-                "skipping version bump (telemetry guard)"
-            )
-    if self._sync_error is not None:
-        log.error("Rank %d: previous async weight sync had an error: %s", self.rank, self._sync_error)
-        self._sync_error = None  # reset so training continues
 
 def _start_deferred_broadcast(self) -> None:
     """Start the deferred XCCL broadcast after vLLM generation completes.

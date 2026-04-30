@@ -658,11 +658,16 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         self._async_generation_enabled = bool(_async_cfg.get("enabled", False))
         self._async_generation_max_staleness = int(_async_cfg.get("max_staleness", 1))
         # Behavior-policy correctness guard.
-        # The async path recomputes rollout logprobs on the *current* training
-        # weights (see generate_trajectory step 2). With max_staleness=1, vLLM
-        # weights == training weights at consume time (the next sync hasn't
-        # dispatched yet). With max_staleness>1, pi_old_logprobs are biased and
-        # GRPO IS ratios are wrong. Until vLLM-time logprob capture lands, hard-cap.
+        # Async lookahead generates batch N+1 under vLLM weights v_k while the
+        # trainer is still on step N. After step N's optimizer.step + weight
+        # sync, vLLM holds v_{k+1}. The trainer then consumes batch N+1 and
+        # recomputes pi_old_logprobs on the *current* training model (≈ v_{k+1}),
+        # but the rollout itself was sampled under v_k. So even at staleness=1
+        # pi_old_logprobs are biased and GRPO IS ratios are not exactly 1.
+        # The bias is strictly larger at staleness > 1 — hard-cap there.
+        # The real fix is to capture rollout-time logprobs from vLLM (or to
+        # recompute against a frozen copy of the policy version that generated
+        # the rollout); until then, async should be considered EXPERIMENTAL.
         if self._async_generation_enabled and self._async_generation_max_staleness > 1:
             raise ValueError(
                 "async_generation.max_staleness>1 is not safe yet: "
@@ -673,9 +678,13 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             )
         if self._async_generation_enabled:
             log.warning(
-                "async_generation enabled (max_staleness=%d): pi_old_logprobs "
-                "are recomputed on current training weights. Safe at staleness=1; "
-                "do not raise without implementing vLLM-time logprob capture.",
+                "async_generation enabled (max_staleness=%d): EXPERIMENTAL. "
+                "pi_old_logprobs are recomputed on the current training model, "
+                "but the rollout was sampled under the *previous* vLLM weight "
+                "version (v_k vs v_{k+1} after the step-N sync). GRPO IS ratios "
+                "carry a small bias even at staleness=1; the bias grows with "
+                "staleness. Do NOT treat async as on-policy until vLLM-time "
+                "logprob capture (or frozen-policy recompute) is implemented.",
                 self._async_generation_max_staleness,
             )
         # Rollout-time logprobs are required when off-policy by k>=1 OR explicitly
