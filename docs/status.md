@@ -1,6 +1,6 @@
 # Project Status — Aurora RL (torchtune XPU)
 
-Last updated: 2026-04-29 (BioReason 4B Phase 2 validated: 2-node asymmetric server-mode with HTTP prompt_embeds + shared-FS raw_bytes wsync, 5/5 steps clean)
+Last updated: 2026-04-30 (Qwen3-30B-A3B EP=4/DP=6 v8 series: first `loss=` line at G=1/fbs=1/NSTEPS=1 on 3-node hold; v8m_b + v8n diagnose unified architectural blocker — v59 `reduce_grads=False` keeps ~18.5 GiB FSDP2 unsharded grads alive across BOTH chunk and step boundaries, blocking G≥2 and NSTEPS≥2 alike)
 
 This document synthesizes the current state of the vLLM weight sync implementation,
 active training runs, open issues, and prioritized next steps. It is a living companion
@@ -17,6 +17,12 @@ to `docs/features/vllm_weight_sync.md`, `docs/features/moe_integration.md`, and 
   - **BioReason-Pro 4B (multimodal RL, NEW 2026-04-29)**: two paths now working.
     - **Single-node (run 41/42 baseline)**: 11+0 FSDP1 SHARD_GRAD_OP, ~43-45s/step, 20/20 clean. Fix combination = drop `_multimodal` chunked-loss gate + persistent wsync chunk buffer + G=4/fbs=4. See `docs/reports/bioreason_4b_status_20260429.md`.
     - **2-node asymmetric server mode (Phase 2, runs 49/50, job 8457145)**: 11 train ranks on TRAIN_NODE + 12 vLLM HTTP servers on VLLM_NODE (DP=12, ports 8001-8012). Multimodal pipeline (ESM3 + GO encoder + protein projection + Qwen3 embed_tokens) stays on train side; final `[B*G, T, hidden]` embed shipped over HTTP via base64-encoded `torch.save(bf16)` → vLLM `/v1/completions {prompt_embeds: ...}`. Weight sync via shared-FS `/lus/flare/.../weight_update.raw` → `/collective_rpc load_weights_from_raw` (399 backbone-only params, ~6-8s save @ 1.0-1.3 GB/s + 8.5-10.7s vLLM load). **Run 50: 5/5 steps clean, 4 consecutive successful syncs, KL evolves (0.0016-0.0027)**. Step time ~88-95s with `other=40-47s` blocking on wsync wait — async overlap not yet realized in server mode (optimization target before capacity 4h run). See `docs/reports/bioreason_4b_phase2_20260429.md`.
+    - **Run 51 (2026-04-29) parallel POST fan-out**: ThreadPoolExecutor over 12 vLLM tiles dropped step time 95.8s → 58s (39% reduction). other=47s → 5s. 5/5 clean, KL 0.002-0.006, memory FLAT.
+    - **wsync correctness bug (FIXED 2026-04-30)**: `GRPOBioReasonDistributedXPU.train()` override never called `_sync_weights_to_vllm`. vLLM rollouts in runs 47/50/51 used SFT-initial weights for the entire run — training optimized the policy normally, rollouts never saw the updates. Fix: mirror base recipe lines 3380-3392 after `optimizer.step()`. Validated on hold 8460176, G=4 fbs=4 max_gen=1024 NSTEPS=5: **5/5 clean, weight versions 1→5, 399 params/step, memory FLAT 52.87 GiB steps 2-5, +7s/step over baseline (43→50s)**. See `docs/reports/bioreason_wsync_fix_20260430.md` and `memory/bugs/project_bioreason_train_missing_wsync.md`.
+    - **G-bisect blocker (2026-04-30)**: G>4 with parallel HTTP fan-out hits a banned:1 PDE Segfault whose crash step is inversely correlated with G — G=4 ≥15 steps clean; G=8 step 13; G=12 step 3; G=16 step 2. Same root-cause class as `memory/bugs/project_ccl_ipc_handle_cache.md` (cumulative IPC-handle accumulation in CCL/L0 that scales with G). Falsified hypotheses: HTTP fan-out concurrency cap (G=16 cap=4 still crashes) and chunk count (G=16 fbs=4 still crashes). Side-effect: any banned:1 crash makes the hold's L0 device state unrecoverable (`torch.xpu.device_count()=0` after pkill+clean_tiles); bisects require fresh holds. See `memory/feedback_banned1_destroys_xpu.md`.
+    - **G=8 unblocked by IPEX `varlen_attention` (NEW 2026-04-30)**: Set `TORCHTUNE_USE_IPEX_VARLEN=1` to route causal-only SDPA calls through `intel_extension_for_pytorch.llm.functional.varlen_attention` with a persistent output buffer (added in `torchtune/modules/attention_utils.py`). Validated on hold 8460388: G=8 NSTEPS=15 **15/15 clean exit=0** (vs baseline crash at step 13); steady-state reserved memory **5 GiB lower** (57.21 vs 62.28 GiB); GRPO step ~19% faster at G=4. Bit-exact vs PyTorch SDPA on XPU. **Production envelope: G=8 fbs=8 max_gen=1024 (~2× rollout throughput vs G=4).** G=12+ ceiling not yet tested. Worth trying on other XPU recipes (32B dense, Qwen3-30B-A3B MoE, gene_recall) — same micro-bench wins (21% kernel speedup + 64% lower per-call peak transient memory) should apply. Falls back to PyTorch SDPA when conditions don't apply (mask present, dropout > 0, non-causal, non-XPU). See `docs/reports/bioreason_ipex_varlen_20260430.md` and `memory/project_bioreason_ipex_varlen_20260430.md`.
+    - **`force_math_sdpa` is a no-op on XPU (NEW 2026-04-30)**: The config flag in `grpo_full_finetune_distributed_xpu.py:307-311` calls `torch.backends.cuda.enable_flash_sdp(False)` which only affects the CUDA dispatcher, not the XPU SDPA path. Validated micro-bench: identical timing AND identical peak memory regardless of the flag. Don't vary it expecting behavioral change on XPU. See `memory/feedback_force_math_sdpa_xpu_noop.md`.
+- **Async GRPO**: Phase 1 (server-mode, RolloutProducer overlap) validated on Qwen2.5-3B; 50-step k=1 convergence run clean. **Phase 2 dedicated-rank (NEW 2026-04-30)**: Steps 1+3+4 validated end-to-end on Qwen2.5-3B 1-node. Step 1 = dedicated-rank gloo ring buffer (`_gen_pg`) decouples vLLM rank from world PG; v12 20/20 steps clean, ratios in [0.9998, 1.0014] (matches Phase 1 server-mode parity). Step 4 = `while True` + sentinel exit on vLLM rank loop (eliminates v10/v12 "Failed to send sentinel" race). Step 3 = producer telemetry (`prod_qsize / weight_lag / prod_wait_ms / prod_idle_ms`) instrumentation. Wsync rank=0 sender ~4.7s/step @ 3.2 GB/s gloo loopback. Architectural unblocker for 32B/MoE async — those models only run viably in dedicated-rank mode. **Step 5 — 32B 2-node smoke validated (NEW 2026-04-30, job 8460392)**: Qwen3-32B with 23 train ranks (FSDP2) + 1 vLLM rank (LOCAL_RANK 11 of node 1, TP=1) over a single c10d rdzv torchrun group spanning both nodes. **5/5 steps clean, exit=0** at 13:50:42 UTC. Per-step ~228-237s (gen 76.9-77.6s + grpo 109.5-109.7s + wsync 41.8-41.9s). Stability: ratios=1.0000 all steps (sync mode), kl_loss 0.000551-0.000912, grad_norm 0.0017-0.1215, clipfrac=0, 0 retries / 0 OOMs across all 23 ranks both nodes. Memory FLAT through entire run (torch_resv 40.3-40.8 GiB no growth, torch_alloc 18.92 GiB POST-BWD steady, l0_free 19-23 GiB headroom). Wsync 65.52 GB at 3.21 GB/s = 41.94s (better than predicted 1.3 GB/s; gloo over hsn0 actually delivers ~3 GB/s at this payload size). Step 4 shutdown sentinel handshake confirmed: `Rank 23 (vLLM server): shutdown sentinel received at step 5`. Critical config (in `qwen32B_grpo_async_dedicated_2node_xpu.yaml`): `vllm_max_num_seqs: 8 + vllm_gpu_memory_utilization: 0.97 + vllm_max_model_len: 384` (32B at TP=1 needs aggressive KV budgeting). Critical launcher fix: PYTHONPATH must include `/home/ngetty/.local/aurora/frameworks/2025.3.1/lib/python3.12/site-packages` for `math_verify` while keeping `PYTHONNOUSERSITE=1` for torchao precedence (pattern in `experiments/async_grpo/run_phase2_32b_2node_dedicated.sh` via `USER_SITE_3_12` + `aurora_pythonpath` helper). This is the architectural baseline for 32B/MoE async runs; gen=77s vs grpo=110s = ~30% headroom for true async overlap when `async_generation.enabled=true`. Out-of-scope: did NOT test convergence (5 steps + max_gen=128 truncated gsm8k responses → rewards=0). See `docs/features/async_implementation.md` and `memory/project_phase2_32b_2node_validated.md`.
 - **Weight sync**: 2-hop with **gloo cross-PG** + XCCL intra is the production method for 32B runs >30 steps (47s sync at 1.3 GB/s; eliminates CXI RDMA leak). For short runs, XCCL cross-PG is faster (9.1s sync at 7.9 GB/s but leaks ~9 MiB/step → crash ~step 30).
   SHM remains viable for 3B (1.4s sync, fully hidden behind generation).
 - **Framework**: `frameworks/2025.3.1` is production-ready with `unset PYTORCH_ALLOC_CONF`.
@@ -27,17 +33,7 @@ to `docs/features/vllm_weight_sync.md`, `docs/features/moe_integration.md`, and 
   out the CXI-NIC-contamination hypothesis and exposed a per-rank autograd ordering
   bug: ranks within an EP group execute backward ops in different orders, causing
   gloo collective mismatch. See `docs/features/moe_integration.md` for the v141–v153 saga.
-- **Expert Parallelism (EP=4/DP=3 for Qwen3-30B-A3B, NEW 2026-04-28)**: not yet at `loss=`.
-  v1-v7 on the new `Qwen3MoeTransformerLayer` + `qwen3_moe_ep_plan` infra: forward
-  succeeds in lockstep across all 12 ranks through ref/policy passes, but train fwd
-  (the only fwd with autograd save) deterministically crashes mid-fwd with banned:0/1
-  PDE write faults at L0 IPC addresses. Tier 1 env (CCL_ZE_CACHE=65536, unset
-  XPU_USM_ALLOC_SO, gc:0.99) collapses gloo coll= time 134s→10s but doesn't fix the
-  PDE crash. **Activation-memory hypothesis disproven** (v7: 4× reduction = +3 layers).
-  Working hypothesis: L0 IPC handle pressure during autograd graph build over EP
-  collectives. None of the Gemma4 v141-v161 blockers (BWD desync, ScatterAdd
-  mismatch, asymmetric-AG deadlock) are present in the Qwen3 path.
-  See "Qwen3-30B-A3B Expert Parallelism Status (2026-04-28)" section below.
+- **Expert Parallelism (EP=4/DP=6 for Qwen3-30B-A3B, UPDATED 2026-04-30)**: **first `loss=` line reached** (v8i, G=1/fbs=1/NSTEPS=1 on 3-node hold). v8g per-EP-OP MEMPROBE refuted the IPC-handle hypothesis: external CCL/IPC stays FLAT at ~3.4 GiB, all ~45 GiB growth is `torch_alloc` from saved activations — `banned:1 PDE` was activation OOM all along. **Both G≥2 (v8m_b) and NSTEPS≥2 (v8n) blocked by the same architectural issue**: v59's `reduce_grads=False` (`grpo_full_finetune_distributed_xpu.py:1440-1464`) keeps the full ~18.5 GiB FSDP2 unsharded grad pool resident across both chunk and step boundaries; `optimizer.zero_grad(set_to_none=True)` doesn't reach FSDP2's internal grad buffers. Halving `max_gen` 32→16 only reduces per-chunk activations by <1 GiB — fixed buffers (KV cache, prompts, ref_logprobs) dominate. **Unblocking requires a code change**: explicit `fully_shard`-aware reduce_scatter between chunks AND after the optimizer step. Production RL continues on EP=1 (G=8, 54.8s/step). See "Qwen3-30B-A3B Expert Parallelism Status (2026-04-30, v8 series)" section below; full writeup `docs/reports/qwen3_ep_v8_3node_20260430.md`.
 - **Training stability (Gemma4-31B gene recall)**: KL explodes at step 4 — root cause
   is task-level (no SFT warm-up, no EOS in 512 tokens), not infrastructure. Must fix
   before any meaningful Gemma4 RL run.
@@ -565,7 +561,7 @@ Key robustness features:
 
 ---
 
-## Qwen3-30B-A3B Expert Parallelism Status (2026-04-28)
+## Qwen3-30B-A3B Expert Parallelism Status (2026-04-30, v8 series)
 
 First end-to-end EP=4/DP=3 attempts on the new Qwen3MoE infrastructure
 (`Qwen3MoeTransformerLayer` + `qwen3_moe_ep_plan`). Run on 2-node dedicated-vLLM
@@ -581,6 +577,15 @@ topology: 12 train tiles + 12 vLLM tiles (3×TP=4). PBS jobs 8453156 (v1/v2) and
 | v5 | `forward_batch_size=4` (disable chunking) | pass-2 OOM @ 60.83 GiB | clean Python OOM |
 | v6 | `max_generated_tokens=128→64` (½ acts) | op #439, layer ~27 | banned:0 PDE |
 | v7 | `max_gen=32 grpo_samples=4→2` (¼ acts vs v3) | op #253-equiv, layer ~30 | banned:1 PDE |
+| v8a (3-node DP=6) | same as v7, +1 train node | op #261 | banned:1 PDE — same regime |
+| v8g (3-node + MEMPROBE) | + per-EP-OP `mem_get_info`/`memory_allocated` probe | op #261 | **diagnostic: l0_free 46.7→0.17 GiB, torch_alloc 15.6→60.4 GiB, external FLAT at ~3.4 GiB → activation OOM, NOT IPC** |
+| v8h (3-node) | + `forward_batch_size=1` | op #527 (full fwd + chunk-1 bwd done) → OOM at op #624 in chunk-2 fwd | activation OOM — chunk-1 grads pile on chunk-2 fwd |
+| v8i (3-node) | + `forward_batch_size=1 grpo_samples=1` | **completed step 1, rc=0** | **first `loss=` line on Qwen3 EP** — loss=nan (max_gen=32 truncates response before reward signal; rewards=0.000 ⇒ zero-advantage divide), kl_loss=0.000984, ratios=1.000, resp_len=31 |
+| v8j (3-node) | + `max_gen=64` | step 1, rc=0 | loss=nan (G=1 reward variance still 0); 44.1s/step (+33% vs mg=32) |
+| v8k (3-node) | + `fsdp_cpu_offload=true G=2 fbs=1` | DNF (init >30 min) | FSDP2 cpu_offload H2D init too slow at 30B; left orphans → contaminated nodes |
+| v8l/v8m (contaminated) | NSTEPS=5 / G=2 mg=16 | hung between gen and `chunk[0:1] fwd` | held-node contamination from v8k cleanup; mitigation = switch to fresh PBS job |
+| v8m_b (fresh nodes) | `G=2 fbs=1 mg=16` | crash in `chunk[1:2] fwd`, banned:1 | **chunk[0:1] PRE-BWD = 50.08 GiB at mg=16 vs 50.85 GiB at mg=32 — halving max_gen reduced acts by <1 GiB**. Activations dominated by fixed buffers (KV cache, prompts, ref_logprobs), NOT response tokens. |
+| v8n (fresh nodes) | `NSTEPS=2 G=1 fbs=1 mg=32` | step 0 clean; step 1 banned:1 in `chunk[0:1] fwd` | **PRE-STEP 1 alloc = 34.72 GiB** (vs PRE-STEP 0 = 14.06 GiB). `optimizer.zero_grad(set_to_none=True)` does NOT release FSDP2's internal unsharded grad buffers in EP mode → ~18.5 GiB grads carry into next step. |
 
 ### What we learned
 
@@ -602,13 +607,62 @@ topology: 12 train tiles + 12 vLLM tiles (3×TP=4). PBS jobs 8453156 (v1/v2) and
   inside the **train fwd** (the fwd with autograd save). Ref/policy fwds (no_grad,
   same EP code path) complete cleanly every run.
 
-### Working hypothesis
+### Working hypothesis (REFUTED 2026-04-30 by v8g MEMPROBE)
 
-The crash is L0 IPC handle pressure that accumulates only when autograd builds
-its graph over EP collectives. Tier 1's `CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD=65536`
-helps but is not sufficient at 48 MoE layers × 2 EP collectives × 5 fwd passes per
-GRPO step. Best next experiment: **force the EP gloo PG to TCP-only transport** to
-eliminate SHM IPC handles entirely.
+Earlier hypothesis was L0 IPC handle pressure during autograd graph build over EP
+collectives. **v8g per-EP-OP memory probe disproved this**: `external = l0_used -
+torch_alloc` stayed FLAT at ~3.4 GiB through all 261 ops, while `torch_alloc` walked
+linearly from 15.6 → 60.4 GiB driven by saved-activation accumulation. The "banned:1
+PDE" signature is just how XPU surfaces an L0 OOM during a CCS write that overruns
+the allocation map.
+
+### Resolution (2026-04-30)
+
+v8h cut `forward_batch_size 2→1` (halves saved activations per fwd pass): completed
+all 48 layers fwd + chunk-1 bwd, then OOMed in chunk-2 fwd (chunk-1 grads stayed live).
+v8i added `grpo_samples 2→1` (single chunk): **first `loss=` line on Qwen3 EP**, rc=0.
+
+Loss is `nan` because `max_gen=32` truncates the response before any GO term reward
+match — rewards=0.000 → zero-advantage divide. Not an infrastructure bug; it's the
+activation-budget tradeoff.
+
+**Production envelope for Qwen3 EP=4/DP=6** (current code, `EP=4/DP_replicate=6/DP_shard=4`):
+`forward_batch_size=1 / grpo_samples=1 / num_steps=1 / max_generated_tokens ∈ {32, 64}`
+with ~8 GiB headroom at the 48-layer fwd peak. **Both G≥2 and NSTEPS≥2 are blocked.**
+
+### Unified architectural blocker (v8m_b + v8n share root cause)
+
+v59's `reduce_grads=False` (`grpo_full_finetune_distributed_xpu.py:1440-1464`)
+forces FSDP2 to skip `post_backward` reduce_scatter on every FSDPParamGroup in
+EP mode. The full unsharded grad pool (~18.5 GiB at DP_shard=4) stays resident:
+- between chunks within a step → blocks G≥2 (v8m_b chunk-2 fwd OOM)
+- between steps → blocks NSTEPS≥2 (v8n step-1 chunk-0 fwd OOM, with PRE-STEP 1
+  allocation already at 34.72 GiB before any new activations are saved)
+
+`optimizer.zero_grad(set_to_none=True)` at lines 3047/3322 does not reach
+FSDP2's internal grad buffers — those grads live in `FSDPParamGroup` state, not
+in `optimizer.param_groups[*]['params']`. Halving `max_gen` (v8m_b 32→16) only
+reduced per-chunk activations by <1 GiB because activations are dominated by
+fixed-cost buffers (KV cache for prompt+ref, ref_logprobs storage, prompt
+sequence buffers).
+
+The current path's grad sync is a single deferred XCCL all_reduce on the
+dp_replicate group AFTER all chunks (lines 2945-2954). Unblocking BOTH G≥2 AND
+NSTEPS≥2 requires explicit `fully_shard`-aware reduce_scatter immediately after
+each chunk's bwd AND after the optimizer step, sequenced with the existing
+deferred all_reduce so grads aren't double-reduced. **Code change required —
+not a tuning fix.**
+
+### Diagnostic rule (kept for future XPU EP work)
+
+For any future XPU `banned:0/1 PDE` crash with addresses in `0xff0[0-5]...`:
+1. Add `_ep_mem_probe`-style trace (`torchtune/modules/moe/_parallelism.py:108-135`)
+   to localize whether `torch_alloc` or `external` is climbing.
+2. If `external` is FLAT, it's an activation OOM and the fix is per-tile budget
+   (`forward_batch_size`, `grpo_samples`, `max_generated_tokens`, AC), not env
+   vars or PG transport changes.
+3. The PDE signature is a red herring; XPU surfaces L0 OOM as a CCS-write fault
+   that overruns the allocation map.
 
 ### Comparison with Gemma4 EP (v141–v161)
 
@@ -625,13 +679,19 @@ not autograd ordering.
 
 ### Production status
 
-EP for Qwen3-30B-A3B is **not yet at `loss=`**. Production training continues with
-EP=1 (replicated experts) — the validated G=8 single-node config (54.8s/step,
-9.2 tok/s, 2026-04-27).
+EP for Qwen3-30B-A3B reached **first `loss=` line** at G=1/fbs=1/NSTEPS=1
+(v8i, 2026-04-30) but is **not yet a viable training config** — both G≥2
+(needed for advantage variance) and NSTEPS≥2 (needed to actually train) are
+blocked by the unified architectural issue above. Production RL training
+continues on EP=1 (replicated experts) — the validated G=8 single-node config
+(54.8s/step, 9.2 tok/s, 2026-04-27).
 
-Full v1-v2 details: memory `project_qwen3_ep_v1_v2.md`. v3-v7 details:
-`project_qwen3_ep_v3_v7.md`. Launcher: `experiments/ep_parallelism/hold_qwen3_ep_v{1-7}.sh`,
-underlying recipe: `recipes/dev/run_qwen3_30b_ep4_vllm_2node.sh`.
+Full writeup: `docs/reports/qwen3_ep_v8_3node_20260430.md`. Memories:
+`project_qwen3_ep_v1_v2.md` (v1-v2), `project_qwen3_ep_v3_v7.md` (v3-v7),
+`project_qwen3_ep_v8_3node.md` (v8 series). Launchers:
+`experiments/ep_parallelism/hold_qwen3_ep_v{1-7,8}.sh`. Underlying recipes:
+`recipes/dev/run_qwen3_30b_ep4_vllm_2node.sh` (v1-v7),
+`recipes/dev/run_qwen3_30b_ep4_vllm_3node.sh` (v8 series).
 
 ---
 
@@ -658,7 +718,14 @@ underlying recipe: `recipes/dev/run_qwen3_30b_ep4_vllm_2node.sh`.
 - **Next**: Validate DP>1 per-replica PGs (VLLM_DP=3); long production run (50+ steps)
 - Script: `experiments/multinode_32b/run_32b_3node_24way.sh`
 
-**4. Gemma4 31B gene recall — fix training stability first**
+**4. Qwen3-30B-A3B EP=4 — unblock G≥2 / NSTEPS≥2 (CODE CHANGE) (NEW 2026-04-30)**
+- v8 series reached first `loss=` line (G=1/fbs=1/NSTEPS=1) but is not yet trainable: G≥2 needed for advantage variance, NSTEPS≥2 needed to actually train.
+- Both blocked by v59's `reduce_grads=False` keeping ~18.5 GiB FSDP2 unsharded grads alive across chunk and step boundaries.
+- Concrete patch: in `recipes/dev/grpo_full_finetune_distributed_xpu.py`, add explicit `fully_shard`-aware reduce_scatter immediately after each chunk's bwd (~line 2945-2954) AND after the optimizer step (~line 3047, 3322), sequenced with the existing deferred dp_replicate all_reduce so grads aren't double-reduced.
+- Validation plan once landed: rerun v8m_b config (G=2 mg=16) and v8n config (NSTEPS=2) on a fresh 3-node hold; need PRE-STEP N alloc to drop back near params-only (~14 GiB) and chunk[1:2] PRE-FWD alloc to drop by ~18.5 GiB.
+- Full diagnosis: `docs/reports/qwen3_ep_v8_3node_20260430.md`. Memory: `project_qwen3_ep_v8_3node.md`.
+
+**5. Gemma4 31B gene recall — fix training stability first**
 - Root cause 1: no SFT warm-up for `<genes>` format → add 5–10 SFT examples as prompt prefix, or cold-start with supervised fine-tuning on 20 examples
 - Root cause 2: max_generated_tokens=512 causes all responses to be truncated → reduce to 256, or better: fix EOS generation by adjusting stop tokens config
 - Root cause 3: lr too high for warm-up — step 2 grad_norm=3968 suggests initial lr is too aggressive; try linear warm-up over 20 steps
@@ -666,31 +733,31 @@ underlying recipe: `recipes/dev/run_qwen3_30b_ep4_vllm_2node.sh`.
 
 ### Tier 2: Infrastructure improvements
 
-**5. 3B gene recall: improve convergence**
+**6. 3B gene recall: improve convergence**
 - Current: 130 steps, noisy reward, peak 43.75% success, no monotonic improvement
 - Options: increase G (16→32), curriculum (easy genes first), SFT warm-up, longer runs (500+)
 - Checkpoints available in `outputs/gene_recall_production/ref/` for resume
 
-**6. 50-100 step 32B validation**
+**7. 50-100 step 32B validation**
 - 24 steps shows steady state; a longer run would confirm indefinite stability
 - Use `experiments/multinode_32b/run_32b_2hop_production.sh` with NSTEPS=100, longer walltime
 
-**7. ~~Single large memmove for 31B~~ (SUPERSEDED)**
+**8. ~~Single large memmove for 31B~~ (SUPERSEDED)**
 - 2-hop XCCL replaced SHM for 32B weight sync. SHM memmove optimization no longer on critical path.
 - SHM still used for 3B but sync is already hidden (1.4s waited). Low priority.
 
-**8. ~~Test XCCL broadcast as SHM replacement~~ (DONE)**
+**9. ~~Test XCCL broadcast as SHM replacement~~ (DONE)**
 - 2-hop XCCL is now the production weight sync method for 32B (9.1s sync, 7.9 GB/s).
 - Implemented in `vllm_weight_sync_worker.py` + recipe. SHM eliminated for 32B.
 
 ### Tier 3: Research / deferred
 
-**9. 1-step gather overlap** (reduce 31B waited from 13s to ~7s)
+**10. 1-step gather overlap** (reduce 31B waited from 13s to ~7s)
 - Restructure training loop to start gather immediately after optimizer step
 - Feed gathered weights to vLLM during GRPO forward of the SAME step
 - 1-step weight lag is standard in RL — no algorithmic concern
 
-**10. EP backward AllToAll resolution** (deferred)
+**11. EP backward AllToAll resolution** (deferred)
 - v133 (gloo all_reduce) result pending
 - If v133 fails: consider abandoning gloo entirely; pre-allocate fixed XPU buffers and use XCCL with static tensor shapes (avoids variable-shape AllToAll entirely)
 - Only pursue if EP at large batch sizes shows > 30% throughput improvement
