@@ -254,7 +254,7 @@ class GRPOFullFinetuneRecipeDistributed(FTRecipeInterface):
         self._vllm_url = cfg.get("vllm_url", None)
         self._vllm_client = None
         if self._vllm_url is not None:
-            from torchtune.dev.grpo.vllm_client import VLLMClient
+            from torchtune.dev.rl.vllm_client import VLLMClient
             self._vllm_client = VLLMClient(
                 base_url=self._vllm_url,
                 connection_timeout=300.0,

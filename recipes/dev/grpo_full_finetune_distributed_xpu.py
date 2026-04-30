@@ -2061,7 +2061,7 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         should_init_client = self._is_rank_zero
 
         if should_init_client:
-            from torchtune.dev.grpo.vllm_client import VLLMClient
+            from torchtune.dev.rl.vllm_client import VLLMClient
 
             # Create clients for all vLLM URLs (supports DP vLLM replicas)
             self._vllm_clients = []
@@ -4388,7 +4388,7 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             if not hasattr(self, '_tune_to_hf_map'):
                 self._build_tune_to_hf_map()
 
-            from torchtune.dev.grpo.vllm_client import VLLMClient
+            from torchtune.dev.rl.vllm_client import VLLMClient
             self._vllm_clients = [
                 VLLMClient(
                     base_url=url,
@@ -5913,7 +5913,7 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         if self._enable_packing and not _multimodal:
             # Pack sequences to eliminate padding waste in forward/backward.
             # Packing requires token IDs — skip for multimodal (inputs_embeds path).
-            from torchtune.dev.grpo.packing import (
+            from torchtune.dev.rl.packing import (
                 pack_trajectory_for_training,
                 unpack_tensor,
             )
