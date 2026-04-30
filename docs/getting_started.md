@@ -5,22 +5,19 @@ This guide covers environment setup and running GRPO training on Aurora HPC (Int
 ## Prerequisites
 
 - **Aurora HPC allocation** (PBS project, e.g., `AuroraGPT`)
-- Models staged to `/lus/flare/projects/ModCon/ngetty/models/` (Qwen2.5-3B, Qwen3-32B, gemma-4-31B, etc.)
+- Models staged to `/lus/flare/projects/ModCon/ngetty/models/` (Qwen2.5-3B, Qwen3-32B, Gemma4-26B, etc.)
 
 ## Environment Setup
 
 ### 1. Install (one-time, on a login node)
 
 ```bash
-cd /path/to/torchtune-aurora
 module load frameworks/2025.3.1
 # Remove any user virtualenv that conflicts with frameworks
 export PATH=$(echo "$PATH" | tr ':' '\n' | grep -v myenv | tr '\n' ':' | sed 's/:$//')
 unset VIRTUAL_ENV
-# Optional if your TRL checkout is not at the Aurora default
-export TRL_DIR=/path/to/trl
 
-pip install -e .
+pip install -e /lus/flare/projects/ModCon/ngetty/torchtune
 ```
 
 `module load frameworks/2025.3.1` provides:
@@ -28,225 +25,270 @@ pip install -e .
 - Python 3.12
 - oneCCL/XCCL distributed backend
 - Intel Level Zero drivers
-- vLLM 0.10.1 (bundled in frameworks)
+- vLLM 0.10.1 (bundled)
 
-> **Note**: Do NOT co-locate vLLM and training on the same node for 32B models with XCCL weight sync.
-> The L0 IPC handle cache accumulates ~10.85 GiB of external memory by step 1 backward (707 params × 9+
-> peers), leaving insufficient free HBM for step 2. Fix: vLLM on a dedicated separate node (XCCL then
-> goes over Slingshot, not L0 IPC). See `docs/bugs/intel_ccl_ipc_handle_accumulation.md`.
+> **Note**: Do NOT co-locate vLLM and training on the same node for 32B models. The L0 IPC
+> handle cache accumulates ~10.85 GiB of external memory by step 1 backward, leaving
+> insufficient free HBM for step 2. Use separate nodes (3-node config recommended for 32B).
+> See `docs/bugs/intel_ccl_ipc_handle_accumulation.md`.
 
 ### 2. Verify installation
 
 ```bash
 # On a compute node (not login)
 python -c "import torch; print(torch.xpu.device_count(), 'XPU devices')"
-python -c "from torchtune.training import get_xpu_distributed_backend; print(get_xpu_distributed_backend())"
+```
+
+## Holding a Node for Interactive Testing
+
+**Always hold a node and SSH in for iterative testing.** Never submit a new job for each attempt.
+
+```bash
+# Hold 1 node (1 hour, debug-scaling queue)
+qsub -I -l select=1:system=aurora -l walltime=1:00:00 -q debug-scaling -A AuroraGPT
+
+# Or use the provided hold scripts:
+bash recipes/dev/hold_node.sh          # 1 node
+bash recipes/dev/hold_2nodes.sh        # 2 nodes
+bash recipes/dev/hold_3nodes.sh        # 3 nodes
+```
+
+After getting a job allocation, SSH directly into the node:
+
+```bash
+qstat -u $USER                         # find your running job and its node
+ssh <nodename>
+```
+
+Always use `nohup` for tests run over SSH (sessions drop after ~10 min):
+
+```bash
+nohup bash /lus/flare/.../experiments/run.sh > /lus/flare/.../run.log 2>&1 &
 ```
 
 ## Running GRPO Training
 
-> **Weight sync is required.** A run with `vllm_weight_sync=false` uses a stale vLLM model for
-> generation — the policy model and generation model diverge immediately. Every step trains on
-> off-policy data. This is not valid RL training. All production launchers below have weight sync
-> enabled.
+> **Weight sync is required.** Running with `vllm_weight_sync=false` uses a stale vLLM model
+> — the policy and generation model diverge immediately. All production launchers below have
+> weight sync enabled.
 
-### Production 32B — 2-node dedicated vLLM with XCCL weight sync
+---
 
-This is the **only validated 32B configuration with legitimate training** (weight sync enabled,
-3+ steps clean on Aurora XPU).
+### Flagship: Qwen3-32B on 3 nodes (24-way FSDP)
+
+This is the recommended 32B configuration: pure 24-way FSDP across 2 training nodes,
+dedicated vLLM on 1 node, deferred gloo weight sync.
 
 **Architecture:**
-- Node 0 (vLLM only): 3 replicas × TP=4 = 12 tiles, `WeightSyncFromFileExtension`
-- Node 1 (training only): 12-tile FSDP2 training, torch.distributed.run --standalone
-- XCCL weight sync over Slingshot (cross-node, ~6.5 GB/s, ~38s for 32B)
-- Weight sync fires every step (configurable via `vllm_weight_sync_interval`)
+- Node 0 (vLLM only): TP=4, DP=1, 4 tiles
+- Nodes 1-2 (training): 12+12 tile 24-way FSDP, `--standalone`
+- Weight sync: deferred gloo cross-PG (training → vLLM over Slingshot) + XCCL intra-PG
+- Sync interval=2 (broadcast every other step, fires during generation)
 
 ```bash
-# Hold 2 nodes (interactive)
-qsub -I -l select=2:system=aurora -l walltime=2:00:00 -l filesystems=home:flare -q debug -A AuroraGPT
+# Hold 3 nodes
+qsub -I -l select=3:system=aurora -l walltime=4:00:00 -q debug-scaling -A AuroraGPT
 
-# On the login/submit node (or inside the PBS job):
-export PBS_NODEFILE=/var/spool/pbs/aux/<jobid>
-
-# Default: VLLM_TP=4, VLLM_DP=3, G=16, 5 steps
-bash recipes/dev/aurora_grpo_dedicated_vllm.sh
-
-# Or submit directly as a PBS job:
-qsub recipes/dev/aurora_grpo_dedicated_vllm.sh
+# From a held session, SSH into the job's first node, then:
+bash /lus/flare/projects/ModCon/ngetty/torchtune/experiments/multinode_32b/run_32b_3node_24way.sh
 ```
 
-Overridable via environment variables:
+**Expected performance** (Qwen3-32B, G=16, fbs=16, max_gen=128):
 
+| Config | Step time | Memory margin | Status |
+|--------|-----------|---------------|--------|
+| G=16, max_gen=128 | ~41 s | 10+ GiB | **Best stability** |
+| G=32, max_gen=128 | ~53 s | ~5 GiB | **Best throughput** (1.54× samples/s) |
+| G=32, max_gen=192 | ~72 s | ~1.5 GiB | Marginal |
+| G=48+ | hangs/OOM | — | Blocked (2-chunk rule: G/fbs > 2 triggers CCL explosion) |
+
+Key env vars for 3-node config:
 ```bash
-NSTEPS=20 GRPO_SAMPLES=8 MAX_GEN_TOKENS=64 \
-    VLLM_TP=4 VLLM_DP=3 \
-    MODEL_SRC=/lus/flare/projects/ModCon/ngetty/models/Qwen3-32B \
-    bash recipes/dev/aurora_grpo_dedicated_vllm.sh
+WSYNC_CROSS_METHOD=gloo     # gloo TCP for cross-node PG (eliminates CXI MR leak)
+WSYNC_INTRA_METHOD=xccl     # XCCL for intra-node PG (2.4× faster than gloo)
+TORCHTUNE_PINNED_CPU_BUF=1  # 8.5× gather speedup (31s → 3.7s)
+TORCHTUNE_USE_CHUNKED_LOSS=1
+vllm_weight_sync_interval=2
+forward_batch_size=16        # 1 AllGather round (config default says 4; CLI override)
 ```
 
-**Expected performance** (G=16, fbs=4, max_gen=128, Qwen3-32B):
+---
 
-| Phase | Time | Notes |
-|-------|------|-------|
-| Generation | ~20 s | 3×TP4 vLLM replicas |
-| GRPO backward | ~14 s | 12-tile FSDP2, `TORCHTUNE_USE_CHUNKED_LOSS=1` |
-| XCCL weight sync | ~38 s | 61 GiB at 6.5 GB/s; dominates step time |
-| **Total step** | **~72 s** | |
+### Qwen3-32B on 2 nodes (dedicated vLLM, short runs)
 
-> **Interactive sessions**: For SSH into a held 2-node job (most common for debugging),
-> `aurora_grpo_dedicated_vllm.sh` uses `mpiexec --pmi=pmix` which requires the PBS process group
-> context. Use `experiments/multinode_32b/test_cd_wsync.sh` instead — it uses SSH + `--standalone`
-> which works from any SSH session.
-
-### Quick start — Gemma4-31B single-node (interactive)
+2-node config is faster per-step (~43s vs 41s) but accumulates a slow CXI MR leak
+(~9 MiB/step) that causes a crash around step 55-80. Use for validation runs (<30 steps).
+For production runs (>30 steps), use the 3-node config above.
 
 ```bash
-# On a compute node:
-cd /path/to/torchtune-aurora
+bash /lus/flare/projects/ModCon/ngetty/torchtune/experiments/multinode_32b/run_32b_2hop_production.sh
+```
+
+Architecture: Node 0 (vLLM, 3×TP=4=12 tiles) + Node 1 (training, 12-tile FSDP2).
+2-hop XCCL weight sync: ~9s per sync.
+
+---
+
+### Single-node: smaller models (3B, 8B, 30B-MoE)
+
+```bash
+# Qwen2.5-3B with colocated vLLM + SHM weight sync
+bash recipes/dev/run_grpo_vllm_xpu.sh \
+    2 10 /lus/flare/projects/ModCon/ngetty/models/Qwen2.5-3B 5 \
+    recipes/configs/dev/production/qwen3B_grpo_colocate_xpu.yaml
+
+# Qwen3-30B-A3B (MoE) — validated at G=8, ~55s/step
+bash recipes/dev/run_grpo_vllm_xpu.sh \
+    2 10 /lus/flare/projects/ModCon/ngetty/models/Qwen3-30B-A3B 5 \
+    recipes/configs/dev/production/qwen3_30b_a3b_grpo_xpu.yaml
+
+# Gemma4-26B-A4B with vLLM server mode
 bash recipes/dev/run_gemma4_grpo_vllm.sh 2 10 5
 ```
 
-This launches:
-- vLLM server with Gemma4 overlay on 2 tiles (TP=2, tiles 10-11)
-- 10 FSDP training ranks on tiles 0-9
-- Uses custom `vllm_gemma4_overlay/` to add Gemma4 support to vLLM 0.10.1
+Colocated vLLM (10 training + 2 vLLM tiles) works for 3B and 30B-MoE. The IPC handle
+accumulation issue is proportional to parameter count — 3B/30B stay within bounds
+single-node; 32B requires separate nodes.
 
-> **Note**: Gemma4's larger head dimensions (local 256, global 512 vs Qwen3's 128) make vLLM generation
-> ~60% slower than Qwen3-32B, but training is 31% faster due to K=V architecture. Weight sync for
-> single-node Gemma4 co-located (10+2) is subject to the same L0 IPC handle accumulation issue
-> as Qwen3-32B; validate step 2+ before production use.
+---
 
-### Smaller models (3B, 8B)
+### Async GRPO (Qwen3-3B)
+
+Overlaps vLLM generation with training backward pass via `RolloutProducer`.
+Phase 1 validated at 22.6s/step (vs 31s synchronous).
 
 ```bash
-# 3B single-node with colocated vLLM + SHM weight sync
-bash recipes/dev/run_grpo_colocate_xpu.sh \
-    12 /lus/flare/projects/ModCon/ngetty/models/Qwen2.5-3B 5 \
-    recipes/configs/dev/production/qwen3B_grpo_colocate_xpu.yaml
-
-# 8B single-node with colocated vLLM (12 tiles)
-bash recipes/dev/run_grpo_colocate_xpu.sh \
-    12 /lus/flare/projects/ModCon/ngetty/models/Qwen3-8B 5 \
-    recipes/configs/dev/production/qwen8B_grpo_colocate_xpu.yaml
+bash /lus/flare/projects/ModCon/ngetty/torchtune/experiments/async_grpo/run_phase1_async.sh
 ```
 
-Smaller models (3B, 8B) use colocated vLLM on the same node. The IPC handle accumulation issue
-is proportional to model parameter count — 3B has ~200 params vs 707 for 32B, so the external
-memory footprint is much smaller and single-node colocated works.
+Config: `recipes/configs/dev/production/qwen3B_grpo_async_xpu.yaml`
+
+---
+
+### BioReason multimodal GRPO
+
+2-node setup: training node (11 ranks, FSDP1) + vLLM node (12 HTTP servers, DP=12).
+ESM3 protein encoder + GO term encoder + Qwen3-4B backbone. Weight sync via shared FS.
+
+```bash
+bash /lus/flare/projects/ModCon/ngetty/torchtune/experiments/bioreason/hold_bioreason_2node.sh
+```
+
+Config: `recipes/configs/dev/production/bioreason_4b_grpo_2node_server_xpu.yaml`
+
+Phase 2 validated (run 50): 5/5 steps clean, ~58s/step (wsync overlap optimization pending).
+
+---
 
 ## Production Performance Summary
 
-Validated results on Aurora (Intel Max 1550, 64 GiB/tile) **with weight sync enabled**:
+| Model | Config | Nodes | Weight sync | Step time |
+|-------|--------|-------|-------------|-----------|
+| Qwen2.5-3B | 10+2 tiles, SHM, G=16 | 1 | SHM 1.4s (hidden) | ~21 s |
+| Qwen3-3B | Async GRPO, G=8 | 1 | SHM | ~23 s |
+| Qwen3-30B-A3B (MoE) | 10+2 tiles, SHM, G=8 | 1 | SHM 3.3s | ~55 s |
+| Gemma4-26B-A4B | 10+2 tiles, server, G=16 | 1 | HTTP | ~24 s |
+| **Qwen3-32B** | **3-node 24-way, G=16** | **3** | **gloo 47s deferred** | **~41 s** |
+| Qwen3-32B | 3-node 24-way, G=32 | 3 | gloo 47s deferred | ~53 s |
+| BioReason-Pro 4B | 2-node server, 11+12 tiles | 2 | shared-FS | ~58 s |
 
-| Model | Config | Nodes | Weight sync | Step time | Notes |
-|-------|--------|-------|-------------|-----------|-------|
-| Qwen2.5-3B | colocated vLLM, 12 tiles | 1 | SHM | ~21 s | Validated Test CI |
-| Qwen3-32B | dedicated vLLM 2-node | 2 | XCCL | ~72 s | G=16/fbs=4/max_gen=128; Tests CD/CE |
-| Gemma4-26B-A4B | single-node, 12 tiles | 1 | — | ~24 s | MoE; weight sync TBD |
-
-Sync dominates 32B step time: gen=20s, grpo=14s, XCCL=38s. To reduce XCCL overhead:
-- Use `vllm_weight_sync_interval=N` to sync every N steps (amortizes 38s over N steps)
-- SHM weight sync requires H2D batching fix to beat XCCL at max_gen=64 (see `docs/status.md`)
-
-A100-40GB comparison: 32B+ models are **infeasible** on A100-40GB (OOM in all configs).
-Aurora's 64 GiB tiles are required.
+---
 
 ## PBS Job Template
 
 ```bash
 #!/bin/bash
-#PBS -l select=N:system=aurora      # N = number of nodes
+#PBS -l select=N:system=aurora      # N = number of nodes (1 for 3B/30B, 3 for 32B)
 #PBS -l filesystems=home:flare
-#PBS -l walltime=1:00:00
-#PBS -q debug                        # or prod for longer runs
+#PBS -l walltime=4:00:00
+#PBS -q debug-scaling               # or prod for longer runs
 #PBS -A AuroraGPT
-#PBS -o logs/job.out
-#PBS -e logs/job.err
+#PBS -o /lus/flare/projects/ModCon/ngetty/torchtune/experiments/<topic>/job.out
+#PBS -e /lus/flare/projects/ModCon/ngetty/torchtune/experiments/<topic>/job.err
 #PBS -N grpo_training
 set -e
 
-cd /path/to/torchtune-aurora
+TT_DIR=/lus/flare/projects/ModCon/ngetty/torchtune
+TRL_DIR=/flare/ModCon/ngetty/trl
 
 # --- Environment ---
 module load frameworks/2025.3.1 2>/dev/null || true
 export PATH=$(echo "$PATH" | tr ':' '\n' | grep -v myenv | tr '\n' ':' | sed 's/:$//')
 unset VIRTUAL_ENV
-export TRL_DIR=${TRL_DIR:-/flare/ModCon/ngetty/trl}
 
 # --- CCL Configuration (CRITICAL — do not omit) ---
-export CCL_PROCESS_LAUNCHER=pmix
+export CCL_PROCESS_LAUNCHER=pmix          # Requires: mpiexec --pmi=pmix (NOT --standalone)
 export CCL_ATL_TRANSPORT=mpi
 export CCL_KVS_MODE=mpi
 export CCL_KVS_USE_MPI_RANKS=1
 export CCL_CONFIGURATION=cpu_gpu_dpcpp
 export CCL_KVS_CONNECTION_TIMEOUT=600
-# CRITICAL: default=1000 fills at step 1 backward (707 params × peers) → eviction → banned:1.
-# 65536 prevents eviction; for co-located single-node 32B, accumulation then causes OOM at
-# step 2 (10.85 GiB external). Fix for 32B: separate vLLM node (XCCL over Slingshot, not L0).
-export CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD=65536
+export CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD=65536  # CRITICAL: prevents eviction at step 1
 export CCL_OP_SYNC=1
 export FI_PROVIDER=cxi
 export CCL_WORKER_COUNT=1              # CRITICAL: 4 → 48x AllGather regression
 export CCL_ALLREDUCE=ring
 # Do NOT set CCL_REDUCE_SCATTER=ring   # Causes 63x regression on multi-node
 export CCL_CHUNK_SIZE=16777216
-export FI_CXI_RX_MATCH_MODE=hybrid
-export FI_CXI_OFLOW_BUF_SIZE=8388608
-export FI_CXI_DEFAULT_CQ_SIZE=131072
 export FI_MR_CACHE_MONITOR=disabled
 export ZE_FLAT_DEVICE_HIERARCHY=FLAT
-unset PYTORCH_ALLOC_CONF
+unset PYTORCH_ALLOC_CONF               # expandable_segments:True breaks oneCCL USM check
 export TORCH_COMPILE_DISABLE=1
-
-# RC1 fix: prevents OOM at G=16 with 32B (per-chunk fwd+bwd loop kept unsharded grads live)
-export TORCHTUNE_USE_CHUNKED_LOSS=1
+export TORCHTUNE_USE_CHUNKED_LOSS=1   # Prevents per-chunk fwd+bwd OOM (RC1 fix)
 
 # --- Paths ---
-export PYTHONPATH="$(pwd)${TRL_DIR:+:${TRL_DIR}}:${PYTHONPATH}"
+export PYTHONPATH="${TT_DIR}${TRL_DIR:+:${TRL_DIR}}:${PYTHONPATH}"
 export HF_DATASETS_OFFLINE=1
 export HF_HUB_OFFLINE=1
 
-# --- Launch (adjust for your model/config) ---
-# See recipes/dev/aurora_grpo_dedicated_vllm.sh for full 32B example
+# --- NOTE: For SSH+standalone (interactive, not mpiexec-launched jobs) ---
+# Replace CCL_PROCESS_LAUNCHER=pmix with CCL_PROCESS_LAUNCHER=none
+# CCL_ATL_TRANSPORT=ofi (not mpi — pmix env vars hang --standalone)
+# See memory/feedback_pmix_envs_break_standalone.md
+
+# --- Launch ---
+# See experiments/multinode_32b/run_32b_3node_24way.sh for 32B 3-node example
+# See recipes/dev/run_grpo_vllm_xpu.sh for 1-node examples
 ```
 
 ## Key Files
 
 | File | Purpose |
 |------|---------|
-| `recipes/dev/grpo_full_finetune_distributed_xpu.py` | Main training recipe (~2300 lines) |
-| `recipes/dev/aurora_grpo_dedicated_vllm.sh` | **Primary 32B launcher** (2-node dedicated vLLM, XCCL weight sync) |
-| `recipes/dev/aurora_grpo_vllm_wrapper.sh` | Per-rank wrapper (env, affinity, CCL) — used by mpiexec launchers |
-| `recipes/dev/run_gemma4_grpo_vllm.sh` | Single-node vLLM server mode launcher (Gemma4) |
-| `recipes/dev/run_grpo_colocate_xpu.sh` | Single-node colocated vLLM launcher (3B/8B) |
-| `recipes/dev/vllm_gemma4_overlay/` | Gemma4 model support for vLLM 0.10.1 |
-| `recipes/dev/_usercustomize_vllm/` | Runtime patches for vLLM on XPU |
-| `recipes/configs/dev/experimental/` | Working configs (Qwen3-32B dedicated vLLM, etc.) |
-| `recipes/configs/dev/production/` | Smaller model configs (3B, 8B) |
-| `torchtune/models/gemma4/` | Native torchtune Gemma4 model module |
-| `docs/aurora_rl_baselines.md` | Full benchmarking results and history |
-| `experiments/multinode_32b/test_cd_wsync.sh` | Validated 32B XCCL sync test (SSH+standalone) |
-| `experiments/multinode_32b/test_ce_wsync_batched.sh` | Validated 32B batched XCCL test |
+| `recipes/dev/grpo_full_finetune_distributed_xpu.py` | General GRPO base recipe (~3750 lines) |
+| `recipes/dev/grpo_bioreason_distributed_xpu.py` | BioReason multimodal subclass (~1450 lines) |
+| `recipes/dev/async_grpo_full_finetune_distributed.py` | Async GRPO (RolloutProducer overlap) |
+| `recipes/dev/run_grpo_vllm_xpu.sh` | Single-node vLLM launcher (3B/8B/30B) |
+| `recipes/dev/run_gemma4_grpo_vllm.sh` | Gemma4 single-node vLLM server launcher |
+| `experiments/multinode_32b/run_32b_3node_24way.sh` | **Primary 32B launcher** (3-node, gloo cross+XCCL intra) |
+| `experiments/multinode_32b/run_32b_2hop_production.sh` | 2-node 32B (short runs <30 steps) |
+| `experiments/bioreason/hold_bioreason_2node.sh` | BioReason 2-node launcher |
+| `experiments/async_grpo/run_phase1_async.sh` | Async GRPO Phase 1 launcher |
+| `recipes/configs/dev/production/` | All production YAML configs |
+| `torchtune/dev/rl/weight_sync.py` | All weight sync runtime (~1770 lines) |
+| `torchtune/dev/rl/vllm_backend.py` | vLLM init and mode setup (~690 lines) |
+| `torchtune/dev/bioreason/model.py` | BioReasonModel (ESM3+GO+Qwen3-4B) |
+| `torchtune/modules/moe/experts.py` | GroupedExperts BMM kernel (6.3× speedup) |
+| `recipes/dev/clean_tiles.sh` | Kill all vLLM processes on current node |
+| `docs/status.md` | Full run history and current baselines |
+| `docs/bugs/` | Specific bug investigations |
 
-## Overriding Config Values
+## Known Platform Constraints
 
-All YAML config values can be overridden at the command line:
-
-```bash
-bash recipes/dev/aurora_grpo_dedicated_vllm.sh  # uses defaults
-
-# Override steps, samples, generation length:
-NSTEPS=20 GRPO_SAMPLES=8 MAX_GEN_TOKENS=64 \
-    bash recipes/dev/aurora_grpo_dedicated_vllm.sh
-```
+- **`torch.compile` deadlocks on multi-node** with oneCCL. Single-node backbone-only compile is viable but slow (SYCL kernel compilation takes minutes per kernel). Disabled by default (`TORCH_COMPILE_DISABLE=1`).
+- **`glob.glob()` hangs** on DAOS/dfuse mounts — use `os.listdir()` + filtering.
+- **`torch.xpu.empty_cache()`** causes Level Zero UR handle leaks with FSDP. Never call it in FSDP training loops.
+- **CCL_WORKER_COUNT must be 1** — 4 causes 48× AllGather regression.
+- **Do not set `CCL_REDUCE_SCATTER=ring`** — causes 63× regression on multi-node.
+- **CCL_PROCESS_LAUNCHER=pmix** requires `mpiexec --pmi=pmix` (not `--standalone`). For SSH+interactive testing, use `CCL_PROCESS_LAUNCHER=none` + `CCL_ATL_TRANSPORT=ofi`.
+- **FSDP per-module wrapping** causes catastrophic overhead — use top-level-only wrapping.
 
 ## Syncing with Upstream TorchTune
 
-This repo tracks [meta-pytorch/torchtune](https://github.com/meta-pytorch/torchtune) as the `upstream` remote. To incorporate upstream changes:
+This repo tracks [pytorch/torchtune](https://github.com/pytorch/torchtune) as the `upstream`
+remote. Only 4 upstream files are modified, so rebases are typically clean.
 
 ```bash
 git fetch upstream
-git rebase upstream/main  # or merge
+git rebase upstream/main
 ```
-
-Only 4 upstream files are modified (backend string, XPU util exports, minor fixes), so rebases should be clean.
