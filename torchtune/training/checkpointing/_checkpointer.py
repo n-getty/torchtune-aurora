@@ -657,6 +657,20 @@ class FullModelHFCheckpointer(_CheckpointerInterface):
                 dim=self._config["hidden_size"],
                 tie_word_embeddings=self._config["tie_word_embeddings"],
             )
+        elif self._model_type == ModelType.QWEN3_MOE:
+            from torchtune.models.qwen3_moe._convert_weights import (
+                qwen3_moe_hf_to_tune,
+            )
+
+            converted_state_dict[training.MODEL_KEY] = qwen3_moe_hf_to_tune(
+                merged_state_dict,
+                num_heads=self._config["num_attention_heads"],
+                num_kv_heads=self._config["num_key_value_heads"],
+                dim=self._config["hidden_size"],
+                head_dim=self._config.get("head_dim", None),
+                tie_word_embeddings=self._config.get("tie_word_embeddings", False),
+                num_experts=self._config.get("num_experts", 128),
+            )
         elif self._model_type == ModelType.LLAMA3_VISION:
             from torchtune.models.llama3_2_vision._convert_weights import (
                 llama3_vision_hf_to_tune,
@@ -837,6 +851,20 @@ class FullModelHFCheckpointer(_CheckpointerInterface):
                     num_kv_heads=self._config["num_key_value_heads"],
                     dim=self._config["hidden_size"],
                     tie_word_embeddings=self._config["tie_word_embeddings"],
+                )
+            elif self._model_type == ModelType.QWEN3_MOE:
+                from torchtune.models.qwen3_moe._convert_weights import (
+                    qwen3_moe_tune_to_hf,
+                )
+
+                state_dict[training.MODEL_KEY] = qwen3_moe_tune_to_hf(
+                    state_dict[training.MODEL_KEY],
+                    num_heads=self._config["num_attention_heads"],
+                    num_kv_heads=self._config["num_key_value_heads"],
+                    dim=self._config["hidden_size"],
+                    head_dim=self._config.get("head_dim", None),
+                    tie_word_embeddings=self._config.get("tie_word_embeddings", False),
+                    num_experts=self._config.get("num_experts", 128),
                 )
             elif self._model_type == ModelType.LLAMA3_VISION:
                 from torchtune.models.llama3_2_vision._convert_weights import (

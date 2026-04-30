@@ -1,0 +1,160 @@
+# Async GRPO prototype — Qwen2.5 3B, single node, vLLM server mode (TP=2).
+#
+# Built off qwen3B_gene_recall_xpu.yaml; differences from that baseline:
+#   1. Switches loss to GRPOLoss (token-wise IS ratios). GRPOSimpleLoss
+#      ignores pi_old_logprobs and so cannot exercise the off-policy path.
+#   2. Adds always_compute_rollout_logprobs flag so Phase-0 baseline can
+#      run with rollout-time logprobs populated even at ppo_epochs=1.
+#   3. Adds async_generation block (disabled by default; flip to enable
+#      Phase 1 / Phase 2 async paths once those land).
+#   4. Switches generation backend to vLLM server mode (10 train + 2 vLLM tiles).
+#
+# Plan: docs/plans/eventual-juggling-prism.md (Phase 0 → Phase 1 → Phase 2).
+#
+# Phase 0 baseline launch:
+#   bash recipes/dev/run_grpo_async_proto_xpu.sh
+# Phase 1 launch (when implemented):
+#   ASYNC=1 bash recipes/dev/run_grpo_async_proto_xpu.sh
+
+name: grpo_async_proto_qwen3b_xpu
+
+output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/outputs/grpo_async_proto_qwen3b
+base_model_path: /lus/flare/projects/ModCon/ngetty/models/Qwen2.5-3B
+data_dir: /lus/flare/projects/ModCon/ngetty/hackathon_rl/prepared_data
+
+# Tokenizer
+tokenizer:
+  _component_: torchtune.models.qwen2_5.qwen2_5_tokenizer
+  path: ${base_model_path}/vocab.json
+  merges_file: ${base_model_path}/merges.txt
+  max_seq_len: 1024
+
+# Dataset — gene recall JSONL (same as the proven 3B baseline)
+dataset:
+  _component_: torchtune.dev.grpo.gene_recall.gene_recall_dataset
+  data_files: ${data_dir}/gene_recall_train.jsonl
+  max_seq_len: 1024
+seed: 42
+shuffle: True
+
+# Model
+model:
+  _component_: torchtune.models.qwen2_5.qwen2_5_3b
+
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [
+    model-00001-of-00002.safetensors,
+    model-00002-of-00002.safetensors,
+  ]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: QWEN2
+
+ref_checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [
+    model-00001-of-00002.safetensors,
+    model-00002-of-00002.safetensors,
+  ]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}/ref
+  model_type: QWEN2
+
+resume_from_checkpoint: False
+save_every_n_epochs: 1
+save_every_n_steps: 50
+
+# vLLM server mode — separate tile group (TP=2), HTTP weight sync.
+# Launcher script starts a local vLLM at http://localhost:8001 on tiles 10-11.
+vllm_mode: server
+vllm_url: "http://localhost:8001"
+vllm_group_port: 51216
+vllm_weight_sync: true
+vllm_weight_sync_method: shm  # 2.8s SHM path validated on 3B
+vllm_weight_sync_interval: 1  # k=1 deferred; bumped per-experiment for k>1
+
+# ----------------------------------------------------------------
+# Async generation (Phase 0 / 1 / 2)
+# ----------------------------------------------------------------
+# Phase 0: leave async_generation.enabled=false but flip
+# always_compute_rollout_logprobs=true to validate the rollout-time fwd path
+# matches the sync baseline (loss + grad_norm within noise).
+# Phase 1+: set async_generation.enabled=true; max_staleness=k drives the
+# producer queue depth and the wsync interval relationship.
+always_compute_rollout_logprobs: true
+
+async_generation:
+  enabled: false
+  max_staleness: 1
+
+# Reward
+reward_mode: gene_recall
+gene_reward_metric: f1
+
+# GRPO parameters — same scale as proven 3B baseline.
+# fbs=4 keeps peak memory ~20-25 GiB stable; B=2, G=8 → 16 sequences.
+batch_size: 2
+grpo_samples: 8
+forward_batch_size: 4
+max_generated_tokens: 512
+top_k: null
+temperature: 1.0
+
+ppo_epochs: 1
+gradient_accumulation_steps: 1
+
+epochs: 5
+num_steps: 30  # enough to see steady-state behavior; bump for convergence runs
+
+clip_grad_norm: 1.0
+
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 5e-6
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  num_warmup_steps: 10
+
+# Loss: GRPOLoss (token-wise) — exercises pi_old_logprobs IS ratios.
+# Required for the async/off-policy path to do anything meaningful;
+# GRPOSimpleLoss collapses ratios to 1 unconditionally.
+loss:
+  _component_: torchtune.dev.grpo.loss.GRPOLoss
+  kl_coeff: 0.1
+  epsilon: 0.2
+
+# XPU device
+device: xpu
+
+# Memory
+enable_activation_checkpointing: True
+compile: False
+
+# Precision
+dtype: bf16
+
+# Logging
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+log_every_n_steps: 1
+log_peak_memory_stats: True
+
+# Profiler disabled
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: False
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: True
+  cuda: False
+  profile_memory: False
+  with_stack: False
+  record_shapes: False
+  with_flops: False
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1

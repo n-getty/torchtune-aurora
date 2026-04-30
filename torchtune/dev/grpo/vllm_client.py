@@ -237,6 +237,94 @@ class VLLMClient:
         return all_completion_ids
 
     # ------------------------------------------------------------------
+    # Multimodal generation (prompt_embeds, OpenAI API only)
+    # ------------------------------------------------------------------
+    def generate_from_embeds(
+        self,
+        prompt_embeds: list[torch.Tensor],
+        max_tokens: int = 256,
+        temperature: float = 1.0,
+        top_k: int = 0,
+        top_p: float = 1.0,
+    ) -> list[list[int]]:
+        """Send pre-computed prompt embeddings to vLLM and return completion token IDs.
+
+        Used by BioReason where the embeddings come from a multimodal pipeline
+        (ESM3 + GO encoder + projectors) computed on the training side; vLLM only
+        runs the LM backbone.
+
+        The wire format matches vLLM's CompletionRequest spec:
+          prompt_embeds: bytes (base64 of torch.save'd tensor) for one prompt,
+                         OR list[bytes] for a batch.
+
+        Args:
+            prompt_embeds: list of length B, each element a [P_i, H] bf16/fp16 tensor.
+            max_tokens, temperature, top_k, top_p: sampling params.
+
+        Returns:
+            list[list[int]] of length B — token IDs for each completion.
+        """
+        if self._api_type != "openai":
+            raise RuntimeError(
+                "generate_from_embeds requires the OpenAI API server "
+                "(launch vLLM with vllm.entrypoints.openai.api_server "
+                "--enable-prompt-embeds)."
+            )
+
+        import base64
+        import io
+
+        comp_url = f"{self.base_url}/v1/completions"
+        encoded = []
+        for t in prompt_embeds:
+            buf = io.BytesIO()
+            # NOTE: use torch.save (NOT tensor.numpy().tobytes()) — vLLM's
+            # OpenAIServingCompletion calls torch.load(...) on the bytes.
+            torch.save(t.detach().cpu().contiguous(), buf)
+            encoded.append(base64.b64encode(buf.getvalue()).decode("ascii"))
+
+        payload = {
+            "model": self._model_name,
+            "prompt_embeds": encoded if len(encoded) > 1 else encoded[0],
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "top_p": top_p,
+        }
+        if top_k and top_k > 0:
+            payload["top_k"] = top_k
+
+        r = self.session.post(comp_url, json=payload, timeout=600)
+        if r.status_code != 200:
+            raise RuntimeError(
+                f"vLLM /v1/completions (prompt_embeds) failed: "
+                f"{r.status_code} {r.text[:500]}"
+            )
+        data = r.json()
+        if "choices" not in data:
+            error_msg = data.get("error", data.get("message", str(data)))
+            raise RuntimeError(f"vLLM error response: {error_msg}")
+
+        # Token IDs may not be present in every choice — fall back to /tokenize.
+        tok_url = f"{self.base_url}/tokenize"
+        out = []
+        for choice in data["choices"]:
+            ids = choice.get("token_ids")
+            if ids:
+                out.append(list(ids))
+            else:
+                tok_r = self.session.post(
+                    tok_url,
+                    json={"model": self._model_name, "prompt": choice["text"]},
+                    timeout=30,
+                )
+                if tok_r.status_code != 200:
+                    raise RuntimeError(
+                        f"/tokenize failed: {tok_r.status_code} {tok_r.text[:500]}"
+                    )
+                out.append(tok_r.json()["tokens"])
+        return out
+
+    # ------------------------------------------------------------------
     # Weight sync – XCCL communicator
     # ------------------------------------------------------------------
     def init_communicator(self, device: torch.device) -> None:

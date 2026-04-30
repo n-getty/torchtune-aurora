@@ -120,6 +120,7 @@ def _ep_reduce_scatter(input: Tensor, group: dist.ProcessGroup, label: str = "RS
     Forward (RS-FWD): partial_out(ep_degree×s_local, dim) → all_reduce → slice → (s_local, dim)
     Backward (RS-BWD): same path on grad_output from AG-FWD.
     """
+    import time as _time
     global _EP_OP_N
     n = _EP_OP_N; _EP_OP_N += 1
     r = dist.get_rank()
@@ -130,10 +131,18 @@ def _ep_reduce_scatter(input: Tensor, group: dist.ProcessGroup, label: str = "RS
 
     if input.device.type == "xpu" and _GLOO_EP_PG is not None:
         # gloo CPU-bounce: XPU → CPU → gloo all_reduce(SUM) → slice → XPU
+        _t0 = _time.monotonic()
         input_cpu = input.contiguous().cpu()  # (ep_degree * s_local, dim)
+        _t_d2h = _time.monotonic() - _t0
+        _t1 = _time.monotonic()
         dist.all_reduce(input_cpu, op=dist.ReduceOp.SUM, group=_GLOO_EP_PG)
+        _t_coll = _time.monotonic() - _t1
+        _t2 = _time.monotonic()
         out_cpu = input_cpu[ep_rank * out_rows : (ep_rank + 1) * out_rows].contiguous()
         out = out_cpu.to(input.device)
+        _t_h2d = _time.monotonic() - _t2
+        if _t_d2h > 1.0 or _t_coll > 5.0 or _t_h2d > 1.0:
+            print(f"[rank{r}] EP-OP #{n} {label} SLOW d2h={_t_d2h:.2f}s coll={_t_coll:.2f}s h2d={_t_h2d:.2f}s shape={tuple(input.shape)}", flush=True)
     else:
         # Fallback: native XCCL reduce_scatter (non-XPU or no gloo group configured)
         out = input.new_empty(out_rows, *input.shape[1:])
@@ -153,6 +162,7 @@ def _ep_all_gather(out: Tensor, input: Tensor, group: dist.ProcessGroup, label: 
     Forward (AG-FWD): (s_local, dim) → all_gather → (ep_degree×s_local, dim)
     Backward (AG-BWD): same path on grad_output from RS-FWD.
     """
+    import time as _time
     global _EP_OP_N
     n = _EP_OP_N; _EP_OP_N += 1
     r = dist.get_rank()
@@ -160,10 +170,18 @@ def _ep_all_gather(out: Tensor, input: Tensor, group: dist.ProcessGroup, label: 
 
     if input.device.type == "xpu" and _GLOO_EP_PG is not None:
         # gloo CPU-bounce: XPU → CPU → gloo all_gather_into_tensor → XPU
+        _t0 = _time.monotonic()
         input_cpu = input.contiguous().cpu()  # (s_local, dim)
+        _t_d2h = _time.monotonic() - _t0
+        _t1 = _time.monotonic()
         out_cpu = torch.zeros(out.shape, dtype=out.dtype, device="cpu")
         dist.all_gather_into_tensor(out_cpu, input_cpu, group=_GLOO_EP_PG)
+        _t_coll = _time.monotonic() - _t1
+        _t2 = _time.monotonic()
         out.copy_(out_cpu.to(input.device))
+        _t_h2d = _time.monotonic() - _t2
+        if _t_d2h > 1.0 or _t_coll > 5.0 or _t_h2d > 1.0:
+            print(f"[rank{r}] EP-OP #{n} {label} SLOW d2h={_t_d2h:.2f}s coll={_t_coll:.2f}s h2d={_t_h2d:.2f}s shape={tuple(input.shape)}", flush=True)
     else:
         # Fallback: native XCCL all_gather (non-XPU or no gloo group configured)
         dist.all_gather_into_tensor(out, input.contiguous(), group=group)
@@ -529,6 +547,14 @@ class ExpertParallel(ParallelStyle):
         # OFI CQ entries that contaminate gloo TCP (which also goes through CXI on Aurora).
         # Replacing with gloo CPU-bounce isolates NTPE from the OFI/CXI stack.
         # The GLOO_SOCKET_IFNAME=lo env var forces gloo to use loopback (not CXI).
+        # v8: count NTPE-AG against _EP_OP_N. Without this, every per-layer dispatch
+        # fires AG-FWD + NTPE-AG + RS-FWD against a counter that increments only twice
+        # → forensics are off-by-one-per-layer across all ranks (consistent across
+        # ranks, so it doesn't itself cause desync, but it does make logs misleading).
+        global _EP_OP_N
+        n_ntpe = _EP_OP_N; _EP_OP_N += 1
+        r_ntpe = dist.get_rank()
+        print(f"[rank{r_ntpe}] EP-OP #{n_ntpe} ENTER NTPE-AG", flush=True)
         if routed_input.device.type == "xpu" and _GLOO_EP_PG is not None:
             ntpe_cpu = num_tokens_per_expert.to(torch.long).contiguous().cpu()
             all_ntpe_cpu = torch.zeros(ep_degree * num_experts, dtype=torch.long, device="cpu")
@@ -538,6 +564,7 @@ class ExpertParallel(ParallelStyle):
             dist.all_gather_into_tensor(
                 all_ntpe_flat, num_tokens_per_expert.to(torch.long), group=group
             )
+        print(f"[rank{r_ntpe}] EP-OP #{n_ntpe} EXIT NTPE-AG", flush=True)
         all_ntpe = all_ntpe_flat.view(ep_degree, num_experts)
 
         # Cumulative token offsets within each rank's expert-sorted section.

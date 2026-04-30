@@ -1,0 +1,117 @@
+# GRPO sum-of-digits comparison — Qwen3-0.6B, single node, vLLM dedicated
+#
+# Apples-to-apples comparison with torchtitan/ezpz verified results.
+# Their setup: 24 tiles, HF .generate() on all ranks, G=2, no vLLM, no weight sync.
+# Our setup: vLLM dedicated tiles + FSDP training tiles + SHM weight sync.
+#
+# Launch (6 tiles, 5 train + 1 vLLM):
+#   NTILES=6 bash experiments/comparison/run_0_6b_comparison.sh
+# Launch (12 tiles, 11 train + 1 vLLM):
+#   NTILES=12 bash experiments/comparison/run_0_6b_comparison.sh
+
+name: grpo_sum_digits_qwen3_0_6b_comparison
+
+output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/outputs/comparison_sum_digits
+base_model_path: /lus/flare/projects/ModCon/ngetty/models/Qwen3-0.6B
+data_dir: /lus/flare/projects/ModCon/ngetty/torchtune/data
+
+# Tokenizer
+tokenizer:
+  _component_: torchtune.models.qwen3.qwen3_tokenizer
+  path: ${base_model_path}/vocab.json
+  merges_file: ${base_model_path}/merges.txt
+  max_seq_len: 512
+
+# Dataset — sum of digits JSONL
+dataset:
+  _component_: torchtune.dev.rl.tasks.sum_digits.sum_digits_dataset
+  data_files: ${data_dir}/sum_digits_train.jsonl
+  max_seq_len: 512
+seed: 42
+shuffle: True
+
+# Model
+model:
+  _component_: torchtune.models.qwen3.qwen3_0_6b_instruct
+
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [model.safetensors]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: QWEN3
+
+ref_checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [model.safetensors]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}/ref
+  model_type: QWEN3
+
+resume_from_checkpoint: False
+
+# Reward — sum_digits mode (accuracy + format, matching torchtitan/ezpz)
+reward_mode: sum_digits
+
+# GRPO parameters — match torchtitan/ezpz where applicable
+batch_size: 1
+grpo_samples: 8
+forward_batch_size: 8
+max_generated_tokens: 64
+top_k: null
+temperature: 0.7
+
+ppo_epochs: 1
+gradient_accumulation_steps: 1
+
+epochs: 1
+num_steps: 50
+save_every_n_epochs: 1
+
+clip_grad_norm: 1.0
+
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 1e-5
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  num_warmup_steps: 2
+loss:
+  _component_: torchtune.dev.grpo.loss.GRPOSimpleLoss
+  kl_coeff: 0.1
+  epsilon: 0.2
+
+# XPU device
+device: xpu
+
+# 0.6B doesn't need AC
+enable_activation_checkpointing: False
+compile: False
+
+# Precision
+dtype: bf16
+
+# Logging
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+log_every_n_steps: 1
+log_peak_memory_stats: True
+
+# Profiler disabled
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: False
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: True
+  cuda: False
+  profile_memory: False
+  with_stack: False
+  record_shapes: False
+  with_flops: False
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1

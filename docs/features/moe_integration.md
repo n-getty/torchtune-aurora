@@ -1,18 +1,225 @@
-# MoE Expert Parallelism Integration — Aurora/XPU
+# MoE Integration — Aurora/XPU
 
-Status and implementation notes for Expert Parallelism (EP) support for Gemma4 26B-A4B
-on Aurora HPC (Intel Max Series GPUs / XPU), targeting EP=4/DP=3 on 12 tiles per node.
+MoE model support on Aurora HPC (Intel Max Series GPUs / XPU). Two workstreams:
 
-## Goal
+1. **Qwen3-30B-A3B** — E2E GRPO training with vLLM weight sync (production-ready)
+2. **Gemma4 26B-A4B Expert Parallelism** — EP=4/DP=3 on 12 tiles (research, backward blocked)
 
-Reduce per-tile expert parameter memory by partitioning Gemma4's 128 experts across 4 EP
-ranks, so each tile holds 32 experts instead of 128. Primary benefit is memory reduction
-(~3 GiB/tile at bfloat16) which enables larger batch sizes or reduces optimizer state
-pressure during GRPO training.
+---
 
-Topology: `dp_replicate=3 × dp_shard=4` on 12 tiles. The `dp_shard` submesh doubles as
-the EP communicator group — the same 4 ranks handle both FSDP sharding of non-expert
-parameters and Expert Parallel token dispatch.
+## Qwen3-30B-A3B — E2E GRPO with MoE Weight Sync
+
+### Architecture
+
+Qwen3-30B-A3B: 36 transformer layers, 48 MoE layers (every even layer is MoE).
+Each MoE layer: 128 experts (top-8 active), `gate_proj` + `up_proj` + `down_proj`
+per expert. Total model size: 56.87 GiB (BF16).
+
+**Training layout**: 10 tiles FSDP2 (XCCL) + 2 vLLM tiles (TP=2), single Aurora node.
+SHM weight sync via `/dev/shm/torchtune/weight_update.raw`.
+
+### MoE Weight Sync Challenge
+
+MoE models have thousands of small per-expert weight tensors (18,867 for Qwen3-30B-A3B).
+Two problems:
+
+1. **vLLM-side**: IPEX's `_IPEXGatedMLPMOEXPU` transposes w13/w2 expert weights in-place
+   during first forward. After that, `weight_loader` cannot handle the post-prepack shapes.
+   `model.load_weights()` on 18,867 individual expert tensors triggers this bug.
+2. **Training-side**: Gathering 18,867 FSDP shards and copying them individually to SHM is
+   slow (high Python dispatch overhead).
+
+### Solution: Fused Expert Weight Sync
+
+Training side fuses per-expert gate+up projections into w13 and keeps down as w2
+before sending to vLLM. This reduces 18,867 params to 531 fused params.
+
+**Training-side flow** (`_sync_weights_to_vllm_shm()` in recipe):
+1. `full_tensor()` gather — all FSDP ranks participate
+2. Inline GPU fuse: as gate/up/down experts arrive for each layer, fuse `torch.cat([gate, up], dim=1)` on GPU, then `.cpu()`
+3. Background thread: `ctypes.memmove()` fused tensors into SHM block
+4. POST metadata to vLLM `/collective_rpc`
+
+**vLLM-side flow** (`load_weights_from_shm()` in `vllm_weight_sync_worker.py`):
+1. Detect fused expert params via regex (`model.layers.N.mlp.experts.w13_weight`)
+2. Route fused experts to `_load_fused_moe_experts()` (bypasses `weight_loader`)
+3. TP-shard experts: slice by `tp_rank * shard_size : (tp_rank+1) * shard_size`
+4. GPU transpose: `.to(device).transpose(1,2).contiguous()` — detects IPEX transpose via shape comparison
+5. `param.data.copy_()` in-place
+
+### Optimization History
+
+**vLLM-side reload** (56.87 GiB, 48 MoE layers):
+
+| Version | Method | Time | Bottleneck |
+|---------|--------|------|------------|
+| v1 | Per-expert tensors (18,867 params) | 82-86s | Stack+TP+transpose per layer |
+| v2 | Pre-fused w13/w2 (531 params) | 62s | CPU transpose ~27 GiB at 20 GB/s = 55s |
+| v3 | GPU transpose | **13s** | `.to(device)` before `.transpose(1,2).contiguous()`, 1.6 TB/s GPU vs 20 GB/s CPU |
+
+**Training-side gather** (FSDP AllGather + fuse + SHM copy):
+
+| Version | Method | Time | Bottleneck |
+|---------|--------|------|------------|
+| v1 | CPU fuse (separate `fuse_experts_for_vllm()`) | 18s | `torch.cat` on CPU for 48 layers = 14s |
+| v2 | Inline GPU fuse during gather loop | **3.3s** | Fuse on GPU as experts arrive; `.cpu()` per-layer |
+
+**End-to-end step time** (step 2 steady-state, max_gen=64):
+
+| Version | G | vLLM reload | Gather | Step total | "Other" |
+|---------|---|-------------|--------|------------|---------|
+| Baseline (per-expert) | 4 | 84s | 4s | 95s | 64s |
+| Pre-fused | 4 | 62s | 4s | ~80s | ~50s |
+| GPU transpose | 4 | 13s | 18s | 50s | 18s |
+| GPU fuse | 4 | 13s | 3.3s | 35.3s | 3.3s |
+| **G=8 (production)** | **8** | **13s** | **3.3s** | **54.8s** | **3.3s** |
+
+G=8 step time is higher (54.8s vs 35.3s) but processes 2× sequences/step → **1.8× throughput** (9.2 vs ~5 tok/s). G=4 OOMs at step 1; G=8 is the only stable config.
+
+### Key Technical Details
+
+**GPU transpose in `_load_fused_moe_experts()`**: IPEX transposes w13/w2 weights
+in-place during `_IPEXGatedMLPMOEXPU.__init__()`. After that first forward, the
+parameter shapes are permanently transposed. The reload function detects this via
+`w13_param.shape[1] != w13_tp.shape[1]` and transposes on GPU. `.to(device)` is a
+no-op if the tensor is already on the correct device (XCCL path).
+
+**Inline GPU fuse**: During the FSDP gather loop, expert tensors stay on GPU. When
+all 3 projections (gate, up, down) for a layer arrive, gate+up are fused via
+`torch.cat([gate, up], dim=1)` on GPU, then moved to CPU. Peak GPU overhead: ~1.9 GiB
+per layer (source + fused result). Non-expert params go straight to `.cpu()`.
+
+**BMM expert forward**: `GroupedExpertsHF` uses scatter-pad-bmm-gather path
+(not sequential per-expert loops). GRPO fwd+bwd across 48 MoE layers: ~23s.
+See `project_bmm_expert_speedup.md` for the 6.3x speedup details.
+
+### XCCL Weight Sync for MoE
+
+XCCL Mode 0 in the recipe also supports fused experts: the gather-into-dict flow
+calls `fuse_experts_for_vllm()` after gathering, then builds the manifest and batches
+from fused names/shapes. The vLLM XCCL receive side routes fused experts to
+`_load_fused_moe_experts()` via the same regex detection.
+
+**Single-node XCCL: BLOCKED** — `full_tensor()` AllGather on 10 FSDP ranks triggers
+UR:40 (IPC handle accumulation exhausts L0 driver cache). Same known issue as 32B dense.
+Only viable in 2-node HSDP mode (5 ranks/node).
+
+### Files Modified (MoE weight sync)
+
+| File | Change |
+|------|--------|
+| `torchtune/dev/vllm_weight_sync_worker.py` | `_load_fused_moe_experts()` with GPU transpose; fused expert routing in `load_weights_from_shm()` and `receive_weights_xccl_streaming()` |
+| `recipes/dev/grpo_full_finetune_distributed_xpu.py` | Inline GPU fuse in SHM path; gather-fuse-batch flow in XCCL Mode 0 |
+| `torchtune/models/qwen3_moe/_convert_weights.py` | `fuse_experts_for_vllm()` utility (used by XCCL path) |
+
+### Validation (2026-04-27)
+
+| Test | Config | Status | Notes |
+|------|--------|--------|-------|
+| SHM + GPU transpose + GPU fuse | 10+2 tiles, G=4, 3 steps | **PASS** | 35.3s/step steady-state; 3.3s gather; 13s vLLM reload |
+| Memory stability | G=4, 3 steps | **PASS** | FLAT at 30.41 GiB between steps |
+| XCCL single-node | 10+2 tiles, step 0-1 | **BLOCKED** | UR:40 at step 2 (IPC handle accumulation) |
+
+### P0/P1 Config Tuning + torch.compile (2026-04-27)
+
+Four sequential tests on a single debug-scaling node, shared vLLM server (TP=2).
+
+| Test | batch | G | fbs | compile | Steps | Step Time | Throughput | Result |
+|------|-------|---|-----|---------|-------|-----------|------------|--------|
+| A (baseline) | 1 | 4 | 4 | False | 1/3 | 50.9s | ~5 tok/s | OOM step 1 |
+| B (batch=2) | 2 | 4 | 4 | False | 0/3 | — | — | OOM step 0 bwd |
+| **C (G=8)** | **1** | **8** | **8** | **False** | **3/3** | **54.8s** | **9.2 tok/s** | **PASS** |
+| D (compile) | 1 | 4 | 4 | True | 0/3 | — | — | SYCL compile timeout |
+
+**Winner: G=8** — 2× RL samples per step, 1.8× throughput vs G=4.
+
+**Test C (G=8) details** (steady-state step 2):
+- TIMING: total=54.8s, gen=7.6s, grpo=43.5s, clip=0.2s, opt=0.2s, other=3.3s
+- GENTIMING (warm): vllm=3.1s, policy_fwd=2.1s, ref_fwd=2.2s
+- Weight sync: gather=3.3s, copy=7.1s (8.1 GB/s), http=14.6s → total=25.0s
+- Memory: peak_resv=62.43 GiB on rank 6 (0.41 GiB free). Stable after step 1.
+
+**Why G=8 survives but G=4 OOMs at step 1**: G=8's larger initial allocation (8 seqs)
+pre-shapes the PyTorch allocator's block pool to match steady-state needs. G=4's smaller
+step 0 allocation (reserved=43.35 GiB) fragments, and step 1 backward can't reuse the
+reserved blocks despite ~20 GiB l0_free — the gap between allocated (30.40) and reserved
+(43.35) is 13 GiB of unusable fragmented blocks.
+
+**Why batch=2 is worse than G=8 (both produce 8 sequences)**: batch=2 stores 2 prompts +
+8 completions (different memory layout); G=8 stores 1 prompt + 8 completions. The extra
+prompt storage and different allocation pattern pushes batch=2 into OOM during step 0
+backward.
+
+**FSDP communication dominance**: GRPO fwd+bwd = 42.8-43.5s for 8 sequences. Of this,
+~85% is AllGather/ReduceScatter for 30B total params (~122 GB per fwd+bwd). Only ~5-7s
+is actual compute (MoE expert BMM + attention). Expert Parallelism is the only path to
+reduce communication volume (from ~122 GB to ~13 GB for attention+router only).
+
+### torch.compile on MoE — Impractical on XPU
+
+torch.compile is not viable for MoE training on XPU due to SYCL compilation overhead:
+
+- **Full model** (48 layers including experts): 500+ SYCL kernel modules compiled over
+  25+ minutes. Never finished within 1-hour job walltime. `L0 build module failed` /
+  `IGC: Internal Compiler Error` when processes were killed.
+- **Attention-only** (with `@torch.compiler.disable` on `GroupedExpertsHF.forward` and
+  `GroupedExperts.forward`): 144 kernels compiled before walltime expired. ~75% fewer
+  kernels but still too slow — each SYCL C++ kernel requires an `icpx` invocation.
+
+**Root cause**: The XPU inductor backend generates SYCL C++ source that must be compiled
+by `icpx`. This is fundamentally slower than Triton's PTX generation on CUDA. For 48
+transformer layers × 10 ranks, hundreds of unique compiled graphs are generated. Not a
+graph complexity issue — even attention-only compilation is impractical.
+
+**Current state**: `@torch.compiler.disable` decorators remain on both expert forward
+methods (`torchtune/models/qwen3_moe/_experts.py`, `torchtune/modules/moe/experts.py`).
+These prevent wasted compilation time if `compile=True` is passed, though compile remains
+impractical for the non-expert layers too on XPU.
+
+**Recommendation**: Do not use `compile=True` for MoE models on XPU. The 6.3× BMM
+speedup from scatter-pad-bmm-gather is the best compute optimization available. Further
+gains require Expert Parallelism to cut communication overhead.
+
+Report: `docs/reports/moe_p0p1_experiments_20260427.md`
+
+### Launcher
+
+```bash
+# SHM weight sync (production) — use G=8 config
+experiments/qwen3_moe/run_grpo_e2e.sh
+
+# P0/P1 experiment tests
+experiments/qwen3_moe/run_moe_p0p1_tests.sh
+
+# XCCL weight sync (blocked on single-node)
+experiments/wsync/run_moe_xccl_test.sh
+```
+
+Config: `recipes/configs/dev/production/qwen3_30b_a3b_grpo_xpu.yaml`
+
+---
+
+## Gemma4 26B-A4B Expert Parallelism (paused at v154; see Qwen3 EP for active work)
+
+Status and implementation notes for Expert Parallelism (EP) on Gemma4 26B-A4B,
+EP=4/DP=3 on 12 tiles per node. **EP for Gemma4 is paused** — see "Backward
+Dispatch Saga" and "v154 Result" below for the autograd-ordering and router-
+determinism blockers. Active EP work is on Qwen3-30B-A3B (later in this doc).
+
+## Goal (revised 2026-04-22, audit)
+
+Original aim was to partition 128 experts × 4 EP → 32 experts/tile, claimed at
+~3 GiB/tile savings. The "Memory Model" section below shows that claim does not
+hold once non-expert FSDP2 becomes coarser (3-rank vs 12-rank), and the only
+end-to-end measurement so far (April 11, batch=1, grpo_samples=2) showed EP=4
+**2.6× slower** than EP=1 across every phase (gen 2.2×, grpo 2.4×, opt 24×
+because expert AdamW runs on CPU). EP becomes interesting only at batches large
+enough to amortize dispatch latency *and* once the autograd/IPC blockers below
+are resolved. Until then the headline savings claim is retracted.
+
+Topology: `dp_replicate=3 × dp_shard=4` on 12 tiles. The `dp_shard` submesh
+doubles as the EP communicator group — the same 4 ranks handle both FSDP
+sharding of non-expert parameters and Expert Parallel token dispatch.
 
 ---
 
@@ -143,7 +350,11 @@ not `.values()`.
 
 ---
 
-## Setup Sequence (CRITICAL Ordering)
+## Setup Sequence (current as of v158+)
+
+The original recipe in this section called `apply_ep_weight_sharding` after
+`load_state_dict`. That has been replaced. The current path (recipe lines
+~1815-2240 in `recipes/dev/grpo_full_finetune_distributed_xpu.py`) is:
 
 ```python
 # 1. Build 2D mesh
@@ -152,33 +363,55 @@ dp_mesh = init_device_mesh(device.type, (dp_replicate, dp_shard),
 ep_mesh = dp_mesh["dp_shard"]
 
 # 2. Eager process group initialization (prevents XCCL deadlock in forward hooks)
-_ = ep_mesh.get_group()          # ep_mesh is 1D
-_ = dp_mesh.get_all_groups()     # dp_mesh is 2D — must use get_all_groups(), NOT get_group()
+_ = ep_mesh.get_group()
+_ = dp_mesh.get_all_groups()
 dist.barrier()
 
 # 3. Build model on meta device
 with training.set_default_dtype(torch.bfloat16), torch.device("meta"):
-    model = gemma4_26b_a4b()
+    model = gemma4_26b_a4b()  # or qwen3_30b_a3b
 
-# 4. Apply EP hooks (stores _ep_device_mesh, registers forward hooks)
-ep_plan = gemma4_ep_plan(model)
+# 4. Pre-FSDP2 meta-param shrinking: replace expert nn.Parameter shapes on the
+#    meta model so each rank only materializes its EP shard. The full-checkpoint
+#    state_dict is then **pre-sliced** at load-time (model_sd[..., ep_rank_slice])
+#    instead of being loaded full and then sharded post-hoc. This sidesteps the
+#    pre-shard memory peak that killed earlier versions.
+#    (Code: `_shrink_ep_meta_params()` and the model_sd pre-slice block in the
+#     recipe init flow.)
+
+# 5. Apply EP hooks (registers _token_dispatch / _token_combine pre/post hooks)
+ep_plan = gemma4_ep_plan(model)            # or qwen3_moe_ep_plan(model)
 parallelize_module(model, ep_mesh, ep_plan)
 
-# 5. Stage checkpoint to /tmp (rank 0 copies, barrier, all ranks load)
+# 6. Stage checkpoint to /tmp (rank 0 copies, barrier, all ranks load)
 if rank == 0:
-    shutil.copy2(LUSTRE_CKPT, TMP_CKPT)   # ~62s vs 357s from Lustre with 12 concurrent readers
+    shutil.copy2(LUSTRE_CKPT, TMP_CKPT)
 dist.barrier()
 
-# 6. Materialize model on XPU and load checkpoint
+# 7. Materialize model on XPU and load the (pre-sliced) checkpoint
 model.to_empty(device=device)
 sd = checkpointer.load_checkpoint()
 model.load_state_dict(sd["model"], strict=False)
 
-# 7. Slice expert weights to local EP shards (PRE-FSDP2)
-apply_ep_weight_sharding(model)
+# 8. Layered FSDP2:
+#    - Non-expert params: fully_shard on dp_replicate (3 ranks),
+#      reshard_after_forward=False (ZeRO-2). Disjoint from ep_mesh ranks.
+#    - Expert params: trivial 1-rank "solo" FSDP2 with reduce_grads=False
+#      (pure local wrapping; no comm). Silences ze_handle_manager crashes
+#      on 1-rank reduce_scatter.
+#    - All FSDP2 groups have reduce_grads=False (suppressed). Gradient sync
+#      is done post-backward by `_ep_post_backward_grad_sync_xccl()` over
+#      an explicit `_XCCL_DP_REP_PG`.
 
-# 8. shard_model() / FSDP2 — see "FSDP2 integration" below
+# 9. EP collectives (AG/RS/NTPE-AG) use **gloo CPU-bounce** (`_GLOO_EP_PG`,
+#    a per-EP-group gloo PG separate from `_GLOO_DP_SHARD_PG`). XCCL is NOT
+#    used in the EP dispatch path; see _ep_all_gather/_ep_reduce_scatter in
+#    `torchtune/modules/moe/_parallelism.py`.
 ```
+
+`apply_ep_weight_sharding` (post-load slicing) is no longer called from the
+recipe — the pre-FSDP2 meta-param + state_dict pre-slice replaces it. The
+function still exists for unit tests and ad-hoc scripts.
 
 ---
 
@@ -214,7 +447,13 @@ if "torchtune" not in sys.modules:
 
 ---
 
-## Validation Status (April 10, 2026)
+## Validation Status (setup-phase only — see v141+ sagas for end-to-end)
+
+These tests cover **module-level setup correctness**, not end-to-end training.
+End-to-end EP=4/DP=3 GRPO training is **not** validated on either Gemma4 (paused
+at v154 on ScatterAddBackward0 router-determinism) or Qwen3 (v1–v7, train-fwd
+PDE crash). The "Backward Dispatch Saga" and "Qwen3-30B-A3B Expert Parallelism
+— v1–v7" sections are the authoritative status for any EP work.
 
 | Test | Config | Status | Notes |
 |------|--------|--------|-------|
@@ -224,7 +463,10 @@ if "torchtune" not in sys.modules:
 | Import smoke test | EP=4, 4 tiles | **PASS** | |
 | All-to-All forward | EP=4, 4 tiles | **PASS** | |
 | EP=2 vs replicated | EP=2, 2 tiles | **PASS** | Bit-exact match (max_err=0.0) |
-| 12-tile forward pass | EP=4/DP=3, 12 tiles | **PASS** | See results below |
+| 12-tile forward pass | EP=4/DP=3, 12 tiles | **PASS (setup only)** | See results below |
+| Gemma4 EP=4/DP=3 GRPO end-to-end | 12 tiles | **BLOCKED** | v154 ScatterAddBackward0 ±1; see Backward Dispatch Saga |
+| Qwen3 EP=4/DP=3 GRPO end-to-end | 2-node 12+12 | **BLOCKED** | v1-v7 train-fwd PDE; never reached `loss=` |
+| EP=1 (replicated) vs EP=4 throughput | batch=1, G=2 | **EP=4 is 2.6× SLOWER** | April 11; see new throughput section above |
 
 ### 12-tile forward pass results (test_ep_model_setup.py)
 
@@ -250,38 +492,40 @@ optimizer states are the dominant factor.
 
 ---
 
-## FSDP2 + EP Communicator Conflict
+## FSDP2 + EP Communicator Layering (resolved)
 
-Running FSDP2 all-gather (12-rank `dp_mesh` group) and EP All-to-All (4-rank `ep_mesh`
-group) concurrently during a single forward pass causes XCCL deadlock on Aurora.
-Symptoms: all 12 ranks spin at 92–97% CPU (XCCL busy-wait), no system calls, no progress.
+The earlier section claimed FSDP2 was "skipped" — that workaround is **gone**.
+The recipe now uses a layered scheme that prevents the XCCL group-conflict
+without disabling FSDP2:
 
-The conflict arises because FSDP2 prefetches the next layer's all-gather while the current
-layer's EP all-to-all is in-flight, and XCCL can't interleave operations across different
-communicator groups.
+- **Non-expert params**: FSDP2 on `dp_replicate` (3 ranks),
+  `reshard_after_forward=False`. The shard group is disjoint from the `ep_mesh`
+  ranks, so FSDP AllGather and EP collectives never share a communicator.
+- **Expert params**: trivial 1-rank "solo" FSDP2 with `reduce_grads=False` —
+  pure local wrapping, no inter-rank comm. Used only to silence the
+  `ze_handle_manager` crash that 1-rank reduce_scatter hits on Aurora.
+- **All FSDP2 `reduce_grads` are suppressed.** Gradient sync runs after backward
+  via `_ep_post_backward_grad_sync_xccl()` on an explicit `_XCCL_DP_REP_PG`.
+- **EP collectives use gloo CPU-bounce.** `_GLOO_EP_PG` is a per-EP-group gloo
+  PG, separate from `_GLOO_DP_SHARD_PG` (which carries FSDP grad sync). Sharing
+  one gloo communicator caused sequence-number collisions at op #259 (v152).
+  See `torchtune/modules/moe/_parallelism.py` `_ep_all_gather`/`_ep_reduce_scatter`
+  and the v152→v153 entries below.
 
-**Current workaround**: FSDP2 is skipped in the 12-tile forward pass test.
-
-**Solutions for training integration** (in order of preference):
-
-1. **Wrap non-expert params on `dp_replicate` mesh only (3 ranks)**
-   FSDP2 all-gather runs within a 3-rank group; EP all-to-all runs within a 4-rank group.
-   No overlap. Non-expert memory savings are 3× (vs 12× without EP). Expert params
-   are already EP-partitioned (4×) and can be FSDP-wrapped separately on `ep_mesh`.
-
-2. **Sequential FSDP scheduling** (`reshard_after_forward=False`)
-   Disables FSDP prefetch, forcing all-gather to complete before the next layer starts.
-   Eliminates overlap but reduces throughput.
-
-3. **Skip FSDP2 for experts, use FSDP2 on `dp_replicate` for all other params**
-   Expert params don't participate in FSDP2 at all — they're sliced by EP, gradient
-   reduction happens via the EP all-to-all backward. Clean separation.
+This layering eliminates the XCCL communicator-conflict mode that motivated
+the original "skip FSDP2" workaround. The remaining EP blockers (op #259
+desync, ScatterAddBackward0 mismatch, train-fwd PDE) are autograd / IPC
+issues, not FSDP2 conflicts.
 
 ---
 
-## Memory Model
+## Memory Model — net-neutral, not net-positive
 
-Without any FSDP2 (current test state):
+Earlier versions of this section claimed EP=4 saves ~3 GiB/tile vs EP=1. The
+v17/v40 runtime data and the April 11 EP=1 vs EP=4 benchmark contradict that
+at the achieved configuration.
+
+Without any FSDP2 (initial setup-only test state):
 
 | Component | EP=1 | EP=4 (no FSDP2) |
 |-----------|------|-----------------|
@@ -300,23 +544,48 @@ With FSDP2 on `dp_replicate` (3-rank) for non-expert params (training target):
 | Activations (training) | ~4.5 GiB | ~4.5 GiB |
 | **Estimated peak** | ~20.7 GiB | ~24.0 GiB |
 
-EP=4 peak may be slightly higher than EP=1 in the param+optimizer breakdown because
-non-expert FSDP sharding is coarser (3-rank vs 12-rank). The benefit is in
-**load balancing** and enabling larger effective batch sizes without expert OOM.
+The 3 GiB/tile expert savings are consumed by +2.1 GiB coarser non-expert FSDP
+and +4.2 GiB expert optimizer state on the EP path. Net memory at the achieved
+configuration is **roughly neutral** — not the headline savings the earlier
+section advertised. EP only wins memory once the configuration enables a batch
+size EP=1 cannot fit; that crossover has not yet been measured.
+
+---
+
+## EP=1 vs EP=4 throughput (April 11 benchmark — strictly worse at small batch)
+
+This finding lived only in `project_ep_implementation.md`; surfaced here so it
+isn't missed by anyone reading the doc to plan EP work.
+
+At batch=1, grpo_samples=2 (before the BWD blockers resurfaced):
+
+| Phase | EP=1 | EP=4 |
+|-------|------|------|
+| gen | 60.2s | 131s (2.2×) |
+| grpo | 31.2s | 74s (2.4×) |
+| opt | 1.6s | 39s (24× — expert AdamW on CPU) |
+| **total** | **93s** | **246s (2.6×)** |
+
+EP=4 is **strictly worse** at small batches, end-to-end. The 24× opt-phase
+penalty alone dwarfs any communication savings. EP only becomes interesting
+once the batch is large enough that expert GEMM dominates dispatch latency
+**and** AdamW for the expert shards can move back to GPU. Neither has been
+measured. "≤+10% step time" from the earlier "What's Next" target was based
+on no data — disregard until a fresh benchmark exists.
 
 ---
 
 ## What's Next
 
-1. **FSDP2 integration**: wire `shard_model()` to use `dp_replicate` mesh for non-expert
-   params, and wrap expert modules separately on `ep_mesh`. Validate no deadlock.
-
-2. **GRPO recipe wiring**: update `grpo_full_finetune_distributed_xpu.py` to accept
-   `expert_parallel_degree` config, build the 2D mesh, apply EP hooks, call
-   `apply_ep_weight_sharding`, then call `shard_model`.
-
-3. **Full EP=4/DP=3 GRPO benchmark**: step time and peak memory vs EP=1 baseline
-   (24.5 s/step, 20.66 GiB). Target: memory neutral-to-better, step time ≤ +10%.
+1. **Resolve the EP backward blockers** (Gemma4: router-determinism in AC
+   recompute, see v154 below; Qwen3: train-fwd L0 IPC pressure, see v1–v7
+   below). Until at least one of these unblocks `loss=`, every other priority
+   is downstream.
+2. **Re-benchmark EP=1 vs EP=4 at a batch size large enough to amortize
+   dispatch** — current data only covers grpo_samples=2 where EP=4 is 2.6×
+   slower. Find the crossover or confirm there isn't one on this hardware.
+3. **Move expert AdamW back to GPU** if memory allows. The 24× opt-phase
+   penalty in the EP=4 column above is entirely CPU optimizer overhead.
 
 ---
 
@@ -625,10 +894,12 @@ Re-prioritized after the 2026-04-22 audit (hypothesis 1 closed, 3 closed,
    after the cheap experiments are exhausted. This is the largest change and is only
    worth attempting once the cheap fixes are ruled out.
 
-**Do not** retry XCCL for AG/RS with the arena/caching USM allocator — the IPC
-sub-allocation bug bites at 26B+ scale (`feedback_alloc_conf_env_var.md`). The
-4× CPU-bounce tax is the price of stability at this model size and is not the
-bottleneck for an algorithm that doesn't run.
+**Do not** retry XCCL for AG/RS with the **arena** USM allocator — its slab
+sub-allocation causes `zeMemGetIpcHandle` to return the slab base pointer,
+not the sub-offset, triggering GPU page faults at 26B+ scale. The **caching**
+allocator (`usm_caching_alloc.so`) does NOT sub-allocate — each pooled block
+is a standalone `sycl::malloc_device` call with a valid IPC handle. The caching
+allocator is production-ready at 3B and under validation at 32B.
 
 ### 8. What the doc should say but doesn't
 
@@ -743,3 +1014,99 @@ target. Hold-node 8445872 was returned without further launches.
 **Status.** v154 hypothesis on collective-ordering desync confirmed. Router-
 recompute determinism is the next blocker. No more compute until we pick one
 of fixes 1–3 above.
+
+---
+
+## Qwen3-30B-A3B Expert Parallelism — v1–v7 (2026-04-28)
+
+First end-to-end EP=4/DP=3 attempts on the new Qwen3MoE infrastructure.
+Architecture: 2 nodes, 1 vLLM (3×TP=4) + 1 train (12 tiles EP=4/DP=3). Recipe
+`recipes/dev/run_qwen3_30b_ep4_vllm_2node.sh` calls the standard GRPO recipe
+with `qwen3_30b_a3b_grpo_ep4_xpu.yaml`. PBS jobs 8453156 (v1/v2) and 8453205
+(v3-v7).
+
+### Why this works where Gemma4 didn't (so far)
+
+The Qwen3MoE codepath sidesteps every Gemma4 v141-v161 blocker:
+
+| Gemma4 blocker | Qwen3 status |
+|----------------|--------------|
+| BWD desync at op #259 (autograd hook ordering) | Not seen — fwd lockstep across 12 ranks |
+| ScatterAddBackward0 ±1 mismatch (router non-determinism in AC recompute) | Not seen — `Qwen3MoeTransformerLayer` puts MoE outside AC, so no router recompute |
+| AsymmetricAG-BWD deadlock (v158) | Not reached — crashes before bwd starts |
+| Reentrant AC tie-flip | N/A — `use_reentrant=False` from the start |
+
+Qwen3 EP forward through ref/policy passes (no_grad, chunked) is reliable and
+clean. **Failure mode is new and isolated to the train fwd.**
+
+### v1-v7 result table
+
+| Run | Knob | Furthest op (train fwd) | Crash | Notes |
+|-----|------|-------------------------|-------|-------|
+| v1 | baseline (gloo timeout 120s) | ~op #100 | gloo timeout | `XPU_USM_ALLOC_SO` leaked from held shell |
+| v2 | gloo timeout 1800s + per-phase timing | op #427, layer ~13 | banned:1 PDE | coll= grew 19s→134s/layer monotonically |
+| v3 | Tier 1: `CCL_ZE_CACHE=65536`, `unset XPU_USM_ALLOC_SO`, `gc:0.99` | op #425 | banned:1 PDE | coll= flat ~10s — gloo pressure fixed; PDE not |
+| v4 | + `torch.xpu.synchronize()` after H2D in EP collectives | op #427 | banned:1 PDE | Async H2D use-after-free disproven |
+| v5 | `forward_batch_size=4` (no chunking) | pass-2 OOM @ 60.83 GiB | clean Python OOM | Ranks 3/7/11 first → expert-load imbalance |
+| v6 | `max_generated_tokens=128→64` (½ acts) | op #439, layer ~27 | banned:0 PDE | First time past v3's #425 — looked memory-bound |
+| v7 | `max_gen=32 grpo_samples=4→2` (¼ acts vs v3) | op #253-equiv, layer ~30 | banned:1 PDE | 4× reduction → only +3 layers; **memory hypothesis disproven** |
+
+### What we ruled out
+
+1. **Gloo CPU pressure** (v3): the 134s coll= escalation was the fixable part —
+   `CCL_ZE_CACHE=65536` + `unset XPU_USM_ALLOC_SO` + `gc:0.99` collapses it to
+   flat 10s/layer. But the GPU PDE crash persists, so gloo pressure was a
+   correlated symptom, not the cause.
+2. **Async H2D use-after-free in EP collectives** (v4): adding
+   `torch.xpu.synchronize()` after the gloo→XPU H2D copy in `_ep_all_gather` /
+   `_ep_reduce_scatter` did not change the crash.
+3. **No_grad → grad transition** (v5): turning off chunking gave a clean
+   Python OOM in pass 2 (the policy fwd), not a banned:1 — so the
+   `with torch.no_grad():` exit isn't the trigger.
+4. **Pure activation memory pressure** (v7): a 4× activation reduction relative
+   to v3 (max_gen 128→32 + grpo_samples 4→2) gained only ~3 layers vs v6's 2×
+   reduction (layer 27→30). With proportional scaling we would have expected
+   layer ~41. Diminishing returns rule out pure memory.
+5. **Saved-tensor pinning of bounce-CPU buffers**: confirmed by reading
+   `_AllGatherRS` and `_ReduceScatterAG` in `torchtune/modules/moe/_parallelism.py`
+   — both save **only `ctx.group`**, no tensors. Backward recomputes via the
+   inverse collective from `grad_output` only.
+
+### What we know for sure
+
+- Crash is always in the **train fwd** (ref + policy fwds run no_grad and
+  succeed every time on the same EP code path).
+- Crash address is in the L0 IPC range (`0xff01...`), not the standard USM
+  device range (`0xff00...`).
+- Crash position scales weakly with activation size — implying it's correlated
+  with how much state autograd holds across EP collectives, not the activation
+  bytes themselves.
+- The recipe's own `device_empty_cache` is monkey-patched to no-op on XPU —
+  not a confound here.
+
+### Working hypothesis (v8 candidate)
+
+L0 IPC handle pressure accumulates only when autograd builds its graph over EP
+collectives. Each `_AllGatherRS.forward` / `_ReduceScatterAG.forward` registers
+the gloo SHM IPC handles needed for the (eventual) gloo→XPU bounce; with 48
+MoE layers × 2 EP collectives × 5 fwd passes per GRPO step that's ~480 IPC
+handle registrations per training step. `CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD=65536`
+helps but apparently isn't enough when autograd is also live.
+
+**Next experiment (v8)**: force the EP gloo PG onto pure TCP-loopback transport
+(no SHM IPC). Suspect knobs: `GLOO_DEVICE_TRANSPORT=tcp`, `GLOO_USE_LIBUV=1`,
+or wiring the EP PG explicitly through `dist.new_group(..., backend="gloo",
+pg_options=ProcessGroupGloo.Options(devices=[create_tcp_device]))`. If TCP-only
+also crashes, the IPC pressure is upstream (CCL/FSDP sharing the L0 IPC pool).
+
+### Files of record
+
+- Launcher (per-run): `experiments/ep_parallelism/hold_qwen3_ep_v{1-7}.sh`
+- Output logs (per-run): `experiments/ep_parallelism/hold_qwen3_ep_v{1-7}.out`
+- Common training launcher: `recipes/dev/run_qwen3_30b_ep4_vllm_2node.sh`
+- vLLM server launcher: `recipes/dev/run_qwen3_30b_vllm_server.sh`
+- Config: `recipes/configs/dev/experimental/qwen3_30b_a3b_grpo_ep4_xpu.yaml`
+- EP collective definitions: `torchtune/modules/moe/_parallelism.py:193-227`
+  (`_AllGatherRS`, `_ReduceScatterAG`)
+- EP plan: `torchtune/models/qwen3_moe/_parallelism.py` (`qwen3_moe_ep_plan`)
+- Memory entries: `project_qwen3_ep_v1_v2.md`, `project_qwen3_ep_v3_v7.md`

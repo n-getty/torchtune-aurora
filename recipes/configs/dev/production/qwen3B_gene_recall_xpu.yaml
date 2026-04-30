@@ -72,11 +72,13 @@ gene_reward_metric: f1
 # kl_coeff=0.01 caused exponential KL spikes (peaked at 70); 0.1 suppresses runaway divergence.
 # grpo_samples=4→8: more rollouts per prompt → better group baseline → lower advantage variance.
 # batch_size=2: keep to focus budget on rollout quality over theme diversity.
-# forward_batch_size=16: must be >= batch_size(2) × grpo_samples(8) = 16 → single fwd pass.
-# Peak memory with AC: ~22-24 GiB active (was 11-12 GiB with grpo_samples=4). Well within budget.
+# forward_batch_size=4: processes 16 total sequences (batch=2 × grpo_samples=8) in 4 chunks of 4.
+# TORCHTUNE_USE_CHUNKED_LOSS=1 required for chunked forward; grads accumulated before single BWD.
+# Peak memory with fbs=16: allocator grows to 62 GiB by step 7 → L0 evicts IPC handles → crash.
+# Peak memory with fbs=4: ~20-25 GiB stable (estimated). See experiments/gene_recall/run_3b_*.out.
 batch_size: 2
 grpo_samples: 8
-forward_batch_size: 16
+forward_batch_size: 4
 max_generated_tokens: 512
 top_k: null
 temperature: 1.0

@@ -21,7 +21,13 @@ class GRPOLoss(nn.Module):
     Currently not validated to perform well.
 
     Args:
-        epsilon (float): clipping range for GRPO update.
+        epsilon (float): lower clipping range for GRPO update (1 - epsilon).
+        epsilon_high (Optional[float]): upper clipping range for GRPO update
+            (1 + epsilon_high). When None, defaults to ``epsilon`` for the
+            symmetric PPO/GRPO clip. Setting ``epsilon_high > epsilon``
+            implements the DAPO-style dual clip, which is useful when the
+            rollout policy lags the training policy by more than one step
+            (off-policy with bounded staleness k > 1).
         kl_coeff (float): KL divergence coefficient (also known as beta).
     """
 
@@ -29,9 +35,11 @@ class GRPOLoss(nn.Module):
         self,
         epsilon: float = 0.1,
         kl_coeff: float = 0.1,
+        epsilon_high: Optional[float] = None,
     ):
         super().__init__()
         self.epsilon = epsilon
+        self.epsilon_high = epsilon if epsilon_high is None else epsilon_high
         self.kl_coeff = kl_coeff
 
     def forward(
@@ -64,7 +72,7 @@ class GRPOLoss(nn.Module):
 
         ratios = torch.exp(pi_logprobs - pi_old_logprobs)  # [B x G, L]
         clipped_ratios = torch.clamp(
-            ratios, 1.0 - self.epsilon, 1.0 + self.epsilon
+            ratios, 1.0 - self.epsilon, 1.0 + self.epsilon_high
         )  # [B x G, L]
 
         advantages = advantages[:, None]  # [B x G, 1]
@@ -108,7 +116,10 @@ class GRPOCompletionLoss(nn.Module):
     Currently not validated to perform well.
 
     Args:
-        epsilon (float): clipping range for GRPO update.
+        epsilon (float): lower clipping range for GRPO update (1 - epsilon).
+        epsilon_high (Optional[float]): upper clipping range for GRPO update
+            (1 + epsilon_high). When None, defaults to ``epsilon`` for the
+            symmetric PPO/GRPO clip. See ``GRPOLoss`` for details.
         kl_coeff (float): KL divergence coefficient (also known as beta).
     """
 
@@ -116,9 +127,11 @@ class GRPOCompletionLoss(nn.Module):
         self,
         epsilon: float = 0.1,
         kl_coeff: float = 0.1,
+        epsilon_high: Optional[float] = None,
     ):
         super().__init__()
         self.epsilon = epsilon
+        self.epsilon_high = epsilon if epsilon_high is None else epsilon_high
         self.kl_coeff = kl_coeff
 
     def forward(
@@ -155,7 +168,7 @@ class GRPOCompletionLoss(nn.Module):
 
         ratios = torch.exp(pi_logprobs - pi_old_logprobs)  # [B x G]
         clipped_ratios = torch.clamp(
-            ratios, 1.0 - self.epsilon, 1.0 + self.epsilon
+            ratios, 1.0 - self.epsilon, 1.0 + self.epsilon_high
         )  # [B x G]
 
         policy_losses_clipped = advantages * clipped_ratios  # [B x G]

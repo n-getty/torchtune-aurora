@@ -134,6 +134,75 @@ context collision.
   deadlock (both sides must enter the PG constructor concurrently)
 - `PrefixStore("wsync", store)` isolates this PG's keys from any other PGs
 
+### 5. 2-hop broadcast — dedicated vLLM (recommended for 32B)
+
+For multi-node configurations where vLLM runs on a separate node, a 2-hop
+broadcast architecture replaces the flat cross-process methods above.
+
+**Architecture (3-node example):**
+```
+Node 0 (vLLM):     TP=4 workers (ranks 1-4 in wsync PG)
+Node 1 (Training):  12 tiles, pure FSDP
+Node 2 (Training):  12 tiles, pure FSDP
+
+Hop 1 (cross-node): Training rank 0 → vLLM TP-0  (2-rank PG, gloo TCP over Slingshot)
+Hop 2 (intra-node):  vLLM TP-0 → TP-1..3          (TP-rank PG, XCCL over XeLink)
+```
+
+**Cross-PG transport** (`WSYNC_CROSS_METHOD`):
+- `gloo` (default): TCP over Slingshot at ~1.3 GB/s. CXI RDMA leak eliminated.
+  Requires `GLOO_SOCKET_IFNAME=hsn0`.
+- `xccl`: XCCL RDMA. On 3-node 24-way, `other` is same ~31s (dominated by FSDP
+  AllGather), but gen on sync steps drops from ~20s to ~12s because vLLM receives
+  weights faster. Leaked CXI MR entries on 2-node (~step 30); 3-node 5/5 clean
+  with 20+ GiB l0_free headroom but long-term stability unproven.
+
+**Intra-PG transport** (`WSYNC_INTRA_METHOD`):
+- `xccl` (default, recommended): XeLink, ~2.2 GB/s for TP=4. Uses GPU tensors directly.
+- `gloo` (fallback): Localhost TCP/SHM, ~0.9 GB/s for TP=4. Requires CPU staging
+  buffers (`_gloo_intra_buf` on non-root, reuses `_gloo_recv_buf` on root).
+
+**Setup** (once, at first weight sync):
+1. Training rank 0 creates a `TCPStore(is_master=True)`
+2. POSTs `init_xccl_communicator` to vLLM's `/collective_rpc` with store info
+3. vLLM workers create per-replica PGs:
+   - Cross-PG: 2-rank (vLLM TP-0 ↔ training rank 0), prefix `wsync_cross_{replica_idx}`
+   - Intra-PG: TP-rank (all TP workers for this replica), prefix `wsync_intra_{replica_idx}`
+4. Training creates matching cross-PGs (one per vLLM replica)
+
+**Per-step sync (deferred broadcast pattern)**:
+```
+Step N:  [...GRPO fwd/bwd...] [opt] [gather → cpu_batches]
+Step N+1: [gen ← vLLM uses old weights] [bg: cross-PG bcast → intra-PG bcast]
+```
+
+Weights gathered at the end of step N are broadcast during step N+1's generation
+phase. With `vllm_weight_sync_interval=2`, broadcast happens every other step,
+further reducing overhead. The deferred pattern hides broadcast latency behind
+generation — measured overhead is ~0.3s on even steps.
+
+**DP>1 per-replica PGs** (implemented 2026-04-28):
+
+When `VLLM_DP > 1`, each vLLM replica gets its own intra-PG and cross-PG:
+- Intra-PG: `intra_size = tp_size_local` (not `world_size - 1`), prefix
+  `wsync_intra_{replica_idx}`
+- Cross-PG: prefix `wsync_cross_{replica_idx}`, guard `tp_rank == 0` (not `my_rank == 1`)
+- Training broadcasts to all cross-PGs in parallel (start all, wait all) for each batch
+
+Without per-replica PGs, a shared intra-PG spanning all replicas deadlocks
+because `/collective_rpc` dispatches per-replica — each replica's TP workers
+enter the broadcast independently, but broadcast requires ALL `intra_size` workers.
+
+**Performance (32B, 3-node 24-way, v11 2026-04-28):**
+
+| Metric | Gloo cross-PG | XCCL cross-PG (2-node) |
+|--------|---------------|------------------------|
+| Cross-node bcast BW | 1.3 GB/s | 7.9 GB/s |
+| Intra-node bcast BW | 2.0 GB/s | 8.0 GB/s |
+| Sync time (61 GiB) | ~47s | ~9.1s |
+| Step time (with all opts) | **32.6s** (deferred) | ~43s |
+| Stability | 20/20 clean (2-node) | 24/24 clean (2-node) |
+
 ---
 
 ## Async Flow
@@ -166,6 +235,21 @@ For 3B, XCCL sync (gather+concat+bcast = 3.1s) completes within the generation
 time (~5s), so `waited ≈ 0` — sync is fully hidden. For 32B, XCCL sync is
 estimated at ~8s (see below), which would also be hidden behind generation
 (~9s).
+
+### Deferred broadcast (2-hop, 3-node)
+
+The 2-hop architecture uses a **deferred broadcast** pattern that hides sync
+latency behind generation:
+
+```
+Step N:   [ gen ] [ GRPO fwd/bwd ] [ opt ] [ gather → cpu_batches ]
+Step N+1: [ gen ←── vLLM uses step N-1 weights ──→ ] [ GRPO ... ]
+          [ bg: cross-PG bcast ─→ intra-PG bcast ]
+```
+
+Weights gathered at end of step N are broadcast during step N+1's generation.
+With `vllm_weight_sync_interval=2`, broadcast only occurs on even steps.
+Measured overhead: ~0.3s on broadcast steps (vs 47s if synchronous).
 
 ---
 
@@ -226,8 +310,111 @@ cross-process XCCL rendezvous overhead.
 - Weight sync (waited): ~13s (SHM) or ~0s (XCCL, estimated)
 - Total: ~22.8 s/step (best config, with SHM wait absorbed into gen time)
 
-**XCCL for 32B has not been validated in production** — see "32B Memory
-Constraints" below for why single-node 32B is currently blocked.
+**XCCL for 32B has not been validated in production** on single-node — see "32B Memory
+Constraints" below. Multi-node 2-hop is the production path (see below).
+
+#### Dedicated vLLM multi-node (2-hop weight sync)
+
+| Config | Sync method | Sync time | Step time | Steps clean |
+|--------|-------------|-----------|-----------|-------------|
+| 2-node (12 train + 12 vLLM), XCCL cross+intra | 9.1s at 7.9 GB/s | ~43s | 24/24 |
+| 2-node, gloo cross + XCCL intra | 47s at 1.3 GB/s | ~67s | 20/20, exit=0 |
+| **3-node 24-way** (24 train + 4 vLLM), gloo cross + XCCL intra, deferred | ~0.3s overhead | **56.1s avg** | **5/5 clean** (v12, fresh L0) |
+| 3-node 24-way, gloo cross + **gloo intra**, deferred | ~0.3s overhead | **72.1s avg** | **5/5 clean** (v13) |
+| 3-node 24-way, gloo cross + XCCL intra, **20-step** | ~0.3s overhead | **53.5s avg** | **20/20 clean, 10/10 syncs** (v14) |
+| 3-node 24-way, **XCCL cross** + XCCL intra | ~0.3s overhead | **53.9s avg** | **5/5 clean** (v16b) |
+| 3-node 24-way, gloo cross, **DP=3 parallel bcast** | ~0.3s overhead | **59.9s avg** | **5/5 clean** (v18) |
+| 3-node 24-way, **pinned CPU buffer**, G=16 fbs=16 | ~0.3s overhead | **~41s avg** | **5/5 clean** (Test A) |
+| 3-node 24-way, **pinned CPU buffer + G=32**, fbs=16 | ~0.3s overhead | **~53s avg** | **5/5 clean** (Test B) |
+| 3-node 24-way, pinned buf, G=16, **max_gen=512** | ~0.3s overhead | **~82s** | **3/3 clean** (Test D). 0.01 GiB free (absolute limit) |
+| 3-node 24-way, pinned buf, **G=64** | — | — | **FAILED** (Test E). XPU kernel bug at batch=64 |
+| 3-node 24-way, pinned buf, G=32, **max_gen=256** | — | — | **OOM step 1** (Test G). CCL external 1.85→13-20 GiB (3 chunks) |
+| 3-node 24-way, pinned buf, G=32, **max_gen=192** | ~0.3s overhead | **~72s** | **3/3 clean** (Test G2). 1.50 GiB free (marginal) |
+| 3-node 24-way, pinned buf, **G=48** | — | — | **HUNG step 1** (Test H). CCL external→15.26 GiB (3 chunks) |
+
+#### Pinned CPU buffer optimization (2026-04-28)
+
+The gather phase (`full_tensor()` → `.to(bf16).contiguous()` → `.cpu()`) was
+31s for 61 GiB at 32B. The bottleneck was 707 synchronous `.cpu()` calls, each
+allocating unpinned memory and blocking on D2H copy, plus 66 `torch.cat()` calls.
+
+**Fix** (`TORCHTUNE_PINNED_CPU_BUF=1`):
+1. Pre-allocate a single 61 GiB CPU buffer with `pin_memory()` (works on XPU)
+2. Replace `.cpu()` with `.copy_(non_blocking=True)` into buffer slices
+3. Eliminate all `torch.cat()` calls — `cpu_batches` entries are zero-copy views
+4. Sync once per batch boundary via `torch.xpu.synchronize()`
+
+| Metric | Baseline | Pinned buffer | Speedup |
+|--------|----------|---------------|---------|
+| Gather time (steady-state) | 31.3s | **3.7s** | **8.5×** |
+| ft (full_tensor AllGather) | 3.2s | 3.5s | — |
+| cast (.to(bf16).contiguous()) | 24.0s† | 0.0s | — |
+| d2h (.cpu() / .copy_) | 4.2s | 0.0s | — |
+| Total step time (G=16, sync interval=2) | ~53.5s | **~41s** | 23% |
+
+† The 24s "cast" time in baseline is actually the AllGather completion — the
+`full_tensor()` dispatch returns in ~3.2s but the actual data arrives during the
+subsequent `.to(bf16).contiguous()` which forces synchronization. With pinned
+buffer, `non_blocking=True` returns immediately and sync is deferred.
+
+**G=32** (`GRPO_SAMPLES=32 FORWARD_BATCH_SIZE=16`): Doubles generation rollouts.
+2 forward chunks per step (32/16=2). Memory tighter (l0_free=4.94 GiB at step 4
+PRE-BWD vs 17.75 GiB at G=16) but stable with 0 retries, 0 OOMs. Per-sample
+throughput: 32/53s = 0.60 samples/s vs 16/41s = 0.39 samples/s → **1.54× improvement**.
+
+**2-Chunk Rule** (discovered 2026-04-29): G/fbs must be ≤ 2. With 3+ forward
+chunks, CCL external memory explodes from ~1.8 GiB to 13-15 GiB at step 1.
+Root cause: FSDP AllGather/ReduceScatter buffer retention across multiple model
+scans — 3 ref_fwd chunks trigger 3 full FSDP scans, and intermediate CCL buffers
+accumulate. Tests G (G=32/max_gen=256, OOM) and H (G=48/max_gen=128, hung) both
+had 3 chunks and showed identical CCL explosion. Test G2 (G=32/max_gen=192, 2
+chunks) survived with 1.50 GiB margin.
+
+**Production config envelope (2026-04-29):**
+
+| Config | Step time | Samples/s | Margin | Status |
+|--------|-----------|-----------|--------|--------|
+| G=16, max_gen=128 | ~41s | 0.39 | 10+ GiB | Safe |
+| **G=32, max_gen=128** | **~53s** | **0.60** | ~5 GiB | **Best throughput** |
+| G=32, max_gen=192 | ~72s | 0.44 | ~1.5 GiB | Marginal |
+| G=16, max_gen=512 | ~82s | 0.20 | ~0 GiB | Limit |
+| G=48+, any | — | — | OOM/hang | Blocked (3+ chunks) |
+| G=64, any | — | — | XPU bug | Blocked (kernel bug at batch=64) |
+
+**3-node step-time comparison (2026-04-28):**
+
+| Step | v12 gloo×+XCCL_i | v13 gloo×+gloo_i | v14 (20-step) | v16b XCCL×+XCCL_i | v18 DP=3 parallel |
+|------|------------------|------------------|---------------|-------------------|-------------------|
+| 0 | 79.8s | 78.1s | 78.4s | 80.6s | 79.2s |
+| 1 | 32.2s | 32.3s | 32.4s | 33.9s | 34.2s |
+| 2 | 68.2s (gen=19.1) | 110.6s (gen=60.9) | 69.4s | 61.9s (gen=11.8) | 75.8s (gen=26.5) |
+| 3 | 29.9s | 29.9s | 30.1s | 31.2s | 31.7s |
+| 4 | 70.4s (gen=20.7) | 109.5s (gen=59.3) | 72.0s | 61.8s (gen=11.8) | 78.4s (gen=28.1) |
+| **Avg** | **56.1s** | **72.1s** | **56.5s** | **53.9s** | **59.9s** |
+
+**Key findings:**
+
+- **v11 crash was stale L0**: Fresh L0 (v12) 5/5 clean, v14 extended to 20/20 steps
+  with 10 successful syncs — XCCL intra is stable. NOT a fundamental XCCL bug.
+- **Gloo intra penalty**: +28.5% step time (0.9 GB/s vs 2.2 GB/s). Penalty is
+  entirely in gen delay on sync steps (vLLM blocked by slower intra broadcast).
+- **XCCL cross-PG (v16b)**: `other` unchanged (~31s, dominated by FSDP AllGather),
+  but gen on sync steps drops from ~20s to ~12s — vLLM receives faster via RDMA.
+  Net: ~2s/step improvement. 5/5 clean on 3-node (20+ GiB l0_free headroom),
+  but long-term CXI MR leak risk unvalidated beyond 5 steps.
+- **DP>1 parallel broadcast (v18)**: Sync-step gen time 26.5s vs 63.6s sequential
+  (v17). But DP>1 avg step (59.9s) > DP=1 avg step (53.9s) because the 3× gloo
+  broadcast overhead outweighs the 3× generation throughput at G=16/max_gen=128.
+  DP>1 benefits kick in at higher generation loads (G=64+, max_gen=512+).
+
+**DP>1 bug fixes (2026-04-28):**
+- **Bug #18: `vllm_tensor_parallel_size` not passed to recipe** — launcher
+  defaulted to tp=1, miscalculating `base_rank` for replicas >0. Replica 1
+  joined `wsync_cross_0` instead of `wsync_cross_1` → timeout. Fixed by adding
+  `vllm_tensor_parallel_size=${VLLM_TP}` to launcher config overrides.
+- **Bug #19: `WSYNC_CROSS_METHOD` hardcoded to gloo** — launcher had
+  `export WSYNC_CROSS_METHOD=gloo` instead of `"${WSYNC_CROSS_METHOD:-gloo}"`.
+  XCCL cross-PG was impossible to enable. Fixed.
 
 #### Colocate-sleep mode (12 tiles, TP=4, DP=3)
 
@@ -399,23 +586,84 @@ vLLM workers → world size should be 3. Fixed: launcher passes
 All training ranks called `_init_xccl_weight_sync()` → only shard leader
 (rank 0) should. Fixed: guard with `if self._is_shard_leader:`.
 
+### 14. XCCL intra-PG broadcast crash (2026-04-28, RESOLVED)
+
+On the second XCCL intra-PG broadcast (after the first deferred broadcast
+completed successfully), vLLM TP worker 2 crashed:
+```
+CCL_ERROR| atl_def.cpp:19 validate: condition comm_rank < comm_size failed
+```
+
+**Root cause: stale L0 device state** from a prior v9 crash on the same nodes.
+Confirmed by v12 test: fresh job with clean L0 state completes 5/5 steps with
+2 successful XCCL intra-PG broadcasts, including surviving the exact failure
+point (2nd sync round after FSDP training activity). NOT a fundamental XCCL bug.
+
+**Mitigation**: Ensure clean process cleanup between jobs (the launcher's
+`pkill -9 -f 'VLLM::'` and `pkill -9 -f 'vllm.entrypoints'` commands).
+
+**Gloo intra-PG fallback** (`WSYNC_INTRA_METHOD=gloo`) was also implemented
+and validated (v13, 5/5 clean) as insurance. Available at 2.4x performance
+cost (0.9 GB/s vs 2.2 GB/s).
+
+### 15. DP>1 intra-PG deadlock (2026-04-28, FIXED)
+
+With `VLLM_DP > 1`, one shared intra-PG (size=world_size-1) spanning all
+replicas caused a deadlock. `/collective_rpc` dispatches per-replica, so each
+replica's TP workers entered the XCCL broadcast independently, but the broadcast
+requires all `intra_size` workers to participate. Fixed: per-replica PGs with
+`intra_size = tp_size_local`.
+
+### 16. Stale vLLM worker processes (2026-04-28, FIXED)
+
+vLLM renames worker processes to `VLLM::Worker_TP*` which evades
+`pkill -f vllm`. Stale workers from crashed runs consume L0 device contexts,
+causing `UR_RESULT_ERROR_OUT_OF_RESOURCES` on subsequent launches. Fixed:
+added `pkill -9 -f 'VLLM::'` to launcher cleanup.
+
+### 17. Infinite health check polling (2026-04-28, FIXED)
+
+`curl -s` with no timeout caused SSH+curl iterations to hang indefinitely during
+vLLM health checks. Fixed: `curl --max-time 5` + `ssh -o ConnectTimeout=5`.
+
+### 18. DP>1 base_rank miscalculation (2026-04-28, FIXED)
+
+Launcher didn't pass `vllm_tensor_parallel_size` to the training recipe. With
+TP=4 vLLM but recipe defaulting to `tp_size=1`:
+- TCPStore `world_size = 1 + 3×1 = 4` (should be `1 + 3×4 = 13`)
+- `base_rank` for replica 1 = 2 (should be 5)
+- vLLM replica 1 computed `replica_idx = (2-1)//4 = 0` instead of 1
+- Replica 1 joined `wsync_cross_0` instead of `wsync_cross_1` → 30-min timeout
+
+Fixed: added `vllm_tensor_parallel_size=${VLLM_TP}` to launcher config overrides.
+
+### 19. WSYNC_CROSS_METHOD hardcoded (2026-04-28, FIXED)
+
+Launcher had `export WSYNC_CROSS_METHOD=gloo` instead of
+`export WSYNC_CROSS_METHOD="${WSYNC_CROSS_METHOD:-gloo}"`. The env var from the
+PBS script was silently overridden, making XCCL cross-PG impossible to enable.
+v16 test ran with gloo cross despite `WSYNC_CROSS_METHOD=xccl` being set.
+
 ---
 
 ## Key Files
 
 | File | Role |
 |------|------|
-| `torchtune/dev/vllm_weight_sync_worker.py` | vLLM worker extension: `load_weights_from_path`, `load_weights_from_raw`, `load_weights_from_shm`, `init_xccl_communicator`, `receive_weights_xccl` |
+| `torchtune/dev/vllm_weight_sync_worker.py` | vLLM worker extension: `load_weights_from_path`, `load_weights_from_raw`, `load_weights_from_shm`, `_load_fused_moe_experts`, `init_xccl_communicator`, `receive_weights_xccl_streaming` |
 | `recipes/dev/grpo_full_finetune_distributed_xpu.py` | Recipe: `_sync_weights_to_vllm()`, `_sync_weights_to_vllm_shm()`, `_init_xccl_weight_sync()`, `_sync_weights_to_vllm_xccl()`, `_wait_for_sync_complete()`, `cleanup()` |
+| `torchtune/models/qwen3_moe/_convert_weights.py` | `fuse_experts_for_vllm()` — fuses per-expert gate+up→w13, down→w2 (used by XCCL path) |
+| `recipes/configs/dev/production/qwen3_30b_a3b_grpo_xpu.yaml` | Qwen3-30B-A3B MoE GRPO config |
 | `recipes/dev/run_grpo_vllm_xpu.sh` | Launcher: sets `VLLM_SERVER_DEV_MODE=1`, `--worker-extension-cls`, `VLLM_GEMMA4` path |
 | `recipes/configs/dev/production/qwen3B_gene_recall_xpu.yaml` | `vllm_weight_sync_method: shm` |
 | `recipes/configs/dev/production/gemma4_31B_gene_recall_xpu.yaml` | `vllm_weight_sync_method: shm` |
 | `recipes/dev/usm_arena_alloc.cpp` | Custom XPU allocator (exact-aligned caching, no arena) |
+| `experiments/multinode_32b/run_32b_3node_24way.sh` | 3-node 24-way FSDP launcher (1 vLLM + 2 training) |
 | `docs/bugs/intel_ccl_expandable_segments_bug.md` | CCL IPC bug reports (expandable_segments + XPUPluggableAllocator) |
 
 ---
 
-## Current Status (2026-04-22)
+## Current Status (2026-04-28)
 
 ### 3B (Qwen2.5-3B / Qwen3-3B)
 
@@ -424,19 +672,42 @@ All training ranks called `_init_xccl_weight_sync()` → only shard leader
 | Best sync method | `xccl` — 3.1s total, fully hidden, 6.2s/step |
 | SHM fallback | Validated — 2.8s total, 1.4s waited, 21s/step |
 | Production config | `vllm_weight_sync_method: shm` (XCCL not yet default) |
-| Gene recall training | 44 steps completed, F1 0→0.405, learning confirmed |
-| Allocator | Default (no custom allocator needed — no OOM at 3B) |
+| Gene recall training | 130 steps clean (job 8449766), peak 43.75% success |
+| Allocator | `usm_caching_alloc.so` (pluggable, prevents late-step banned:1) |
+
+### 30B MoE (Qwen3-30B-A3B)
+
+| Aspect | Status |
+|--------|--------|
+| Best sync method | `shm` + GPU transpose + GPU fuse — 3.3s gather, 13s vLLM reload |
+| Step time | **35.3s** steady-state (10+2 tiles, batch=1, grpo_samples=4, max_gen=64) |
+| Production config | `vllm_weight_sync_method: shm` |
+| XCCL (single-node) | **BLOCKED** — UR:40 (IPC handle accumulation on 10 FSDP ranks) |
+| Memory | FLAT at 30.41 GiB between steps |
+
+**MoE-specific optimizations** (see `docs/features/moe_integration.md` for details):
+- **Fused experts**: 18,867 per-expert params → 531 fused w13/w2 params (training-side fuse)
+- **GPU transpose**: vLLM-side `.to(device).transpose(1,2).contiguous()` — 62s → 13s reload
+- **Inline GPU fuse**: Fuse gate+up on GPU during gather loop — 18s → 3.3s gather
 
 ### 32B (Qwen3-32B)
 
 | Aspect | Status |
 |--------|--------|
-| Best sync method (single-node) | `shm` — 19s total, 13s waited |
-| XCCL (estimated) | ~8s total, ~0s waited — **not validated** at 32B |
-| Single-node blocker | OOM at step 4 (default allocator) or GPU segfault (custom allocator) |
-| Colocate-sleep | 100s/step with v2 weight sync — functional but slow |
-| Multi-node (2-node HSDP) | 66–81s/step, OFI transport, SHM per-node — **production viable** |
-| Best single-node config | G=8/fbs=8, 10+2 tiles, 22.8s/step (3–4 steps before OOM) |
+| Best sync method | 2-hop gloo cross-PG + XCCL intra (dedicated vLLM node) |
+| 2-node gloo cross-PG | 47s sync at 1.3 GB/s, ~67s/step. **20/20 clean, exit=0**. CXI leak eliminated |
+| 2-node XCCL cross-PG | 9.1s sync at 7.9 GB/s, ~43s/step. **24/24 clean** but leaks ~9 MiB/step |
+| **3-node 24-way, gloo×+XCCL_i** | **53.5s avg**. **20/20 clean, 10/10 syncs** (v14). Definitive stability proof |
+| 3-node 24-way, XCCL×+XCCL_i | **53.9s avg**. **5/5 clean** (v16b). Sync-step gen 12s vs 20s |
+| 3-node 24-way, gloo intra | **72.1s/step avg**. **5/5 clean** (v13). Fallback only |
+| 3-node 24-way, **DP=3 parallel** | **59.9s avg**. **5/5 clean** (v18). Benefits at high gen load |
+| 3-node 24-way, **pinned buf + G=32** | **~53s avg, 0.60 samples/s**. **Best throughput config** (Test B, 5/5 clean) |
+| 3-node 24-way, pinned buf, G=32/max_gen=192 | **~72s avg**. **3/3 clean** (Test G2). Marginal (1.50 GiB free) |
+| 3-node 24-way, pinned buf, G=16/max_gen=512 | **~82s**. **3/3 clean** (Test D). At absolute limit (0.01 GiB free) |
+| 3-node 24-way, G=48+ or G=64 | **BLOCKED** — 2-chunk rule (G/fbs>2 → CCL explosion); XPU bug at batch=64 |
+| Single-node (10+2) | **BLOCKED** — IPC handle accumulation at step 2 |
+| Production config | 3-node dedicated vLLM, `vllm_weight_sync_method: xccl`, `WSYNC_INTRA_METHOD=xccl`, **G=32 fbs=16 max_gen=128** |
+| DP>1 per-replica PGs | **Validated** (v17/v18, 2026-04-28). Parallel broadcast implemented |
 
 ### Summary of weight sync evolution
 
@@ -444,40 +715,42 @@ All training ranks called `_init_xccl_weight_sync()` → only shard leader
 path (safetensors)     →  raw_bytes (/dev/shm)  →  shm (POSIX shared mem)  →  xccl (GPU broadcast)
    ~94s (31B NVMe)          ~20s (31B /dev/shm)       ~19s (31B)                ~8s (31B est.)
    ~9s (3B)                 ~9s (3B)                   ~3s (3B)                  ~3s (3B)
+
+MoE extension (Qwen3-30B-A3B):
+per-expert (84s reload)  →  pre-fused (62s)  →  GPU transpose (13s)  →  + GPU fuse (3.3s gather)
+   18,867 params             531 params          CPU→GPU transpose       inline fuse during gather
 ```
 
 Each generation eliminated a bottleneck:
 - `path` → `raw_bytes`: removed safetensors serialization overhead
 - `raw_bytes` → `shm`: removed file read (zero-copy via shared pages)
 - `shm` → `xccl`: removed CPU staging entirely (GPU→GPU broadcast)
+- `xccl` → `2-hop`: cross-node gloo + intra-node XCCL; per-replica PGs for DP>1
+- 2-hop + deferred broadcast: hide sync latency behind generation (interval=2)
+- MoE fused experts: removed per-expert overhead + IPEX shape mismatch bug
+- MoE GPU transpose: moved 27 GiB transpose from CPU (20 GB/s) to GPU (1.6 TB/s)
+- MoE GPU fuse: moved 48-layer `torch.cat` from CPU (14s) to GPU (<1s)
 
 ---
 
 ## Potential Next Steps
 
-### Validate XCCL at 32B scale
+### Validate DP>1 per-replica PGs
 
-XCCL broadcast was validated for 3B (5.75 GiB, 434 params, 3.1s). For 32B
-(59 GiB, ~700 params), the expected time is ~8s at 2.2 GB/s cross-process
-bandwidth. This would eliminate the 13s waited time that SHM incurs. However,
-32B single-node training is currently blocked by the OOM/allocator issue — XCCL
-weight sync can only be validated once training itself is stable.
-
-### Dedicated vLLM node for 32B
-
-Use 1 node (12 tiles) for FSDP training with default allocator, 1 node for
-vLLM. This eliminates vLLM memory contention from the training node, potentially
-avoiding the step-4 OOM. Weight sync would use SHM or raw_bytes to a cross-node
-file path (Lustre or /dev/shm with RDMA). Not yet tested.
-
-### Reduce cross-process XCCL bandwidth gap
-
-Isolated XCCL broadcast achieves 14 GB/s but cross-process only 2.2 GB/s
-(6.4× gap). Investigating whether this is a Level Zero IPC overhead, TCPStore
-rendezvous cost, or XCCL internal serialization.
+Per-replica intra-PG and cross-PG fix is implemented but untested with DP>1.
+Needed for 3-node with multiple vLLM replicas (e.g., TP=4 DP=3 on 12 tiles).
+With N replicas, gloo broadcast is N× sequential — may need concurrent threads
+or increased `vllm_weight_sync_interval`.
 
 ### Default XCCL for 3B production
 
 Switch `qwen3B_gene_recall_xpu.yaml` from `shm` to `xccl`. The XCCL path is
 validated and faster (no CPU staging), but SHM is kept as default until XCCL
 has more production mileage.
+
+### Long-run 32B stability
+
+2-node gloo cross-PG: 20/20 clean but FSDP collectives leak CXI MR entries
+(root cause identified 2026-04-28). Step-28 crash is from FSDP AllGather/ReduceScatter,
+not weight sync. Must prevent caching allocator contraction or wait for Intel
+SHS 13.1.0. Current mitigation: checkpoint-restart at ~step 60-70.

@@ -1,0 +1,121 @@
+# BioReason-Pro 4B GRPO RL fine-tuning on Aurora XPU
+# Model: wanglab/bioreason-pro-sft (Qwen3-4B + ESM3 + GO graph encoder)
+# Algorithm: GRPO with sequence-level advantages (batch-level normalization)
+# Data: wanglab/bioreason-pro-rl-reasoning-data (9.2k examples)
+#
+# Launch (single node, 3 tiles: 2 training + 1 vLLM):
+#   bash experiments/bioreason/run_bioreason_grpo.sh
+# Or manually:
+#   python3 -m torch.distributed.run --standalone --nproc_per_node=2 \
+#       recipes/dev/grpo_full_finetune_distributed_xpu.py \
+#       --config recipes/configs/dev/production/bioreason_4b_grpo_xpu.yaml
+
+name: grpo_bioreason_4b_xpu
+output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/outputs/bioreason_4b_grpo
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+# model_type=bioreason bypasses FSDP checkpointer — instantiates BioReasonModel
+# directly from base_model_path via _setup_bioreason_models().
+model_type: bioreason
+base_model_path: /tmp/torchtune/bioreason-pro-sft
+
+# ── Tokenizer ─────────────────────────────────────────────────────────────────
+# BioReason extends Qwen3 vocab with <|protein_pad|> and <|go_graph_pad|> tokens.
+# _setup_bioreason_models() sets self._tokenizer = model.tokenizer directly.
+# This entry is kept for dataset instantiation (config.instantiate(cfg_dataset, tokenizer)).
+tokenizer:
+  _component_: torchtune.dev.bioreason.bioreason_tokenizer
+  ckpt_dir: ${base_model_path}
+
+# ── Dataset ───────────────────────────────────────────────────────────────────
+dataset:
+  _component_: torchtune.dev.bioreason.bioreason_rl_dataset
+  data_files: /lus/flare/projects/ModCon/ngetty/datasets/bioreason_rl
+  max_seq_len: ${max_seq_len}
+  max_protein_len: 512
+  num_go_tokens: 200
+
+collate_fn: torchtune.dev.bioreason.dataset.bioreason_collate_fn
+
+seed: 42
+shuffle: True
+resume_from_checkpoint: False
+
+# ── RL Hyperparameters ────────────────────────────────────────────────────────
+grpo_samples: 8            # rollouts per prompt (G)
+max_seq_len: 1024          # total context (prompt + completion)
+max_generated_tokens: 512  # max completion length
+temperature: 0.8
+top_k: null                # disabled — nucleus sampling via temperature only
+
+# ── Training ──────────────────────────────────────────────────────────────────
+epochs: 1
+num_steps: 1200             # matches BioReason-Pro paper (1200 total steps)
+ppo_epochs: 1               # inner epochs per trajectory batch
+batch_size: 4               # prompts per batch (effective rollouts = batch_size * grpo_samples = 32)
+forward_batch_size: 4       # chunks for forward/backward (4 seqs at a time)
+gradient_accumulation_steps: 4
+
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 1e-6                  # conservative for RL stability
+  weight_decay: 0.01
+  fused: false              # XPU: fused AdamW not stable
+
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  num_warmup_steps: 50
+
+clip_grad_norm: 1.0
+
+# ── Loss ──────────────────────────────────────────────────────────────────────
+loss:
+  _component_: torchtune.dev.grpo.loss.GRPOSimpleLoss
+  kl_coeff: 0.01
+  epsilon: 0.2
+
+# ── Reward ────────────────────────────────────────────────────────────────────
+reward_mode: bioreason
+
+# ── Distributed (DDP, no FSDP needed for 4B) ─────────────────────────────────
+enable_activation_checkpointing: true
+
+# ── XPU ───────────────────────────────────────────────────────────────────────
+device: xpu
+dtype: bf16
+compile: false
+
+# ── vLLM rollout generation ───────────────────────────────────────────────────
+vllm_mode: colocate_sleep        # 2 training tiles + 1 vLLM tile on same node
+vllm_tensor_parallel_size: 1
+vllm_gpu_memory_utilization: 0.4
+vllm_max_model_len: 2048  # prompt (max_seq_len=1024) + output (max_generated_tokens=512)
+vllm_enable_prompt_embeds: true  # REQUIRED: vLLM receives pre-computed ESM3+GO embeddings
+
+# ── Weight sync ───────────────────────────────────────────────────────────────
+vllm_weight_sync_method: shm     # POSIX shared memory (fast for same-node colocation)
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+log_every_n_steps: 1
+log_peak_memory_stats: true
+save_every_n_epochs: 1
+
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+
+# ── Profiler ──────────────────────────────────────────────────────────────────
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: false
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: true
+  cuda: false
+  profile_memory: false
+  with_stack: false
+  record_shapes: false
+  with_flops: false
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1

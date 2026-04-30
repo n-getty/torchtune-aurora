@@ -1,0 +1,123 @@
+# BioReason-Pro 4B GRPO RL — 2-node asymmetric (HTTP vLLM + prompt_embeds)
+# Phase 2: see memory/project_bioreason_phase2_prototype.md
+#
+# Topology:
+#   Node 0 (TRAIN_NODE): 11 training ranks. FSDP1 SHARD_GRAD_OP across all 11
+#     (server mode: no rank reserved for vLLM). Owns multimodal embedding pipeline
+#     (ESM3 + GO encoder + protein projection + Qwen3 embed_tokens) and ships
+#     final [B*G, T, hidden] embed over HTTP to VLLM_NODE.
+#   Node 1 (VLLM_NODE): 12 vLLM HTTP servers (DP=12, ports 8001-8012, one per tile).
+#     Loads bioreason-pro-sft as plain Qwen3-4B (aux .pt files ignored by vLLM).
+#     Validated 2026-04-29: all 12 reach startup, KV uniform 240-250K tokens.
+#
+# Wire format: base64(torch.save(bf16_tensor)) → POST /v1/completions {prompt_embeds: ...}.
+# Weight sync: raw_bytes path → /dev/shm + /collective_rpc → load_weights_from_raw.
+# Backbone-only: state_dict() filtered to backbone.* and prefix stripped (vLLM has no aux).
+#
+# Launch (from login node, after 2-node hold job is R):
+#   bash experiments/bioreason/run_bioreason_2node_server.sh
+
+name: grpo_bioreason_4b_2node_server
+output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/outputs/bioreason_2node_server_v1
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+model_type: bioreason
+base_model_path: /tmp/torchtune/bioreason-pro-sft
+
+# ── Tokenizer ─────────────────────────────────────────────────────────────────
+tokenizer:
+  _component_: torchtune.dev.bioreason.bioreason_tokenizer
+  ckpt_dir: ${base_model_path}
+
+# ── Dataset ───────────────────────────────────────────────────────────────────
+dataset:
+  _component_: torchtune.dev.bioreason.bioreason_rl_dataset
+  data_files: /lus/flare/projects/ModCon/ngetty/datasets/bioreason_rl
+  max_seq_len: ${max_seq_len}
+  max_protein_len: 128
+  num_go_tokens: 50
+
+collate_fn: torchtune.dev.bioreason.dataset.bioreason_collate_fn
+
+seed: 42
+shuffle: True
+resume_from_checkpoint: False
+
+# ── RL Hyperparameters ────────────────────────────────────────────────────────
+grpo_samples: 4
+max_seq_len: 1024
+max_generated_tokens: 1024
+temperature: 0.8
+top_k: null
+
+# ── Training ──────────────────────────────────────────────────────────────────
+epochs: 1
+num_steps: 1200
+ppo_epochs: 1
+batch_size: 1
+forward_batch_size: 2
+gradient_accumulation_steps: 1
+
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 1e-6
+  weight_decay: 0.01
+  fused: false
+
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  num_warmup_steps: 50
+
+clip_grad_norm: 1.0
+
+# ── Loss ──────────────────────────────────────────────────────────────────────
+loss:
+  _component_: torchtune.dev.grpo.loss.GRPOSimpleLoss
+  kl_coeff: 0.01
+  epsilon: 0.2
+
+# ── Reward ────────────────────────────────────────────────────────────────────
+reward_mode: bioreason
+
+# ── Distributed ───────────────────────────────────────────────────────────────
+enable_activation_checkpointing: true
+
+# ── XPU ───────────────────────────────────────────────────────────────────────
+device: xpu
+dtype: bf16
+compile: false
+force_math_sdpa: false
+
+# ── vLLM rollout (server mode, multi-URL DP=12) ───────────────────────────────
+# vllm_url is filled in at runtime by the launcher (depends on which node PBS gave us).
+# launcher passes: vllm_url=http://VLLM_HOST:8001,http://VLLM_HOST:8002,...,http://VLLM_HOST:8012
+vllm_mode: server
+vllm_weight_sync: true
+vllm_weight_sync_method: raw_bytes
+vllm_weight_sync_interval: 1
+vllm_max_model_len: 2048
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+log_every_n_steps: 1
+log_peak_memory_stats: true
+save_every_n_epochs: 1
+
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+
+# ── Profiler ──────────────────────────────────────────────────────────────────
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: false
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: true
+  cuda: false
+  profile_memory: false
+  with_stack: false
+  record_shapes: false
+  with_flops: false
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1

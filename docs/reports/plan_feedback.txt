@@ -1,0 +1,29 @@
+1. The "Zero-Compute" Overlap Trap
+You noted that the async overlap isn't being realized. This is almost certainly an architectural flaw in how your loop is structured.
+
+If your training loop looks like this:
+
+_wait_for_sync_complete()
+generate()
+grpo_step()
+start_background_sync()
+Then there is zero compute happening between the start and the wait. The loop finishes step 0, kicks off the background thread, immediately loops back to step 1, and hits the _wait wall. It doesn't matter if it's in a background thread; you are joining it before doing any actual work.
+
+The Fix: To get true async overlap, you must adopt the 1-step lag policy we discussed for the 32B model. You move _wait_for_sync_complete() to after generation (or right before you save the next step's weights). This allows the GPUs to spend 30s generating the next batch of trajectories while the previous step's weight sync finishes in the background. (Generating trajectories from a 1-step stale policy is mathematically accounted for by GRPO's KL divergence penalty).
+
+2. The DAOS "Thundering Herd" (mmap Contention)
+You correctly noticed that save (8s) + load (9s) = 17s of work, so why does it take 47s? You hypothesized that the ThreadPoolExecutor might be sequential. While max_workers might be throttling you, the much more severe issue is OS-level contention.
+
+You have 12 vLLM servers on a single node (VLLM_NODE), and you are telling all 12 of them to simultaneously mmap and read the exact same 8.5 GB file directly from DAOS.
+
+12 servers × 8.5 GB = 102 GB of data attempting to cross the network and hit the Linux page cache at the exact same millisecond.
+Because they are all mmaping the same file, the Linux kernel triggers massive page-fault storms. The kernel has to lock pages as they stream in from DAOS, causing severe mmap semaphore contention across the 12 Python processes.
+This OS-level locking and network saturation easily balloons a 9s read into a 47s traffic jam.
+The Fix:
+
+The clean fix: Have one process (or a pre-sync script) on the VLLM_NODE pull the DAOS file into the node-local /dev/shm, and then have your 12 vLLM servers read from that local /dev/shm copy. This reduces your DAOS read traffic by 12x.
+The quick hack: Stagger your ThreadPool HTTP POSTs. Add a time.sleep(0.5) between launching each POST. This prevents the 12 processes from slamming the page cache simultaneously and allows the first reader to warm the cache for the others.
+3. Reward Signal Sanity
+Your assumption here is correct: 5 steps is absolutely not enough to see reward convergence. GRPO requires a massive exploration space, and initially, the model is basically taking random walks around the prompt. The fact that the KL divergence is moving (0.0016 $\rightarrow$ 0.0027) proves the mathematical loop is intact and the weights are successfully shifting.
+
+Conclusion: You have successfully separated the memory pools and proven the architecture works. To reclaim your 45s/step baseline, implement the 1-step lag (move the wait barrier) and stagger your vLLM HTTP POSTs to eliminate the DAOS read contention. Once that's in, you are clear to launch the 4h capacity job.

@@ -134,6 +134,7 @@ class GroupedExperts(nn.Module):
     # TODO: force no inference mode as a hack to get around
     # "Cannot set version_counter for inference tensor"
     @torch.inference_mode(mode=False)
+    @torch.compiler.disable
     def forward(
         self,
         x: torch.Tensor,

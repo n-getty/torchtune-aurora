@@ -39,6 +39,7 @@ class GRPOTrajectory(NamedTuple):
     response_padding_masks: torch.Tensor = None  # [B x G, L]
     seq_lens: torch.Tensor = None
     answers: str = None
+    prompt_embeds: Optional[torch.Tensor] = None  # [B x G, P, H] CPU — multimodal only
 
 
 class GRPOStats(NamedTuple):

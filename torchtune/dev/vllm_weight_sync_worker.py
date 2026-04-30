@@ -36,6 +36,7 @@ Usage:
 """
 import logging
 import os
+import re
 import time
 
 logger = logging.getLogger("vllm_weight_sync_worker")
@@ -169,19 +170,19 @@ class WeightSyncFromFileExtension:
         weight tensors via torch.frombuffer (no copy), then passes them to load_weights()
         which does in-place param.copy_() — no extra GPU allocation needed.
 
+        MoE expert weights bypass model.load_weights() and are copied directly to
+        the fused w13/w2 params. This is necessary because IPEX's GatedMLPMOE transposes
+        the weight data in-place on first forward, making vLLM's weight_loader narrow
+        logic incompatible with the post-prepack shapes.
+
         Args:
             meta: JSON string with keys:
                 shm_name   — POSIX shared memory name (as passed to SharedMemory)
                 total_bytes — total size of the SHM block
                 tensors    — list of {name, shape, dtype, offset, nbytes}
-
-        Key design: tensors are passed as CPU views directly to load_weights().
-        This avoids allocating a second full copy of the model on XPU (which OOMs
-        on 31B models that fill >95% of device memory). vLLM's load_weights does
-        param.copy_(cpu_tensor) in-place — no extra XPU allocation.
-        shm is kept open until after load_weights() so the buffer stays valid.
         """
         import json
+        import re
         import torch
         from multiprocessing.shared_memory import SharedMemory
 
@@ -195,16 +196,12 @@ class WeightSyncFromFileExtension:
 
             weights = []
             for entry in tensors_meta:
-                dtype_str = entry["dtype"]  # e.g. "torch.bfloat16"
+                dtype_str = entry["dtype"]
                 dtype = getattr(torch, dtype_str.split(".")[-1])
                 shape = entry["shape"]
                 offset = entry["offset"]
                 nbytes = entry["nbytes"]
 
-                # Zero-copy view into shared memory pages. frombuffer maps the same
-                # physical RAM — no copy. BF16 stored as int16 for numpy compat.
-                # Do NOT call .to(device) here — that would double XPU memory usage.
-                # load_weights() does param.copy_(cpu_tensor) in-place instead.
                 if dtype == torch.bfloat16:
                     n_elems = nbytes // 2
                     tensor = (
@@ -226,11 +223,30 @@ class WeightSyncFromFileExtension:
             n = len(weights)
 
             t_load0 = time.perf_counter()
-            # shm stays open here — tensors are views into shm.buf, must stay valid
-            self.model_runner.model.load_weights(weights=weights)
+
+            fused_re = re.compile(
+                r"model\.layers\.(\d+)\.mlp\.experts\.(w13|w2)_weight"
+            )
+            fused_data = {}
+            non_expert = []
+            for name, tensor in weights:
+                m = fused_re.match(name)
+                if m:
+                    layer_idx = int(m.group(1))
+                    kind = m.group(2)
+                    fused_data.setdefault(layer_idx, {})[kind] = tensor
+                else:
+                    non_expert.append((name, tensor))
+
+            if non_expert:
+                self.model_runner.model.load_weights(weights=non_expert)
+
+            if fused_data:
+                self._load_fused_moe_experts(fused_data)
+
             t_load = time.perf_counter() - t_load0
 
-            shm.close()  # Release mapping after load_weights — training side owns unlink
+            shm.close()
             del weights
 
             logger.info(
@@ -242,13 +258,69 @@ class WeightSyncFromFileExtension:
             logger.exception("load_weights_from_shm failed")
             return {"status": "error", "message": str(e)}
 
+    def _load_fused_moe_experts(self, fused_data: dict) -> None:
+        """Copy pre-fused MoE w13/w2 weights directly to vLLM params.
+
+        Receives pre-fused tensors from the training side (gate+up already
+        concatenated into w13), so no per-expert stacking is needed. Just
+        TP-shard, detect IPEX transpose, and copy.
+
+        Args:
+            fused_data: {layer_idx: {"w13": tensor, "w2": tensor}}
+                w13: [E, 2*intermediate, hidden]  (gate || up on dim=1)
+                w2:  [E, hidden, intermediate]     (down)
+        """
+        import torch
+        import torch.distributed as dist
+
+        tp_rank = dist.get_rank() if dist.is_initialized() else 0
+        tp_size = dist.get_world_size() if dist.is_initialized() else 1
+
+        params = dict(self.model_runner.model.named_parameters())
+
+        for layer_idx in sorted(fused_data.keys()):
+            w13 = fused_data[layer_idx]["w13"]
+            w2 = fused_data[layer_idx]["w2"]
+
+            inter = w13.shape[1] // 2
+            inter_per_tp = inter // tp_size
+
+            gate_shard = w13[:, tp_rank * inter_per_tp:(tp_rank + 1) * inter_per_tp, :]
+            up_shard = w13[:, inter + tp_rank * inter_per_tp:inter + (tp_rank + 1) * inter_per_tp, :]
+            w13_tp = torch.cat([gate_shard, up_shard], dim=1)
+
+            w2_tp = w2[:, :, tp_rank * inter_per_tp:(tp_rank + 1) * inter_per_tp]
+
+            w13_key = f"model.layers.{layer_idx}.mlp.experts.w13_weight"
+            w2_key = f"model.layers.{layer_idx}.mlp.experts.w2_weight"
+            w13_param = params[w13_key]
+            w2_param = params[w2_key]
+
+            num_experts = w13.shape[0]
+            e_local = w13_param.shape[0]
+            if e_local < num_experts:
+                ep_start = tp_rank * e_local
+                w13_tp = w13_tp[ep_start:ep_start + e_local]
+                w2_tp = w2_tp[ep_start:ep_start + e_local]
+
+            device = w13_param.device
+            is_transposed = w13_param.shape[1] != w13_tp.shape[1]
+            if is_transposed:
+                # Move to GPU before transpose: 1.6 TB/s GPU vs 20 GB/s CPU
+                w13_param.data.copy_(w13_tp.to(device).transpose(1, 2).contiguous())
+                w2_param.data.copy_(w2_tp.to(device).transpose(1, 2).contiguous())
+            else:
+                w13_param.data.copy_(w13_tp)
+                w2_param.data.copy_(w2_tp)
+
     # ------------------------------------------------------------------
     # XCCL broadcast weight sync
     # ------------------------------------------------------------------
 
     def init_xccl_communicator(
         self, host: str, port: int, world_size: int, base_rank: int,
-        use_two_hop: bool = False,
+        use_two_hop: bool = False, wsync_method: str = "xccl_sendrecv",
+        pool_size: int = 0,
     ) -> dict:
         """Create a cross-process XCCL group with the training rank.
 
@@ -264,6 +336,9 @@ class WeightSyncFromFileExtension:
                 training cross-node and then broadcasts intra-node via XeLink,
                 reducing sync time from ~38s (12 sequential Slingshot sends) to
                 ~3s (1 Slingshot send + XeLink broadcast).
+            pool_size: Number of sender ranks in the dynamic sender pool.
+                0 = legacy single sender (rank 0). >0 = create pool_size
+                cross-PGs for rotating sender ranks.
         """
         import torch
         import torch.distributed as dist
@@ -272,7 +347,7 @@ class WeightSyncFromFileExtension:
         try:
             t0 = time.perf_counter()
 
-            # Clean up any stale XCCL pgs from a previous run.
+            # Clean up any stale PGs from a previous run.
             for attr in ('_xccl_pg', '_xccl_cross_pg', '_xccl_intra_pg'):
                 if hasattr(self, attr):
                     try:
@@ -280,15 +355,26 @@ class WeightSyncFromFileExtension:
                     except Exception:
                         pass
                     delattr(self, attr)
+            if hasattr(self, '_xccl_cross_pgs'):
+                for pg in self._xccl_cross_pgs:
+                    try:
+                        pg.abort()
+                    except Exception:
+                        pass
+                del self._xccl_cross_pgs
             self._is_intra_root = False
+            self._gloo_recv_buf = None
 
             device = next(self.model_runner.model.parameters()).device
             tp_rank = dist.get_rank() if dist.is_initialized() else 0
+            tp_size_local = dist.get_world_size() if dist.is_initialized() else 1
             my_rank = base_rank + tp_rank
+            replica_idx = (my_rank - 1) // tp_size_local
             logger.info(
                 "init_xccl_communicator: connecting to %s:%d (world=%d, my_rank=%d, tp_rank=%d, "
-                "device=%s, two_hop=%s)",
-                host, port, world_size, my_rank, tp_rank, device, use_two_hop,
+                "tp_size=%d, replica=%d, device=%s, two_hop=%s, pool_size=%d)",
+                host, port, world_size, my_rank, tp_rank, tp_size_local,
+                replica_idx, device, use_two_hop, pool_size,
             )
 
             import datetime
@@ -299,44 +385,79 @@ class WeightSyncFromFileExtension:
                 is_master=False,
                 timeout=datetime.timedelta(seconds=120),
             )
-            opts = c10d.ProcessGroupXCCL.Options()
             self._xccl_rank = my_rank
             self._xccl_device = device
+            self._xccl_store = store
+            self._wsync_pg_gen = 0
+            self._wsync_pg_reset_interval = int(os.environ.get("WSYNC_PG_RESET_INTERVAL", "0"))
 
             if use_two_hop:
-                # 2-hop design: XCCL send/recv is not supported (hangs); use broadcast.
-                #
-                # Cross PG (size=2): training rank 0 + vLLM rank 1 only.
-                #   broadcast(root=0) sends one cross-Slingshot copy (~2.4s for 61 GiB
-                #   at ~25 GB/s) instead of 12 sequential copies (38s flat broadcast).
-                #   Only vLLM rank 1 joins this PG — other vLLM ranks skip it.
-                #
-                # Intra PG (size=world_size-1): all vLLM ranks.
-                #   broadcast(root=0) distributes intra-node via XeLink (~0.6s).
-                #   Rank 1 (intra_rank=0) is the intra root; it broadcasts after
-                #   receiving from training.
-                intra_rank = my_rank - 1
-                intra_size = world_size - 1
+                intra_rank = tp_rank
+                intra_size = tp_size_local
+                self._wsync_cross_method = wsync_method
+                intra_method = os.environ.get("WSYNC_INTRA_METHOD", "xccl")
+                self._wsync_intra_method = intra_method
 
-                if my_rank == 1:
-                    # Only vLLM rank 1 joins the 2-rank cross PG.
-                    cross_prefixed = c10d.PrefixStore("wsync_cross", store)
-                    self._xccl_cross_pg = c10d.ProcessGroupXCCL(
-                        store=cross_prefixed, rank=1, size=2, options=opts,
-                    )
+                if tp_rank == 0:
+                    if pool_size > 0:
+                        # Dynamic sender pool: create N cross-PGs
+                        self._xccl_cross_pgs = []
+                        for i in range(pool_size):
+                            prefix = f"wsync_sender_{i}"
+                            prefixed = c10d.PrefixStore(prefix, store)
+                            if wsync_method == "gloo":
+                                pg = c10d.ProcessGroupGloo(
+                                    store=prefixed, rank=1, size=2,
+                                )
+                            else:
+                                opts_cross = c10d.ProcessGroupXCCL.Options()
+                                pg = c10d.ProcessGroupXCCL(
+                                    store=prefixed, rank=1, size=2,
+                                    options=opts_cross,
+                                )
+                            self._xccl_cross_pgs.append(pg)
+                            logger.info(
+                                "init_xccl_communicator: cross PG %d/%d created "
+                                "(method=%s)", i, pool_size, wsync_method)
+                        self._xccl_cross_pg = self._xccl_cross_pgs[0]
+                    else:
+                        cross_prefixed = c10d.PrefixStore(f"wsync_cross_{replica_idx}", store)
+                        if wsync_method == "gloo":
+                            self._xccl_cross_pg = c10d.ProcessGroupGloo(
+                                store=cross_prefixed, rank=1, size=2,
+                            )
+                        else:
+                            opts_cross = c10d.ProcessGroupXCCL.Options()
+                            self._xccl_cross_pg = c10d.ProcessGroupXCCL(
+                                store=cross_prefixed, rank=1, size=2,
+                                options=opts_cross,
+                            )
                     self._is_intra_root = True
-                    logger.info("init_xccl_communicator: cross PG ready (rank 1/2, intra root)")
+                    self._gloo_recv_buf = None
+                    logger.info(
+                        "init_xccl_communicator: cross PG ready (rank 1/2, "
+                        "method=%s, pool=%d, intra root)",
+                        wsync_method, pool_size)
 
-                intra_prefixed = c10d.PrefixStore("wsync_intra", store)
-                self._xccl_intra_pg = c10d.ProcessGroupXCCL(
-                    store=intra_prefixed, rank=intra_rank, size=intra_size, options=opts,
-                )
+                intra_prefixed = c10d.PrefixStore(f"wsync_intra_{replica_idx}", store)
+                if intra_method == "gloo":
+                    self._xccl_intra_pg = c10d.ProcessGroupGloo(
+                        store=intra_prefixed, rank=intra_rank, size=intra_size,
+                    )
+                else:
+                    opts = c10d.ProcessGroupXCCL.Options()
+                    self._xccl_intra_pg = c10d.ProcessGroupXCCL(
+                        store=intra_prefixed, rank=intra_rank, size=intra_size,
+                        options=opts,
+                    )
+                self._gloo_intra_buf = None
                 logger.info(
-                    "init_xccl_communicator: intra PG ready (rank=%d/%d, is_root=%s)",
-                    intra_rank, intra_size, self._is_intra_root,
+                    "init_xccl_communicator: intra PG ready (replica=%d, rank=%d/%d, method=%s, is_root=%s)",
+                    replica_idx, intra_rank, intra_size, intra_method, self._is_intra_root,
                 )
             else:
                 # Legacy flat broadcast: training rank 0 broadcasts to all vLLM ranks.
+                opts = c10d.ProcessGroupXCCL.Options()
                 prefixed = c10d.PrefixStore("wsync", store)
                 self._xccl_pg = c10d.ProcessGroupXCCL(
                     store=prefixed, rank=my_rank, size=world_size, options=opts,
@@ -344,7 +465,8 @@ class WeightSyncFromFileExtension:
 
             dt = time.perf_counter() - t0
             logger.info("init_xccl_communicator: ready in %.1fs", dt)
-            return {"status": "ok", "init_s": round(dt, 2), "two_hop": use_two_hop}
+            return {"status": "ok", "init_s": round(dt, 2), "two_hop": use_two_hop,
+                    "pool_size": pool_size}
         except Exception as e:
             logger.exception("init_xccl_communicator failed")
             return {"status": "error", "message": str(e)}
@@ -442,6 +564,11 @@ class WeightSyncFromFileExtension:
             # Legacy per-param mode if no batch_max_numel
             apply_every = manifest_dict.get("apply_every", 64)
 
+            # Select active cross-PG for sender pool
+            sender_index = manifest_dict.get("sender_index", -1)
+            if sender_index >= 0 and hasattr(self, '_xccl_cross_pgs'):
+                self._xccl_cross_pg = self._xccl_cross_pgs[sender_index]
+
             n_params = len(tensors_meta)
             total_elements = sum(e["numel"] for e in tensors_meta)
             gb = total_elements * 2 / 1024**3
@@ -454,6 +581,20 @@ class WeightSyncFromFileExtension:
             if batch_max_numel > 0:
                 # Batched mode: receive one flat tensor per batch, split back into params.
                 # Same greedy split as training side: flush when adding next param exceeds max.
+
+                # Static buffer: reuse the same VA every step so oneCCL registers
+                # the IPC handle once and gets 100% cache hits thereafter.
+                # Size must cover the largest actual batch, which can exceed
+                # batch_max_numel when a single param is larger than the limit
+                # (the greedy split always includes the first param in a batch).
+                max_single = max(e["numel"] for e in tensors_meta)
+                buf_numel = max(batch_max_numel, max_single)
+                if not hasattr(self, '_xccl_recv_buf') or self._xccl_recv_buf is None or self._xccl_recv_buf.numel() < buf_numel:
+                    self._xccl_recv_buf = torch.empty(
+                        buf_numel, device=self._xccl_device, dtype=torch.bfloat16)
+                    logger.info("XCCL recv buf allocated: %d elements, data_ptr=0x%x",
+                                buf_numel, self._xccl_recv_buf.data_ptr())
+
                 i = 0
                 while i < n_params:
                     batch_start = i
@@ -465,35 +606,70 @@ class WeightSyncFromFileExtension:
                         batch_numel += pn
                         i += 1
 
-                    recv_buf = torch.empty(
-                        batch_numel, device=self._xccl_device, dtype=torch.bfloat16,
-                    )
+                    recv_buf = self._xccl_recv_buf[:batch_numel]
                     t_b0 = time.perf_counter()
                     if two_hop:
-                        # 2-hop: rank 1 receives cross-node from training via 2-rank
-                        # broadcast PG, then distributes to all vLLM ranks via intra PG.
+                        intra_method = getattr(self, '_wsync_intra_method', 'xccl')
                         if self._is_intra_root:
-                            self._xccl_cross_pg.broadcast(recv_buf, root=0).wait()
-                            self._xccl_intra_pg.broadcast(recv_buf, root=0).wait()
+                            cross_method = getattr(self, '_wsync_cross_method', 'gloo')
+                            if cross_method == "gloo":
+                                if self._gloo_recv_buf is None or self._gloo_recv_buf.numel() < batch_numel:
+                                    self._gloo_recv_buf = torch.empty(batch_numel, dtype=torch.bfloat16)
+                                    logger.info("gloo recv buf allocated: %d elements", batch_numel)
+                                cpu_recv = self._gloo_recv_buf[:batch_numel]
+                                self._xccl_cross_pg.broadcast(cpu_recv, root=0).wait()
+                                if intra_method == "gloo":
+                                    self._xccl_intra_pg.broadcast(cpu_recv, root=0).wait()
+                                    recv_buf.copy_(cpu_recv)
+                                else:
+                                    recv_buf.copy_(cpu_recv)
+                                    self._xccl_intra_pg.broadcast(recv_buf, root=0).wait()
+                            elif cross_method == "xccl_sendrecv":
+                                self._xccl_cross_pg.recv([recv_buf], 0, 0).wait()
+                                self._xccl_intra_pg.broadcast(recv_buf, root=0).wait()
+                            else:
+                                self._xccl_cross_pg.broadcast(recv_buf, root=0).wait()
+                                self._xccl_intra_pg.broadcast(recv_buf, root=0).wait()
                         else:
-                            self._xccl_intra_pg.broadcast(recv_buf, root=0).wait()
+                            if intra_method == "gloo":
+                                if self._gloo_intra_buf is None or self._gloo_intra_buf.numel() < batch_numel:
+                                    self._gloo_intra_buf = torch.empty(batch_numel, dtype=torch.bfloat16)
+                                    logger.info("gloo intra buf allocated: %d elements", batch_numel)
+                                cpu_buf = self._gloo_intra_buf[:batch_numel]
+                                self._xccl_intra_pg.broadcast(cpu_buf, root=0).wait()
+                                recv_buf.copy_(cpu_buf)
+                            else:
+                                self._xccl_intra_pg.broadcast(recv_buf, root=0).wait()
                     else:
                         self._xccl_pg.broadcast(recv_buf, root=0).wait()
                     t_bcast_total += time.perf_counter() - t_b0
 
-                    # Split flat buffer back into per-param tensors and apply
+                    # Split flat buffer back into per-param tensors, routing
+                    # fused MoE experts to _load_fused_moe_experts (GPU-direct)
                     offset = 0
-                    batch_weights = []
+                    non_expert_weights = []
+                    fused_data = {}
+                    _fused_re = re.compile(
+                        r"model\.layers\.(\d+)\.mlp\.experts\.(w13|w2)_weight"
+                    )
                     for entry in tensors_meta[batch_start:i]:
                         n = entry["numel"]
-                        batch_weights.append(
-                            (entry["name"], recv_buf[offset:offset + n].reshape(entry["shape"]))
-                        )
+                        tensor = recv_buf[offset:offset + n].reshape(entry["shape"])
+                        m = _fused_re.match(entry["name"])
+                        if m:
+                            layer_idx = int(m.group(1))
+                            kind = m.group(2)
+                            fused_data.setdefault(layer_idx, {})[kind] = tensor
+                        else:
+                            non_expert_weights.append((entry["name"], tensor))
                         offset += n
                     t_l0 = time.perf_counter()
-                    self.model_runner.model.load_weights(weights=batch_weights)
+                    if non_expert_weights:
+                        self.model_runner.model.load_weights(weights=non_expert_weights)
+                    if fused_data:
+                        self._load_fused_moe_experts(fused_data)
                     t_load_total += time.perf_counter() - t_l0
-                    del recv_buf, batch_weights
+                    del non_expert_weights, fused_data
 
             else:
                 # Legacy: one broadcast per param
@@ -504,11 +680,33 @@ class WeightSyncFromFileExtension:
                     )
                     t_b0 = time.perf_counter()
                     if two_hop:
+                        intra_method = getattr(self, '_wsync_intra_method', 'xccl')
                         if self._is_intra_root:
-                            self._xccl_cross_pg.broadcast(recv_buf, root=0).wait()
-                            self._xccl_intra_pg.broadcast(recv_buf, root=0).wait()
+                            cross_method = getattr(self, '_wsync_cross_method', 'gloo')
+                            if cross_method == "gloo":
+                                cpu_recv = torch.empty(entry["numel"], dtype=torch.bfloat16)
+                                self._xccl_cross_pg.broadcast(cpu_recv, root=0).wait()
+                                if intra_method == "gloo":
+                                    self._xccl_intra_pg.broadcast(cpu_recv, root=0).wait()
+                                    recv_buf.copy_(cpu_recv)
+                                else:
+                                    recv_buf.copy_(cpu_recv)
+                                    self._xccl_intra_pg.broadcast(recv_buf, root=0).wait()
+                                del cpu_recv
+                            elif cross_method == "xccl_sendrecv":
+                                self._xccl_cross_pg.recv([recv_buf], 0, 0).wait()
+                                self._xccl_intra_pg.broadcast(recv_buf, root=0).wait()
+                            else:
+                                self._xccl_cross_pg.broadcast(recv_buf, root=0).wait()
+                                self._xccl_intra_pg.broadcast(recv_buf, root=0).wait()
                         else:
-                            self._xccl_intra_pg.broadcast(recv_buf, root=0).wait()
+                            if intra_method == "gloo":
+                                cpu_recv = torch.empty(entry["numel"], dtype=torch.bfloat16)
+                                self._xccl_intra_pg.broadcast(cpu_recv, root=0).wait()
+                                recv_buf.copy_(cpu_recv)
+                                del cpu_recv
+                            else:
+                                self._xccl_intra_pg.broadcast(recv_buf, root=0).wait()
                     else:
                         self._xccl_pg.broadcast(recv_buf, root=0).wait()
                     t_bcast_total += time.perf_counter() - t_b0
@@ -517,9 +715,25 @@ class WeightSyncFromFileExtension:
 
                     if len(weights_batch) >= apply_every or idx == n_params - 1:
                         t_l0 = time.perf_counter()
-                        self.model_runner.model.load_weights(weights=weights_batch)
+                        # Route fused MoE experts to GPU-direct path
+                        _fused_re_leg = re.compile(
+                            r"model\.layers\.(\d+)\.mlp\.experts\.(w13|w2)_weight"
+                        )
+                        non_expert = []
+                        fused_leg = {}
+                        for wname, wtensor in weights_batch:
+                            m = _fused_re_leg.match(wname)
+                            if m:
+                                li = int(m.group(1))
+                                fused_leg.setdefault(li, {})[m.group(2)] = wtensor
+                            else:
+                                non_expert.append((wname, wtensor))
+                        if non_expert:
+                            self.model_runner.model.load_weights(weights=non_expert)
+                        if fused_leg:
+                            self._load_fused_moe_experts(fused_leg)
                         t_load_total += time.perf_counter() - t_l0
-                        del weights_batch
+                        del weights_batch, non_expert, fused_leg
                         weights_batch = []
 
             torch.xpu.synchronize(self._xccl_device)
@@ -558,6 +772,7 @@ class WeightSyncFromFileExtension:
                     except Exception:
                         pass
                     delattr(self, attr)
+            self._xccl_recv_buf = None
             logger.info("close_xccl_communicator: XCCL PGs aborted")
             return {"status": "ok"}
         except Exception as e:

@@ -174,15 +174,16 @@ launch_vllm_replica() {
     # which the training recipe calls after saving weights to /tmp as safetensors.
     # This avoids XCCL communicator setup which SIGABRTs on XPU.
     #
-    # For TP>1: needs OFI transport and --distributed-executor-backend mp.
-    # For TP=1: use MPI transport to isolate from training's OFI/CXI fabric.
+    # CCL transport: ofi for both TP=1 and TP>1. Earlier TP=1 path used "mpi"
+    # + CCL_PROCESS_LAUNCHER=None (capital N), which on the current
+    # frameworks/2025.3.1 makes the vLLM EngineCore spawn worker die silently
+    # before logging anything. Validated 2026-04-29: switching to ofi/none
+    # makes vLLM start cleanly on a single tile (Phase 1 async path).
     local EXTRA_VLLM_ARGS=""
-    local VLLM_CCL_TRANSPORT="mpi"
-    local VLLM_CCL_LAUNCHER="None"
+    local VLLM_CCL_TRANSPORT="ofi"
+    local VLLM_CCL_LAUNCHER="none"
     if [ ${VLLM_TP} -gt 1 ]; then
         EXTRA_VLLM_ARGS="--distributed-executor-backend mp"
-        VLLM_CCL_TRANSPORT="ofi"
-        VLLM_CCL_LAUNCHER="none"
     fi
 
     ZE_AFFINITY_MASK=${TILE_MASK} \

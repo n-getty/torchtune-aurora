@@ -1,0 +1,121 @@
+# BioReason-Pro 4B GRPO RL fine-tuning on Aurora XPU — 11+1 dedicated vLLM mode
+# Model: wanglab/bioreason-pro-sft (Qwen3-4B + ESM3 + GO graph encoder)
+# Algorithm: GRPO with sequence-level advantages (batch-level normalization)
+# Data: wanglab/bioreason-pro-rl-reasoning-data (9.2k examples)
+#
+# Architecture: 12 tiles total
+#   Ranks 0-10: training tiles (DDP, policy + ref + ESM3 + bf16 AdamW)
+#   Rank 11:    vLLM tile (dedicated generation server, no training)
+#
+# Per training tile: policy(8G) + ref(8G) + optim(16G) + ESM3(2.8G) + acts(~13G) = ~48G
+#
+# Launch (single node, 12 tiles):
+#   bash experiments/bioreason/run_bioreason_dedicated.sh
+
+name: grpo_bioreason_4b_dedicated_xpu
+output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/outputs/bioreason_dedicated_v1
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+model_type: bioreason
+base_model_path: /tmp/torchtune/bioreason-pro-sft
+
+# ── Tokenizer ─────────────────────────────────────────────────────────────────
+tokenizer:
+  _component_: torchtune.dev.bioreason.bioreason_tokenizer
+  ckpt_dir: ${base_model_path}
+
+# ── Dataset ───────────────────────────────────────────────────────────────────
+dataset:
+  _component_: torchtune.dev.bioreason.bioreason_rl_dataset
+  data_files: /lus/flare/projects/ModCon/ngetty/datasets/bioreason_rl
+  max_seq_len: ${max_seq_len}
+  max_protein_len: 128   # was 512 — reduces context by 384 tokens so model can finish reasoning
+  num_go_tokens: 50      # was 200 — reduces context by 150 tokens; same total_len as before
+
+collate_fn: torchtune.dev.bioreason.dataset.bioreason_collate_fn
+
+seed: 42
+shuffle: True
+resume_from_checkpoint: False
+
+# ── RL Hyperparameters ────────────────────────────────────────────────────────
+grpo_samples: 4            # G=4: halves activation peak vs G=8 (run 40 hit 60 GiB POST-BWD; G/fbs=1 chunk preserved)
+max_seq_len: 1024
+max_generated_tokens: 1024  # was 512 — now model can complete reasoning chains (context reduced by ~534 tokens)
+temperature: 0.8
+top_k: null
+
+# ── Training ──────────────────────────────────────────────────────────────────
+epochs: 1
+num_steps: 1200
+ppo_epochs: 1
+batch_size: 1               # 1 prompt × 8 rollouts = 8 seqs generated per step
+forward_batch_size: 4       # G=4 → fbs=4 keeps G/fbs=1 (single chunk, no no_sync regression)
+                            # fbs=8 (1 chunk): POST-BWD ~54 GiB. Pre-warm keeps summon_full_params
+                            # AllGather in cache → no new L0 alloc → pool stays ≤54 GiB → GC never fires.
+gradient_accumulation_steps: 1   # FSDP1 SHARD_GRAD_OP handles ReduceScatter; no accumulation needed
+
+optimizer:
+  _component_: torch.optim.AdamW  # ZeRO-2: shard is 1.45 GiB — no CPU offload needed
+  lr: 1e-6
+  weight_decay: 0.01
+  fused: false
+
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  num_warmup_steps: 50
+
+clip_grad_norm: 1.0
+
+# ── Loss ──────────────────────────────────────────────────────────────────────
+loss:
+  _component_: torchtune.dev.grpo.loss.GRPOSimpleLoss
+  kl_coeff: 0.01
+  epsilon: 0.2
+
+# ── Reward ────────────────────────────────────────────────────────────────────
+reward_mode: bioreason
+
+# ── Distributed ───────────────────────────────────────────────────────────────
+enable_activation_checkpointing: true    # math-only attn O(seq^2) peaks 56 GiB; AC keeps to ~2 GiB/layer
+
+# ── XPU ───────────────────────────────────────────────────────────────────────
+device: xpu
+dtype: bf16
+compile: false
+# Flash SDPA is safe here: DDP (not FSDP) + no empty_cache() calls.
+# The UR-leak that forced math-only SDPA was FSDP+empty_cache specific.
+# With flash SDPA: grpo expected to drop from ~80s → ~20-30s/step.
+force_math_sdpa: false
+
+# ── vLLM rollout generation (dedicated rank mode) ─────────────────────────────
+vllm_mode: dedicated_rank
+vllm_dedicated_rank: 11              # rank 11 runs vLLM only; ranks 0-10 train
+vllm_tensor_parallel_size: 1
+vllm_gpu_memory_utilization: 0.7    # dedicated tile — no training pressure
+vllm_max_model_len: 2048
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+log_every_n_steps: 1
+log_peak_memory_stats: true
+save_every_n_epochs: 1
+
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+
+# ── Profiler ──────────────────────────────────────────────────────────────────
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: false
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: true
+  cuda: false
+  profile_memory: false
+  with_stack: false
+  record_shapes: false
+  with_flops: false
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1

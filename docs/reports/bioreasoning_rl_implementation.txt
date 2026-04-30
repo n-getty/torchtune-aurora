@@ -1,0 +1,71 @@
+While the GitHub repository might not have the RL training code pushed just yet, the paper outlines the following details regarding their implementation and use of vLLM:
+
+vLLM Integration for Online Generation
+To handle the heavy computation of generating reasoning traces during training, the authors state that they use DeepSpeed combined with vLLM in colocate mode for online rollout generation.
+
+    Hardware & Scale: The RL training runs for 1,200 steps with an effective batch size of 192, distributed across eight H100 GPUs spanning two nodes.
+
+    Inference Serving: Outside of the training loop, they also use vLLM to serve standard inference, noting that it natively handles batched inference and takes roughly a few seconds per protein (allowing for a maximum generation length of 10,000 tokens).
+
+RL Framework & Methodology
+Their underlying RL algorithm is a hybrid variant of group-based policy optimization. They build primarily on GRPO (Group Relative Policy Optimization) so they can avoid training a separate value model, but they pull in several modifications to stabilize the training:
+
+    GSPO (Group Sequence Policy Optimization): They align importance correction with the unit of reward at the sequence level, rather than the token level, to fix instabilities in sampling weights.
+
+    Dr. GRPO: They include modifications to correct optimization biases and mitigate length-dependent reward artifacts (which they noted was a failure mode where prompts varying in length caused instability).
+
+    DAPO (Clip-Higher strategy): They use asymmetric clipping to encourage better exploration when advantages are positive.
+
+    Reward Normalization: To combat low-variance rewards (which happens when the model produces highly similar completions across rollouts), they shifted from prompt-level grouping to batch-level grouping, normalizing advantages using the global batch standard deviation rather than per-group variance.
+
+So, their pipeline is ultimately built on PyTorch, Hugging Face Transformers, and Unsloth for the base models, while leveraging the DeepSpeed + vLLM colocate strategy to efficiently execute the GRPO rollouts.
+
+
+To handle the integration of continuous multimodal features without breaking standard text-generation pipelines, the authors utilize a placeholder token strategy.
+
+Because passing raw inputs_embeds is a known hurdle when configuring vLLM endpoints for distributed RLHF training loops, they split their approach depending on the phase of the pipeline:
+
+1. Supervised Fine-Tuning (PyTorch / Unsloth)
+During SFT, they bypass vLLM entirely. The model is implemented using PyTorch, Hugging Face Transformers, and Unsloth. In this standard environment, constructing custom inputs_embeds is trivial. They project the ESM3 protein features and the 200 fixed-length GO graph embeddings, and concatenate them directly with the text token embeddings before passing the full sequence to the LLM backbone.
+
+    To optimize the memory footprint, the protein encoder (ESM3) and the LLM backbone are kept completely frozen, meaning the heavy ESM3 residue embeddings can be precomputed and cached.
+
+    Only the GO graph encoder, the projection layers, and the LLM's LoRA adapters remain trainable.
+
+2. Online RL Generation and Inference (vLLM)
+When transitioning to RL fine-tuning (specifically their variant of GRPO) and standard inference, they utilize DeepSpeed with vLLM in "colocate mode" to handle the heavy rollout generation.
+
+To inject the embeddings into vLLM, they assemble a text prompt that contains specific placeholder tokens reserved for the modalities. Similar to how vision-language models intercept <image> or patch tokens, the system identifies these placeholders in the context window and swaps out standard discrete token lookups for the dynamically computed continuous embeddings (the ESM3 residue vectors and the 200 GO embeddings).
+
+By anchoring the continuous data to these placeholder tokens, they trick the serving engine into handling the multimodal context natively. This allows them to exploit vLLM's highly optimized batched inference for their RL rollouts without needing to author a heavily customized, non-standard vLLM fork just to support arbitrary tensor injection.
+
+1. Why DeepSpeed for RL? (The Memory Monster)
+
+While DeepSpeed is famous for pretraining, it is actually a crucial piece of the puzzle for large-scale RL fine-tuning.  
+
+RL tuning is notoriously memory-hungry. Even though they are using GRPO (which famously drops the need for a separate Value model to save memory), they still have to keep multiple things resident on their GPUs:
+
+    The Active Policy Model (the one being trained/updated).
+
+    The Reference Model (frozen, used to calculate the KL-divergence penalty so the model doesn't drift too far from its SFT behavior).
+
+    The Massive Rollout Batches (they generate 24 responses per protein to calculate group advantages).
+
+DeepSpeed’s ZeRO (Zero Redundancy Optimizer) allows them to shard the model states, gradients, and optimizer states across their 8x H100 GPUs. Without DeepSpeed orchestrating the memory across those two nodes, the multi-model overhead and massive generation batches required for GRPO would likely OOM (Out of Memory) the cluster.  
+2. Why not standard TRL? (The Custom GRPO Cocktail)
+
+While TRL has been rapidly adding support for newer algorithms like GRPO, standard implementations often struggle with the specific quirks of biological reasoning tasks—namely, long generations and sparse, low-variance rewards.
+
+The authors basically had to roll a highly customized "Frankenstein" RL algorithm to keep the training stable:
+
+    The Base: GRPO (Group Relative Policy Optimization) to avoid training a value model.  
+
+    The Fix for Token Math: They pulled in mechanics from GSPO (Group Sequence Policy Optimization) to calculate importance sampling at the sequence level rather than the token level, preventing weight instability.
+
+    The Fix for Length Bias: They added modifications from Dr. GRPO to penalize runaway generation lengths (since biological traces can vary wildly in size).
+
+    The Fix for Exploration: They adopted the "Clip-Higher" strategy from DAPO to allow the model to explore more aggressively when it finds a good reward, while clamping down hard on bad rewards.  
+
+    The Fix for Flat Rewards: Because the model often output very similar responses across its 24 rollouts, the reward variance would drop to zero and kill the learning signal. They had to custom-wire the advantage estimation to look at the global batch variance rather than just the group variance.
+
+To wire all of these specific mathematical tweaks together—while simultaneously passing continuous protein embeddings through placeholder tokens to vLLM for the rollout generations—they needed a level of low-level control over the training loop that a high-level wrapper like standard TRL might not easily accommodate.

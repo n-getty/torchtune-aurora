@@ -441,3 +441,105 @@ def batched_rewards(
                 successes_tensor[b, g, rw_idx] += success
 
     return rewards_tensor, successes_tensor, metadata
+
+
+# ---------------------------------------------------------------------------
+# Sum-of-digits rewards (torchtitan/ezpz comparison task)
+# ---------------------------------------------------------------------------
+
+def _extract_numeric_answer(text: str) -> str | None:
+    """Extract a numeric answer using cascading patterns matching torchtitan/ezpz."""
+    m = re.search(r"\\boxed\{([^}]+)\}", text)
+    if m:
+        return m.group(1).strip()
+    m = re.search(r"(?:the\s+)?answer\s+is\s+(\d+)", text, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    m = re.search(r"=\s*(\d+)", text)
+    if m:
+        return m.group(1).strip()
+    numbers = re.findall(r"\b(\d+)\b", text)
+    if numbers:
+        return numbers[-1]
+    return None
+
+
+class SumDigitsReward(Reward):
+    """
+    Two-component reward for sum-of-digits arithmetic, matching torchtitan/ezpz:
+    accuracy (1.0/0.0) + format (0.5/0.0).
+    """
+
+    def __init__(
+        self,
+        accuracy_reward: float = 1.0,
+        format_reward: float = 0.5,
+    ):
+        self.accuracy_reward = accuracy_reward
+        self.format_reward = format_reward
+
+    def __call__(
+        self,
+        completion_ids: torch.Tensor,
+        completions: list[str],
+        answers: list[str],
+    ) -> RewardOutput:
+        acc_rewards = []
+        fmt_rewards = []
+        for completion, answer in zip(completions, answers):
+            extracted = _extract_numeric_answer(completion)
+            acc_rewards.append(
+                self.accuracy_reward if extracted == answer else 0.0
+            )
+            fmt_rewards.append(
+                self.format_reward
+                if re.search(r"\d+\s*\+\s*\d+", completion)
+                else 0.0
+            )
+
+        acc_t = torch.tensor(acc_rewards)
+        fmt_t = torch.tensor(fmt_rewards)
+        total = acc_t + fmt_t
+        return RewardOutput(
+            reward_base_name="sum_digits",
+            total_reward=total,
+            successes=(acc_t == self.accuracy_reward).float(),
+            rewards={"accuracy": acc_t, "format": fmt_t},
+        )
+
+
+def sum_digits_batched_rewards(
+    tokenizer: Union[ModelTokenizer, HuggingFaceModelTokenizer],
+    completions: torch.Tensor,
+    answers: list[str],
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, dict]:
+    """Batched sum-of-digits rewards shaped ``[B, G, 2]``."""
+    reward_fn = SumDigitsReward()
+
+    batch_size, grpo_size, _ = completions.shape
+    num_funcs = 2
+
+    rewards_tensor = torch.zeros(
+        batch_size, grpo_size, num_funcs, dtype=torch.float32, device=device
+    )
+    successes_tensor = torch.zeros(
+        batch_size, grpo_size, num_funcs, dtype=torch.float32, device=device
+    )
+
+    for b in range(batch_size):
+        for g in range(grpo_size):
+            answer = answers[b]
+            text_completion = tokenizer.decode(completions[b, g].tolist())
+            out = reward_fn(
+                completion_ids=completions[b, g],
+                completions=[text_completion],
+                answers=[answer],
+            )
+            rewards_tensor[b, g, 0] = out.rewards["accuracy"][0]
+            rewards_tensor[b, g, 1] = out.rewards["format"][0]
+            successes_tensor[b, g, 0] = out.successes[0]
+            successes_tensor[b, g, 1] = (out.rewards["format"][0] > 0).float()
+
+    metadata = {"func_names": ["accuracy", "format"]}
+    return rewards_tensor, successes_tensor, metadata

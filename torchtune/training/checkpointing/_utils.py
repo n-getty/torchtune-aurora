@@ -127,6 +127,7 @@ class ModelType(Enum):
     T5_ENCODER: str = "t5_encoder"
     QWEN3: str = "qwen3"
     GEMMA4: str = "gemma4"
+    QWEN3_MOE: str = "qwen3_moe"
 
 
 class FormattedCheckpointFiles:
