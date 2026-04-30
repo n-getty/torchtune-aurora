@@ -56,8 +56,11 @@ export PYTORCH_ALLOC_CONF=garbage_collection_threshold:0.99
 # the 4 EP ranks may straddle nodes (depending on rank ordering), so gloo must
 # go through the Slingshot NIC. Cross-node EP collectives are inherently slower
 # but unavoidable at 2 train nodes.
+# NOTE: do NOT set GLOO_DEVICE_TRANSPORT — this PyTorch build (frameworks/2025.3.1)
+# does not recognize the env-var-controlled factory and ProcessGroupGloo()
+# raises `makeDeviceForInterface(): unsupported gloo device`. GLOO_SOCKET_IFNAME
+# alone routes through the named interface via the default tcp transport.
 export GLOO_SOCKET_IFNAME=hsn0
-export GLOO_DEVICE_TRANSPORT=tcp
 
 FW_SITE=/opt/aurora/25.190.0/frameworks/aurora_frameworks-2025.3.1/lib/python3.12/site-packages
 LOCAL_SITE=/home/ngetty/.local/aurora/frameworks/2025.3.1/lib/python3.12/site-packages
