@@ -1,42 +1,32 @@
-# GRPO with replicated vLLM + HSDP on Aurora XPU (2+ nodes)
+# Phase 2 Step 1 prototype — Qwen2.5 3B, dedicated-rank vLLM via gloo gen_pg.
 #
-# Each node runs: vLLM (tiles 10-11, TP=2) + 10 training ranks (tiles 0-9)
-# HSDP: FSDP within node (dp_shard=10), DDP across nodes (dp_replicate=2)
-# Each shard leader talks to its local vLLM at localhost.
+# Mirrors qwen3B_grpo_async_xpu.yaml (server mode) with one structural change:
+# vllm_mode: dedicated_rank, vllm_dedicated_rank: 11. Generation now flows over
+# the 2-rank gloo `_gen_pg`; the vLLM rank no longer participates in world-PG
+# collectives, so training ranks 1..N-2 can run fwd/bwd while the producer
+# thread on rank 0 talks to the vLLM rank.
 #
-# Launch:
-#   bash recipes/dev/aurora_grpo_vllm_hsdp_multinode.sh
+# Layout: 11 training tiles (FSDP) + 1 vLLM tile (rank 11) on a single node.
 
-name: grpo_vllm_hsdp_qwen3b_xpu
+name: grpo_async_dedicated_qwen3b_xpu
 
-output_dir: /tmp/torchtune/grpo_vllm_hsdp
-
+output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/outputs/grpo_async_dedicated_qwen3b
 base_model_path: /lus/flare/projects/ModCon/ngetty/models/Qwen2.5-3B
+data_dir: /lus/flare/projects/ModCon/ngetty/hackathon_rl/prepared_data
 
-# HSDP: set by launcher (data_parallel_replicate_dim=NUM_NODES)
-data_parallel_replicate_dim: 2
-
-# vLLM generation server (each node has its own at localhost)
-vllm_url: "http://localhost:8001"
-vllm_group_port: 51216
-vllm_weight_sync: true
-vllm_weight_sync_interval: 5
-
-# Tokenizer
 tokenizer:
   _component_: torchtune.models.qwen2_5.qwen2_5_tokenizer
   path: ${base_model_path}/vocab.json
   merges_file: ${base_model_path}/merges.txt
   max_seq_len: 1024
 
-# Dataset
 dataset:
-  _component_: torchtune.dev.rl.gsm8k.gsm8k_dataset
-  partition: 1-9/10
+  _component_: torchtune.dev.rl.gene_recall.gene_recall_dataset
+  data_files: ${data_dir}/gene_recall_train.jsonl
+  max_seq_len: 1024
 seed: 42
-shuffle: False
+shuffle: True
 
-# Model
 model:
   _component_: torchtune.models.qwen2_5.qwen2_5_3b
 
@@ -64,63 +54,66 @@ ref_checkpointer:
 
 resume_from_checkpoint: False
 save_every_n_epochs: 1
+save_every_n_steps: 50
 
-# Fine-tuning arguments
-batch_size: 1
-grpo_samples: 4
-forward_batch_size: 1
-max_generated_tokens: 256
+# Phase 2: dedicated_rank vLLM. Rank 11 runs the vLLM engine + generation
+# loop; rank 0 is paired with it via _gen_pg (gloo, 2-rank).
+vllm_mode: dedicated_rank
+vllm_dedicated_rank: 11
+vllm_max_model_len: 2048
+vllm_gpu_memory_utilization: 0.7
+vllm_weight_sync: true
+vllm_weight_sync_interval: 1
+
+always_compute_rollout_logprobs: true
+
+async_generation:
+  enabled: false  # Phase 2 Step 1 first validates synchronous gen_pg roundtrip
+  max_staleness: 1
+
+reward_mode: gene_recall
+gene_reward_metric: f1
+
+batch_size: 2
+grpo_samples: 8
+forward_batch_size: 4
+max_generated_tokens: 512
 top_k: null
 temperature: 1.0
 
 ppo_epochs: 1
 gradient_accumulation_steps: 1
 
-num_steps: 5
+epochs: 5
+num_steps: 10  # smoke smoke; bump after Step 1 lands
 
 clip_grad_norm: 1.0
 
-epochs: 1
 optimizer:
   _component_: torch.optim.AdamW
-  lr: 1e-5
+  lr: 5e-6
 lr_scheduler:
   _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
-  num_warmup_steps: 2
+  num_warmup_steps: 10
+
 loss:
-  _component_: torchtune.dev.rl.loss.GRPOSimpleLoss
-  kl_coeff: 0.01
+  _component_: torchtune.dev.rl.loss.GRPOLoss
+  kl_coeff: 0.1
   epsilon: 0.2
 
-# XPU device
 device: xpu
 
-# Memory management
 enable_activation_checkpointing: True
 compile: False
 
-# Precision
 dtype: bf16
 
-reward_functions:
-    - _component_: torchtune.dev.rl.rewards.FormattedMathCorrectnessReward
-      answer_tag: answer
-      positive_reward: 10.0
-      negative_reward: 0.0
-    - _component_: torchtune.dev.rl.rewards.ThinkingAnswerFormattingReward
-      think_tag: think
-      answer_tag: answer
-      positive_reward: 1.0
-      negative_reward: 0.0
-
-# Logging
 metric_logger:
   _component_: torchtune.training.metric_logging.DiskLogger
   log_dir: ${output_dir}/logs
 log_every_n_steps: 1
 log_peak_memory_stats: True
 
-# Profiler disabled
 profiler:
   _component_: torchtune.training.setup_torch_profiler
   enabled: False

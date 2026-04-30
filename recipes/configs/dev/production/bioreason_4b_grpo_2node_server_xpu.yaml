@@ -72,7 +72,7 @@ clip_grad_norm: 1.0
 
 # ── Loss ──────────────────────────────────────────────────────────────────────
 loss:
-  _component_: torchtune.dev.grpo.loss.GRPOSimpleLoss
+  _component_: torchtune.dev.rl.loss.GRPOSimpleLoss
   kl_coeff: 0.01
   epsilon: 0.2
 

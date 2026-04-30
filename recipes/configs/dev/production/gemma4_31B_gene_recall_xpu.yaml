@@ -39,7 +39,7 @@ tokenizer:
 
 # Dataset — gene recall JSONL
 dataset:
-  _component_: torchtune.dev.grpo.gene_recall.gene_recall_dataset
+  _component_: torchtune.dev.rl.gene_recall.gene_recall_dataset
   data_files: ${data_dir}/gene_recall_train.jsonl
   max_seq_len: 1024
 seed: 42
@@ -103,7 +103,7 @@ lr_scheduler:
   _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
   num_warmup_steps: 5
 loss:
-  _component_: torchtune.dev.grpo.loss.GRPOSimpleLoss
+  _component_: torchtune.dev.rl.loss.GRPOSimpleLoss
   kl_coeff: 0.01  # reduced from 0.1 — also added exp() clamp(max=20) in loss.py for overflow protection
 
   epsilon: 0.2

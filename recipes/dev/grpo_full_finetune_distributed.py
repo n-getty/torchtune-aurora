@@ -203,7 +203,7 @@ class GRPOFullFinetuneRecipeDistributed(FTRecipeInterface):
         # sampler and dataloader depend on the tokenizer and loss_fn and should be
         # setup after both of these are initialized
         collate_name = cfg.get(
-            "collate_fn", "torchtune.dev.grpo.data.padded_collate_rl"
+            "collate_fn", "torchtune.dev.rl.data.padded_collate_rl"
         )
         self._dataloader = self._setup_data(
             cfg_dataset=cfg.dataset,

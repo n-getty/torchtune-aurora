@@ -36,7 +36,7 @@ tokenizer:
 
 # Dataset
 dataset:
-  _component_: torchtune.dev.grpo.gsm8k.gsm8k_dataset
+  _component_: torchtune.dev.rl.gsm8k.gsm8k_dataset
   partition: 1-9/10
 seed: 42
 shuffle: False
@@ -99,7 +99,7 @@ lr_scheduler:
   _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
   num_warmup_steps: 2
 loss:
-  _component_: torchtune.dev.grpo.loss.GRPOSimpleLoss
+  _component_: torchtune.dev.rl.loss.GRPOSimpleLoss
   kl_coeff: 0.01
   epsilon: 0.2
 

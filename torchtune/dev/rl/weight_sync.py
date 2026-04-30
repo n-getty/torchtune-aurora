@@ -331,91 +331,122 @@ def _generate_with_dedicated_vllm(
     context_length: int,
     protein_sequences,
 ):
-    """Generate using the dedicated vLLM rank (rank N-1).
+    """Generate using the dedicated vLLM rank via the 2-rank gen_pg ring buffer.
 
-    Training ranks (0..N-2) call this. They broadcast protein_sequences and
-    batch_input_ids to the vLLM rank, which computes ESM3 embeddings, runs
-    vLLM, and broadcasts the resulting query_responses back.
+    Phase 2: only rank 0 talks to the vLLM rank — the other training ranks no
+    longer participate in the generation handshake. Rank 0 is responsible for
+    fanning the resulting `query_responses` out to the rest of the training
+    cohort via the world-PG broadcast helper that callers already invoke.
+
+    All collectives go over `self._gen_pg` (gloo, [0, vllm_rank]), which means
+    payloads are CPU tensors. Returns the query_responses CPU tensor; the caller
+    moves it to device + broadcasts to other training ranks.
 
     Returns:
-        query_responses: ``[B*G, context_length + max_generated_tokens]``
+        query_responses: ``[B*G, context_length + max_generated_tokens]`` (CPU)
     """
-    # Broadcast protein_sequences from rank 0 to all (including vLLM rank).
-    # Pass device= so the serialized buffer lands on XPU (required by XCCL backend).
-    obj = [protein_sequences]
-    torch.distributed.broadcast_object_list(obj, src=0, device=self._device)
+    if self.rank != 0:
+        raise RuntimeError(
+            "_generate_with_dedicated_vllm must be called only on rank 0 "
+            "(other training ranks should consume via _broadcast_query_responses)"
+        )
 
-    # Broadcast batch_input_ids (shape + content) from rank 0 to all.
     bsz = batch_input_ids.shape[0]
     total_len = context_length + self._max_generated_tokens
-    obj2 = [batch_input_ids.cpu()]
-    torch.distributed.broadcast_object_list(obj2, src=0, device=self._device)
 
-    # Receive the query_responses that the vLLM rank broadcasts back.
+    # Send protein_sequences + batch_input_ids over gen_pg as a single object payload.
+    payload = {
+        "protein_sequences": protein_sequences,
+        "batch_input_ids": batch_input_ids.cpu(),
+        "context_length": context_length,
+    }
+    torch.distributed.broadcast_object_list(
+        [payload], src=0, group=self._gen_pg
+    )
+
+    # Receive query_responses (CPU tensor) from the vLLM rank over gen_pg.
     query_responses = torch.empty(
         (bsz, total_len),
         dtype=batch_input_ids.dtype,
-        device=self._device,
     )
-    torch.distributed.broadcast(query_responses, src=self._vllm_dedicated_rank)
+    torch.distributed.recv(
+        query_responses, src=self._vllm_dedicated_rank, group=self._gen_pg
+    )
 
     return query_responses
 
 def _run_vllm_generation_server(self) -> None:
     """Run the dedicated vLLM generation server loop (rank N-1 only).
 
-    Participates in world-group broadcasts in lock-step with training ranks:
-    1. Receive protein_sequences + batch_input_ids from rank 0.
-    2. Compute prompt_embeds via local ESM3 + projectors.
-    3. Generate with vLLM.
-    4. Broadcast query_responses to all training ranks.
-    5. Receive weight update from rank 0 via wsync_pg.
-    Repeat for each step.
+    Phase 2: communicates with rank 0 ONLY, over the 2-rank gloo `_gen_pg`
+    ring buffer. The vLLM rank no longer participates in any world-PG
+    collective during generation, which lets training ranks 1..N-2 run
+    fwd/bwd in parallel with vLLM's generation step.
+
+    Per iteration:
+        1. recv payload {protein_sequences, batch_input_ids, context_length}
+           from rank 0 over gen_pg.
+        2. (BioReason only) compute prompt_embeds via local ESM3 + projectors.
+        3. Generate with vLLM.
+        4. send query_responses CPU tensor back to rank 0 over gen_pg.
+        5. Receive weight update from rank 0 via wsync_pg.
+
+    Loop exits on the shutdown sentinel `{"shutdown": True}` (Step 4) or when
+    the legacy total_steps counter is exhausted.
     """
     from vllm import SamplingParams
 
     num_steps = self._total_steps if hasattr(self, '_total_steps') and self._total_steps > 0 else 10000
-    log.info("Rank %d (vLLM server): entering generation loop (max_steps=%d)", self.rank, num_steps)
+    log.info(
+        "Rank %d (vLLM server): entering generation loop (max_steps=%d, gen_pg=2-rank gloo)",
+        self.rank, num_steps,
+    )
 
     for step in range(num_steps):
-        # 1. Receive protein_sequences.
+        # 1. Receive request payload from rank 0 over gen_pg.
         obj = [None]
-        torch.distributed.broadcast_object_list(obj, src=0, device=self._device)
-        protein_sequences = obj[0]
-
-        # 2. Receive batch_input_ids.
-        obj2 = [None]
-        torch.distributed.broadcast_object_list(obj2, src=0, device=self._device)
-        batch_input_ids = obj2[0].to(self._device)
+        torch.distributed.broadcast_object_list(obj, src=0, group=self._gen_pg)
+        payload = obj[0]
+        if isinstance(payload, dict) and payload.get("shutdown"):
+            log.info("Rank %d (vLLM server): shutdown sentinel received at step %d", self.rank, step)
+            return
+        protein_sequences = payload["protein_sequences"]
+        batch_input_ids = payload["batch_input_ids"]  # CPU tensor
+        context_length = payload["context_length"]
         bsz = batch_input_ids.shape[0]
-        context_length = batch_input_ids.shape[1]  # [B*G, context_length]
         total_len = context_length + self._max_generated_tokens
 
-        # 3. Compute prompt_embeds.
-        # batch_input_ids is [B*G, L]; build_prompt_embeds expects [B, L].
-        # Deduplicate by taking every grpo_size-th row (rows are repeated G times).
-        grpo_size = self.grpo_samples
-        n_unique = bsz // grpo_size
-        unique_input_ids = batch_input_ids[::grpo_size]  # [B, L]
-        with torch.no_grad():
-            pe_base = self._embed_model.build_prompt_embeds(
-                unique_input_ids, protein_sequences
-            )  # [B, P, H] CPU
-        prompt_embeds = (
-            pe_base.unsqueeze(1)
-            .expand(-1, grpo_size, -1, -1)
-            .reshape(bsz, pe_base.shape[1], pe_base.shape[2])
-            .contiguous()
-        )  # [B*G, P, H] CPU
+        # 2. Compute prompt_embeds (BioReason path) or skip (text-only).
+        if protein_sequences is not None and getattr(self, "_embed_model", None) is not None:
+            batch_input_ids_dev = batch_input_ids.to(self._device)
+            grpo_size = self.grpo_samples
+            unique_input_ids = batch_input_ids_dev[::grpo_size]  # [B, L]
+            with torch.no_grad():
+                pe_base = self._embed_model.build_prompt_embeds(
+                    unique_input_ids, protein_sequences
+                )  # [B, P, H] CPU
+            prompt_embeds = (
+                pe_base.unsqueeze(1)
+                .expand(-1, grpo_size, -1, -1)
+                .reshape(bsz, pe_base.shape[1], pe_base.shape[2])
+                .contiguous()
+            )  # [B*G, P, H] CPU
+            vllm_prompts = [{"prompt_embeds": prompt_embeds[i]} for i in range(bsz)]
+            pad_id = self._embed_model.tokenizer.pad_token_id
+        else:
+            vllm_prompts = [
+                {"prompt_token_ids": batch_input_ids[i, :context_length].tolist()}
+                for i in range(bsz)
+            ]
+            pad_id = 0
 
-        # 4. Generate with vLLM.
+        # 3. Generate with vLLM.
         sampling_params = SamplingParams(
             max_tokens=self._max_generated_tokens,
             temperature=self._temperature,
             top_k=self._top_k if self._top_k else -1,
             detokenize=False,
         )
-        vllm_prompts = [{"prompt_embeds": prompt_embeds[i]} for i in range(bsz)]
         t0 = time.perf_counter()
         outputs = self._vllm_llm.generate(
             prompts=vllm_prompts,
@@ -424,9 +455,10 @@ def _run_vllm_generation_server(self) -> None:
         )
         gen_time = time.perf_counter() - t0
 
-        # Pack into query_responses tensor.
-        pad_id = self._embed_model.tokenizer.pad_token_id
-        query_responses = batch_input_ids.new_full((bsz, total_len), pad_id)
+        # Pack into CPU query_responses tensor (gen_pg is gloo).
+        query_responses = torch.full(
+            (bsz, total_len), pad_id, dtype=batch_input_ids.dtype
+        )
         query_responses[:, :context_length] = batch_input_ids[:, :context_length]
         total_tokens = 0
         for i, output in enumerate(outputs):
@@ -434,7 +466,7 @@ def _run_vllm_generation_server(self) -> None:
             total_tokens += len(comp)
             length = min(len(comp), self._max_generated_tokens)
             query_responses[i, context_length: context_length + length] = torch.tensor(
-                comp[:length], dtype=batch_input_ids.dtype, device=self._device
+                comp[:length], dtype=batch_input_ids.dtype
             )
 
         log.info(
@@ -442,10 +474,10 @@ def _run_vllm_generation_server(self) -> None:
             self.rank, step, bsz, total_tokens, gen_time,
         )
 
-        # 5. Broadcast query_responses to all training ranks.
-        torch.distributed.broadcast(query_responses, src=self.rank)
+        # 4. Send query_responses back to rank 0 over gen_pg.
+        torch.distributed.send(query_responses, dst=0, group=self._gen_pg)
 
-        # 6. Receive weight update from rank 0.
+        # 5. Receive weight update from rank 0.
         self._recv_weight_update()
 
     log.info("Rank %d (vLLM server): generation loop complete", self.rank)

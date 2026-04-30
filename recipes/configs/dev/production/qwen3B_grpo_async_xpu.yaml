@@ -31,7 +31,7 @@ tokenizer:
 
 # Dataset — gene recall JSONL (same as the proven 3B baseline)
 dataset:
-  _component_: torchtune.dev.grpo.gene_recall.gene_recall_dataset
+  _component_: torchtune.dev.rl.gene_recall.gene_recall_dataset
   data_files: ${data_dir}/gene_recall_train.jsonl
   max_seq_len: 1024
 seed: 42
@@ -122,7 +122,7 @@ lr_scheduler:
 # Required for the async/off-policy path to do anything meaningful;
 # GRPOSimpleLoss collapses ratios to 1 unconditionally.
 loss:
-  _component_: torchtune.dev.grpo.loss.GRPOLoss
+  _component_: torchtune.dev.rl.loss.GRPOLoss
   kl_coeff: 0.1
   epsilon: 0.2
 
