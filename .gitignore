@@ -198,6 +198,12 @@ core.*
 logs/*
 !logs/.gitkeep
 fsdp_debug.*
+# PBS job outputs and node allocation files
+nodefile_*
+hold_*.o[0-9]*
+hold_*.e[0-9]*
+hold_2node_ds.out
+data/weights/
 tests/recipes/dev/
 tests/torchtune/training/test_xpu_utils.py
 benchmarks/
