@@ -605,3 +605,87 @@ def _setup_vllm_colocate_mode(self, cfg):
     )
     torch.distributed.barrier()
 
+
+def _create_dedicated_pgs(self) -> None:
+    """Create _training_pg (xccl), _wsync_pg (gloo/xccl), and _gen_pg (gloo) for dedicated_rank mode.
+
+    Must be called in the same order on ALL ranks — training ranks and the dedicated
+    vLLM rank both call this so that new_group() ordering is consistent (any mismatch
+    deadlocks). PG backend is controlled by TORCHTUNE_WSYNC_BACKEND (default: gloo).
+
+    `_gen_pg` is the Phase-2 generation ring buffer: a 2-rank gloo group [0, vllm_rank]
+    that carries generation requests/responses, so the dedicated vLLM rank no longer
+    has to participate in world-PG broadcasts each step. Always gloo (XCCL would
+    deadlock with the producer-thread/consumer-thread overlap on the same XPU).
+    """
+    _training_ranks = list(range(self.world_size - 1))
+    self._training_pg = torch.distributed.new_group(_training_ranks, backend="xccl")
+
+    import torch.distributed.distributed_c10d as _dc10d
+
+    _wsync_backend = os.environ.get("TORCHTUNE_WSYNC_BACKEND", "gloo")
+    if _wsync_backend == "gloo":
+        _default_pg = _dc10d._get_default_group()
+        _orig_bound = _default_pg.bound_device_id
+        _default_pg.bound_device_id = None
+        try:
+            self._wsync_pg = torch.distributed.new_group(
+                [0, self._vllm_dedicated_rank], backend=_wsync_backend
+            )
+        finally:
+            _default_pg.bound_device_id = _orig_bound
+    else:
+        self._wsync_pg = torch.distributed.new_group(
+            [0, self._vllm_dedicated_rank], backend=_wsync_backend
+        )
+
+    _default_pg = _dc10d._get_default_group()
+    _orig_bound = _default_pg.bound_device_id
+    _default_pg.bound_device_id = None
+    try:
+        self._gen_pg = torch.distributed.new_group(
+            [0, self._vllm_dedicated_rank], backend="gloo"
+        )
+    finally:
+        _default_pg.bound_device_id = _orig_bound
+
+
+def _setup_dedicated_vllm_rank(self, cfg) -> None:
+    """Generic setup for the dedicated vLLM generation server rank.
+
+    Creates _training_pg (xccl) and _wsync_pg (gloo) then seeds generation
+    hyperparams (_total_steps, _temperature, etc.) from cfg. Called after
+    init_process_group() completes on the vLLM rank.
+
+    Subclasses that use dedicated_rank mode (e.g. BioReason) call this first,
+    then layer model-specific setup (embed model, _compute_wsync_layout) on top.
+    """
+    _create_dedicated_pgs(self)
+
+    self._total_steps = cfg.get("num_steps", 10000)
+    self._max_generated_tokens = cfg.get("max_generated_tokens", 512)
+    self._temperature = cfg.get("temperature", 0.8)
+    self._top_k = cfg.get("top_k", None)
+    self.grpo_samples = cfg.get("grpo_samples", 8)
+
+    log.info(
+        "Rank %d (dedicated vLLM): training_pg=[0..%d] wsync_pg=[0,%d] backend=%s total_steps=%d",
+        self.rank, self.world_size - 2, self._vllm_dedicated_rank,
+        os.environ.get("TORCHTUNE_WSYNC_BACKEND", "gloo"), self._total_steps,
+    )
+
+
+def _setup_dedicated_training_pgs(self, cfg) -> None:
+    """Create process groups on training ranks for dedicated_rank weight sync.
+
+    Mirrors _setup_dedicated_vllm_rank: both must call new_group in identical
+    order. Call this from setup() before any FSDP wrapping that uses _training_pg.
+    """
+    _create_dedicated_pgs(self)
+
+    log.info(
+        "Rank %d (dedicated training): training_pg=[0..%d] wsync_pg=[0,%d] backend=%s",
+        self.rank, self.world_size - 2, self._vllm_dedicated_rank,
+        os.environ.get("TORCHTUNE_WSYNC_BACKEND", "gloo"),
+    )
+

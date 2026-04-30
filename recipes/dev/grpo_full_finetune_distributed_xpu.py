@@ -701,132 +701,130 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             self._metric_logger = config.instantiate(cfg.metric_logger)
             self._metric_logger.log_config(cfg)
 
-        _is_bioreason = cfg.get("model_type") == "bioreason"
         if self._is_vllm_rank:
             # Rank runs as dedicated vLLM generation server — skip all training setup.
-            self._setup_bioreason_vllm_rank(cfg)
+            # Create _training_pg + _wsync_pg + seed gen params in same new_group order
+            # as training ranks (all ranks must call new_group identically or deadlock).
+            self._setup_dedicated_vllm_rank(cfg)
             return
-        if _is_bioreason:
-            self._setup_bioreason_models(cfg)
-        else:
-            # Setup model to train
-            checkpoint_dict = self.load_checkpoint(cfg_checkpointer=cfg.checkpointer)
-            if self._resume_from_checkpoint:
-                self._update_recipe_state(checkpoint_dict)
-            # Reshard parameters after forward to avoid keeping the full unsharded
-            # model in memory. For 31B+ with FSDP-10/12, full unshard = 62+ GiB
-            # which exceeds tile capacity. Always reshard except in colocate mode
-            # (non-sleep) where model stays on GPU anyway.
-            # Can be overridden via config: reshard_after_forward: false
-            reshard_policy = cfg.get("reshard_after_forward",
-                                     self._vllm_mode != "colocate")
-            # MEMPROBE: baseline (pre-policy)
+        # Setup model to train
+        checkpoint_dict = self.load_checkpoint(cfg_checkpointer=cfg.checkpointer)
+        if self._resume_from_checkpoint:
+            self._update_recipe_state(checkpoint_dict)
+        # Reshard parameters after forward to avoid keeping the full unsharded
+        # model in memory. For 31B+ with FSDP-10/12, full unshard = 62+ GiB
+        # which exceeds tile capacity. Always reshard except in colocate mode
+        # (non-sleep) where model stays on GPU anyway.
+        # Can be overridden via config: reshard_after_forward: false
+        reshard_policy = cfg.get("reshard_after_forward",
+                                 self._vllm_mode != "colocate")
+        # MEMPROBE: baseline (pre-policy)
+        try:
+            import sys as _sys
+            _mp_path = "/lus/flare/projects/ModCon/ngetty/torchtune/experiments/multinode_32b"
+            if _mp_path not in _sys.path:
+                _sys.path.insert(0, _mp_path)
+            from mem_probe import dump_mem as _dump_mem_init
+            _dump_mem_init("INIT pre-policy")
+        except Exception as _e:
+            log.warning("mem_probe pre-policy failed: %r", _e)
+            _dump_mem_init = None
+        self._model = self._setup_model(
+            cfg_model=cfg.model,
+            enable_activation_checkpointing=self._enable_activation_checkpointing,
+            custom_sharded_layers=cfg.get("custom_sharded_layers", None),
+            fsdp_cpu_offload=self.fsdp_cpu_offload,
+            model_sd=checkpoint_dict[training.MODEL_KEY],
+            reshard_after_forward=reshard_policy,
+        )
+        if _dump_mem_init is not None:
             try:
-                import sys as _sys
-                _mp_path = "/lus/flare/projects/ModCon/ngetty/torchtune/experiments/multinode_32b"
-                if _mp_path not in _sys.path:
-                    _sys.path.insert(0, _mp_path)
-                from mem_probe import dump_mem as _dump_mem_init
-                _dump_mem_init("INIT pre-policy")
-            except Exception as _e:
-                log.warning("mem_probe pre-policy failed: %r", _e)
-                _dump_mem_init = None
-            self._model = self._setup_model(
-                cfg_model=cfg.model,
-                enable_activation_checkpointing=self._enable_activation_checkpointing,
-                custom_sharded_layers=cfg.get("custom_sharded_layers", None),
-                fsdp_cpu_offload=self.fsdp_cpu_offload,
-                model_sd=checkpoint_dict[training.MODEL_KEY],
-                reshard_after_forward=reshard_policy,
-            )
-            if _dump_mem_init is not None:
-                try:
-                    _dump_mem_init("INIT post-policy")
-                except Exception:
-                    pass
-            # Free the policy state-dict references that load_from_full_model_state_dict
-            # nullified internally (release_sd=True). Without this, the checkpoint_dict
-            # outer keys + the FullModelHFCheckpointer's own buffers stay live on rank 0.
-            # Test T showed rank 0/1 carry +10 GiB external HBM through training; this is
-            # the targeted release.
-            import gc as _gc_post_policy
-            try:
-                checkpoint_dict.clear()
+                _dump_mem_init("INIT post-policy")
             except Exception:
                 pass
-            del checkpoint_dict
-            _gc_post_policy.collect()
-            if self._device.type == "xpu":
-                try:
-                    torch.xpu.synchronize()
-                except Exception:
-                    pass
-            if _dump_mem_init is not None:
-                try:
-                    _dump_mem_init("INIT post-policy-cleanup")
-                except Exception:
-                    pass
-            # Setup reference model
-            ref_checkpoint_dict = self.load_checkpoint(
-                cfg_checkpointer=cfg.ref_checkpointer
-            )
-            # ref model: use ref_cpu_offload if set (saves ~12 GiB XPU HBM).
-            # Policy model stays on GPU for inline generation; ref can live on CPU.
-            _ref_offload = self.fsdp_cpu_offload or self._ref_cpu_offload
-            self._ref_model = self._setup_model(
-                cfg_model=cfg.model,
-                enable_activation_checkpointing=self._enable_activation_checkpointing,
-                custom_sharded_layers=cfg.get("custom_sharded_layers", None),
-                fsdp_cpu_offload=_ref_offload,
-                model_sd=ref_checkpoint_dict[training.MODEL_KEY],
-                eval_mode=True,
-                reshard_after_forward=True,
-            )
-            if _dump_mem_init is not None:
-                try:
-                    _dump_mem_init("INIT post-ref")
-                except Exception:
-                    pass
-            # Free ref state-dict references (mirror of policy cleanup above).
+        # Free the policy state-dict references that load_from_full_model_state_dict
+        # nullified internally (release_sd=True). Without this, the checkpoint_dict
+        # outer keys + the FullModelHFCheckpointer's own buffers stay live on rank 0.
+        # Test T showed rank 0/1 carry +10 GiB external HBM through training; this is
+        # the targeted release.
+        import gc as _gc_post_policy
+        try:
+            checkpoint_dict.clear()
+        except Exception:
+            pass
+        del checkpoint_dict
+        _gc_post_policy.collect()
+        if self._device.type == "xpu":
             try:
-                ref_checkpoint_dict.clear()
+                torch.xpu.synchronize()
             except Exception:
                 pass
-            del ref_checkpoint_dict
-            _gc_post_policy.collect()
-            if self._device.type == "xpu":
-                try:
-                    torch.xpu.synchronize()
-                except Exception:
-                    pass
-            if _dump_mem_init is not None:
-                try:
-                    _dump_mem_init("INIT post-ref-cleanup")
-                except Exception:
-                    pass
-            if _ref_offload and not getattr(self, "_ref_no_fsdp2", False):
-                # FSDP2 cpu_offload manages parameters only; registered buffers
-                # (layer_scalar, rope cache, etc.) are left on CPU after setup.
-                # Move them to XPU so they don't cause device mismatch against XPU
-                # inputs during ref forward passes. Params still live on CPU and are
-                # fetched to XPU on-demand by FSDP2's param-fetch hook.
-                # v120: skip for _ref_no_fsdp2 case — the whole model (params+buffers)
-                # is on CPU; generate_trajectory() does model.to(device) before fwd.
-                for _buf_name, _buf in self._ref_model.named_buffers():
-                    if _buf is not None and _buf.device.type == "cpu":
-                        _buf.data = _buf.data.to(self._device)
-                if self._is_rank_zero:
-                    log.info(
-                        "ref_cpu_offload: moved registered buffers to XPU "
-                        "(params remain on CPU for FSDP2 on-demand fetch)"
-                    )
-            # Skip barrier on multi-node (XCCL sub-communicator creation deadlocks
-            # on 2D mesh). FSDP will implicitly sync during first forward pass.
-            if not self._production_mode:
-                torch.distributed.barrier()
+        if _dump_mem_init is not None:
+            try:
+                _dump_mem_init("INIT post-policy-cleanup")
+            except Exception:
+                pass
+        # Setup reference model
+        ref_checkpoint_dict = self.load_checkpoint(
+            cfg_checkpointer=cfg.ref_checkpointer
+        )
+        # ref model: use ref_cpu_offload if set (saves ~12 GiB XPU HBM).
+        # Policy model stays on GPU for inline generation; ref can live on CPU.
+        _ref_offload = self.fsdp_cpu_offload or self._ref_cpu_offload
+        self._ref_model = self._setup_model(
+            cfg_model=cfg.model,
+            enable_activation_checkpointing=self._enable_activation_checkpointing,
+            custom_sharded_layers=cfg.get("custom_sharded_layers", None),
+            fsdp_cpu_offload=_ref_offload,
+            model_sd=ref_checkpoint_dict[training.MODEL_KEY],
+            eval_mode=True,
+            reshard_after_forward=True,
+        )
+        if _dump_mem_init is not None:
+            try:
+                _dump_mem_init("INIT post-ref")
+            except Exception:
+                pass
+        # Free ref state-dict references (mirror of policy cleanup above).
+        try:
+            ref_checkpoint_dict.clear()
+        except Exception:
+            pass
+        del ref_checkpoint_dict
+        _gc_post_policy.collect()
+        if self._device.type == "xpu":
+            try:
+                torch.xpu.synchronize()
+            except Exception:
+                pass
+        if _dump_mem_init is not None:
+            try:
+                _dump_mem_init("INIT post-ref-cleanup")
+            except Exception:
+                pass
+        if _ref_offload and not getattr(self, "_ref_no_fsdp2", False):
+            # FSDP2 cpu_offload manages parameters only; registered buffers
+            # (layer_scalar, rope cache, etc.) are left on CPU after setup.
+            # Move them to XPU so they don't cause device mismatch against XPU
+            # inputs during ref forward passes. Params still live on CPU and are
+            # fetched to XPU on-demand by FSDP2's param-fetch hook.
+            # v120: skip for _ref_no_fsdp2 case — the whole model (params+buffers)
+            # is on CPU; generate_trajectory() does model.to(device) before fwd.
+            for _buf_name, _buf in self._ref_model.named_buffers():
+                if _buf is not None and _buf.device.type == "cpu":
+                    _buf.data = _buf.data.to(self._device)
+            if self._is_rank_zero:
+                log.info(
+                    "ref_cpu_offload: moved registered buffers to XPU "
+                    "(params remain on CPU for FSDP2 on-demand fetch)"
+                )
+        # Skip barrier on multi-node (XCCL sub-communicator creation deadlocks
+        # on 2D mesh). FSDP will implicitly sync during first forward pass.
+        if not self._production_mode:
+            torch.distributed.barrier()
 
-            # Utilize the same tokenizer for both models (hack)
-            self._tokenizer = config.instantiate(cfg.tokenizer)
+        # Utilize the same tokenizer for both models (hack)
+        self._tokenizer = config.instantiate(cfg.tokenizer)
 
         self._optimizer = self._setup_optimizer(
             cfg_optimizer=cfg.optimizer,
@@ -947,9 +945,15 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             # present alongside FSDP collectives on the same XPU tile.
             global _colocate_vllm_mode
             _colocate_vllm_mode = True
+        elif self._vllm_mode == "dedicated_rank":
+            # Create _training_pg + _wsync_pg for weight sync with the vLLM rank.
+            # PG creation order must match _setup_dedicated_vllm_rank on rank N-1.
+            self._setup_dedicated_training_pgs(cfg)
 
     _setup_vllm_server_mode = _vllm_backend_module._setup_vllm_server_mode
     _setup_vllm_colocate_mode = _vllm_backend_module._setup_vllm_colocate_mode
+    _setup_dedicated_vllm_rank = _vllm_backend_module._setup_dedicated_vllm_rank
+    _setup_dedicated_training_pgs = _vllm_backend_module._setup_dedicated_training_pgs
     def _build_tune_to_hf_map(self):
         """Build torchtune -> HuggingFace parameter name mapping for weight sync.
 
@@ -957,10 +961,6 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         FSDP1's AllGather collective (which would deadlock if only shard leaders
         call this function).
         """
-        if getattr(self, '_is_bioreason', False):
-            # BioReason params are already HF-format names. _tune_to_hf_map is {}
-            # so all weight-sync .get(k, k) calls fall back to identity.
-            return
         from torchtune.models.convert_weights import get_mapped_key
         from torchtune.training.checkpointing._utils import ModelType
 
@@ -1644,228 +1644,11 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
 
         return model
 
-    def _setup_bioreason_vllm_rank(self, cfg: DictConfig) -> None:
-        """Initialize the dedicated vLLM generation server rank (rank N-1).
-
-        vLLM engine is already initialized in _init_vllm_early_dedicated() (called
-        before the CCL process group in __init__). This method:
-        - Loads BioReasonModel (frozen) for ESM3+GO embed computation.
-        - Creates training_pg and wsync_pg for coordination with training ranks.
-        - Stores generation params for _run_vllm_generation_server().
-        """
-        from torchtune.dev.bioreason.model import BioReasonModel
-
-        ckpt_dir = cfg.base_model_path
-        log.info("Rank %d (vLLM server): loading embed model from %s", self.rank, ckpt_dir)
-        self._embed_model = BioReasonModel(
-            ckpt_dir=ckpt_dir,
-            device=self._device,
-            dtype=self._dtype,
-        )
-        self._embed_model.eval()
-        for p in self._embed_model.parameters():
-            p.requires_grad_(False)
-
-        # Pre-compute flat buffer layout for batched weight sync (1 broadcast vs 398).
-        self._compute_wsync_layout(self._embed_model)
-
-        # vLLM engine already created in _init_vllm_early_dedicated — verify it exists.
-        assert self._vllm_llm is not None, "vLLM LLM should have been initialized in _init_vllm_early_dedicated"
-
-        # Create process groups in the SAME ORDER as _setup_bioreason_models on training ranks.
-        # All ranks in the world must call new_group in identical order or deadlock occurs.
-        _training_ranks = list(range(self.world_size - 1))
-        torch.distributed.new_group(_training_ranks, backend="xccl")  # training_pg (unused on vLLM rank)
-        # wsync_pg: bench shows xccl on [0, N-1] intra-node ≈ 0.34 GB/s (run 45).
-        # gloo via SHM loopback should be ≥5 GB/s. Set TORCHTUNE_WSYNC_BACKEND=xccl to revert.
-        _wsync_backend = os.environ.get("TORCHTUNE_WSYNC_BACKEND", "gloo")
-        if _wsync_backend == "gloo":
-            import torch.distributed.distributed_c10d as _dc10d
-            _default_pg = _dc10d._get_default_group()
-            _orig_bound = _default_pg.bound_device_id
-            _default_pg.bound_device_id = None
-            try:
-                self._wsync_pg = torch.distributed.new_group(
-                    [0, self._vllm_dedicated_rank], backend=_wsync_backend
-                )
-            finally:
-                _default_pg.bound_device_id = _orig_bound
-        else:
-            self._wsync_pg = torch.distributed.new_group(
-                [0, self._vllm_dedicated_rank], backend=_wsync_backend
-            )
-
-        # Store generation params needed by _run_vllm_generation_server.
-        self._total_steps = cfg.get("num_steps", 10000)
-        self._max_generated_tokens = cfg.get("max_generated_tokens", 512)
-        self._temperature = cfg.get("temperature", 0.8)
-        self._top_k = cfg.get("top_k", None)
-        self.grpo_samples = cfg.get("grpo_samples", 8)
-
-        log.info(
-            "Rank %d (vLLM server): setup complete — embed_model loaded, wsync_pg created, num_steps=%d",
-            self.rank, self._total_steps,
-        )
-
-    def _setup_bioreason_models(self, cfg: DictConfig) -> None:
-        """Instantiate BioReasonModel for policy and ref — no FSDP/checkpointer needed.
-
-        BioReason loads ESM3 + GO graph encoder + projectors + Qwen3-4B backbone
-        from a single checkpoint directory. The 4B model fits on 1-2 XPU tiles
-        without FSDP sharding at the batch sizes used for GRPO RL training.
-        """
-        from torchtune.dev.bioreason.model import BioReasonModel
-
-        ckpt_dir = cfg.base_model_path
-        log.info("BioReason: loading policy model from %s", ckpt_dir)
-        self._model = BioReasonModel(
-            ckpt_dir=ckpt_dir,
-            device=self._device,
-            dtype=self._dtype,
-        )
-        self._model.train()
-        if self._enable_activation_checkpointing:
-            self._model.backbone.gradient_checkpointing_enable(
-                gradient_checkpointing_kwargs={"use_reentrant": False}
-            )
-            log.info("BioReason: gradient checkpointing enabled on backbone")
-
-        ref_device = torch.device("cpu") if self._ref_cpu_offload else self._device
-        log.info("BioReason: loading ref model from %s (device=%s)", ckpt_dir, ref_device)
-        self._ref_model = BioReasonModel(
-            ckpt_dir=ckpt_dir,
-            device=ref_device,
-            dtype=self._dtype,
-        )
-        self._ref_model.eval()
-        for p in self._ref_model.parameters():
-            p.requires_grad_(False)
-        # Stored so ref forward can move inputs to the right device.
-        self._ref_model_device = ref_device
-
-        # Use BioReasonHFTokenizer wrapper (exposes pad_id, eos_id, stop_tokens).
-        # model.tokenizer is the raw HF Qwen2TokenizerFast which lacks pad_id.
-        from torchtune.dev.bioreason.dataset import BioReasonHFTokenizer
-        self._tokenizer = BioReasonHFTokenizer(ckpt_dir=ckpt_dir)
-
-        # FSDP1 is used in dedicated_rank mode (ZeRO-2); set True after wrapping below.
-        self._use_fsdp1 = False
-        self._fsdp2_param_groups_meta = []
-        self._tune_to_hf_map = {}
-        self._vocab_size = self._model.vocab_size
-        # No checkpointer for bioreason — loaded directly from HF ckpt dir.
-        self._checkpointer = None
-        self._is_bioreason = True
-        # Move ref model to XPU only during ref forward, then back to CPU.
-        # Saves ~8 GiB HBM during backward while keeping XPU ref forward speed.
-        self._bioreason_dynamic_ref_offload = True
-
-        if self._is_rank_zero:
-            trainable = sum(
-                p.numel() for p in self._model.parameters() if p.requires_grad
-            )
-            log.info(
-                "BioReason setup: vocab=%d, trainable=%.3fB params",
-                self._vocab_size,
-                trainable / 1e9,
-            )
-
-        # Dedicated vLLM mode: wrap policy in FSDP1 SHARD_GRAD_OP (ZeRO-2) over
-        # training ranks (0..N-2). Rank N-1 is the vLLM server and does not reach this.
-        # SHARD_GRAD_OP shards gradients and optimizer states (ZeRO-2); params are
-        # AllGathered during forward/backward (replicated during compute) and sharded
-        # at rest. For 11 ranks this reduces gradient memory from 8 GiB to 0.73 GiB
-        # and optimizer moments from 16 GiB to 1.45 GiB — eliminating the DDP bucket
-        # pinning that forced forward_batch_size=4 in earlier runs.
-        # FSDP2 (fully_shard) is NOT used — it deadlocks with oneCCL per-layer comms.
-        _wrap_fsdp1 = (
-            self._vllm_mode == "dedicated_rank" and self._vllm_dedicated_rank is not None
-        ) or (self._vllm_mode == "server")
-        if _wrap_fsdp1:
-            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-            from torch.distributed.fsdp import ShardingStrategy, MixedPrecision
-            if self._vllm_mode == "dedicated_rank":
-                _training_ranks = list(range(self.world_size - 1))
-            else:
-                # server mode: all ranks are training ranks; vLLM lives on a separate
-                # node entirely (asymmetric launcher) and is not part of WORLD.
-                _training_ranks = list(range(self.world_size))
-            self._training_pg = torch.distributed.new_group(_training_ranks, backend="xccl")
-            if self._vllm_mode == "dedicated_rank":
-                _wsync_backend = os.environ.get("TORCHTUNE_WSYNC_BACKEND", "gloo")
-                if _wsync_backend == "gloo":
-                    import torch.distributed.distributed_c10d as _dc10d
-                    _default_pg = _dc10d._get_default_group()
-                    _orig_bound = _default_pg.bound_device_id
-                    _default_pg.bound_device_id = None
-                    try:
-                        self._wsync_pg = torch.distributed.new_group(
-                            [0, self._vllm_dedicated_rank], backend=_wsync_backend
-                        )
-                    finally:
-                        _default_pg.bound_device_id = _orig_bound
-                else:
-                    self._wsync_pg = torch.distributed.new_group(
-                        [0, self._vllm_dedicated_rank], backend=_wsync_backend
-                    )
-            else:
-                # server mode: no torch.distributed wsync PG; weights ship over HTTP
-                # (raw_bytes path → /dev/shm + /collective_rpc).
-                self._wsync_pg = None
-            _pre_wrap = self._model
-            # Freeze the embed copy — it's a replicated convenience tensor (not the
-            # backbone's embed_tokens), so FSDP should NOT shard it. With requires_grad=False,
-            # FSDP excludes it from the flat param and keeps it replicated on each rank.
-            # This lets build_full_embeds() work correctly outside the FSDP forward context.
-            _pre_wrap._embed.requires_grad_(False)
-            _mp_policy = MixedPrecision(
-                param_dtype=torch.bfloat16,
-                reduce_dtype=torch.bfloat16,
-                buffer_dtype=torch.bfloat16,
-            )
-            self._model = FSDP(
-                _pre_wrap,
-                sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
-                mixed_precision=_mp_policy,
-                process_group=self._training_pg,
-                ignored_modules=[m for m in [_pre_wrap._embed,
-                                             _pre_wrap.protein_encoder,
-                                             _pre_wrap.go_encoder]
-                                 if m is not None and isinstance(m, torch.nn.Module)],
-                use_orig_params=True,
-                device_id=self._device,
-            )
-            self._use_fsdp1 = True
-            # Pre-compute chunked broadcast layout inside summon_full_params.
-            # Outside summon_full_params, use_orig_params=True params reflect SHARD sizes
-            # (not full), so chunk boundaries would be wrong. With rank0_only=True, all
-            # training ranks see the correct full shapes (rank 0 gets real values, 1-10
-            # get zeros); numel() is consistent across all ranks after this call.
-            with FSDP.summon_full_params(self._model, writeback=False, rank0_only=True):
-                self._compute_wsync_layout(self._model)
-            _wsync_desc = (
-                f"wsync_pg=[0,{self._vllm_dedicated_rank}]"
-                if self._vllm_mode == "dedicated_rank"
-                else "wsync=HTTP raw_bytes (no PG)"
-            )
-            log.info(
-                "Rank %d: FSDP1 SHARD_GRAD_OP (ZeRO-2) wrapped over training_pg (%d ranks), "
-                "ignored=[_embed, protein_encoder, go_encoder], %s",
-                self.rank, len(_training_ranks), _wsync_desc,
-            )
-        else:
-            self._training_pg = None
-            self._wsync_pg = None
-
     def _setup_optimizer(
         self,
         cfg_optimizer: DictConfig,
         opt_state_dict: Optional[dict[str, Any]] = None,
     ) -> Optional[Optimizer]:
-        # BioReasonModel exposes trainable_parameters() to exclude frozen encoders.
-        # For standard TorchTune models, use model.parameters() (all params).
-        # FSDP1 with use_orig_params=True exposes the original params directly —
-        # no .module unwrapping needed.
         if hasattr(self._model, 'trainable_parameters'):
             params = [p for _, p in self._model.trainable_parameters()]
         else:
@@ -2001,32 +1784,6 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         self,
         epoch: int,
     ) -> None:
-        # BioReasonModel checkpointing: save backbone + projectors directly.
-        # Bypasses FSDP gather (not applicable for DDP/plain model).
-        if hasattr(self._policy, 'vllm_param_iter'):
-            if self._is_rank_zero:
-                save_dir = os.path.join(self._output_dir, f"epoch_{epoch}")
-                os.makedirs(save_dir, exist_ok=True)
-                # Save projectors
-                torch.save(
-                    self._policy.protein_projection.state_dict(),
-                    os.path.join(save_dir, "protein_projection.pt"),
-                )
-                torch.save(
-                    self._policy.go_projection.state_dict(),
-                    os.path.join(save_dir, "go_projection.pt"),
-                )
-                # Save backbone via HF save_pretrained
-                self._policy.backbone.save_pretrained(
-                    os.path.join(save_dir, "backbone")
-                )
-                log.info("BioReason checkpoint saved to %s", save_dir)
-            # In dedicated_rank mode, rank 11 is in server loop — use training_pg only.
-            if torch.distributed.is_initialized():
-                pg = self._training_pg if self._vllm_mode == "dedicated_rank" else None
-                torch.distributed.barrier(group=pg)
-            return
-
         checkpoint_dict = {}
 
         intermediate_checkpoint = epoch + 1 < self.total_epochs
@@ -2092,7 +1849,7 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                 )
                 log.info(f"Saving checkpoint took {time.perf_counter() - start:.2f} secs")
             else:
-                log.info("No checkpointer configured (bioreason model) — skipping checkpoint save")
+                log.info("No checkpointer configured — skipping checkpoint save")
 
         # Skip barrier in production mode — checkpoint save is rank-0 only,
         # other ranks just need to stay out of the way during full_tensor() gather.
@@ -2195,100 +1952,16 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         )
         return query_responses
 
-    def _generate_with_vllm_server_embeds(
-        self,
-        batch_input_ids: torch.Tensor,
-        context_length: int,
-        prompt_embeds: torch.Tensor,
-    ) -> torch.Tensor:
-        """vLLM server mode for multimodal (BioReason): POST prompt_embeds.
-
-        Differs from _generate_with_vllm: instead of token IDs, sends per-prompt
-        bf16 embedding tensors (built from ESM3+GO+projectors on the train side).
-        Each replica handles a round-robin slice of the batch in parallel.
-
-        Returns:
-            query_responses: ``[B*G, context_length + max_generated_tokens]``
-        """
-        bsz = batch_input_ids.shape[0]
-        total_len = context_length + self._max_generated_tokens
-
-        if self._is_rank_zero:
-            assert prompt_embeds is not None and prompt_embeds.shape[0] == bsz, (
-                f"prompt_embeds required for vllm_server_embeds; got "
-                f"{None if prompt_embeds is None else prompt_embeds.shape}, bsz={bsz}"
-            )
-            embeds_list = [prompt_embeds[i].detach().cpu().contiguous() for i in range(bsz)]
-            gen_kwargs = dict(
-                max_tokens=self._max_generated_tokens,
-                temperature=self._temperature,
-                top_k=self._top_k or 0,
-                top_p=getattr(self, "_top_p", 1.0),
-            )
-
-            t0 = time.perf_counter()
-            num_clients = len(self._vllm_clients)
-            # Submit one /v1/completions request per prompt so the vLLM scheduler
-            # on each tile sees concurrent in-flight requests and can batch their
-            # decode kernels. Sending a chunk-list-per-server (the previous
-            # implementation) caused the OpenAI server to serialize the chunk
-            # internally — Running:1 reqs per tile, ~50 tok/s wasted decode.
-            # Round-robin assignment keeps load balanced across the 12 servers.
-            from concurrent.futures import ThreadPoolExecutor, as_completed
-
-            def _call_one(client, embed):
-                # generate_from_embeds returns list[list[int]]; we sent 1 prompt
-                # so unwrap to list[int].
-                out = client.generate_from_embeds(prompt_embeds=[embed], **gen_kwargs)
-                return out[0] if out else []
-
-            completions = [None] * bsz
-            max_workers = max(1, min(bsz, num_clients * 8))
-            with ThreadPoolExecutor(max_workers=max_workers) as pool:
-                futures = {
-                    pool.submit(_call_one, self._vllm_clients[i % num_clients], embeds_list[i]): i
-                    for i in range(bsz)
-                }
-                for future in as_completed(futures):
-                    i = futures[future]
-                    completions[i] = future.result()
-            gen_time = time.perf_counter() - t0
-
-            query_responses = batch_input_ids.new_full((bsz, total_len), self._tokenizer.pad_id)
-            query_responses[:, :context_length] = batch_input_ids
-            for i, comp in enumerate(completions):
-                length = min(len(comp), self._max_generated_tokens)
-                query_responses[i, context_length : context_length + length] = torch.tensor(
-                    comp[:length], dtype=batch_input_ids.dtype, device=self._device
-                )
-
-            total_tokens = sum(len(c) for c in completions)
-            log.info(
-                "Rank %d: vLLM-embeds generation: %d sequences (%d clients), %d tokens in %.1fs (%.1f tok/s)",
-                self.rank, bsz, num_clients, total_tokens, gen_time, total_tokens / max(gen_time, 0.01),
-            )
-        else:
-            query_responses = batch_input_ids.new_empty(bsz, total_len)
-
-        torch.distributed.broadcast(query_responses, src=0)
-        return query_responses
-
     def _generate_with_colocated_vllm(
         self,
         batch_input_ids: torch.Tensor,
         context_length: int,
-        prompt_embeds: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Generate using this rank's colocated vLLM engine.
 
         With a DistributedSampler, each rank already has its own subset of
         prompts. Each rank generates ALL grpo_samples completions for its own
         prompts locally — no cross-rank communication needed.
-
-        Args:
-            prompt_embeds: ``[B*G, ctx_len, H]`` CPU tensor for multimodal inputs.
-                When provided, passes embeddings to vLLM instead of token IDs.
-                Requires vLLM initialised with ``enable_prompt_embeds=True``.
 
         Returns:
             query_responses: ``[B*G, context_length + max_generated_tokens]``
@@ -2305,17 +1978,13 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             detokenize=False,
         )
 
-        if prompt_embeds is not None:
-            # Multimodal: pass pre-computed embeddings to vLLM (CPU tensors required).
-            vllm_prompts = [{"prompt_embeds": prompt_embeds[i]} for i in range(bsz)]
-        else:
-            # Text-only: strip padding and pass token ID lists.
-            raw_prompts = []
-            for i in range(bsz):
-                ids = batch_input_ids[i].cpu().tolist()
-                ids = [t for t in ids if t != self._tokenizer.pad_id]
-                raw_prompts.append(ids)
-            vllm_prompts = [{"prompt_token_ids": p} for p in raw_prompts]
+        # Text-only: strip padding and pass token ID lists.
+        raw_prompts = []
+        for i in range(bsz):
+            ids = batch_input_ids[i].cpu().tolist()
+            ids = [t for t in ids if t != self._tokenizer.pad_id]
+            raw_prompts.append(ids)
+        vllm_prompts = [{"prompt_token_ids": p} for p in raw_prompts]
 
         t0 = time.perf_counter()
         outputs = self._vllm_llm.generate(
@@ -2411,7 +2080,6 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         self,
         input_ids: torch.Tensor,
         answers: list[str],
-        protein_sequences: Optional[list] = None,
     ) -> GRPOTrajectory:
         """
         Generates a trajectory given the current policy model, the reference policy model,
@@ -2457,50 +2125,26 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         batch_input_ids = input_ids[:, None, :].expand(-1, grpo_size, -1)
         batch_input_ids = batch_input_ids.reshape(batch_size * grpo_size, -1)
 
-        # Multimodal: build prompt embeddings once per unique prompt, then expand to B*G.
-        # BioReasonModel.build_prompt_embeds(input_ids [B, P], protein_sequences [B])
-        # returns [B, P, H] on CPU. Expand to [B*G, P, H] for rollouts.
-        # Each training rank computes its own prompt_embeds (different context_lengths
-        # per rank from DistributedSampler). The caching allocator (XPU_USM_ALLOC_SO)
-        # prevents L0 GC at the step boundary, allowing safe ESM3 activation at step 1+.
-        prompt_embeds = None
-        if protein_sequences is not None and hasattr(self._policy, 'build_prompt_embeds'):
-            # protein_projection and go_projection are trainable → FSDP-sharded at rest.
-            # summon_full_params gathers them so build_prompt_embeds sees complete weights.
-            # This is a collective over _training_pg (all training ranks call it together).
-            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-            import contextlib
-            _gather_ctx = (
-                FSDP.summon_full_params(self._model, writeback=False)
-                if isinstance(self._model, FSDP) else contextlib.nullcontext()
-            )
-            with torch.no_grad(), _gather_ctx:
-                pe_base = self._policy.build_prompt_embeds(
-                    input_ids.to(self._device), protein_sequences
-                )  # [B, P, H] CPU
-            prompt_embeds = (
-                pe_base.unsqueeze(1)
-                .expand(-1, grpo_size, -1, -1)
-                .reshape(batch_size * grpo_size, pe_base.shape[1], pe_base.shape[2])
-                .contiguous()
-            )  # [B*G, P, H] CPU
 
         # step 1: generate responses using the current policy (or vLLM)
         _vllm_t0 = time.perf_counter()
         if self._vllm_mode in ("colocate", "colocate_sleep"):
             query_responses = self._generate_with_colocated_vllm(
-                batch_input_ids, context_length, prompt_embeds=prompt_embeds
+                batch_input_ids, context_length
             )
         elif self._vllm_mode == "dedicated_rank":
-            query_responses = self._generate_with_dedicated_vllm(
-                batch_input_ids, context_length, protein_sequences
-            )
-        elif self._vllm_mode == "server":
-            if getattr(self, "_is_bioreason", False) and prompt_embeds is not None:
-                query_responses = self._generate_with_vllm_server_embeds(
-                    batch_input_ids, context_length, prompt_embeds
+            bsz = batch_input_ids.shape[0]
+            total_len = context_length + self._max_generated_tokens
+            if self._is_rank_zero:
+                query_responses_cpu = self._generate_with_dedicated_vllm(
+                    batch_input_ids, context_length, None
                 )
-            elif getattr(self, "_pending_async_query_responses", None) is not None:
+                query_responses = query_responses_cpu.to(self._device)
+            else:
+                query_responses = batch_input_ids.new_empty(bsz, total_len)
+            torch.distributed.broadcast(query_responses, src=0, group=self._training_pg)
+        elif self._vllm_mode == "server":
+            if getattr(self, "_pending_async_query_responses", None) is not None:
                 # Phase 1 async: producer thread already issued HTTP on rank 0
                 # and stashed the tensor here. Run the matching collective
                 # broadcast on all ranks; consumers see the same tensor.
@@ -2637,15 +2281,7 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             with torch.no_grad():
                 if fwd_bs >= num_seqs:
                     log.info("Rank %d: policy forward start (shape=%s)", self.rank, list(query_responses.shape))
-                    if prompt_embeds is not None:
-                        _full_emb = self._policy.build_full_embeds(prompt_embeds, responses)
-                        _attn_mask = (query_responses != self._tokenizer.pad_id).long()
-                        logits = self._model(
-                            inputs_embeds=_full_emb, attention_mask=_attn_mask, position_ids=position_ids
-                        )
-                        del _full_emb, _attn_mask
-                    else:
-                        logits = self._model(query_responses, input_pos=position_ids, mask=masks)
+                    logits = self._model(query_responses, input_pos=position_ids, mask=masks)
                     log.info("Rank %d: policy forward done", self.rank)
                     logits = logits[:, context_length - 1 :]
                     logprobs = rlhf.batched_logits_to_logprobs(logits, responses, self._temperature)
@@ -2658,20 +2294,11 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                     logprobs_chunks = []
                     for cs in range(0, num_seqs, fwd_bs):
                         ce = min(cs + fwd_bs, num_seqs)
-                        if prompt_embeds is not None:
-                            _full_emb = self._policy.build_full_embeds(prompt_embeds[cs:ce], responses[cs:ce])
-                            _attn_mask = (query_responses[cs:ce] != self._tokenizer.pad_id).long()
-                            chunk_logits = self._model(
-                                inputs_embeds=_full_emb, attention_mask=_attn_mask,
-                                position_ids=position_ids[cs:ce],
-                            )
-                            del _full_emb, _attn_mask
-                        else:
-                            chunk_logits = self._model(
-                                query_responses[cs:ce],
-                                input_pos=position_ids[cs:ce],
-                                mask=masks[cs:ce],
-                            )
+                        chunk_logits = self._model(
+                            query_responses[cs:ce],
+                            input_pos=position_ids[cs:ce],
+                            mask=masks[cs:ce],
+                        )
                         if self.rank == 0 and self._device.type == "xpu":
                             log.info("Rank 0: POST-chunk[%d:%d] memory: alloc=%.2f GiB, resv=%.2f GiB",
                                      cs, ce, torch.xpu.memory_allocated() / 1024**3, torch.xpu.memory_reserved() / 1024**3)
@@ -2728,29 +2355,15 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         elif not self._production_mode:
             self._training_barrier()  # dedicated_rank: training_pg only (rank 11 not here)
         # Dynamic ref offload: move ref model to XPU for fast ref forward.
-        if getattr(self, '_bioreason_dynamic_ref_offload', False):
-            self._ref_model.to(self._device)
-            log.info("Rank %d: ref model → XPU for ref forward", self.rank)
         # Use actual model parameter device (more robust than stored attr).
         _ref_dev = next(self._ref_model.parameters()).device
         log.info("Rank %d: ref model device=%s, position_ids.device=%s",
                  self.rank, _ref_dev, position_ids.device)
         if fwd_bs >= num_seqs:
             log.info("Rank %d: ref forward start", self.rank)
-            if prompt_embeds is not None:
-                _full_emb = self._ref_model.build_full_embeds(prompt_embeds, responses)
-                # _full_emb already on _ref_dev (build_full_embeds moves it).
-                # _attn_mask and position_ids must also be on _ref_dev.
-                _attn_mask = (query_responses != self._tokenizer.pad_id).long().to(_ref_dev)
-                ref_logits = self._ref_model(
-                    inputs_embeds=_full_emb, attention_mask=_attn_mask,
-                    position_ids=position_ids.to(_ref_dev),
-                ).to(self._device)
-                del _full_emb, _attn_mask
-            else:
-                ref_logits = self._ref_model(
-                    query_responses, input_pos=position_ids, mask=masks
-                )
+            ref_logits = self._ref_model(
+                query_responses, input_pos=position_ids, mask=masks
+            )
             ref_logits = rlhf.truncate_sequence_for_logprobs(ref_logits, context_length)
             ref_logprobs = rlhf.batched_logits_to_logprobs(
                 ref_logits, responses, self._temperature
@@ -2761,22 +2374,11 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             ref_logprobs_chunks = []
             for cs in range(0, num_seqs, fwd_bs):
                 ce = min(cs + fwd_bs, num_seqs)
-                if prompt_embeds is not None:
-                    _full_emb = self._ref_model.build_full_embeds(prompt_embeds[cs:ce], responses[cs:ce])
-                    # _full_emb already on _ref_dev (build_full_embeds moves it).
-                    # _attn_mask and position_ids must also be on _ref_dev.
-                    _attn_mask = (query_responses[cs:ce] != self._tokenizer.pad_id).long().to(_ref_dev)
-                    chunk_ref_logits = self._ref_model(
-                        inputs_embeds=_full_emb, attention_mask=_attn_mask,
-                        position_ids=position_ids[cs:ce].to(_ref_dev),
-                    ).to(self._device)
-                    del _full_emb, _attn_mask
-                else:
-                    chunk_ref_logits = self._ref_model(
-                        query_responses[cs:ce],
-                        input_pos=position_ids[cs:ce],
-                        mask=masks[cs:ce],
-                    )
+                chunk_ref_logits = self._ref_model(
+                    query_responses[cs:ce],
+                    input_pos=position_ids[cs:ce],
+                    mask=masks[cs:ce],
+                )
                 chunk_ref_logits = rlhf.truncate_sequence_for_logprobs(chunk_ref_logits, context_length)
                 ref_logprobs_chunks.append(
                     rlhf.batched_logits_to_logprobs(chunk_ref_logits, responses[cs:ce], self._temperature)
@@ -2792,9 +2394,6 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         # empty_cache() returns L0 pages whose addresses CCL has cached as IPC handles
         # → step 1 banned:1 (see bugs/project_xpu_emptycache_revalidated.md).
         # The ref params being freed will live in the caching allocator until reused.
-        if getattr(self, '_bioreason_dynamic_ref_offload', False):
-            self._ref_model.to('cpu')
-            log.info("Rank %d: ref model → CPU after ref forward (freed ~8 GiB XPU)", self.rank)
         if self._device.type == "xpu":
             torch.xpu.synchronize()
         if self._is_rank_zero:
@@ -2831,21 +2430,6 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             rewards, successes, metadata = sum_digits_batched_rewards(
                 self._tokenizer, responses, answers, device=self._device,
             )
-        elif self._reward_mode == "bioreason":
-            from torchtune.dev.bioreason.reward import bioreason_reward_fn as _br_reward
-            # Decode responses → strings, expand answers to match G rollouts per prompt.
-            _decoded, _expanded_answers = [], []
-            for _b in range(batch_size):
-                for _g in range(grpo_size):
-                    _ids = responses[_b, _g]
-                    _non_pad = _ids[_ids != self._tokenizer.pad_id]
-                    _decoded.append(self._tokenizer.decode(_non_pad.cpu().tolist()))
-                    _expanded_answers.append(answers[_b])
-            _rw, _succ = _br_reward(_decoded, _expanded_answers)
-            # Reshape to [B, G, 1] to match the batched_rewards interface.
-            rewards = _rw.view(batch_size, grpo_size, 1)
-            successes = _succ.float().view(batch_size, grpo_size, 1)
-            metadata = {}
         else:
             rewards, successes, metadata = batched_rewards(
                 self._tokenizer, responses, answers, device=self._device
@@ -2900,14 +2484,12 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             response_padding_masks=response_padding_masks,
             seq_lens=training.get_unmasked_sequence_lengths(response_padding_masks),
             answers=answers,
-            prompt_embeds=prompt_embeds,  # None for text-only; [B*G, P, H] CPU for multimodal
         )
 
     def generate_trajectory_batched(
         self,
         input_ids: torch.Tensor,
         answers: list[str],
-        protein_sequences: Optional[list] = None,
     ) -> GRPOTrajectory:
         """
         Generates trajectories using forward_batch_size micro-batches.
@@ -2921,13 +2503,9 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                 batch_answers = answers[
                     batch_start : batch_start + self._forward_batch_size
                 ]
-                batch_proteins = (
-                    protein_sequences[batch_start : batch_start + self._forward_batch_size]
-                    if protein_sequences is not None else None
-                )
                 device_empty_cache(self._device)
                 trajectories.append(
-                    self.generate_trajectory(batch_input_ids, batch_answers, batch_proteins)
+                    self.generate_trajectory(batch_input_ids, batch_answers)
                 )
                 device_empty_cache(self._device)
 
@@ -2976,12 +2554,9 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         # estimate logprobs from the policy at the current optimisation step
         _fwd_t0 = time.perf_counter()
 
-        # Detect multimodal trajectory: BioReasonModel uses inputs_embeds path.
-        _multimodal = trajectory.prompt_embeds is not None
 
-        if self._enable_packing and not _multimodal:
+        if self._enable_packing:
             # Pack sequences to eliminate padding waste in forward/backward.
-            # Packing requires token IDs — skip for multimodal (inputs_embeds path).
             from torchtune.dev.rl.packing import (
                 pack_trajectory_for_training,
                 unpack_tensor,
@@ -3012,35 +2587,17 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             os.environ.get("TORCHTUNE_USE_CHUNKED_LOSS") == "1"
             and self._expert_parallel_degree <= 1
         ):
-            # Single forward + single backward (non-EP only; includes multimodal).
-            # Multimodal previously fell through to the chunked path; that retains
-            # per-chunk fwd graphs simultaneously and pushes BWD peak past the
-            # caching-allocator GC threshold (run 38: ~60 GiB → auto-GC →
-            # CCL IPC handles invalidated → step 2 banned:1).
-            # The _multimodal sub-branch below uses build_full_embeds for the
-            # whole batch; for G=8/T=1024/H=2048 bf16 the embed tensor is ~32 MiB
-            # and pi_logits is ~2.5 GiB — both well within budget.
+            # Single forward + single backward (non-EP only).
             total_seqs = trajectory.query_responses.shape[0]
             grad_scale = max(1, self._gradient_accumulation_steps)
 
             log.info("Rank %d: single-backward forward start (total=%d seqs)", self.rank, total_seqs)
             _fwd_t0_sb = time.perf_counter()
-            if _multimodal:
-                _comp_ids = trajectory.query_responses[:, context_length:]
-                _full_emb = self._policy.build_full_embeds(trajectory.prompt_embeds, _comp_ids)
-                _attn_mask = (trajectory.query_responses != self._tokenizer.pad_id).long()
-                pi_logits = self._model(
-                    inputs_embeds=_full_emb,
-                    attention_mask=_attn_mask,
-                    position_ids=trajectory.position_ids,
-                )
-                del _full_emb, _attn_mask, _comp_ids
-            else:
-                pi_logits = self._model(
-                    trajectory.query_responses,
-                    input_pos=trajectory.position_ids,
-                    mask=trajectory.masks,
-                )
+            pi_logits = self._model(
+                trajectory.query_responses,
+                input_pos=trajectory.position_ids,
+                mask=trajectory.masks,
+            )
             pi_logits = rlhf.truncate_sequence_for_logprobs(pi_logits, context_length)
             pi_logprobs = rlhf.batched_logits_to_logprobs(
                 pi_logits,
@@ -3142,9 +2699,6 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                 and hasattr(self._model, 'no_sync')
             )
             # DDP (nn.parallel.DistributedDataParallel) also has no_sync().
-            # BioReason dedicated_rank now uses FSDP1 (ZeRO-2), so _use_fsdp1=True
-            # and _use_fsdp1_no_sync handles no_sync there. This path remains for
-            # any plain-DDP cases in other model configs.
             _use_ddp_no_sync = (
                 num_fwd_chunks > 1
                 and not self._use_fsdp1
@@ -3167,26 +2721,11 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                         _cs, _ce, _pre_fwd_alloc, _pre_fwd_resv,
                     )
                 log.info("Rank %d: grpo_step chunk[%d:%d] fwd", self.rank, _cs, _ce)
-                if _multimodal:
-                    _chunk_comp_ids = trajectory.query_responses[_cs:_ce, context_length:]
-                    _chunk_full_emb = self._policy.build_full_embeds(
-                        trajectory.prompt_embeds[_cs:_ce], _chunk_comp_ids
-                    )
-                    _chunk_attn_mask = (
-                        trajectory.query_responses[_cs:_ce] != self._tokenizer.pad_id
-                    ).long()
-                    _c_logits = self._model(
-                        inputs_embeds=_chunk_full_emb,
-                        attention_mask=_chunk_attn_mask,
-                        position_ids=trajectory.position_ids[_cs:_ce],
-                    )
-                    del _chunk_full_emb, _chunk_attn_mask, _chunk_comp_ids
-                else:
-                    _c_logits = self._model(
-                        trajectory.query_responses[_cs:_ce],
-                        input_pos=trajectory.position_ids[_cs:_ce],
-                        mask=trajectory.masks[_cs:_ce],
-                    )
+                _c_logits = self._model(
+                    trajectory.query_responses[_cs:_ce],
+                    input_pos=trajectory.position_ids[_cs:_ce],
+                    mask=trajectory.masks[_cs:_ce],
+                )
                 _c_logits = rlhf.truncate_sequence_for_logprobs(_c_logits, context_length)
                 _c_pi_lp = rlhf.batched_logits_to_logprobs(
                     _c_logits,
@@ -3516,7 +3055,6 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
 
                 tokens = batch["tokens"]
                 answers = batch["answers"]
-                protein_sequences = batch.get("protein_sequences", None)
                 tokens = tokens.to(self._device)
 
                 _, context_length = tokens.shape
@@ -3536,7 +3074,7 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                 # vLLM generates with the latest available weights (no contention).
 
                 _step_t0 = time.perf_counter()
-                trajectory = self.generate_trajectory_batched(tokens, answers, protein_sequences)
+                trajectory = self.generate_trajectory_batched(tokens, answers)
                 if self._device.type == "xpu":
                     torch.xpu.synchronize()
                 _gen_time = time.perf_counter() - _step_t0
@@ -3915,6 +3453,20 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                         "Continuing training.",
                     )
             if training_completed:
+                # Phase 2 Step 4: signal the dedicated vLLM rank to exit its
+                # generation loop cleanly. Only rank 0 is paired with the vLLM
+                # rank over gen_pg, so only rank 0 sends the sentinel.
+                if (
+                    self._vllm_mode == "dedicated_rank"
+                    and self._is_rank_zero
+                    and getattr(self, "_gen_pg", None) is not None
+                ):
+                    try:
+                        torch.distributed.broadcast_object_list(
+                            [{"shutdown": True}], src=0, group=self._gen_pg
+                        )
+                    except Exception as _e:
+                        log.warning("Failed to send vLLM shutdown sentinel: %r", _e)
                 if self._expert_parallel_degree > 1:
                     # Sync all ranks before teardown. Without this, fast ranks may start
                     # Python GC of FSDP2/ZE objects while slow ranks are still in
