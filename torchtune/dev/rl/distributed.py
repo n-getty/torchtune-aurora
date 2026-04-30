@@ -480,6 +480,243 @@ def _ep_post_backward_grad_sync_xccl(model: nn.Module, dp_rep_degree: int) -> in
 
 
 # ---------------------------------------------------------------------------
+# v9: Per-chunk + per-step FSDP2 unsharded-grad release for EP
+# ---------------------------------------------------------------------------
+#
+# v59 sets `FSDPParamGroup.reduce_grads = False` on all FSDPParamGroups in EP
+# mode, so FSDP2's `post_backward()` never calls `foreach_reduce()`. Unsharded
+# grads stay resident on `FSDPParam._unsharded_param.grad` (and across chunks at
+# `unsharded_accumulated_grad`), and `nn.Parameter.grad` is None — which means
+# `_ep_post_backward_grad_sync_xccl` above silently no-ops (v9a probe confirmed
+# `n_synced=0` on every rank).
+#
+# This helper does what `foreach_reduce` would have done, but explicitly,
+# sequentially, behind a 24-rank gloo barrier so EP-load-imbalance ordering
+# (the original v59 motivation) cannot race.
+#
+# It must be called between every chunk's backward and the next chunk's forward,
+# and again as a defensive sweep after `optimizer.zero_grad`. After it runs:
+#   - sharded `nn.Parameter.grad` is populated as a DTensor on the param's mesh
+#   - `_unsharded_param.grad` and `unsharded_accumulated_grad` are nulled
+#   - `_unsharded_param`'s data storage is freed via `free_unsharded_param()`
+# `_ep_post_backward_grad_sync_xccl` then has real grads to average across DP
+# replicas via XCCL.
+
+def _resolve_pg_for_param_group(pg_obj):
+    """Pick the gloo PG for an FSDPParamGroup by inspecting its mesh size.
+
+    Robust to FSDPParamGroup object replacement between init and runtime
+    (which is why the helper resolves PGs on every call instead of caching).
+    """
+    mesh_info = getattr(pg_obj, "_mesh_info", None)
+    mesh_size = None
+    if mesh_info is not None:
+        mesh_obj = getattr(mesh_info, "mesh", None)
+        if mesh_obj is not None:
+            mesh_size = mesh_obj.size()
+
+    if mesh_size == _DP_SHARD_DEGREE and _GLOO_DP_SHARD_PG is not None:
+        return _GLOO_DP_SHARD_PG
+    if mesh_size == _DP_REP_DEGREE and _GLOO_DP_REP_PG is not None:
+        return _GLOO_DP_REP_PG
+    if _GLOO_DP_SHARD_PG is not None:
+        return _GLOO_DP_SHARD_PG
+    return None
+
+
+def _ep_release_fsdp_unsharded_grads(
+    model,  # nn.Module — the policy model
+    _unused_pg_map,  # legacy arg kept for call-site compat; ignored
+    accumulate_into_grad: bool,
+    warn_on_residue: bool = False,  # True only for post-step defensive sweep
+) -> int:
+    """Release FSDP2's unsharded grad pool into sharded `param.grad` (v9).
+
+    Walks every FSDPParamGroup in fixed order. Behind a global gloo barrier,
+    reduce-scatters each FSDPParam's unsharded grad onto the rank-local shard
+    of `param.grad` (constructed as a DTensor on the first call, accumulated
+    in-place on subsequent calls). Then frees the unsharded pool.
+
+    Args:
+        model: FSDP2-wrapped policy model.
+        mesh_to_pg_map: {id(FSDPParamGroup): gloo PG to reduce-scatter on}.
+            Built once at recipe init via `_ep_build_grad_release_pg_map`.
+        accumulate_into_grad: True for chunk N>0 (sums into existing grad);
+            False for chunk 0 OR for the post-step defensive sweep
+            (overwrites; defensive sweep should find zero residue).
+
+    Returns:
+        Number of FSDPParamGroups processed (for logging / asserts).
+    """
+    try:
+        from torch.distributed.fsdp._fully_shard._fully_shard import FSDPModule
+    except ImportError:
+        log.warning("_ep_release_fsdp_unsharded_grads: FSDP2 not available")
+        return 0
+
+    if _GLOO_GLOBAL_PG is not None:
+        torch.distributed.barrier(group=_GLOO_GLOBAL_PG)
+
+    seen_pg_ids: set = set()
+    param_groups_in_order = []
+    for _name, mod in model.named_modules():
+        if not isinstance(mod, FSDPModule):
+            continue
+        fsdp_state = mod._get_fsdp_state()
+        if fsdp_state is None:
+            continue
+        pg_obj = getattr(fsdp_state, "_fsdp_param_group", None)
+        if pg_obj is None or id(pg_obj) in seen_pg_ids:
+            continue
+        seen_pg_ids.add(id(pg_obj))
+        param_groups_in_order.append(pg_obj)
+
+    n_groups = 0
+    n_params_reduced = 0
+    n_residue_warnings = 0
+    for pg_obj in param_groups_in_order:
+        gloo_pg = _resolve_pg_for_param_group(pg_obj)
+        if gloo_pg is None:
+            continue
+        degree = gloo_pg.size()
+        for fsdp_param in pg_obj.fsdp_params:
+            ush_param = getattr(fsdp_param, "_unsharded_param", None)
+            ush_grad = ush_param.grad if ush_param is not None else None
+            acc_grad = getattr(fsdp_param, "unsharded_accumulated_grad", None)
+            grad_full = acc_grad if acc_grad is not None else ush_grad
+            if grad_full is None:
+                continue
+
+            if warn_on_residue and n_residue_warnings < 3:
+                log.warning(
+                    "_ep_release defensive sweep found residue: numel=%d (expected 0 after zero_grad)",
+                    grad_full.numel(),
+                )
+                n_residue_warnings += 1
+
+            sharded_param = fsdp_param.sharded_param
+            target_size = fsdp_param.sharded_size
+            # FSDP2 shards along dim 0 by default (see FSDPParam._init_sharded_param);
+            # `_post_forward_mesh_info.shard_mesh_dim` is the canonical knob, but
+            # `sharded_size` already encodes the local shape. Resolve shard_dim from
+            # the placements of the existing sharding spec.
+            shard_dim = 0
+            sspec = getattr(fsdp_param, "_sharding_spec", None)
+            if sspec is not None:
+                for plc in sspec.placements:
+                    if hasattr(plc, "dim"):
+                        shard_dim = plc.dim
+                        break
+
+            if degree > 1:
+                grad_cpu = grad_full.contiguous().cpu()
+                _orig_all_reduce(
+                    grad_cpu, op=torch.distributed.ReduceOp.SUM, group=gloo_pg,
+                )
+                grad_cpu.div_(degree)
+                local_rank_in_pg = torch.distributed.get_rank(gloo_pg)
+                # FSDP2 shards via torch.chunk along shard_dim — chunks may be
+                # uneven on the last rank if dim_size % degree != 0.
+                chunks = list(torch.chunk(grad_cpu, degree, dim=shard_dim))
+                local_chunk = chunks[local_rank_in_pg]
+            else:
+                local_chunk = grad_full.contiguous().cpu()
+
+            # Pad/slice along shard_dim to match sharded_size exactly (handles
+            # the uneven last-shard case FSDP2 internally pads with zeros).
+            cur = local_chunk.size(shard_dim) if local_chunk.dim() > shard_dim else 0
+            tgt = target_size[shard_dim] if len(target_size) > shard_dim else 0
+            if cur != tgt:
+                if cur < tgt:
+                    pad_shape = list(local_chunk.shape)
+                    pad_shape[shard_dim] = tgt - cur
+                    pad = torch.zeros(pad_shape, dtype=local_chunk.dtype)
+                    local_chunk = torch.cat([local_chunk, pad], dim=shard_dim)
+                else:
+                    local_chunk = local_chunk.narrow(shard_dim, 0, tgt)
+
+            local_shard = local_chunk.contiguous().to(
+                device=sharded_param.device, dtype=sharded_param.dtype, non_blocking=False,
+            )
+
+            if sharded_param.grad is None or not accumulate_into_grad:
+                sharded_param.grad = fsdp_param.to_sharded_dtensor(local_shard)
+            else:
+                existing = sharded_param.grad
+                existing_local = existing._local_tensor if hasattr(existing, "_local_tensor") else existing
+                existing_local.add_(local_shard)
+
+            if ush_param is not None:
+                ush_param.grad = None
+            fsdp_param.unsharded_accumulated_grad = None
+            try:
+                fsdp_param.free_unsharded_param()
+            except Exception as _free_exc:
+                if n_params_reduced < 3:
+                    log.warning(
+                        "_ep_release: free_unsharded_param failed for fsdp_param "
+                        "(idx=%d): %r", n_params_reduced, _free_exc,
+                    )
+            n_params_reduced += 1
+        n_groups += 1
+
+    return n_groups
+
+
+def _ep_build_grad_release_pg_map(model) -> dict:
+    """Build {id(FSDPParamGroup): gloo PG} for `_ep_release_fsdp_unsharded_grads`.
+
+    Each FSDPParamGroup carries a 1D mesh whose size determines whether it's an
+    expert group (sharded on dp_shard 4-rank mesh) or non-expert (sharded on
+    dp_replicate, but in EP mode this is the dp_shard mesh too — see v59 comment
+    at recipe :1440. Both wind up on the gloo SHARD PG.) Walk every group, look
+    at its mesh size, and route to the matching gloo PG.
+    """
+    try:
+        from torch.distributed.fsdp._fully_shard._fully_shard import FSDPModule
+    except ImportError:
+        return {}
+
+    mapping: dict = {}
+    seen_pg_ids: set = set()
+    for _name, mod in model.named_modules():
+        if not isinstance(mod, FSDPModule):
+            continue
+        fsdp_state = mod._get_fsdp_state()
+        if fsdp_state is None:
+            continue
+        pg_obj = getattr(fsdp_state, "_fsdp_param_group", None)
+        if pg_obj is None or id(pg_obj) in seen_pg_ids:
+            continue
+        seen_pg_ids.add(id(pg_obj))
+
+        mesh = getattr(pg_obj, "_mesh_info", None)
+        mesh_size = None
+        if mesh is not None:
+            mesh_obj = getattr(mesh, "mesh", None)
+            if mesh_obj is not None:
+                mesh_size = mesh_obj.size()
+
+        if mesh_size == _DP_SHARD_DEGREE and _GLOO_DP_SHARD_PG is not None:
+            mapping[id(pg_obj)] = _GLOO_DP_SHARD_PG
+        elif mesh_size == _DP_REP_DEGREE and _GLOO_DP_REP_PG is not None:
+            mapping[id(pg_obj)] = _GLOO_DP_REP_PG
+        elif _GLOO_DP_SHARD_PG is not None:
+            mapping[id(pg_obj)] = _GLOO_DP_SHARD_PG
+            log.warning(
+                "_ep_build_grad_release_pg_map: FSDPParamGroup '%s' mesh_size=%s "
+                "matches neither dp_shard (%d) nor dp_replicate (%d); defaulting to dp_shard PG",
+                _name, mesh_size, _DP_SHARD_DEGREE, _DP_REP_DEGREE,
+            )
+
+    log.info(
+        "_ep_build_grad_release_pg_map: routed %d FSDPParamGroups to gloo PGs (dp_shard=%d, dp_replicate=%d)",
+        len(mapping), _DP_SHARD_DEGREE, _DP_REP_DEGREE,
+    )
+    return mapping
+
+
+# ---------------------------------------------------------------------------
 # XPU-safe memory management
 # ---------------------------------------------------------------------------
 

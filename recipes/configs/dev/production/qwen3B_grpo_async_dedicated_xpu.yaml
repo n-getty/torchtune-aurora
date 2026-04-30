@@ -65,7 +65,12 @@ vllm_gpu_memory_utilization: 0.7
 vllm_weight_sync: true
 vllm_weight_sync_interval: 1
 
-always_compute_rollout_logprobs: true
+# Invariant (test_async_loss_combo.py): with async_generation.enabled=false,
+# always_compute_rollout_logprobs must also be false — GRPOSimpleLoss/SimpleLoss
+# semantics drop the IS ratio so the extra rollout-time fwd would be wasted.
+# When enabling async (max_staleness>0), flip BOTH this flag and the loss to
+# GRPOLoss + always_compute_rollout_logprobs=true.
+always_compute_rollout_logprobs: false
 
 async_generation:
   enabled: false  # Phase 2 Step 1 first validates synchronous gen_pg roundtrip

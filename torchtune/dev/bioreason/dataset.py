@@ -54,14 +54,19 @@ class BioReasonRLDataset(Dataset):
         logger.info(f"Loaded {len(self.examples)} BioReason RL examples from {data_files}")
 
     def _load(self, data_files: str) -> list[dict]:
-        import glob as _glob
-
-        # Collect paths: directory, glob, or comma-separated
+        # Collect paths: directory or comma-separated list.
+        # Use os.walk + extension filter (NOT the stdlib glob module) — recursive
+        # glob hangs on DAOS/dfuse mounts (see CLAUDE.md "Critical Platform
+        # Constraints"). The regression test asserts the substring is absent.
         if os.path.isdir(data_files):
-            paths = (
-                sorted(_glob.glob(os.path.join(data_files, "**/*.parquet"), recursive=True)) +
-                sorted(_glob.glob(os.path.join(data_files, "**/*.jsonl"), recursive=True))
-            )
+            parquets, jsonls = [], []
+            for root, _dirs, files in os.walk(data_files):
+                for fn in files:
+                    if fn.endswith(".parquet"):
+                        parquets.append(os.path.join(root, fn))
+                    elif fn.endswith(".jsonl"):
+                        jsonls.append(os.path.join(root, fn))
+            paths = sorted(parquets) + sorted(jsonls)
         else:
             paths = [p.strip() for p in data_files.split(",")]
 
@@ -124,19 +129,41 @@ class BioReasonRLDataset(Dataset):
         # Truncate protein sequence to max length
         protein_seq = protein_seq[:self.max_protein_len]
 
-        # Build prompt with placeholder tokens injected
-        # Protein tokens: one per residue (after truncation)
-        protein_placeholders = PROTEIN_PAD * len(protein_seq)
-        go_placeholders = GO_PAD * self.num_go_tokens
+        # Render the SFT-canonical chat template (chat_template.jinja). The user
+        # block is a content list so the template emits "Protein: <|protein_pad|>\n\n"
+        # and "GO graph: <|go_graph_pad|>\n\n" (matches what bioreason-pro-sft saw).
+        # add_generation_prompt=True ends the string at "<|im_start|>assistant\n"
+        # and lets the model decide whether to emit <think> itself — never inject
+        # a hardcoded "<think>\n" suffix here, that forces every completion into
+        # reasoning mode and zeros out the reward signal under any practical
+        # max_generated_tokens budget.
+        messages = [
+            {"role": "system", "content": "You are an expert in protein function prediction."},
+            {"role": "user", "content": [
+                {"type": "protein"},
+                {"type": "go_graph"},
+                {"type": "text", "text": prompt_text},
+            ]},
+        ]
+        # Some torchtune tokenizers don't expose apply_chat_template; reach the
+        # underlying HF tokenizer. BioReasonHFTokenizer stores it as `_tok`;
+        # torchtune wrappers expose it as `tokenizer`.
+        _hf_tok = getattr(self.tokenizer, "_tok", None) \
+                  or getattr(self.tokenizer, "tokenizer", self.tokenizer)
+        full_prompt = _hf_tok.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+        )
 
-        # Wrap in the standard BioReason chat template format
-        full_prompt = (
-            f"<|im_start|>system\nYou are an expert in protein function prediction.<|im_end|>\n"
-            f"<|im_start|>user\n"
-            f"Protein sequence embeddings: {protein_placeholders}\n"
-            f"GO graph context: {go_placeholders}\n"
-            f"{prompt_text}<|im_end|>\n"
-            f"<|im_start|>assistant\n<think>\n"
+        # Expand the single placeholder tokens to the true counts the embedding
+        # pipeline expects. Match upstream PLProcessor (processing_pl.py:184-185):
+        # protein placeholders = len(seq) + 2 (ESM3 BOS/EOS) so build_prompt_embeds
+        # can fill them directly with the unstripped ESM3 per-residue features.
+        protein_placeholders_count = len(protein_seq) + 2
+        full_prompt = full_prompt.replace(
+            PROTEIN_PAD, PROTEIN_PAD * protein_placeholders_count, 1,
+        )
+        full_prompt = full_prompt.replace(
+            GO_PAD, GO_PAD * self.num_go_tokens, 1,
         )
 
         # HF tokenizer: encode returns list[int]; TorchTune tokenizer may differ

@@ -20,7 +20,7 @@ set -eo pipefail
 PROJDIR=/lus/flare/projects/ModCon/ngetty/torchtune
 cd ${PROJDIR}
 
-module load frameworks/2025.2.0 2>/dev/null || true
+module load frameworks/2025.3.1 2>/dev/null || true
 export PATH=$(echo "$PATH" | tr ':' '\n' | grep -v myenv | tr '\n' ':' | sed 's/:$//')
 unset VIRTUAL_ENV
 

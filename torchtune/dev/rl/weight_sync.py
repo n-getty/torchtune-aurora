@@ -27,6 +27,34 @@ from torchtune import training, utils
 
 log = utils.get_logger("DEBUG")
 
+
+class _NullCtx:
+    """No-op context manager for FSDP2 path where summon_full_params doesn't apply."""
+    def __enter__(self):
+        return None
+    def __exit__(self, *args):
+        return False
+
+
+def _backbone_param_iter(self, policy=None):
+    """Generic fallback for backbone weight iteration.
+
+    BioReason-style multimodal wrappers expose `vllm_param_iter()` directly.
+    For plain text-only models (Qwen, Gemma, etc.), fall back to
+    `model.named_parameters()` with the tune→HF name map applied.
+    """
+    if policy is None:
+        policy = self._model
+    if hasattr(policy, 'vllm_param_iter'):
+        yield from policy.vllm_param_iter()
+        return
+    tune_to_hf = getattr(self, '_tune_to_hf_map', {}) or {}
+    for tune_name, param in policy.named_parameters():
+        clean = tune_name.replace("_checkpoint_wrapped_module.", "")
+        hf_name = tune_to_hf.get(clean, tune_to_hf.get(tune_name, clean))
+        yield hf_name, param
+
+
 def _sync_colocated_weights(self) -> None:
     """Sync FSDP2 weights to colocated vLLM via load_weights().
 
@@ -95,14 +123,37 @@ def _compute_wsync_layout(self, policy) -> None:
 
     Result: ~38 broadcasts instead of ~400, ~10× speedup with no OOM on vLLM rank.
     CHUNK_NUMEL default = 100M elems = 200 MiB bf16. Override via WSYNC_CHUNK_NUMEL.
+
+    For FSDP2 DTensor params, layout uses the *full* (unsharded) shape/numel
+    because the sender will materialize via `full_tensor()` before packing.
     """
     CHUNK_NUMEL = int(os.environ.get("WSYNC_CHUNK_NUMEL", str(100 * 1024 * 1024)))
 
+    # Lazy-build the tune→HF param name map if not already done. Generic recipes
+    # may not have invoked _build_tune_to_hf_map yet at first sync.
+    if not hasattr(self, '_tune_to_hf_map'):
+        if hasattr(self, '_build_tune_to_hf_map'):
+            self._build_tune_to_hf_map()
+        else:
+            self._tune_to_hf_map = {}
+
     layout = []
     total_numel = 0
-    for hf_name, param in policy.vllm_param_iter():
-        n = param.numel()
-        layout.append((hf_name, tuple(param.shape), n, param.dtype))
+    if hasattr(policy, 'vllm_param_iter'):
+        _piter = policy.vllm_param_iter()
+    else:
+        _piter = _backbone_param_iter(self, policy)
+    for hf_name, param in _piter:
+        # FSDP2 DTensor: shape is local-shard shape; full shape lives in _local_tensor metadata.
+        if hasattr(param, 'full_tensor'):
+            full_shape = tuple(param.shape)  # DTensor.shape is the GLOBAL shape
+            n = 1
+            for s in full_shape:
+                n *= s
+        else:
+            full_shape = tuple(param.shape)
+            n = param.numel()
+        layout.append((hf_name, full_shape, n, param.dtype))
         total_numel += n
 
     # Group into chunks: each chunk holds params until CHUNK_NUMEL is reached.
@@ -130,6 +181,7 @@ def _compute_wsync_layout(self, policy) -> None:
     # See bugs/project_static_xccl_buffer_fix.md for the FSDP2 analog.
     self._wsync_max_chunk_numel = max(c[2] for c in chunks) if chunks else 0
     self._wsync_chunk_buf = None  # lazily allocated on first use
+    self._wsync_layout_published = False
     log.info(
         "Rank %d: wsync layout: %d backbone params → %d chunks of ≤%.0f MiB bf16, "
         "max_chunk_numel=%d (%.0f MiB persistent buf)",
@@ -140,51 +192,166 @@ def _compute_wsync_layout(self, policy) -> None:
 def _sync_dedicated_vllm_weights(self) -> None:
     """Broadcast updated backbone + projector weights from rank 0 to vLLM rank.
 
-    Uses a single flat bf16 broadcast for all backbone params (1 broadcast vs ~400),
-    reducing weight sync from ~31s to ~1-2s.
+    Uses chunked flat bf16 broadcasts for backbone params (1 broadcast per ~200MiB
+    chunk vs ~400 individual broadcasts), reducing weight sync from ~31s to ~1-2s.
 
-    summon_full_params() is a collective — all training ranks (0-10) must enter it.
-    Only rank 0 sends broadcasts; ranks 1-10 participate in the FSDP collective only.
+    Both FSDP1 (summon_full_params) and FSDP2 (DTensor.full_tensor()) paths
+    are supported. In both cases the per-param full tensor materialization is
+    collective across all training ranks — non-rank-0 ranks discard the result.
+
+    A2 (`TORCHTUNE_BG_WSYNC_SEND=1`, rank 0 only): split into two phases.
+      Phase A (main thread, lockstep): FSDP2 full_tensor pack into per-chunk
+        CPU buffers + projector_state_dict() to CPU.
+      Phase B (bg thread, rank 0 only): broadcast each CPU chunk over wsync_pg
+        + send projector obj. Overlapped with the next step's gen+grpo.
+    Bg send must complete before next sync's Phase A begins (the per-chunk
+    CPU buffers double as the staging area for the next pack).
     """
-    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+    _bg_send = (
+        self.rank == 0
+        and os.environ.get("TORCHTUNE_BG_WSYNC_SEND", "0") == "1"
+    )
+    # Bg send only supported on the gloo wsync_pg (xccl path keeps GPU buffers,
+    # broadcast races on shared XPU stream → unsafe). _wsync_is_gloo is computed
+    # below inside the param-summon ctx; do a non-member-safe pre-check here.
+    if _bg_send:
+        try:
+            _bg_send = (
+                torch.distributed.get_backend(self._wsync_pg) == "gloo"
+            )
+        except Exception:
+            _bg_send = False
+        if not _bg_send:
+            log.warning("Rank 0: TORCHTUNE_BG_WSYNC_SEND=1 ignored (wsync_pg is not gloo)")
+    if _bg_send:
+        # Wait for previous sync's bg send to drain so we don't trample its
+        # CPU buffers while it's still broadcasting them.
+        if hasattr(self, '_bg_send_done_evt') and self._bg_send_done_evt is not None:
+            t_wait0 = time.perf_counter()
+            self._bg_send_done_evt.wait(timeout=300.0)
+            t_wait = time.perf_counter() - t_wait0
+            if t_wait > 0.05:
+                log.info("Rank 0: waited %.2fs for previous bg wsync send", t_wait)
+            if getattr(self, '_bg_send_error', None) is not None:
+                raise self._bg_send_error
+        else:
+            self._bg_send_done_evt = threading.Event()
+            self._bg_send_done_evt.set()
+            self._bg_send_error = None
+            self._bg_send_thread = None
     t0 = time.perf_counter()
+    _is_fsdp2 = False
+    try:
+        from torch.distributed.tensor import DTensor as _DT
+        _is_fsdp2 = any(
+            isinstance(p, _DT) for p in self._model.parameters()
+        )
+    except Exception:
+        _is_fsdp2 = False
 
-    # Phase A: enter summon_full_params (AllGather across all 11 training ranks)
     torch.xpu.synchronize()
     t_sum_enter = time.perf_counter()
-    with FSDP.summon_full_params(self._model, writeback=False, rank0_only=True):
+
+    if _is_fsdp2:
+        # FSDP2 path: no summon. We iterate params; .full_tensor() is collective
+        # over the sharding mesh (which is _training_pg, established at setup()).
+        # All training ranks 0..N-2 must enter the iteration in lockstep.
+        _ctx = _NullCtx()
+    else:
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        _ctx = FSDP.summon_full_params(self._model, writeback=False, rank0_only=True)
+
+    with _ctx:
         torch.xpu.synchronize()
         t_sum_done = time.perf_counter()
+        # Lazy layout compute (generic recipe).
+        if not hasattr(self, '_wsync_layout'):
+            _compute_wsync_layout(self, self._model)
+
+        # _wsync_pg is [0, vllm_rank] only; non-members (ranks 1..N-2) cannot
+        # query its backend. They participate in the FSDP2 full_tensor()
+        # collectives over the sharding mesh but never broadcast on _wsync_pg.
         if self.rank == 0:
             _wsync_is_gloo = (
                 torch.distributed.get_backend(self._wsync_pg) == "gloo"
             )
+        else:
+            _wsync_is_gloo = True  # unused on non-rank-0; safe placeholder
+
+        # Layout publish (rank 0 → vLLM rank). Done outside the param-iter so
+        # the broadcast happens once across the wsync_pg only.
+        if self.rank == 0 and not getattr(self, '_wsync_layout_published', False):
+            _layout_obj = {
+                "layout": self._wsync_layout,
+                "chunk_ranges": self._wsync_chunk_ranges,
+                "max_chunk_numel": self._wsync_max_chunk_numel,
+                "total_numel": self._wsync_total_numel,
+            }
+            _layout_dev = "cpu" if _wsync_is_gloo else self._device
+            torch.distributed.broadcast_object_list(
+                [_layout_obj], src=0, group=self._wsync_pg, device=_layout_dev,
+            )
+            self._wsync_layout_published = True
+
+        # Buffer alloc on rank 0 only.
+        if self.rank == 0:
             if self._wsync_chunk_buf is None:
                 self._wsync_chunk_buf = torch.empty(
                     self._wsync_max_chunk_numel, dtype=torch.bfloat16, device=self._device,
                 )
+            # Bg-send needs ONE pinned CPU buffer per chunk (the staging area
+            # the bg thread broadcasts from). Serial mode reuses a single buf.
+            if _wsync_is_gloo and _bg_send and not hasattr(self, '_wsync_chunk_cpu_bufs_send'):
+                self._wsync_chunk_cpu_bufs_send = [
+                    torch.empty(cn, dtype=torch.bfloat16, device="cpu", pin_memory=True)
+                    for (_, _, cn) in self._wsync_chunk_ranges
+                ]
             if _wsync_is_gloo and not hasattr(self, '_wsync_chunk_cpu_buf'):
                 self._wsync_chunk_cpu_buf = torch.empty(
                     self._wsync_max_chunk_numel, dtype=torch.bfloat16,
                     device="cpu", pin_memory=True,
                 )
-            params_list = list(self._model.vllm_param_iter())
 
-            t_pack_total = 0.0
-            t_d2h_total = 0.0
-            t_bcast_total = 0.0
-            bcast_bytes_total = 0
-            for pidx_start, pidx_end, chunk_numel in self._wsync_chunk_ranges:
+        if hasattr(self._model, 'vllm_param_iter'):
+            params_list = list(self._model.vllm_param_iter())
+        else:
+            params_list = list(_backbone_param_iter(self, self._model))
+
+        t_pack_total = 0.0
+        t_d2h_total = 0.0
+        t_bcast_total = 0.0
+        bcast_bytes_total = 0
+        for ci, (pidx_start, pidx_end, chunk_numel) in enumerate(self._wsync_chunk_ranges):
+            tp0 = time.perf_counter()
+            if self.rank == 0:
                 chunk_view = self._wsync_chunk_buf[:chunk_numel]
-                tp0 = time.perf_counter()
                 offset = 0
-                for _, param in params_list[pidx_start:pidx_end]:
-                    n = param.numel()
-                    chunk_view[offset:offset + n].copy_(param.data.to(torch.bfloat16).view(-1))
+            for _, param in params_list[pidx_start:pidx_end]:
+                # full_tensor() is COLLECTIVE — every training rank must call.
+                # On FSDP1 with summon_full_params(rank0_only=True) the params
+                # already are full tensors on rank 0, so just .data works.
+                if _is_fsdp2 and hasattr(param, 'full_tensor'):
+                    full = param.full_tensor()
+                else:
+                    full = param.data
+                if self.rank == 0:
+                    n = full.numel()
+                    chunk_view[offset:offset + n].copy_(
+                        full.to(torch.bfloat16).view(-1)
+                    )
                     offset += n
-                torch.xpu.synchronize()
-                tp1 = time.perf_counter()
-                if _wsync_is_gloo:
+                del full
+            torch.xpu.synchronize()
+            tp1 = time.perf_counter()
+            t_pack_total += (tp1 - tp0)
+            if self.rank == 0:
+                if _bg_send:
+                    # Phase A: D2H into per-chunk CPU buf; defer broadcast to bg thread.
+                    cpu_view = self._wsync_chunk_cpu_bufs_send[ci][:chunk_numel]
+                    cpu_view.copy_(chunk_view, non_blocking=False)
+                    tp2 = time.perf_counter()
+                    t_d2h_total += (tp2 - tp1)
+                elif _wsync_is_gloo:
                     cpu_view = self._wsync_chunk_cpu_buf[:chunk_numel]
                     cpu_view.copy_(chunk_view, non_blocking=False)
                     td2h = time.perf_counter()
@@ -197,32 +364,76 @@ def _sync_dedicated_vllm_weights(self) -> None:
                     torch.xpu.synchronize()
                     tp2 = time.perf_counter()
                     t_bcast_total += (tp2 - tp1)
-                t_pack_total += (tp1 - tp0)
                 bcast_bytes_total += chunk_numel * 2  # bf16
 
+        if self.rank == 0:
+            # Multimodal models (BioReason) carry trainable projector modules
+            # outside the backbone — broadcast their state dicts as a Python obj.
+            # Plain text models have no projectors; broadcast None as a placeholder
+            # so the receiver's matching call doesn't deadlock.
             t_proj_start = time.perf_counter()
-            raw_proj_sd = self._model.projector_state_dict()
-            proj_sd = {k: {pk: pv.cpu() for pk, pv in v.items()} for k, v in raw_proj_sd.items()}
-            _proj_dev = "cpu" if _wsync_is_gloo else self._device
-            torch.distributed.broadcast_object_list([proj_sd], src=0, group=self._wsync_pg, device=_proj_dev)
+            if hasattr(self._model, 'projector_state_dict'):
+                raw_proj_sd = self._model.projector_state_dict()
+                proj_sd = {k: {pk: pv.cpu() for pk, pv in v.items()} for k, v in raw_proj_sd.items()}
+            else:
+                proj_sd = None
+            if not _bg_send:
+                _proj_dev = "cpu" if _wsync_is_gloo else self._device
+                torch.distributed.broadcast_object_list([proj_sd], src=0, group=self._wsync_pg, device=_proj_dev)
             t_proj_done = time.perf_counter()
 
-            bw_gbs = (bcast_bytes_total / 1e9) / max(t_bcast_total, 1e-6)
-            log.info(
-                "WSYNC_PHASE rank=0 total=%.2fs summon=%.2fs pack=%.2fs d2h=%.2fs bcast=%.2fs (%.2f GB at %.2f GB/s) proj=%.2fs backend=%s",
-                time.perf_counter() - t0,
-                t_sum_done - t_sum_enter,
-                t_pack_total,
-                t_d2h_total,
-                t_bcast_total,
-                bcast_bytes_total / 1e9,
-                bw_gbs,
-                t_proj_done - t_proj_start,
-                "gloo" if _wsync_is_gloo else "xccl",
-            )
-        else:
-            # Non-rank-0 training ranks only participate in summon_full_params AllGather
-            pass
+            if _bg_send:
+                # Phase B: hand staged CPU bufs + proj_sd to bg thread.
+                _ranges = list(self._wsync_chunk_ranges)
+                _bufs = self._wsync_chunk_cpu_bufs_send
+                _wsync_pg = self._wsync_pg
+
+                def _bg_send_run():
+                    try:
+                        for ci2, (_, _, cn) in enumerate(_ranges):
+                            torch.distributed.broadcast(
+                                _bufs[ci2][:cn], src=0, group=_wsync_pg
+                            )
+                        torch.distributed.broadcast_object_list(
+                            [proj_sd], src=0, group=_wsync_pg, device="cpu",
+                        )
+                    except BaseException as exc:  # noqa: BLE001
+                        log.exception("Rank 0 bg wsync send: fatal")
+                        self._bg_send_error = exc
+                    finally:
+                        self._bg_send_done_evt.set()
+
+                self._bg_send_done_evt.clear()
+                self._bg_send_thread = threading.Thread(
+                    target=_bg_send_run, name="rank0_bg_wsync_send", daemon=True,
+                )
+                self._bg_send_thread.start()
+                _phase_a_total = time.perf_counter() - t0
+                log.info(
+                    "WSYNC_PHASE rank=0 total=%.2fs summon=%.2fs pack=%.2fs d2h=%.2fs proj_pack=%.2fs backend=%s mode=%s bg_send=1 (broadcast deferred)",
+                    _phase_a_total,
+                    t_sum_done - t_sum_enter,
+                    t_pack_total,
+                    t_d2h_total,
+                    t_proj_done - t_proj_start,
+                    "gloo" if _wsync_is_gloo else "xccl",
+                    "fsdp2" if _is_fsdp2 else "fsdp1",
+                )
+            else:
+                bw_gbs = (bcast_bytes_total / 1e9) / max(t_bcast_total, 1e-6)
+                log.info(
+                    "WSYNC_PHASE rank=0 total=%.2fs summon=%.2fs pack=%.2fs d2h=%.2fs bcast=%.2fs (%.2f GB at %.2f GB/s) proj=%.2fs backend=%s mode=%s",
+                    time.perf_counter() - t0,
+                    t_sum_done - t_sum_enter,
+                    t_pack_total,
+                    t_d2h_total,
+                    t_bcast_total,
+                    bcast_bytes_total / 1e9,
+                    bw_gbs,
+                    t_proj_done - t_proj_start,
+                    "gloo" if _wsync_is_gloo else "xccl",
+                    "fsdp2" if _is_fsdp2 else "fsdp1",
+                )
 
     log.info(
         "Rank %d: dedicated vLLM weight sync: %d backbone params + projectors in %.1fs",
@@ -234,11 +445,50 @@ def _recv_weight_update(self) -> None:
 
     Receives a single flat bf16 tensor containing all backbone params, unpacks it
     using the pre-computed layout, and loads each param into the vLLM engine.
+
+    A2 (`TORCHTUNE_VLLM_BG_WSYNC=1`): the bg wsync thread receives gloo
+    chunks WITHOUT the engine lock (gloo PG independent of vLLM state);
+    only `load_weights` is fenced by the engine lock. To preserve atomicity
+    across the multi-chunk update (gen N+1 must see either all-old or
+    all-new weights, never a mid-batch mix), all chunks are first staged
+    into a contiguous CPU buffer; then a single lock-protected pass calls
+    load_weights for every param. Net effect on the vLLM rank's per-step
+    time: max(gen, recv) instead of gen + recv.
     """
-    _policy = self._embed_model
+    # Multimodal recipes (BioReason) attach a projector-bearing model as
+    # `_embed_model`; plain text recipes don't. The projector path is
+    # gated on `_policy is not None`.
+    _policy = getattr(self, '_embed_model', None)
+    _engine_lock = getattr(self, '_vllm_engine_lock', None)
+    _bg_wsync = _engine_lock is not None
     t0 = time.perf_counter()
 
     llm_model = self._vllm_llm.llm_engine.model_executor.driver_worker.model_runner.model
+
+    # Receive layout from rank 0 on first sync (generic recipe — vLLM rank
+    # has no model and can't compute the layout itself). BioReason precomputes
+    # in setup() so this branch is skipped there.
+    _wsync_is_gloo_pre = (
+        torch.distributed.get_backend(self._wsync_pg) == "gloo"
+    )
+    if not getattr(self, '_wsync_layout_published', False):
+        _layout_dev = "cpu" if _wsync_is_gloo_pre else self._device
+        _obj = [None]
+        torch.distributed.broadcast_object_list(
+            _obj, src=0, group=self._wsync_pg, device=_layout_dev,
+        )
+        _layout_obj = _obj[0]
+        self._wsync_layout = _layout_obj["layout"]
+        self._wsync_chunk_ranges = _layout_obj["chunk_ranges"]
+        self._wsync_max_chunk_numel = _layout_obj["max_chunk_numel"]
+        self._wsync_total_numel = _layout_obj["total_numel"]
+        self._wsync_chunk_buf = None
+        self._wsync_layout_published = True
+        log.info(
+            "Rank %d (vLLM): received wsync layout: %d params, %d chunks, max_chunk_numel=%d",
+            self.rank, len(self._wsync_layout), len(self._wsync_chunk_ranges),
+            self._wsync_max_chunk_numel,
+        )
 
     # Backbone: receive backbone params in chunks matching sender's chunk_ranges.
     # Each chunk_buf is ≤200 MiB — fits in rank 11's ~858 MiB post-init headroom.
@@ -260,56 +510,117 @@ def _recv_weight_update(self) -> None:
     t_bcast_total = 0.0
     t_h2d_total = 0.0
     t_load_total = 0.0
+    t_lock_wait = 0.0
     bcast_bytes_total = 0
-    for pidx_start, pidx_end, chunk_numel in self._wsync_chunk_ranges:
-        chunk_view = self._wsync_chunk_buf[:chunk_numel]
-        tb0 = time.perf_counter()
-        if _wsync_is_gloo:
-            cpu_view = self._wsync_chunk_cpu_buf[:chunk_numel]
-            torch.distributed.broadcast(cpu_view, src=0, group=self._wsync_pg)
-            tb05 = time.perf_counter()
-            chunk_view.copy_(cpu_view, non_blocking=False)
-            torch.xpu.synchronize()
-            tb1 = time.perf_counter()
-            t_bcast_total += (tb05 - tb0)
-            t_h2d_total += (tb1 - tb05)
-        else:
-            torch.distributed.broadcast(chunk_view, src=0, group=self._wsync_pg)
-            torch.xpu.synchronize()
-            tb1 = time.perf_counter()
-            t_bcast_total += (tb1 - tb0)
-        chunk_pairs = []
-        local_off = 0
-        for hf_name, shape, numel, dtype in self._wsync_layout[pidx_start:pidx_end]:
-            param_data = chunk_view[local_off:local_off + numel].view(shape).to(dtype)
-            chunk_pairs.append((hf_name, param_data))
-            local_off += numel
-        llm_model.load_weights(chunk_pairs)
-        torch.xpu.synchronize()
-        tb2 = time.perf_counter()
-        t_load_total += (tb2 - tb1)
-        bcast_bytes_total += chunk_numel * 2
 
-    # Projectors
-    t_proj_start = time.perf_counter()
-    obj = [None]
-    _proj_dev = "cpu" if _wsync_is_gloo else self._device
-    torch.distributed.broadcast_object_list(obj, src=0, group=self._wsync_pg, device=_proj_dev)
-    proj_sd = obj[0]
-    if proj_sd is not None:
-        for module_name, sd in proj_sd.items():
-            module = getattr(_policy, module_name, None)
-            if module is not None:
-                module.load_state_dict(sd, strict=False)
-    t_proj_done = time.perf_counter()
+    # In bg mode, stage every chunk into its own per-chunk CPU buffer first
+    # (lock-free, overlapped with main-thread vllm.generate). In serial mode,
+    # reuse the single _wsync_chunk_cpu_buf and apply each chunk inline.
+    if _bg_wsync and _wsync_is_gloo:
+        if not hasattr(self, '_wsync_chunk_cpu_bufs'):
+            self._wsync_chunk_cpu_bufs = [
+                torch.empty(cn, dtype=torch.bfloat16, device="cpu", pin_memory=True)
+                for (_, _, cn) in self._wsync_chunk_ranges
+            ]
+        staged_cpu_views = []
+        for ci, (pidx_start, pidx_end, chunk_numel) in enumerate(self._wsync_chunk_ranges):
+            cpu_view = self._wsync_chunk_cpu_bufs[ci][:chunk_numel]
+            tb0 = time.perf_counter()
+            torch.distributed.broadcast(cpu_view, src=0, group=self._wsync_pg)
+            t_bcast_total += (time.perf_counter() - tb0)
+            staged_cpu_views.append((pidx_start, pidx_end, chunk_numel, cpu_view))
+            bcast_bytes_total += chunk_numel * 2
+
+        # Projector recv (also lock-free, gloo CPU obj broadcast)
+        t_proj_start = time.perf_counter()
+        obj = [None]
+        torch.distributed.broadcast_object_list(obj, src=0, group=self._wsync_pg, device="cpu")
+        proj_sd = obj[0]
+        t_proj_recv = time.perf_counter() - t_proj_start
+
+        # Atomic apply: hold engine lock for the whole load_weights pass + projector
+        # swap. gen() in main thread waits here briefly.
+        t_lock_t0 = time.perf_counter()
+        with _engine_lock:
+            t_lock_wait = time.perf_counter() - t_lock_t0
+            t_apply_t0 = time.perf_counter()
+            for pidx_start, pidx_end, chunk_numel, cpu_view in staged_cpu_views:
+                chunk_view = self._wsync_chunk_buf[:chunk_numel]
+                chunk_view.copy_(cpu_view, non_blocking=False)
+                torch.xpu.synchronize()
+                t_h2d_total += (time.perf_counter() - t_apply_t0)
+                chunk_pairs = []
+                local_off = 0
+                for hf_name, shape, numel, dtype in self._wsync_layout[pidx_start:pidx_end]:
+                    param_data = chunk_view[local_off:local_off + numel].view(shape).to(dtype)
+                    chunk_pairs.append((hf_name, param_data))
+                    local_off += numel
+                tload0 = time.perf_counter()
+                llm_model.load_weights(chunk_pairs)
+                torch.xpu.synchronize()
+                t_load_total += (time.perf_counter() - tload0)
+                t_apply_t0 = time.perf_counter()
+            if proj_sd is not None:
+                for module_name, sd in proj_sd.items():
+                    module = getattr(_policy, module_name, None)
+                    if module is not None:
+                        module.load_state_dict(sd, strict=False)
+        t_proj_done = time.perf_counter()
+    else:
+        for pidx_start, pidx_end, chunk_numel in self._wsync_chunk_ranges:
+            chunk_view = self._wsync_chunk_buf[:chunk_numel]
+            tb0 = time.perf_counter()
+            if _wsync_is_gloo:
+                cpu_view = self._wsync_chunk_cpu_buf[:chunk_numel]
+                torch.distributed.broadcast(cpu_view, src=0, group=self._wsync_pg)
+                tb05 = time.perf_counter()
+                chunk_view.copy_(cpu_view, non_blocking=False)
+                torch.xpu.synchronize()
+                tb1 = time.perf_counter()
+                t_bcast_total += (tb05 - tb0)
+                t_h2d_total += (tb1 - tb05)
+            else:
+                torch.distributed.broadcast(chunk_view, src=0, group=self._wsync_pg)
+                torch.xpu.synchronize()
+                tb1 = time.perf_counter()
+                t_bcast_total += (tb1 - tb0)
+            chunk_pairs = []
+            local_off = 0
+            for hf_name, shape, numel, dtype in self._wsync_layout[pidx_start:pidx_end]:
+                param_data = chunk_view[local_off:local_off + numel].view(shape).to(dtype)
+                chunk_pairs.append((hf_name, param_data))
+                local_off += numel
+            llm_model.load_weights(chunk_pairs)
+            torch.xpu.synchronize()
+            tb2 = time.perf_counter()
+            t_load_total += (tb2 - tb1)
+            bcast_bytes_total += chunk_numel * 2
+
+        # Projectors (serial path)
+        t_proj_start = time.perf_counter()
+        obj = [None]
+        _proj_dev = "cpu" if _wsync_is_gloo else self._device
+        torch.distributed.broadcast_object_list(obj, src=0, group=self._wsync_pg, device=_proj_dev)
+        proj_sd = obj[0]
+        if proj_sd is not None:
+            for module_name, sd in proj_sd.items():
+                module = getattr(_policy, module_name, None)
+                if module is not None:
+                    module.load_state_dict(sd, strict=False)
+        t_proj_done = time.perf_counter()
 
     t_reset_start = time.perf_counter()
-    self._vllm_llm.llm_engine.reset_prefix_cache()
+    if _bg_wsync:
+        # reset_prefix_cache also mutates engine state — serialize against gen.
+        with _engine_lock:
+            self._vllm_llm.llm_engine.reset_prefix_cache()
+    else:
+        self._vllm_llm.llm_engine.reset_prefix_cache()
     t_reset_done = time.perf_counter()
 
     bw_gbs = (bcast_bytes_total / 1e9) / max(t_bcast_total, 1e-6)
     log.info(
-        "WSYNC_PHASE rank=11 total=%.2fs bcast=%.2fs (%.2f GB at %.2f GB/s) h2d=%.2fs load=%.2fs proj=%.2fs reset=%.2fs backend=%s",
+        "WSYNC_PHASE rank=11 total=%.2fs bcast=%.2fs (%.2f GB at %.2f GB/s) h2d=%.2fs load=%.2fs proj=%.2fs reset=%.2fs lock_wait=%.2fs bg=%s backend=%s",
         time.perf_counter() - t0,
         t_bcast_total,
         bcast_bytes_total / 1e9,
@@ -318,6 +629,8 @@ def _recv_weight_update(self) -> None:
         t_load_total,
         t_proj_done - t_proj_start,
         t_reset_done - t_reset_start,
+        t_lock_wait,
+        _bg_wsync,
         "gloo" if _wsync_is_gloo else "xccl",
     )
     log.info(
@@ -389,20 +702,58 @@ def _run_vllm_generation_server(self) -> None:
         2. (BioReason only) compute prompt_embeds via local ESM3 + projectors.
         3. Generate with vLLM.
         4. send query_responses CPU tensor back to rank 0 over gen_pg.
-        5. Receive weight update from rank 0 via wsync_pg.
+        5. Receive weight update from rank 0 via wsync_pg (default: serial)
+           OR drained by background thread if TORCHTUNE_VLLM_BG_WSYNC=1 (A2).
 
     Loop exits on the shutdown sentinel `{"shutdown": True}` (Step 4) or when
     the legacy total_steps counter is exhausted.
+
+    A2 mode (`TORCHTUNE_VLLM_BG_WSYNC=1`): a background thread blocks on
+    `_recv_weight_update()` (gloo on `_wsync_pg`) while the main thread runs
+    the next gen. A lock serializes `vllm.generate()` against the swap-in
+    inside `_recv_weight_update()` (vLLM is not thread-safe). Net effect:
+    the next gen does not block on the prior wsync recv.
     """
     from vllm import SamplingParams
 
-    num_steps = self._total_steps if hasattr(self, '_total_steps') and self._total_steps > 0 else 10000
+    _bg_wsync = os.environ.get("TORCHTUNE_VLLM_BG_WSYNC", "0") == "1"
     log.info(
-        "Rank %d (vLLM server): entering generation loop (max_steps=%d, gen_pg=2-rank gloo)",
-        self.rank, num_steps,
+        "Rank %d (vLLM server): entering generation loop (gen_pg=2-rank gloo, "
+        "exits on shutdown sentinel, bg_wsync=%s)",
+        self.rank, _bg_wsync,
     )
 
-    for step in range(num_steps):
+    if _bg_wsync:
+        self._vllm_engine_lock = threading.Lock()
+        self._wsync_done_evt = threading.Event()
+        self._wsync_done_evt.set()  # idle at start
+        self._wsync_error: "Optional[BaseException]" = None  # noqa: F821
+        self._wsync_stop_evt = threading.Event()
+
+        def _bg_wsync_loop():
+            log.info("Rank %d (vLLM bg wsync): thread started", self.rank)
+            try:
+                while not self._wsync_stop_evt.is_set():
+                    # Block on the next chunk-broadcast set from rank 0.
+                    # _recv_weight_update grabs the engine lock right before
+                    # calling load_weights so the main gen thread can keep
+                    # using the engine for the prior generation while wsync
+                    # bytes arrive over gloo.
+                    self._wsync_done_evt.clear()
+                    self._recv_weight_update()
+                    self._wsync_done_evt.set()
+            except BaseException as exc:  # noqa: BLE001
+                log.exception("Rank %d (vLLM bg wsync): fatal", self.rank)
+                self._wsync_error = exc
+                self._wsync_done_evt.set()
+        self._wsync_thread = threading.Thread(
+            target=_bg_wsync_loop, name="vllm_bg_wsync", daemon=True,
+        )
+        self._wsync_thread.start()
+
+    step = -1
+    while True:
+        step += 1
         # 1. Receive request payload from rank 0 over gen_pg.
         obj = [None]
         torch.distributed.broadcast_object_list(obj, src=0, group=self._gen_pg)
@@ -448,11 +799,20 @@ def _run_vllm_generation_server(self) -> None:
             detokenize=False,
         )
         t0 = time.perf_counter()
-        outputs = self._vllm_llm.generate(
-            prompts=vllm_prompts,
-            sampling_params=sampling_params,
-            use_tqdm=False,
-        )
+        if _bg_wsync:
+            # A2: serialize against bg wsync's load_weights() swap-in.
+            with self._vllm_engine_lock:
+                outputs = self._vllm_llm.generate(
+                    prompts=vllm_prompts,
+                    sampling_params=sampling_params,
+                    use_tqdm=False,
+                )
+        else:
+            outputs = self._vllm_llm.generate(
+                prompts=vllm_prompts,
+                sampling_params=sampling_params,
+                use_tqdm=False,
+            )
         gen_time = time.perf_counter() - t0
 
         # Pack into CPU query_responses tensor (gen_pg is gloo).
@@ -478,8 +838,17 @@ def _run_vllm_generation_server(self) -> None:
         torch.distributed.send(query_responses, dst=0, group=self._gen_pg)
 
         # 5. Receive weight update from rank 0.
-        self._recv_weight_update()
+        # A2: bg thread drains wsync; main thread continues straight to next gen recv.
+        if not _bg_wsync:
+            self._recv_weight_update()
+        elif self._wsync_error is not None:
+            raise self._wsync_error
 
+    if _bg_wsync:
+        # Stop bg wsync thread so it doesn't block on a recv that will never come.
+        self._wsync_stop_evt.set()
+        # Best-effort join; thread may be parked in gloo recv on a torn-down PG.
+        self._wsync_thread.join(timeout=5.0)
     log.info("Rank %d (vLLM server): generation loop complete", self.rank)
 
 def _save_raw_bytes(state_dict: dict, path: str) -> int:
@@ -658,14 +1027,6 @@ def _sync_weights_to_vllm(self) -> None:
                 continue
             if param.is_cpu:
                 param = param.to(self._device)
-            if hasattr(param, "_local_tensor"):
-                param = param.full_tensor()
-            if self._is_shard_leader:
-                hf_name = _accept_and_rename(param_name)
-                if hf_name is None:
-                    continue
-                hf_state_dict[hf_name] = param.cpu()
-        del sharded_sd
 
     # Barrier: all ranks finish full_tensor() before shard leader saves
     if not self._production_mode:
@@ -681,6 +1042,8 @@ def _sync_weights_to_vllm(self) -> None:
         # _wait_for_sync_complete checking the event).
         self._sync_done_event.clear()
         self._sync_error = None
+        self._sync_id_counter += 1
+        self._pending_sync_id = self._sync_id_counter
 
         def _bg_save_and_post(state_dict=hf_state_dict):
             try:
@@ -848,6 +1211,12 @@ def _init_sender_pool(self) -> None:
         self._sync_done_event.set()
         self._sync_error = None
         self._xccl_bcast_buf = None
+        # Sync dispatch counter — incremented when a new sync is dispatched, set
+        # to None when consumed by _wait_for_sync_complete (which then bumps the
+        # weight version). Prevents over-counting when _wait_for_sync_complete is
+        # called more than once between dispatches.
+        self._pending_sync_id = None
+        self._sync_id_counter = 0
 
         if not hasattr(self, '_tune_to_hf_map'):
             self._build_tune_to_hf_map()
@@ -1098,6 +1467,8 @@ def _sync_weights_to_vllm_xccl(self) -> None:
         if is_active:
             self._sync_done_event.clear()
             self._sync_error = None
+            self._sync_id_counter += 1
+            self._pending_sync_id = self._sync_id_counter
 
         # Detect MoE model for expert fusing (used by Mode 0).
         from torchtune.training.checkpointing._utils import ModelType as _MT
@@ -1508,6 +1879,8 @@ def _sync_weights_to_vllm_shm(self) -> None:
 
         self._sync_done_event.clear()
         self._sync_error = None
+        self._sync_id_counter += 1
+        self._pending_sync_id = self._sync_id_counter
 
         def _bg_shm_and_post(state_dict=hf_state_dict):
             try:
@@ -1660,9 +2033,23 @@ def _wait_for_sync_complete(self) -> None:
         waited = time.perf_counter() - t_wait0
         if waited > 0.05:
             log.info("Rank %d: waited %.1fs for async weight sync to complete", self.rank, waited)
+    # Bump the weight version ONLY if a sync was actually dispatched since the
+    # last bump. Without _pending_sync_id this used to bump on every call (event
+    # starts set()), inflating the "version" telemetry and confusing the
+    # async producer about which weights generated a rollout.
     if self._is_rank_zero and getattr(self, "_weight_versions", None) is not None:
-        new_v = self._weight_versions.bump()
-        log.info("Rank 0: weight version bumped → %d", new_v)
+        if getattr(self, "_pending_sync_id", None) is not None:
+            new_v = self._weight_versions.bump()
+            log.info(
+                "Rank 0: weight version bumped → %d (sync_id=%d)",
+                new_v, self._pending_sync_id,
+            )
+            self._pending_sync_id = None
+        else:
+            log.warning(
+                "Rank 0: _wait_for_sync_complete called with no pending sync — "
+                "skipping version bump (telemetry guard)"
+            )
     if self._sync_error is not None:
         log.error("Rank %d: previous async weight sync had an error: %s", self.rank, self._sync_error)
         self._sync_error = None  # reset so training continues

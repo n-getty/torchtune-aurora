@@ -1,20 +1,25 @@
 #!/bin/bash
-# EP=4/DP=6 Qwen3-30B-A3B GRPO with dedicated vLLM node — 3-node variant of
-# run_qwen3_30b_ep4_vllm_2node.sh.
+# EP=8/DP=3 Qwen3-30B-A3B GRPO with dedicated vLLM node — variant of
+# run_qwen3_30b_ep4_vllm_3node.sh that doubles the EP / dp_shard mesh.
 #
 # Architecture:
-#   Train node 1 + Train node 2: 24 tiles total, EP=4 / DP_replicate=6 / DP_shard=4
+#   Train node 1 + Train node 2: 24 tiles total, EP=8 / DP_replicate=3 / DP_shard=8
 #   vLLM node (VLLM_NODE env var):  12 tiles, vLLM 3xTP=4 serving generation
 #
-# Doubles the DP_replicate dim from 3→6 vs the 2-node v1-v7 path. Same EP shard
-# (4 ranks per EP group, same 32 experts/tile), but 6 parallel replicas instead
-# of 3. Lets us drop per-replica batch (or hold per-replica batch and double
-# global batch) without rebuilding the EP layout.
+# Per-tile state halves vs EP=4 (16 experts/tile vs 32, 1/8 non-expert shard vs
+# 1/4). Should let plain torch.optim.AdamW fit the post-v9-release headroom
+# without the AdamWBf16 CPU-side update.
+#
+# Cross-node EP layout: with 24 tiles split EP=8 dp_replicate=3, the 3 EP groups
+# are ranks [0..7], [8..15], [16..23]. With 12 tiles/node, group [0..7] sits on
+# node-1, group [16..23] sits on node-2, and group [8..15] STRADDLES (last 4 of
+# node-1 + first 4 of node-2). One of three EP collectives goes through hsn0
+# every step. GLOO_SOCKET_IFNAME=hsn0 routes that traffic.
 #
 # Usage:
 #   On a train node (rank 0):
 #     VLLM_NODE=<vllm_hostname> TRAIN_NODE2=<other_train_hostname> \
-#       bash recipes/dev/run_qwen3_30b_ep4_vllm_3node.sh [num_steps]
+#       bash recipes/dev/run_qwen3_30b_ep8_vllm_3node.sh [num_steps]
 
 set -eo pipefail
 
@@ -35,7 +40,7 @@ module load frameworks/2025.3.1 2>/dev/null || true
 export PATH=$(echo "$PATH" | tr ':' '\n' | grep -v myenv | tr '\n' ':' | sed 's/:$//')
 unset VIRTUAL_ENV
 
-# CCL — same recipe as the 2-node run.
+# CCL — same recipe as the EP=4 3-node run.
 export CCL_PROCESS_LAUNCHER=none
 export CCL_ATL_TRANSPORT=ofi
 export CCL_OP_SYNC=1
@@ -51,15 +56,10 @@ export CCL_ALLTOALL=naive
 unset XPU_USM_ALLOC_SO
 export PYTORCH_ALLOC_CONF=garbage_collection_threshold:0.99
 
-# Gloo: loopback NOT viable across 2 train nodes. Use Slingshot HSN explicitly.
-# The v153 GLOO_SOCKET_IFNAME=lo trick was 1-node-only — for cross-node EP gloo
-# the 4 EP ranks may straddle nodes (depending on rank ordering), so gloo must
-# go through the Slingshot NIC. Cross-node EP collectives are inherently slower
-# but unavoidable at 2 train nodes.
-# NOTE: do NOT set GLOO_DEVICE_TRANSPORT — this PyTorch build (frameworks/2025.3.1)
-# does not recognize the env-var-controlled factory and ProcessGroupGloo()
-# raises `makeDeviceForInterface(): unsupported gloo device`. GLOO_SOCKET_IFNAME
-# alone routes through the named interface via the default tcp transport.
+# Gloo: cross-node EP collective on the straddling EP group [8..15] requires
+# Slingshot HSN. GLOO_SOCKET_IFNAME=hsn0 alone routes through the named interface
+# via gloo's default tcp transport. Do NOT set GLOO_DEVICE_TRANSPORT — the
+# frameworks/2025.3.1 build raises `makeDeviceForInterface(): unsupported gloo device`.
 export GLOO_SOCKET_IFNAME=hsn0
 
 FW_SITE=/opt/aurora/25.190.0/frameworks/aurora_frameworks-2025.3.1/lib/python3.12/site-packages
@@ -77,16 +77,18 @@ WORLD=$((NPROC * NNODES))
 NSTEPS=${1:-5}
 VLLM_BASE_PORT=8001
 MODEL_PATH=/lus/flare/projects/ModCon/ngetty/models/Qwen3-30B-A3B
-CONFIG=${PROJDIR}/recipes/configs/dev/experimental/qwen3_30b_a3b_grpo_ep4_xpu.yaml
+CONFIG=${PROJDIR}/recipes/configs/dev/experimental/qwen3_30b_a3b_grpo_ep8_xpu.yaml
 VLLM_ADDR=${VLLM_ADDR:-${VLLM_NODE}}
 VLLM_URLS="http://${VLLM_ADDR}:${VLLM_BASE_PORT},http://${VLLM_ADDR}:$((VLLM_BASE_PORT+1)),http://${VLLM_ADDR}:$((VLLM_BASE_PORT+2))"
 
 JOB_TAG="${PBS_JOBID:-$$}"
+# Force base-10 (10#) so leading-zero last-4 digits like "0780" don't trip
+# bash's octal parser ("value too great for base").
 LAST4=$(echo "${JOB_TAG}" | tr -dc '0-9' | tail -c 4)
 MASTER_PORT=$(( 29500 + ( 10#${LAST4:-0} % 400 ) ))
 MASTER_ADDR=$(hostname -i | awk '{print $1}')
 
-echo "=== EP=4/DP=6 Qwen3-30B-A3B GRPO + Dedicated vLLM Node (3-node) ==="
+echo "=== EP=8/DP=3 Qwen3-30B-A3B GRPO + Dedicated vLLM Node (3-node) ==="
 echo "Train rank-0 node: $(hostname) (${MASTER_ADDR})"
 echo "Train rank-1 node: ${TRAIN_NODE2}"
 echo "vLLM node: ${VLLM_NODE} (addr=${VLLM_ADDR}, 3xTP=4)"
@@ -133,8 +135,8 @@ for PORT in ${VLLM_BASE_PORT} $((VLLM_BASE_PORT+1)) $((VLLM_BASE_PORT+2)); do
 done
 echo "All 3 vLLM replicas ready on ${VLLM_ADDR}"
 
-# DP_replicate override: 24 / 4 = 6 replicas (vs 3 in 2-node)
-EXTRA="data_parallel_replicate_dim=6 ${EXTRA_OVERRIDES:-}"
+# DP_replicate override: 24 / 8 = 3 replicas (vs 6 in EP=4 3-node)
+EXTRA="data_parallel_replicate_dim=3 ${EXTRA_OVERRIDES:-}"
 
 run_torchrun() {
     local node="$1" rank="$2"

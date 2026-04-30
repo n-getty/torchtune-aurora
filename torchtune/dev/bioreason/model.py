@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import os
 import sys
-import glob
+import fnmatch
 import logging
 from typing import Optional
 
@@ -168,10 +168,20 @@ class BioReasonModel(nn.Module):
         from safetensors import safe_open
         emb = nn.Embedding(cfg.vocab_size, cfg.hidden_size, dtype=self.dtype)
         key = "model.embed_tokens.weight"
-        # Try single file, then shards
-        candidates = [os.path.join(ckpt_dir, "model.safetensors")] + sorted(
-            glob.glob(os.path.join(ckpt_dir, "model-*.safetensors"))
-        )
+        # Try single file, then shards. Use os.listdir + fnmatch (NOT the stdlib
+        # glob module) to avoid hangs on DAOS/dfuse mounts (see CLAUDE.md
+        # "Critical Platform Constraints"). The regression test asserts the
+        # forbidden substring is absent from this module.
+        try:
+            shard_names = sorted(
+                fn for fn in os.listdir(ckpt_dir)
+                if fnmatch.fnmatch(fn, "model-*.safetensors")
+            )
+        except FileNotFoundError:
+            shard_names = []
+        candidates = [os.path.join(ckpt_dir, "model.safetensors")] + [
+            os.path.join(ckpt_dir, n) for n in shard_names
+        ]
         for path in candidates:
             if not os.path.exists(path):
                 continue
@@ -245,10 +255,11 @@ class BioReasonModel(nn.Module):
                 protein_sequences, batch_idx_map, B
             )
             # ESM3 per_residue_embedding includes BOS and EOS tokens (+2 per sequence).
-            # Batch item i has one sequence → strip first/last token to match the
-            # len(seq) protein_pad placeholder tokens inserted into the prompt.
-            raw_stripped = [r[1:-1] for r in raw]
-            flat = torch.cat(raw_stripped, dim=0).to(device=self.device, dtype=self.dtype)
+            # SFT was trained with placeholders for the BOS/EOS too — see upstream
+            # PLProcessor (processing_pl.py:184-185, num_protein_tokens = seq_len + 2).
+            # dataset.py inserts len(seq)+2 protein_pad tokens, so fill all of them
+            # with the full unstripped ESM3 features.
+            flat = torch.cat(raw, dim=0).to(device=self.device, dtype=self.dtype)
             flat = self.protein_projection(flat)
             mask = input_ids == self.protein_token_id
             if mask.sum().item() != flat.shape[0]:

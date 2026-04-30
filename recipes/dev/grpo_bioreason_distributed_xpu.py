@@ -21,7 +21,19 @@
 import os
 import sys
 import time
+import logging
 from typing import Any, Optional
+
+# Ensure all module-level loggers (including torchtune.dev.bioreason.model) emit
+# to stderr. Without this, logger.info() inside BioReasonModel silently drops
+# and we cannot tell which step of __init__ crashed.
+_RANK_FOR_LOG = os.environ.get("RANK", "?")
+logging.basicConfig(
+    level=logging.INFO,
+    format=f"%(asctime)s [r{_RANK_FOR_LOG}] %(name)s %(levelname)s: %(message)s",
+    stream=sys.stderr,
+    force=True,
+)
 
 import torch
 from omegaconf import DictConfig
@@ -112,6 +124,12 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
         self._total_steps = cfg.num_steps
         self._reward_mode = cfg.get("reward_mode", "bioreason")
         self._gene_reward_metric = cfg.get("gene_reward_metric", "f1")
+        # Pool advantage normalization across the full batch (BioReason-Pro fix).
+        # Default true for bioreason mode (matches the upstream paper's GRPO setup);
+        # explicit override possible via config field.
+        self._batch_level_advantages = cfg.get(
+            "batch_level_advantages", self._reward_mode == "bioreason",
+        )
         self._enable_packing = cfg.get("enable_packing", False)
         self._expert_parallel_degree = cfg.get("expert_parallel_degree", 1)
         self._shard_pg = None
@@ -265,26 +283,34 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
         from torchtune.dev.bioreason.model import BioReasonModel
 
         ckpt_dir = cfg.base_model_path
+        _r = int(os.environ.get("RANK", "?"))
+        def _mark(tag):
+            print(f"[BIOMARK r{_r}] {tag}", file=sys.stderr, flush=True)
+        _mark("policy:start")
         log.info("BioReason: loading policy model from %s", ckpt_dir)
         self._model = BioReasonModel(
             ckpt_dir=ckpt_dir,
             device=self._device,
             dtype=self._dtype,
         )
+        _mark("policy:loaded")
         self._model.train()
         if self._enable_activation_checkpointing:
             self._model.backbone.gradient_checkpointing_enable(
                 gradient_checkpointing_kwargs={"use_reentrant": False}
             )
             log.info("BioReason: gradient checkpointing enabled on backbone")
+            _mark("policy:ac_enabled")
 
         ref_device = torch.device("cpu") if self._ref_cpu_offload else self._device
+        _mark(f"ref:start dev={ref_device}")
         log.info("BioReason: loading ref model from %s (device=%s)", ckpt_dir, ref_device)
         self._ref_model = BioReasonModel(
             ckpt_dir=ckpt_dir,
             device=ref_device,
             dtype=self._dtype,
         )
+        _mark("ref:loaded")
         self._ref_model.eval()
         for p in self._ref_model.parameters():
             p.requires_grad_(False)
@@ -428,7 +454,20 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
                 return out[0] if out else []
 
             completions = [None] * bsz
-            max_workers = max(1, min(bsz, num_clients * 8))
+            # Optional cap on HTTP fan-out to bound concurrent CCL IPC handle traffic.
+            # Each in-flight POST drives vLLM's tile to allocate IPC handles for the
+            # embedding payload; at G≥16 the simultaneous burst exhausted the IPC
+            # handle pool by step 2 (banned:1 PDE Segfault). Cap defaults off; set
+            # TORCHTUNE_VLLM_FANOUT_MAX=N to test smaller pools.
+            _fanout_cap_env = os.environ.get("TORCHTUNE_VLLM_FANOUT_MAX", "")
+            if _fanout_cap_env:
+                try:
+                    _fanout_cap = max(1, int(_fanout_cap_env))
+                except ValueError:
+                    _fanout_cap = num_clients * 8
+                max_workers = max(1, min(bsz, _fanout_cap))
+            else:
+                max_workers = max(1, min(bsz, num_clients * 8))
             with ThreadPoolExecutor(max_workers=max_workers) as pool:
                 futures = {
                     pool.submit(_call_one, self._vllm_clients[i % num_clients], embeds_list[i]): i
@@ -916,10 +955,23 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
             except Exception as e:
                 log.warning("Could not decode sample response: %s", e)
 
-        advantages = (rewards - rewards.mean(1, keepdim=True)) / (
-            rewards.std(1, keepdim=True) + 1e-4
-        )
-        advantages = advantages.reshape(batch_size * grpo_size)
+        # BioReason-Pro authors' fix for low-variance reward collapse: pool
+        # mean/std across the full B*G batch instead of per-prompt-group, so a
+        # single non-zero reward anywhere in the batch yields signal for every
+        # rollout. Without this, when all G rollouts of a prompt get reward=0
+        # (the common case early in training), advantages collapse to 0 and
+        # gradient is exactly zero — the kl_loss-flat-at-0.003 failure mode.
+        # Default on for bioreason reward; opt-out via batch_level_advantages: false.
+        if self._batch_level_advantages:
+            from torchtune.dev.bioreason.reward import batch_level_advantages
+            advantages = batch_level_advantages(
+                rewards.reshape(batch_size * grpo_size), group_size=grpo_size,
+            )
+        else:
+            advantages = (rewards - rewards.mean(1, keepdim=True)) / (
+                rewards.std(1, keepdim=True) + 1e-4
+            )
+            advantages = advantages.reshape(batch_size * grpo_size)
         del responses
         device_empty_cache(self._device)
 
@@ -1370,6 +1422,19 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
 
                 self._steps_run += 1
                 _step_time = time.perf_counter() - _step_t0
+
+                # Weight sync to vLLM (mirrors base recipe lines 3380-3392).
+                # Without this, vLLM keeps generating with the SFT-initial weights
+                # forever — training updates the policy but rollouts never see them.
+                if getattr(self, "_vllm_mode", None) == "dedicated_rank" and not self._is_vllm_rank:
+                    self._sync_dedicated_vllm_weights()
+                elif (
+                    getattr(self, "_vllm_mode", None) == "server"
+                    and getattr(self, "_vllm_weight_sync", False)
+                ):
+                    if self._steps_run % self._vllm_weight_sync_interval == 0:
+                        self._wait_for_sync_complete()
+                        self._sync_weights_to_vllm()
 
                 if self._is_rank_zero and self._steps_run % self._log_every_n_steps == 0:
                     _stats = grpo_stats[-1]

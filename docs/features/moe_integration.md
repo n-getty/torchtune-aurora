@@ -450,10 +450,14 @@ if "torchtune" not in sys.modules:
 ## Validation Status (setup-phase only — see v141+ sagas for end-to-end)
 
 These tests cover **module-level setup correctness**, not end-to-end training.
-End-to-end EP=4/DP=3 GRPO training is **not** validated on either Gemma4 (paused
-at v154 on ScatterAddBackward0 router-determinism) or Qwen3 (v1–v7, train-fwd
-PDE crash). The "Backward Dispatch Saga" and "Qwen3-30B-A3B Expert Parallelism
-— v1–v7" sections are the authoritative status for any EP work.
+End-to-end EP=4/DP=3 GRPO training is **not** validated on Gemma4 (paused at
+v154 on ScatterAddBackward0 router-determinism). For Qwen3 EP=4/DP=6 (3-node):
+**first `loss=` line reached at v8i** (G=1/fbs=1/NSTEPS=1). The v59
+reduce_grads architectural issue was then unblocked at EP=8 / dp_replicate=1
+on a 2-node hold by adding the v9 `_ep_release_fsdp_unsharded_grads` helper
+plus `AdamWBf16` — see the "Qwen3-30B-A3B EP=8 v10 series" section below
+and `docs/reports/qwen3_ep_v10_20260430.md`. The "Backward Dispatch Saga"
+and the v8/v10 sections are the authoritative status for any EP work.
 
 | Test | Config | Status | Notes |
 |------|--------|--------|-------|
@@ -465,7 +469,9 @@ PDE crash). The "Backward Dispatch Saga" and "Qwen3-30B-A3B Expert Parallelism
 | EP=2 vs replicated | EP=2, 2 tiles | **PASS** | Bit-exact match (max_err=0.0) |
 | 12-tile forward pass | EP=4/DP=3, 12 tiles | **PASS (setup only)** | See results below |
 | Gemma4 EP=4/DP=3 GRPO end-to-end | 12 tiles | **BLOCKED** | v154 ScatterAddBackward0 ±1; see Backward Dispatch Saga |
-| Qwen3 EP=4/DP=3 GRPO end-to-end | 2-node 12+12 | **BLOCKED** | v1-v7 train-fwd PDE; never reached `loss=` |
+| Qwen3 EP=4/DP=3 GRPO end-to-end (2-node 12+12, v1-v7) | 12 train tiles | **BLOCKED** | train-fwd PDE; never reached `loss=` on this topology |
+| Qwen3 EP=4/DP=6 GRPO end-to-end (3-node, v8 series) | 24 train tiles | **PARTIAL** | v8i first `loss=` at G=1/fbs=1/NSTEPS=1 rc=0; G≥2 and NSTEPS≥2 blocked by v59 reduce_grads |
+| Qwen3 EP=8/dp_replicate=1 GRPO end-to-end (2-node, v10 series) | 8 train tiles | **PASS** | v10f G=4 NSTEPS=3 FBS=1 + v9 helper + AdamWBf16: 3/3 steps clean, finite loss, ~200s/step. PRE-STEP-N flat. |
 | EP=1 (replicated) vs EP=4 throughput | batch=1, G=2 | **EP=4 is 2.6× SLOWER** | April 11; see new throughput section above |
 
 ### 12-tile forward pass results (test_ep_model_setup.py)
@@ -577,15 +583,105 @@ on no data — disregard until a fresh benchmark exists.
 
 ## What's Next
 
-1. **Resolve the EP backward blockers** (Gemma4: router-determinism in AC
-   recompute, see v154 below; Qwen3: train-fwd L0 IPC pressure, see v1–v7
-   below). Until at least one of these unblocks `loss=`, every other priority
-   is downstream.
+1. **~~Unblock Qwen3 EP G≥2 / NSTEPS≥2~~ — DONE 2026-04-30 (v10 series).**
+   The v9 `_ep_release_fsdp_unsharded_grads` helper materializes sharded
+   grads after each chunk (gloo CPU-bounce reduce-scatter, behind a global
+   barrier) and the per-step defensive sweep at line 3322 catches any
+   residue. With plain `torch.optim.AdamW` the helper alone was not enough:
+   fp32 momentum+variance materialized ~22.8 GiB on the first step and
+   pinned PRE-STEP-1 to 29.99 GiB. `torchtune.dev.bioreason.optim.AdamWBf16`
+   (CPU-side state, peak GPU = single param delta) restored ~14 GiB and let
+   v10f run G=4 NSTEPS=3 FBS=1 to completion (rc=0). **Cost is steep**:
+   ~200s/step, with ~99s in the helper and ~86s in the CPU optimizer; only
+   ~10s of the step is actual fwd+bwd compute. See "Qwen3-30B-A3B EP=8 v10
+   series" below and `docs/reports/qwen3_ep_v10_20260430.md`. **Resolve the
+   Gemma4 EP backward blocker** (router-determinism in AC recompute, v154)
+   is still open as a parallel research task.
 2. **Re-benchmark EP=1 vs EP=4 at a batch size large enough to amortize
    dispatch** — current data only covers grpo_samples=2 where EP=4 is 2.6×
    slower. Find the crossover or confirm there isn't one on this hardware.
 3. **Move expert AdamW back to GPU** if memory allows. The 24× opt-phase
    penalty in the EP=4 column above is entirely CPU optimizer overhead.
+   On v10f this is still the dominant pattern at EP=8: ~86s/step in
+   AdamWBf16 vs <10s of fwd+bwd compute. Headroom on EP=8 dp_replicate=1
+   is ~7 GiB at PRE-STEP — not enough to fit fp32 AdamW state on-device.
+   3-node dp_replicate=3 (untested) would split optimizer state across
+   replicas and may restore the on-device path.
+
+---
+
+## Qwen3-30B-A3B EP=8 v10 series — multi-step unblocked (2026-04-30)
+
+PBS jobs 8460378 and 8461394 (capacity, 2 nodes). Single training node,
+EP=8 / dp_replicate=1 / dp_shard=8 (8 of 12 tiles), with the 3rd-node
+vLLM 3×TP=4 server. Recipe surgery near
+`grpo_full_finetune_distributed_xpu.py:547` builds a 1D `dp_shard` mesh
+when `self._dp_mesh is None` and routes the v9 helper's PG map.
+
+### Result matrix
+
+| Run    | Config                                    | PRE-STEP-0 | PRE-STEP-1 | Outcome |
+|--------|-------------------------------------------|------------|------------|---------|
+| v10a   | G=1 NSTEPS=1, plain AdamW                 | 7.19 GiB   | n/a        | PASS (rc=0); loss=nan G=1 0/0 advantage artifact |
+| v10b   | G=2 NSTEPS=1 fbs=2 (single chunk B=2)     | 7.19       | n/a        | banned:1 PDE step-0 fwd; activation OOM at B=2 |
+| v10b2  | G=2 NSTEPS=1 FBS=1 (real 2 chunks)        | 7.19       | n/a        | **PASS**; loss=0.0061; chunked accumulate path validated |
+| v10c   | G=4 NSTEPS=3 FBS=1                        | 7.19       | 29.99      | step-1 PASS, step-2 fwd OOM (l0_free=0.05 GiB) |
+| v10d   | G=1 NSTEPS=3 FBS=1                        | 7.19       | 29.96      | step-1 PASS, step-2 fwd OOM same as v10c — proves AdamW state is the wall |
+| v10e   | G=2 NSTEPS=2 FBS=1, **AdamWBf16**         | 7.19       | **15.77**  | **PASS rc=0**; both steps finite loss; ratios=1.000 |
+| v10f   | G=4 NSTEPS=3 FBS=1, **AdamWBf16**         | 7.19       | 15.77 / 15.47 | **PASS rc=0**; ~3:20/step (192-204s); per-step sweep confirmed; loss 0.006-0.009 finite |
+
+### What we learned
+
+- **v9 helper works at EP=8.** All 97 FSDPParamGroups release through the
+  gloo dp_shard PG (~25s per release). The v59 silent no-op is fully
+  replaced.
+- **AdamW fp32 state is the second wall.** v10c and v10d (same crash at
+  G=1 minimum activation) confirm the +22.8 GiB PRE-STEP-1 jump is fp32
+  momentum+variance, not unfreed grads or activation pressure.
+- **AdamWBf16 unblocks multi-step.** PRE-STEP-1 dropped 29.99 → 15.77 GiB,
+  restoring ~14 GiB of L0 headroom. The per-step defensive sweep at line
+  3322 also kept PRE-STEP-2 below PRE-STEP-1 in v10f.
+
+### Per-step wall-clock (v10f, averaged over 3 steps)
+
+| Phase | Time | Share |
+|------|------|------|
+| gen (vLLM HTTP)        | ~5.6 s   | 3% |
+| grpo (fwd + bwd + helper) | ~108.9 s | 54% |
+| &nbsp;&nbsp;– fwd      | ~3.8 s | |
+| &nbsp;&nbsp;– bwd      | ~5.6 s | |
+| &nbsp;&nbsp;– **v9 release helper** | **~99 s** | |
+| clip                   | ~0.1 s | <1% |
+| optimizer (AdamWBf16)  | ~85.8 s | 43% |
+
+~93% of step time is CPU-side workarounds (gloo bounce + CPU optimizer).
+This is **3.6× slower** than the validated EP=1 path (54.8s/step at G=8,
+2026-04-27) at half the rollout count. Two paths can recover much of the
+gap, neither yet committed:
+
+A. **3-node EP=8 dp_replicate=3 / dp_shard=8.** Tests whether v75 XCCL
+   cross-replica sync works with the real grads the helper now produces,
+   and whether spreading optimizer state across 3 replicas restores
+   enough headroom to use plain AdamW back on device.
+B. **Rewrite `_ep_release_fsdp_unsharded_grads` to use XCCL reduce-scatter
+   on-device.** The helper currently does CPU gloo bounce because the v59
+   race was originally diagnosed in XCCL. Re-test whether the global
+   barrier alone is sufficient ordering for on-device XCCL.
+
+Production envelope: optimizer **must be**
+`torchtune.dev.bioreason.optim.AdamWBf16`; `forward_batch_size=1` is
+required to exercise the chunked-accumulate path under `G≥2`. Validated
+to `G=4 NSTEPS=3` with finite losses and PRE-STEP flat. Loss quality is
+still in the regime where many responses get truncated before any reward
+signal — a real reward curve has not been run.
+
+### Memories and launchers
+
+- `memory/project_qwen3_ep_v10_unblocked.md` — full result matrix
+- `memory/project_qwen3_ep_v9_helper.md` — helper design
+- `memory/project_qwen3_ep_v8_3node.md` — v59 unified blocker
+- `experiments/ep_parallelism/hold_qwen3_ep8_v10{a,b,b2,c,d,e,f}.sh`
+- `recipes/dev/run_qwen3_30b_ep8_vllm_2node.sh`
 
 ---
 
@@ -1017,7 +1113,17 @@ of fixes 1–3 above.
 
 ---
 
-## Qwen3-30B-A3B Expert Parallelism — v1–v7 (2026-04-28)
+## Qwen3-30B-A3B Expert Parallelism — v1–v8 (2026-04-28 → 2026-04-30)
+
+**Status (2026-04-30):** First `loss=` line landed on Qwen3 EP at v8i
+(`EP=4/DP_replicate=6/DP_shard=4/fbs=1/G=1/NSTEPS=1` on 3-node hold), rc=0.
+Both **G≥2** (real GRPO advantage variance) and **NSTEPS≥2** (multi-step
+training) remain blocked by a unified architectural issue (v8m_b + v8n share
+one root cause — see "v8 series unified blocker" subsection below). Production
+RL continues on EP=1 (G=8, 54.8s/step). Full writeup:
+`docs/reports/qwen3_ep_v8_3node_20260430.md`.
+
+
 
 First end-to-end EP=4/DP=3 attempts on the new Qwen3MoE infrastructure.
 Architecture: 2 nodes, 1 vLLM (3×TP=4) + 1 train (12 tiles EP=4/DP=3). Recipe
@@ -1084,7 +1190,7 @@ clean. **Failure mode is new and isolated to the train fwd.**
 - The recipe's own `device_empty_cache` is monkey-patched to no-op on XPU —
   not a confound here.
 
-### Working hypothesis (v8 candidate)
+### Working hypothesis at end of v7 (REFUTED 2026-04-30 by v8g MEMPROBE)
 
 L0 IPC handle pressure accumulates only when autograd builds its graph over EP
 collectives. Each `_AllGatherRS.forward` / `_ReduceScatterAG.forward` registers
@@ -1093,20 +1199,109 @@ MoE layers × 2 EP collectives × 5 fwd passes per GRPO step that's ~480 IPC
 handle registrations per training step. `CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD=65536`
 helps but apparently isn't enough when autograd is also live.
 
-**Next experiment (v8)**: force the EP gloo PG onto pure TCP-loopback transport
-(no SHM IPC). Suspect knobs: `GLOO_DEVICE_TRANSPORT=tcp`, `GLOO_USE_LIBUV=1`,
-or wiring the EP PG explicitly through `dist.new_group(..., backend="gloo",
-pg_options=ProcessGroupGloo.Options(devices=[create_tcp_device]))`. If TCP-only
-also crashes, the IPC pressure is upstream (CCL/FSDP sharing the L0 IPC pool).
+**This hypothesis was wrong.** v8g instrumented every `_ep_all_gather` /
+`_ep_reduce_scatter` ENTER/EXIT with `torch.xpu.mem_get_info()` and
+`torch.xpu.memory_allocated()` on rank 0. Through 261 ops, `external = l0_used
+- torch_alloc` stayed FLAT at ~3.4 GiB while `torch_alloc` walked linearly
+from 15.6 → 60.4 GiB. The crash was **straightforward saved-activation OOM**;
+the `banned:1 PDE` signature is just how XPU surfaces an L0 OOM during a CCS
+write that overruns the allocation map.
+
+## v8 series — first `loss=` line + unified architectural blocker (2026-04-30)
+
+3-node hold (1 dedicated vLLM + 2 train), `EP=4 / DP_replicate=6 / DP_shard=4`,
+world=24. EP groups all intra-node. Launcher
+`recipes/dev/run_qwen3_30b_ep4_vllm_3node.sh`, per-run wrapper
+`experiments/ep_parallelism/hold_qwen3_ep_v8.sh`. PBS jobs 8459180 + 8459706.
+
+| Run | Knob | Result | Notes |
+|-----|------|--------|-------|
+| v8a | v7 settings on 3-node | crash op #261 banned:1 | 3-node DP=6 same regime as v7 — **refutes "cross-node TCP-gloo eliminates SHM IPC" hypothesis** (all EP groups intra-node here) |
+| v8g | + `_ep_mem_probe()` per EP-OP | crash op #261 (instrumented) | **DEFINITIVE diagnosis**: external FLAT at ~3.4 GiB, all 45 GiB growth in `torch_alloc`. PDE was activation OOM. |
+| v8h | `forward_batch_size=1` | full fwd + chunk-1 bwd OK; OOM in chunk-2 fwd op #624 | chunk-1 grads stay live (FSDP2 unsharded) → chunk-2 fwd has no budget |
+| v8i | `fbs=1 grpo_samples=1` | **first `loss=` line**, rc=0 | 33.7s/step. loss=nan (G=1 → zero advantage variance), kl_loss=0.000984, ratios=1.000, resp_len=31 |
+| v8j | `fbs=1 G=1 max_gen=64` | step 1 rc=0 | 44.1s/step (+33% vs mg=32). loss=nan (sparse reward at G=1) |
+| v8k | + `fsdp_cpu_offload=true G=2 fbs=1` | DNF (init >30 min) | FSDP2 cpu_offload H2D too slow at 30B. Cleanup left orphans → contaminated nodes |
+| v8l, v8m | NSTEPS=5 / G=2 mg=16 on contaminated nodes | hung between gen and `chunk[0:1] fwd` | held-node contamination; mitigation = switch to fresh PBS job |
+| v8m_b | `G=2 fbs=1 mg=16` on fresh nodes | crash in `chunk[1:2] fwd`, banned:1 | **chunk[0:1] PRE-BWD = 50.08 GiB at mg=16 vs 50.85 GiB at mg=32 — halving max_gen reduced acts by <1 GiB.** Activations dominated by fixed buffers (KV cache, prompts, ref_logprobs), NOT response tokens. |
+| v8n | `NSTEPS=2 G=1 fbs=1 mg=32` on fresh nodes | step 0 clean; step 1 banned:1 in `chunk[0:1] fwd` | **PRE-STEP 1 alloc = 34.72 GiB** vs PRE-STEP 0 = 14.06 GiB. `optimizer.zero_grad(set_to_none=True)` does NOT release FSDP2's internal unsharded grad buffers in EP mode. |
+
+### v8 series unified blocker (v8m_b + v8n share root cause)
+
+v59's `reduce_grads=False` (`recipes/dev/grpo_full_finetune_distributed_xpu.py:1440-1464`)
+forces FSDP2 to skip `post_backward` reduce_scatter on every FSDPParamGroup in
+EP mode. The full unsharded grad pool (~18.5 GiB at DP_shard=4) stays resident:
+
+- **between chunks within a step** → blocks G≥2 (v8m_b: chunk-2 fwd has to fit
+  activations on top of chunk-1's unsharded grads)
+- **between steps** → blocks NSTEPS≥2 (v8n: PRE-STEP 1 already at 34.72 GiB
+  before any new activations are saved; `optimizer.zero_grad(set_to_none=True)`
+  at lines 3047/3322 doesn't reach FSDP2's internal `FSDPParamGroup` grad
+  buffers, only `optimizer.param_groups[*]['params']`)
+
+Halving `max_gen` is not a viable tuning fix because activations are dominated
+by fixed-cost buffers (KV cache for prompt+ref, ref_logprobs storage, prompt
+sequence buffers), not response-token activations.
+
+The current path's grad sync is a single deferred XCCL all_reduce on the
+dp_replicate group AFTER all chunks
+(`grpo_full_finetune_distributed_xpu.py:2945-2954`).
+
+### Real fix (not implemented this session)
+
+Add explicit `fully_shard`-aware reduce_scatter immediately after each chunk's
+bwd (~lines 2945-2954) AND after the optimizer step (~lines 3047, 3322), then
+sequence with the existing deferred dp_replicate all_reduce so grads aren't
+double-reduced. This is the one code change that unblocks BOTH G≥2 AND
+NSTEPS≥2.
+
+### Diagnostic rule for future XPU `banned:0/1 PDE` crashes
+
+For any future XPU `banned:0/1 PDE` crash with addresses in `0xff0[0-5]...`:
+
+1. FIRST add the `_ep_mem_probe`-style trace
+   (`torchtune/modules/moe/_parallelism.py:108-135`, opt-in via rank-0 gate) to
+   localize whether `torch_alloc` is climbing or `external` is climbing.
+2. If `external` is FLAT, it's an activation OOM and the fix is per-tile budget
+   (`forward_batch_size`, `grpo_samples`, `max_generated_tokens`,
+   activation checkpointing) — NOT env vars or PG transport changes.
+3. The PDE signature is a red herring; XPU surfaces L0 OOM as a CCS-write
+   fault that overruns the allocation map.
+
+Pluggable allocator ON (`XPU_USM_ALLOC_SO` set) blinds these probes
+(`mem_get_info` / `memory_stats` are no-ops). The 3-node Qwen3 EP launcher
+leaves `XPU_USM_ALLOC_SO` unset on train ranks (vLLM rank pops it explicitly
+per `grpo_full_finetune_distributed_xpu.py:71-73`), so probes are valid.
+
+### Held-node hygiene rule (from v8k aftermath)
+
+If a heavy training launch — especially `fsdp_cpu_offload=true` or any path
+that loads 30B params per rank — fails partway through init and leaves orphans,
+the held nodes are likely contaminated for further EP runs **even after
+`pkill -9`**. Symptom: subsequent training hangs between gen and `grpo_step`
+with no error. Mitigation: switch to a fresh PBS job's nodes; orphan-free
+pkill alone is insufficient.
 
 ### Files of record
 
-- Launcher (per-run): `experiments/ep_parallelism/hold_qwen3_ep_v{1-7}.sh`
-- Output logs (per-run): `experiments/ep_parallelism/hold_qwen3_ep_v{1-7}.out`
-- Common training launcher: `recipes/dev/run_qwen3_30b_ep4_vllm_2node.sh`
+- Launcher (per-run, v1-v7): `experiments/ep_parallelism/hold_qwen3_ep_v{1-7}.sh`
+- Launcher (per-run, v8): `experiments/ep_parallelism/hold_qwen3_ep_v8.sh`
+  (single wrapper, runs v8a/g/h/i/j/k/l/m/m_b/n via env vars)
+- Output logs: `experiments/ep_parallelism/hold_qwen3_ep_v{1-7,8,8a,8g,8h,8i,8j,8k,8l,8m,8m_b,8n}.out`
+- Common training launchers:
+  `recipes/dev/run_qwen3_30b_ep4_vllm_2node.sh` (v1-v7),
+  `recipes/dev/run_qwen3_30b_ep4_vllm_3node.sh` (v8 series)
 - vLLM server launcher: `recipes/dev/run_qwen3_30b_vllm_server.sh`
 - Config: `recipes/configs/dev/experimental/qwen3_30b_a3b_grpo_ep4_xpu.yaml`
 - EP collective definitions: `torchtune/modules/moe/_parallelism.py:193-227`
   (`_AllGatherRS`, `_ReduceScatterAG`)
+- EP memory probe: `torchtune/modules/moe/_parallelism.py:108-135`
+  (`_ep_mem_probe()`, opt-in via rank-0 gate; landed in v8g)
 - EP plan: `torchtune/models/qwen3_moe/_parallelism.py` (`qwen3_moe_ep_plan`)
-- Memory entries: `project_qwen3_ep_v1_v2.md`, `project_qwen3_ep_v3_v7.md`
+- Reduce-grads suppression site (root of the v8 unified blocker):
+  `recipes/dev/grpo_full_finetune_distributed_xpu.py:1440-1464` (v59);
+  deferred dp_replicate all_reduce: `:2945-2954`;
+  optimizer.zero_grad call sites that don't reach FSDP2 grads: `:3047, 3322`
+- Synthesis report: `docs/reports/qwen3_ep_v8_3node_20260430.md`
+- Memory entries: `project_qwen3_ep_v1_v2.md`, `project_qwen3_ep_v3_v7.md`,
+  `project_qwen3_ep_v8_3node.md`

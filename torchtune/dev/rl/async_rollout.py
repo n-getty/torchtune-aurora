@@ -139,6 +139,8 @@ class RolloutProducer:
         # Telemetry: cumulative time the producer was blocked on a full
         # queue. Read+reset by the consumer each step (Step 3 telemetry).
         self._time_blocked_on_put_s = 0.0
+        # Cumulative time the consumer waited inside .get() (queue empty).
+        self._time_get_wait_s = 0.0
         self._tel_lock = threading.Lock()
 
     # ------------------------------------------------------------------
@@ -230,6 +232,7 @@ class RolloutProducer:
         """
         if self._error is not None:
             raise RuntimeError("Producer thread died") from self._error
+        _wait_t0 = time.perf_counter()
         try:
             item = self._queue.get(timeout=timeout)
         except Empty as exc:
@@ -238,6 +241,8 @@ class RolloutProducer:
             raise TimeoutError(
                 f"RolloutProducer.get timed out after {timeout:.1f}s"
             ) from exc
+        with self._tel_lock:
+            self._time_get_wait_s += time.perf_counter() - _wait_t0
         if item is None:
             # Exhaustion sentinel; do not increment consumed.
             return None
@@ -269,6 +274,13 @@ class RolloutProducer:
         with self._tel_lock:
             ms = self._time_blocked_on_put_s * 1000.0
             self._time_blocked_on_put_s = 0.0
+        return ms
+
+    def read_get_wait_ms(self) -> float:
+        """Read and reset the cumulative consumer-wait-on-get counter."""
+        with self._tel_lock:
+            ms = self._time_get_wait_s * 1000.0
+            self._time_get_wait_s = 0.0
         return ms
 
     @property

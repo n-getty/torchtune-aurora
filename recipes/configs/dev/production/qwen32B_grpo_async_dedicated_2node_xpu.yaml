@@ -1,0 +1,177 @@
+# Phase 2 Step 5 prototype — Qwen3-32B, 2-node, dedicated-rank vLLM via gloo gen_pg.
+#
+# Architecture (24 tiles total = 2 nodes x 12 tiles):
+#   ranks [0..22]: training (FSDP2, 23 ranks)
+#   rank 23: dedicated vLLM (last tile on node 2; TP=1 for now — 32B fits in
+#            64 GiB tile at fbs=8 / G=8 / max_gen=128 per existing single-tile
+#            evidence; if KV cache too tight, bump vllm_tensor_parallel_size: 2
+#            and reserve ranks [22, 23]).
+#
+# Cross-node gloo: GLOO_SOCKET_IFNAME=hsn0 in the launcher (NOT lo).
+# Wsync chunks: 32B bf16 ≈ 64 GB → ~320 chunks @ 200 MiB. Gloo over hsn0 is
+# ~1.3 GB/s → ~50s/sync (acceptable for k=1 smoke). Async overlap drops this
+# behind grpo step (~38s on 32B XCCL baseline).
+
+name: grpo_async_dedicated_qwen3_32b_xpu
+
+output_dir: /tmp/torchtune/grpo_async_dedicated_32b
+base_model_path: /lus/flare/projects/ModCon/ngetty/models/Qwen3-32B
+
+tokenizer:
+  _component_: torchtune.models.qwen3.qwen3_tokenizer
+  path: ${base_model_path}/vocab.json
+  merges_file: ${base_model_path}/merges.txt
+  max_seq_len: 512
+
+dataset:
+  _component_: torchtune.dev.rl.gsm8k.gsm8k_dataset
+  partition: 1-9/10
+seed: 42
+shuffle: False
+
+model:
+  _component_: torchtune.models.qwen3.qwen3_32b
+
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [
+    model-00001-of-00017.safetensors,
+    model-00002-of-00017.safetensors,
+    model-00003-of-00017.safetensors,
+    model-00004-of-00017.safetensors,
+    model-00005-of-00017.safetensors,
+    model-00006-of-00017.safetensors,
+    model-00007-of-00017.safetensors,
+    model-00008-of-00017.safetensors,
+    model-00009-of-00017.safetensors,
+    model-00010-of-00017.safetensors,
+    model-00011-of-00017.safetensors,
+    model-00012-of-00017.safetensors,
+    model-00013-of-00017.safetensors,
+    model-00014-of-00017.safetensors,
+    model-00015-of-00017.safetensors,
+    model-00016-of-00017.safetensors,
+    model-00017-of-00017.safetensors,
+  ]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: QWEN3
+
+ref_checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [
+    model-00001-of-00017.safetensors,
+    model-00002-of-00017.safetensors,
+    model-00003-of-00017.safetensors,
+    model-00004-of-00017.safetensors,
+    model-00005-of-00017.safetensors,
+    model-00006-of-00017.safetensors,
+    model-00007-of-00017.safetensors,
+    model-00008-of-00017.safetensors,
+    model-00009-of-00017.safetensors,
+    model-00010-of-00017.safetensors,
+    model-00011-of-00017.safetensors,
+    model-00012-of-00017.safetensors,
+    model-00013-of-00017.safetensors,
+    model-00014-of-00017.safetensors,
+    model-00015-of-00017.safetensors,
+    model-00016-of-00017.safetensors,
+    model-00017-of-00017.safetensors,
+  ]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}/ref
+  model_type: QWEN3
+
+resume_from_checkpoint: False
+save_every_n_epochs: 1
+
+# Phase 2 Step 5: dedicated_rank vLLM at world_size-1 (= rank 23 on 2-node).
+vllm_mode: dedicated_rank
+vllm_dedicated_rank: 23
+vllm_tensor_parallel_size: 1
+vllm_max_model_len: 384
+vllm_max_num_seqs: 8       # G=8 only needs 8 concurrent seqs; 64 was wasting KV
+vllm_gpu_memory_utilization: 0.97
+vllm_weight_sync: true
+vllm_weight_sync_interval: 1
+
+# NOTE: loss/logprob invariant for this config —
+#   async_generation.enabled=false + GRPOSimpleLoss → DO NOT set
+#   always_compute_rollout_logprobs=true. SimpleLoss collapses ratios to 1, so the
+#   policy fwd at rollout time is wasted work (~6-8s/step on 32B with no benefit).
+#   To enable async (off-policy regime): flip enabled→true, switch loss to
+#   torchtune.dev.rl.loss.GRPOLoss (token-wise IS ratios), AND set
+#   always_compute_rollout_logprobs=true.
+always_compute_rollout_logprobs: false
+
+async_generation:
+  enabled: false  # Step 5 first validates synchronous gen_pg roundtrip on 32B
+  max_staleness: 1
+
+# GRPO parameters — matches single-node 32B HSDP defaults (G=8/fbs=8 optimal)
+batch_size: 1
+grpo_samples: 8
+forward_batch_size: 8
+max_generated_tokens: 128
+top_k: null
+temperature: 1.0
+
+ppo_epochs: 1
+gradient_accumulation_steps: 1
+
+num_steps: 5
+epochs: 1
+
+clip_grad_norm: 1.0
+
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 5e-6
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  num_warmup_steps: 2
+loss:
+  _component_: torchtune.dev.rl.loss.GRPOSimpleLoss
+  kl_coeff: 0.01
+  epsilon: 0.2
+
+reward_functions:
+    - _component_: torchtune.dev.rl.rewards.FormattedMathCorrectnessReward
+      answer_tag: answer
+      positive_reward: 10.0
+      negative_reward: 0.0
+    - _component_: torchtune.dev.rl.rewards.ThinkingAnswerFormattingReward
+      think_tag: think
+      answer_tag: answer
+      positive_reward: 1.0
+      negative_reward: 0.0
+
+device: xpu
+
+enable_activation_checkpointing: True
+compile: False
+
+dtype: bf16
+
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+log_every_n_steps: 1
+log_peak_memory_stats: True
+
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: False
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: True
+  cuda: False
+  profile_memory: False
+  with_stack: False
+  record_shapes: False
+  with_flops: False
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1

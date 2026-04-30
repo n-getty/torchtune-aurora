@@ -16,7 +16,7 @@ set -eo pipefail
 PROJDIR=/lus/flare/projects/ModCon/ngetty/torchtune
 cd ${PROJDIR}
 
-module load frameworks/2025.2.0 2>/dev/null || true
+module load frameworks/2025.3.1 2>/dev/null || true
 export PATH=$(echo "$PATH" | tr ':' '\n' | grep -v myenv | tr '\n' ':' | sed 's/:$//')
 unset VIRTUAL_ENV
 
@@ -38,8 +38,8 @@ export FI_MR_CACHE_MONITOR=userfaultfd
 unset PYTORCH_ALLOC_CONF
 
 GEMMA4_OVERLAY=${PROJDIR}/recipes/dev/vllm_gemma4_overlay
-FW_SITE=/opt/aurora/25.190.0/frameworks/aurora_frameworks-2025.2.0/lib/python3.10/site-packages
-LOCAL_SITE=/home/ngetty/.local/aurora/frameworks/2025.2.0/lib/python3.10/site-packages
+FW_SITE=/opt/aurora/26.26.0/frameworks/aurora_frameworks-2025.3.1/lib/python3.10/site-packages
+LOCAL_SITE=/home/ngetty/.local/aurora/frameworks/2025.3.1/lib/python3.10/site-packages
 export PYTHONNOUSERSITE=1
 export PYTHONPATH=${GEMMA4_OVERLAY}:${PROJDIR}:${FW_SITE}:${LOCAL_SITE}
 export HF_DATASETS_OFFLINE=1

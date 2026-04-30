@@ -79,12 +79,16 @@ vllm_weight_sync_interval: 1  # k=1 deferred; bumped per-experiment for k>1
 # ----------------------------------------------------------------
 # Async generation (Phase 0 / 1 / 2)
 # ----------------------------------------------------------------
-# Phase 0: leave async_generation.enabled=false but flip
-# always_compute_rollout_logprobs=true to validate the rollout-time fwd path
-# matches the sync baseline (loss + grad_norm within noise).
-# Phase 1+: set async_generation.enabled=true; max_staleness=k drives the
-# producer queue depth and the wsync interval relationship.
-always_compute_rollout_logprobs: true
+# Invariant enforced by tests/torchtune/dev/rl/test_async_loss_combo.py:
+#   async_generation.enabled=true  ⇒ loss=GRPOLoss AND
+#                                    always_compute_rollout_logprobs=true.
+#   async_generation.enabled=false ⇒ always_compute_rollout_logprobs=false
+#                                    (the loss is GRPOLoss here for Phase-1
+#                                    code-path coverage; flipping the flag
+#                                    when async is off just wastes a fwd).
+# To validate Phase-0 (rollout-logprob fwd matches sync baseline), flip both
+# flags to true together for that specific run, then revert.
+always_compute_rollout_logprobs: false
 
 async_generation:
   enabled: false

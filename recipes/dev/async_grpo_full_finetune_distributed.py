@@ -4,6 +4,19 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+# ============================================================================
+# WARNING: CUDA/Ray-only recipe. NOT MAINTAINED for Aurora/XPU.
+#
+# This recipe and its supporting workers under torchtune/dev/rl/workers/
+# hardcode device_type="cuda", NCCL backend, and torch.cuda.empty_cache().
+# It is preserved for historical reference and non-Aurora users only.
+#
+# For Aurora/XPU async GRPO, use grpo_full_finetune_distributed_xpu.py with
+# `async_generation.enabled: true` (HTTP lookahead via RolloutProducer).
+#
+# To use this recipe, set TORCHTUNE_ENABLE_RAY=1 in your environment.
+# ============================================================================
+
 import functools
 import os
 import time

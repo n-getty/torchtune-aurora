@@ -38,7 +38,11 @@ def _init_vllm_early(self, cfg):
     """
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    local_rank = _xpu_device_index  # The actual XPU tile for this rank
+    # Match the recipe's _xpu_device_index logic: with single-tile affinity
+    # the rank sees its tile as xpu:0; otherwise select by LOCAL_RANK.
+    _affinity = os.environ.get("ZE_AFFINITY_MASK", "")
+    _aff_tiles = _affinity.split(",") if _affinity else []
+    local_rank = 0 if len(_aff_tiles) == 1 else int(os.environ.get("LOCAL_RANK", "0"))
 
     vllm_mode = cfg.get("vllm_mode", "colocate")
     tp_size = cfg.get("vllm_tensor_parallel_size", 1)
@@ -166,13 +170,14 @@ def _init_vllm_early_dedicated(self, cfg):
 
     gpu_mem = cfg.get("vllm_gpu_memory_utilization", 0.7)
     max_model_len = cfg.get("vllm_max_model_len", 2048)
+    max_num_seqs = cfg.get("vllm_max_num_seqs", 64)
 
     self._vllm_llm = LLM(
         model=cfg.base_model_path,
         tensor_parallel_size=1,
         gpu_memory_utilization=gpu_mem,
         max_model_len=max_model_len,
-        max_num_seqs=64,
+        max_num_seqs=max_num_seqs,
         enforce_eager=True,
         dtype="bfloat16",
         disable_custom_all_reduce=True,
@@ -543,6 +548,13 @@ def _setup_vllm_server_mode(self):
             self._sync_done_event.set()  # initially clear (no sync running)
             self._sync_error = None      # captured exception from background thread
             self._xccl_bcast_buf = None  # static GPU buffer for XCCL broadcast (VA pinning)
+            # Sync dispatch counter — used by raw_bytes _sync_weights_to_vllm to
+            # tag each in-flight sync. xccl path initializes these in
+            # _init_sender_pool but the raw_bytes path (BioReason) calls
+            # _sync_weights_to_vllm directly and would AttributeError without
+            # these defaults.
+            self._sync_id_counter = 0
+            self._pending_sync_id = None
             log.info(
                 "Rank %d: vLLM %d client(s) initialized: %s (%d params mapped, async raw-bytes sync via %s, interval=%d)",
                 self.rank,
@@ -645,6 +657,21 @@ def _create_dedicated_pgs(self) -> None:
     try:
         self._gen_pg = torch.distributed.new_group(
             [0, self._vllm_dedicated_rank], backend="gloo"
+        )
+    finally:
+        _default_pg.bound_device_id = _orig_bound
+
+    # Phase 2: gloo fan-out PG for query_responses broadcast among training
+    # ranks ([0..N-2]). The xccl _training_pg is brittle for the *first* ever
+    # collective fired on it (FSDP2 reduce_scatter is patched to gloo, so the
+    # xccl sub-PG is otherwise unexercised → fi_cq_readerr EPERM on first use).
+    # Gloo is fast enough for the small qr payload (~49 KB at G=8 max_gen=512).
+    _default_pg = _dc10d._get_default_group()
+    _orig_bound = _default_pg.bound_device_id
+    _default_pg.bound_device_id = None
+    try:
+        self._training_fanout_pg = torch.distributed.new_group(
+            _training_ranks, backend="gloo"
         )
     finally:
         _default_pg.bound_device_id = _orig_bound

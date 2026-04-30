@@ -663,7 +663,7 @@ v16 test ran with gloo cross despite `WSYNC_CROSS_METHOD=xccl` being set.
 
 ---
 
-## Current Status (2026-04-28)
+## Current Status (2026-04-30)
 
 ### 3B (Qwen2.5-3B / Qwen3-3B)
 
@@ -709,6 +709,58 @@ v16 test ran with gloo cross despite `WSYNC_CROSS_METHOD=xccl` being set.
 | Production config | 3-node dedicated vLLM, `vllm_weight_sync_method: xccl`, `WSYNC_INTRA_METHOD=xccl`, **G=32 fbs=16 max_gen=128** |
 | DP>1 per-replica PGs | **Validated** (v17/v18, 2026-04-28). Parallel broadcast implemented |
 
+### Phase 2 dedicated-rank async (2026-04-30, validated end-to-end on 3B 1-node)
+
+The Phase 2 async-GRPO refactor introduces a second 2-rank gloo PG —
+`_gen_pg` — that complements the existing `_wsync_pg`. Together the two PGs
+give the dedicated vLLM rank a complete, world-PG-free interface:
+
+| PG | Members | Backend | Carries |
+|----|---------|---------|---------|
+| `_wsync_pg` | `[0, vllm_rank]` | gloo | weight broadcasts (chunks ≤200 MiB) |
+| `_gen_pg`   | `[0, vllm_rank]` | gloo | generation requests + query_responses |
+| `_training_pg` | `[0..N-2]` | xccl | FSDP shard collectives (vLLM excluded) |
+
+Before Phase 2, dedicated-rank generation issued three world-PG collectives
+per step (`broadcast_object_list(protein_seq)`,
+`broadcast_object_list(batch_ids)`, `broadcast(query_responses)`) — these
+forced training ranks 1..N-2 to lockstep with the vLLM rank on every
+generation, blocking async overlap. Phase 2 routes both directions over
+`_gen_pg` instead, leaving the world PG completely free during generation.
+
+**Step 4 — shutdown sentinel for the vLLM loop:** the count-based
+`for step in range(num_steps)` loop in `weight_sync.py:_run_vllm_generation_server`
+was replaced with `while True` + a `{"shutdown": True}` sentinel from rank 0.
+This eliminates the v10/v12 race where vLLM exited before rank 0's sentinel
+arrived (which manifested as the benign warning
+`Failed to send vLLM shutdown sentinel: Connection closed by peer`).
+Validated clean in v13 + v14 (0 warnings, "shutdown sentinel received at step N"
+logged on rank 11).
+
+**Validated wsync performance (Phase 2, dedicated-rank, Qwen2.5-3B 1-node):**
+
+| Phase | Rank 0 sender | Notes |
+|-------|---------------|-------|
+| pack (full_tensor + concat) | 2.6s | FSDP gather + flatten |
+| d2h (.cpu()) | 0.13s | small batches per chunk |
+| bcast (gloo loopback) | 2.0s | 6.17 GiB / 2.0s = 3.2 GB/s |
+| **total wsync/step** | **~4.7s** | 29 chunks ≤200 MiB |
+
+20-step stability run (v12): 20/20 clean, exit=0, ratios in
+[0.9998, 1.0014], clipfrac ≤ 0.0017 — matches Phase 1 server-mode parity
+([0.9998, 1.0010]). Step time ~22.6s, with wsync fully overlapping the
+training fwd/bwd (no end-of-step wait observed).
+
+**Next step:** the same architecture extended cross-node for the 32B 2-node
+smoke. `_gen_pg` and `_wsync_pg` are still 2-rank gloo, but require
+`GLOO_SOCKET_IFNAME=hsn0` (not `lo`). Estimated wsync ~50s for 64 GiB at
+1.3 GB/s, which the deferred-broadcast pattern hides behind grpo step
+(~38s on 32B XCCL baseline).
+Config drafted at `recipes/configs/dev/production/qwen32B_grpo_async_dedicated_2node_xpu.yaml`;
+launcher TBD.
+
+---
+
 ### Summary of weight sync evolution
 
 ```
@@ -727,6 +779,7 @@ Each generation eliminated a bottleneck:
 - `shm` → `xccl`: removed CPU staging entirely (GPU→GPU broadcast)
 - `xccl` → `2-hop`: cross-node gloo + intra-node XCCL; per-replica PGs for DP>1
 - 2-hop + deferred broadcast: hide sync latency behind generation (interval=2)
+- Phase 2 dedicated-rank: dedicated `_gen_pg` removes world-PG lockstep — vLLM rank fully decoupled from training collectives
 - MoE fused experts: removed per-expert overhead + IPEX shape mismatch bug
 - MoE GPU transpose: moved 27 GiB transpose from CPU (20 GB/s) to GPU (1.6 TB/s)
 - MoE GPU fuse: moved 48-layer `torch.cat` from CPU (14s) to GPU (<1s)

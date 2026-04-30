@@ -3,7 +3,7 @@
 set -e
 cd /lus/flare/projects/ModCon/ngetty/torchtune
 
-module load frameworks/2025.2.0
+module load frameworks/2025.3.1
 export PATH=$(echo "$PATH" | tr ':' '\n' | grep -v myenv | tr '\n' ':' | sed 's/:$//')
 unset VIRTUAL_ENV
 

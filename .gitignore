@@ -216,3 +216,7 @@ outputs/
 # Development iteration artifacts — launcher history, one-off experiments
 experiments/
 recipes/configs/dev/experimental/
+
+# Local-only agent + reference material (not committed)
+AGENTS.md
+docs/context/

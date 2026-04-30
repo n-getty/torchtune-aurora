@@ -22,7 +22,12 @@ to `docs/features/vllm_weight_sync.md`, `docs/features/moe_integration.md`, and 
     - **G-bisect blocker (2026-04-30)**: G>4 with parallel HTTP fan-out hits a banned:1 PDE Segfault whose crash step is inversely correlated with G — G=4 ≥15 steps clean; G=8 step 13; G=12 step 3; G=16 step 2. Same root-cause class as `memory/bugs/project_ccl_ipc_handle_cache.md` (cumulative IPC-handle accumulation in CCL/L0 that scales with G). Falsified hypotheses: HTTP fan-out concurrency cap (G=16 cap=4 still crashes) and chunk count (G=16 fbs=4 still crashes). Side-effect: any banned:1 crash makes the hold's L0 device state unrecoverable (`torch.xpu.device_count()=0` after pkill+clean_tiles); bisects require fresh holds. See `memory/feedback_banned1_destroys_xpu.md`.
     - **G=8 unblocked by IPEX `varlen_attention` (NEW 2026-04-30)**: Set `TORCHTUNE_USE_IPEX_VARLEN=1` to route causal-only SDPA calls through `intel_extension_for_pytorch.llm.functional.varlen_attention` with a persistent output buffer (added in `torchtune/modules/attention_utils.py`). Validated on hold 8460388: G=8 NSTEPS=15 **15/15 clean exit=0** (vs baseline crash at step 13); steady-state reserved memory **5 GiB lower** (57.21 vs 62.28 GiB); GRPO step ~19% faster at G=4. Bit-exact vs PyTorch SDPA on XPU. **Production envelope: G=8 fbs=8 max_gen=1024 (~2× rollout throughput vs G=4).** G=12+ ceiling not yet tested. Worth trying on other XPU recipes (32B dense, Qwen3-30B-A3B MoE, gene_recall) — same micro-bench wins (21% kernel speedup + 64% lower per-call peak transient memory) should apply. Falls back to PyTorch SDPA when conditions don't apply (mask present, dropout > 0, non-causal, non-XPU). See `docs/reports/bioreason_ipex_varlen_20260430.md` and `memory/project_bioreason_ipex_varlen_20260430.md`.
     - **`force_math_sdpa` is a no-op on XPU (NEW 2026-04-30)**: The config flag in `grpo_full_finetune_distributed_xpu.py:307-311` calls `torch.backends.cuda.enable_flash_sdp(False)` which only affects the CUDA dispatcher, not the XPU SDPA path. Validated micro-bench: identical timing AND identical peak memory regardless of the flag. Don't vary it expecting behavioral change on XPU. See `memory/feedback_force_math_sdpa_xpu_noop.md`.
-- **Async GRPO**: Phase 1 (server-mode, RolloutProducer overlap) validated on Qwen2.5-3B; 50-step k=1 convergence run clean. **Phase 2 dedicated-rank (NEW 2026-04-30)**: Steps 1+3+4 validated end-to-end on Qwen2.5-3B 1-node. Step 1 = dedicated-rank gloo ring buffer (`_gen_pg`) decouples vLLM rank from world PG; v12 20/20 steps clean, ratios in [0.9998, 1.0014] (matches Phase 1 server-mode parity). Step 4 = `while True` + sentinel exit on vLLM rank loop (eliminates v10/v12 "Failed to send sentinel" race). Step 3 = producer telemetry (`prod_qsize / weight_lag / prod_wait_ms / prod_idle_ms`) instrumentation. Wsync rank=0 sender ~4.7s/step @ 3.2 GB/s gloo loopback. Architectural unblocker for 32B/MoE async — those models only run viably in dedicated-rank mode. **Step 5 — 32B 2-node smoke validated (NEW 2026-04-30, job 8460392)**: Qwen3-32B with 23 train ranks (FSDP2) + 1 vLLM rank (LOCAL_RANK 11 of node 1, TP=1) over a single c10d rdzv torchrun group spanning both nodes. **5/5 steps clean, exit=0** at 13:50:42 UTC. Per-step ~228-237s (gen 76.9-77.6s + grpo 109.5-109.7s + wsync 41.8-41.9s). Stability: ratios=1.0000 all steps (sync mode), kl_loss 0.000551-0.000912, grad_norm 0.0017-0.1215, clipfrac=0, 0 retries / 0 OOMs across all 23 ranks both nodes. Memory FLAT through entire run (torch_resv 40.3-40.8 GiB no growth, torch_alloc 18.92 GiB POST-BWD steady, l0_free 19-23 GiB headroom). Wsync 65.52 GB at 3.21 GB/s = 41.94s (better than predicted 1.3 GB/s; gloo over hsn0 actually delivers ~3 GB/s at this payload size). Step 4 shutdown sentinel handshake confirmed: `Rank 23 (vLLM server): shutdown sentinel received at step 5`. Critical config (in `qwen32B_grpo_async_dedicated_2node_xpu.yaml`): `vllm_max_num_seqs: 8 + vllm_gpu_memory_utilization: 0.97 + vllm_max_model_len: 384` (32B at TP=1 needs aggressive KV budgeting). Critical launcher fix: PYTHONPATH must include `/home/ngetty/.local/aurora/frameworks/2025.3.1/lib/python3.12/site-packages` for `math_verify` while keeping `PYTHONNOUSERSITE=1` for torchao precedence (pattern in `experiments/async_grpo/run_phase2_32b_2node_dedicated.sh` via `USER_SITE_3_12` + `aurora_pythonpath` helper). This is the architectural baseline for 32B/MoE async runs; gen=77s vs grpo=110s = ~30% headroom for true async overlap when `async_generation.enabled=true`. Out-of-scope: did NOT test convergence (5 steps + max_gen=128 truncated gsm8k responses → rewards=0). See `docs/features/async_implementation.md` and `memory/project_phase2_32b_2node_validated.md`.
+- **Async GRPO**: **PAUSED 2026-04-30**, infrastructure complete and validated. Resume after sync production runs and other baselines are hardened. Status:
+  - Phase 1 (server-mode, RolloutProducer overlap) validated on Qwen2.5-3B; 50-step k=1 convergence run clean.
+  - Phase 2 dedicated-rank (Steps 1+3+4): Qwen2.5-3B 1-node 20/20 clean, ratios in [0.9998, 1.0014]. Step 5 32B 2-node sync smoke validated (5/5 clean, ~241s/step on baseline pair: gen 77s + grpo 110s + wsync 42s).
+  - **A2 architectural async (vLLM bg recv + rank 0 bg send) — implemented and validated 5/5 clean (job 8461452, hold pair x4702c6s4b0n0+x4706c1s7b0n0), but NET NEGATIVE on Aurora**. Sender-side broadcast deferred (rank 0 main thread freed: 35s pack+d2h, broadcast deferred to bg thread); receiver-side bg recv overlaps with `vllm.generate`. Ratios=1.0000 (atomic chunk-staged apply preserves correctness); engine lock contention zero (`lock_wait=0.00s`). **The bottleneck is hsn0 bandwidth contention**: bg gloo broadcast competes with FSDP XCCL collectives → bcast bandwidth collapses 3.21 GB/s → 0.27-0.29 GB/s, wall-clock ~300s/step (~25% slower than baseline). Code gated behind `TORCHTUNE_VLLM_BG_WSYNC=1` + `TORCHTUNE_BG_WSYNC_SEND=1` (defaults off, no impact on production sync path). To resume: either throttle bg send to backward-only windows (avoid concurrent FSDP AG/RS), or pivot to algorithm-level async (k≥2 with `RolloutProducer` hiding *generation* — Phase 2 Step 2 — where gloo gen_pg doesn't fight FSDP).
+  - This is the architectural baseline for 32B/MoE async runs when revisited; gen=77s vs grpo=110s = ~30% headroom for true async overlap when `async_generation.enabled=true`.
+  - See `docs/features/async_implementation.md`, `memory/project_phase2_32b_2node_validated.md`, and `memory/project_phase2_a2_paused.md`.
 - **Weight sync**: 2-hop with **gloo cross-PG** + XCCL intra is the production method for 32B runs >30 steps (47s sync at 1.3 GB/s; eliminates CXI RDMA leak). For short runs, XCCL cross-PG is faster (9.1s sync at 7.9 GB/s but leaks ~9 MiB/step → crash ~step 30).
   SHM remains viable for 3B (1.4s sync, fully hidden behind generation).
 - **Framework**: `frameworks/2025.3.1` is production-ready with `unset PYTORCH_ALLOC_CONF`.
@@ -692,6 +697,68 @@ Full writeup: `docs/reports/qwen3_ep_v8_3node_20260430.md`. Memories:
 `experiments/ep_parallelism/hold_qwen3_ep_v{1-7,8}.sh`. Underlying recipes:
 `recipes/dev/run_qwen3_30b_ep4_vllm_2node.sh` (v1-v7),
 `recipes/dev/run_qwen3_30b_ep4_vllm_3node.sh` (v8 series).
+
+---
+
+## Qwen3-30B-A3B EP=8 Status (2026-04-30, v10 series)
+
+PBS jobs 8460378 / 8461394 (capacity, 2 nodes). Single training node, EP=8
+/ dp_replicate=1 / dp_shard=8 (8 of 12 tiles), 3rd-node vLLM 3×TP=4. The
+v9 `_ep_release_fsdp_unsharded_grads` helper plus
+`torchtune.dev.bioreason.optim.AdamWBf16` together unblock the v8 unified
+blocker.
+
+| Run    | Config                                    | PRE-STEP-0 | PRE-STEP-1 | Outcome |
+|--------|-------------------------------------------|------------|------------|---------|
+| v10b2  | G=2 NSTEPS=1 FBS=1                        | 7.19       | n/a        | **PASS**; loss=0.0061; chunked accumulate validated |
+| v10c   | G=4 NSTEPS=3 FBS=1, plain AdamW           | 7.19       | 29.99      | step-2 fwd OOM — fp32 momentum+variance pinned floor |
+| v10d   | G=1 NSTEPS=3 FBS=1, plain AdamW           | 7.19       | 29.96      | step-2 fwd OOM same as v10c — proves AdamW is the wall |
+| v10e   | G=2 NSTEPS=2 FBS=1, **AdamWBf16**         | 7.19       | **15.77**  | **PASS rc=0**; both steps finite |
+| v10f   | G=4 NSTEPS=3 FBS=1, **AdamWBf16**         | 7.19       | 15.77 / 15.47 | **PASS rc=0**; ~3:20/step (192-204s); per-step sweep confirmed |
+
+### Per-step wall clock (v10f average over 3 steps)
+
+| Phase | Time | Share |
+|-------|------|-------|
+| gen (vLLM HTTP)             | ~5.6 s    | 3%   |
+| grpo fwd                    | ~3.8 s    | 2%   |
+| grpo bwd                    | ~5.6 s    | 3%   |
+| **v9 release helper (gloo)** | **~99 s** | 49%  |
+| clip                        | ~0.1 s    | <1%  |
+| **optimizer (AdamWBf16 CPU)** | **~85.8 s** | 43%  |
+
+~93% of step time is CPU-side workarounds: gloo bounce in the helper and
+CPU AdamWBf16. Compared to the validated EP=1 single-node path
+(54.8s/step at G=8, 2026-04-27), EP=8 is **3.6× slower per step at half
+the rollout count**.
+
+### Production envelope
+
+Single-node EP=8 dp_replicate=1, current code:
+- Optimizer **must be** `torchtune.dev.bioreason.optim.AdamWBf16`.
+- `forward_batch_size=1` is required to exercise the chunked-accumulate
+  path under `G≥2` — `fbs=2` collapses `G=2` into a single chunk and
+  hits activation OOM (v10b).
+- Validated to `G=4 NSTEPS=3` with finite losses and PRE-STEP-N flat.
+  Reward curve not yet run.
+
+### Open items (not yet committed)
+
+A. **3-node EP=8 dp_replicate=3 / dp_shard=8** — would test whether v75
+   XCCL cross-replica sync works with the real grads the helper now
+   produces, and whether 3-way replication restores enough headroom to
+   put plain AdamW back on device.
+B. **Rewrite the v9 helper to use XCCL reduce-scatter on-device** —
+   would directly remove the dominant ~99s/step cost. Requires
+   re-validating that the global barrier alone is sufficient ordering
+   for the v59 race that motivated CPU gloo bounce in the first place.
+C. **G≥8 sweep at NSTEPS=1** — PRE-STEP-1 had ~7 GiB headroom on v10f at
+   G=4; G=8 may still fit before any further intervention.
+
+Full writeup: `docs/reports/qwen3_ep_v10_20260430.md`. Memories:
+`project_qwen3_ep_v9_helper.md`, `project_qwen3_ep_v10_unblocked.md`.
+Launchers: `experiments/ep_parallelism/hold_qwen3_ep8_v10{a,b,b2,c,d,e,f}.sh`.
+Underlying recipe: `recipes/dev/run_qwen3_30b_ep8_vllm_2node.sh`.
 
 ---
 

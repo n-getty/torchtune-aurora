@@ -128,6 +128,8 @@ from torchtune.dev.rl.distributed import (
     _apply_split_ac,
     _ep_post_backward_grad_sync,
     _ep_post_backward_grad_sync_xccl,
+    _ep_release_fsdp_unsharded_grads,
+    _ep_build_grad_release_pg_map,
     _slice_trajectory,
     device_empty_cache,
     _orig_all_reduce,
@@ -301,15 +303,20 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         self.world_size, self.rank = utils.get_world_size_and_rank()
         self._is_rank_zero = self.rank == 0
 
-        # SDPA backend selection for XPU.
-        # Default: force math-only SDPA (disable flash/mem_efficient) as a
-        # precaution against UR handle leaks observed with broken CCL config.
-        # Set force_math_sdpa=False to re-enable optimized SDPA backends.
+        # SDPA backend selection.
+        # NOTE: torch.backends.cuda.enable_flash_sdp() is a NO-OP on XPU — those
+        # toggles only affect the CUDA SDPA dispatcher (validated 2026-04-30, see
+        # CLAUDE.md). The flag is kept for CUDA portability but does nothing on
+        # Aurora. The real XPU SDPA fast path is TORCHTUNE_USE_IPEX_VARLEN=1.
         if self._device.type == "xpu" and cfg.get("force_math_sdpa", True):
             torch.backends.cuda.enable_flash_sdp(False)
             torch.backends.cuda.enable_mem_efficient_sdp(False)
-            log.info("Rank %d: forced math-only SDPA (set force_math_sdpa=False to test optimized backends)", self.rank)
-        elif self._device.type == "xpu":
+            if self._is_rank_zero:
+                log.info(
+                    "force_math_sdpa=True is a no-op on XPU (CUDA-only toggle). "
+                    "For the validated XPU SDPA fast path, set TORCHTUNE_USE_IPEX_VARLEN=1."
+                )
+        elif self._device.type == "cuda" and not cfg.get("force_math_sdpa", True):
             log.info("Rank %d: using default SDPA backends (flash/mem_efficient enabled)", self.rank)
 
         # Production mode: skip non-essential barriers/synchronize() calls.
@@ -321,6 +328,10 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             os.environ.get("FSDP_PRODUCTION_MODE", "0") == "1"
             or cfg.get("data_parallel_replicate_dim", 1) > 1
             or (_is_multinode and self._device.type == "xpu")
+            # dedicated_rank: vLLM rank exits setup() early and never participates
+            # in world-PG barriers. Forcing production_mode skips those barriers
+            # so training ranks don't deadlock waiting for the vLLM rank.
+            or cfg.get("vllm_mode", None) == "dedicated_rank"
         )
 
         # Training attributes
@@ -539,6 +550,10 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                 _GLOO_GLOBAL_PG = _GLOO_DP_SHARD_PG
             finally:
                 _default_pg.bound_device_id = _orig_bound_device_id
+            # Stash on self so the EP single-replica branch below can call
+            # set_process_groups(...) with the right handle without re-creating.
+            self._gloo_dp_shard_pg = _GLOO_DP_SHARD_PG
+            self._gloo_global_pg = _GLOO_GLOBAL_PG
             log.info(
                 "v206: non-HSDP gloo PG initialized (world=%d) for "
                 "_xpu_reduce_scatter_via_allreduce CPU-bounce path",
@@ -549,8 +564,50 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         self._expert_parallel_degree = cfg.get("expert_parallel_degree", 1)
         self._expert_cpu_offload = cfg.get("expert_cpu_offload", False)
         if self._expert_parallel_degree > 1:
-            assert self._dp_replicate > 1, (
-                "expert_parallel_degree > 1 requires data_parallel_replicate_dim > 1"
+            # Single-replica EP path (dp_replicate=1, world == ep == dp_shard):
+            # the non-HSDP branch above leaves _dp_mesh=None and _shard_pg=None.
+            # EP reads ep_mesh = self._dp_mesh["dp_shard"] (line ~1173) and the
+            # grad-norm path reads self._shard_pg, so we need a 1D dp_shard mesh
+            # before the asserts below.
+            if self._dp_mesh is None:
+                from torch.distributed.device_mesh import init_device_mesh
+                self._dp_mesh = init_device_mesh(
+                    self._device.type,
+                    (self.world_size,),
+                    mesh_dim_names=("dp_shard",),
+                )
+                self._shard_pg = self._dp_mesh.get_group("dp_shard")
+                self._shard_rank = torch.distributed.get_rank(self._shard_pg)
+                self._is_shard_leader = (self._shard_rank == 0)
+                shard_ranks = torch.distributed.get_process_group_ranks(self._shard_pg)
+                self._shard_leader_global_rank = shard_ranks[0]
+                # Register the existing gloo PG (built in the non-HSDP branch above
+                # under the name _GLOO_DP_SHARD_PG, world-sized) into distributed.py
+                # so the v9 helper barrier and reduce-scatter patches see it.
+                # No dp_replicate gloo/XCCL groups exist at dp_replicate=1 — that's
+                # fine because every consumer of those is gated on dp_replicate > 1.
+                try:
+                    set_process_groups(
+                        None,                              # gloo_dp_rep_pg — unused at dp_replicate=1
+                        getattr(self, "_gloo_dp_shard_pg", None),  # world-sized gloo
+                        getattr(self, "_gloo_global_pg", None),    # same group
+                        None,                              # xccl_dp_rep_pg — unused at dp_replicate=1
+                        1,                                 # dp_rep_degree
+                        self.world_size,                   # dp_shard_degree
+                    )
+                except Exception as _e:
+                    log.warning(
+                        "EP single-replica: set_process_groups skipped (%s) — v9 "
+                        "helper barrier may be a no-op.", _e,
+                    )
+                log.info(
+                    "EP single-replica: built 1D dp_shard mesh (world=%d), "
+                    "_dp_mesh.ndim=%d, _shard_pg established.",
+                    self.world_size, self._dp_mesh.ndim,
+                )
+            assert self._dp_replicate >= 1, (
+                f"expert_parallel_degree > 1 requires data_parallel_replicate_dim >= 1 "
+                f"(got {self._dp_replicate})"
             )
             assert self._expert_parallel_degree == self._dp_shard, (
                 f"expert_parallel_degree={self._expert_parallel_degree} must equal "
@@ -600,6 +657,27 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         _async_cfg = cfg.get("async_generation", {}) or {}
         self._async_generation_enabled = bool(_async_cfg.get("enabled", False))
         self._async_generation_max_staleness = int(_async_cfg.get("max_staleness", 1))
+        # Behavior-policy correctness guard.
+        # The async path recomputes rollout logprobs on the *current* training
+        # weights (see generate_trajectory step 2). With max_staleness=1, vLLM
+        # weights == training weights at consume time (the next sync hasn't
+        # dispatched yet). With max_staleness>1, pi_old_logprobs are biased and
+        # GRPO IS ratios are wrong. Until vLLM-time logprob capture lands, hard-cap.
+        if self._async_generation_enabled and self._async_generation_max_staleness > 1:
+            raise ValueError(
+                "async_generation.max_staleness>1 is not safe yet: "
+                "rollout logprobs are recomputed on current training weights, so "
+                "pi_old_logprobs will not match the behavior policy that produced "
+                "the rollout (biased GRPO IS ratios). "
+                "Either set max_staleness=1 or implement vLLM-time logprob capture."
+            )
+        if self._async_generation_enabled:
+            log.warning(
+                "async_generation enabled (max_staleness=%d): pi_old_logprobs "
+                "are recomputed on current training weights. Safe at staleness=1; "
+                "do not raise without implementing vLLM-time logprob capture.",
+                self._async_generation_max_staleness,
+            )
         # Rollout-time logprobs are required when off-policy by k>=1 OR explicitly
         # requested. ppo_epochs>1 already computes them via the existing branch.
         self._compute_rollout_logprobs_required = (
@@ -703,10 +781,29 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
 
         if self._is_vllm_rank:
             # Rank runs as dedicated vLLM generation server — skip all training setup.
-            # Create _training_pg + _wsync_pg + seed gen params in same new_group order
-            # as training ranks (all ranks must call new_group identically or deadlock).
+            # Create _training_pg + _wsync_pg + _gen_pg + seed gen params in same
+            # new_group order as training ranks (all ranks must call new_group
+            # identically or deadlock).
             self._setup_dedicated_vllm_rank(cfg)
             return
+        # Dedicated_rank training ranks must create the same PGs in lockstep with
+        # the vLLM rank BEFORE any other default-world-PG collective (barrier,
+        # model load, etc.). Otherwise training ranks block on a later barrier
+        # while the vLLM rank blocks at new_group().
+        if self._vllm_mode == "dedicated_rank":
+            self._setup_dedicated_training_pgs(cfg)
+            # FSDP2 sharding mesh must exclude the vLLM rank — otherwise the
+            # AllGather targets the world PG (12 ranks) and the vLLM rank,
+            # which is not in the FSDP forward path, causes a deadlock at the
+            # first policy-fwd AllGather.
+            from torch.distributed.device_mesh import DeviceMesh
+            self._dp_mesh = DeviceMesh.from_group(
+                self._training_pg, self._device.type,
+            )
+            log.info(
+                "Rank %d: FSDP2 dp_mesh built from _training_pg (size=%d)",
+                self.rank, self.world_size - 1,
+            )
         # Setup model to train
         checkpoint_dict = self.load_checkpoint(cfg_checkpointer=cfg.checkpointer)
         if self._resume_from_checkpoint:
@@ -718,17 +815,20 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         # Can be overridden via config: reshard_after_forward: false
         reshard_policy = cfg.get("reshard_after_forward",
                                  self._vllm_mode != "colocate")
-        # MEMPROBE: baseline (pre-policy)
-        try:
-            import sys as _sys
-            _mp_path = "/lus/flare/projects/ModCon/ngetty/torchtune/experiments/multinode_32b"
-            if _mp_path not in _sys.path:
-                _sys.path.insert(0, _mp_path)
-            from mem_probe import dump_mem as _dump_mem_init
-            _dump_mem_init("INIT pre-policy")
-        except Exception as _e:
-            log.warning("mem_probe pre-policy failed: %r", _e)
-            _dump_mem_init = None
+        # MEMPROBE: baseline (pre-policy). Default-off; opt in via TORCHTUNE_MEM_PROBE=1.
+        # Imports the experiment-local probe at experiments/multinode_32b/mem_probe.py.
+        _dump_mem_init = None
+        if os.environ.get("TORCHTUNE_MEM_PROBE"):
+            try:
+                import sys as _sys
+                _mp_path = "/lus/flare/projects/ModCon/ngetty/torchtune/experiments/multinode_32b"
+                if _mp_path not in _sys.path:
+                    _sys.path.insert(0, _mp_path)
+                from mem_probe import dump_mem as _dump_mem_init
+                _dump_mem_init("INIT pre-policy")
+            except Exception as _e:
+                log.warning("mem_probe pre-policy failed: %r", _e)
+                _dump_mem_init = None
         self._model = self._setup_model(
             cfg_model=cfg.model,
             enable_activation_checkpointing=self._enable_activation_checkpointing,
@@ -747,8 +847,23 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         # outer keys + the FullModelHFCheckpointer's own buffers stay live on rank 0.
         # Test T showed rank 0/1 carry +10 GiB external HBM through training; this is
         # the targeted release.
+        # Capture opt/dataloader state BEFORE clearing — they are consumed below
+        # by _setup_optimizer / _setup_data and must survive the cleanup.
+        self._opt_state_dict = (
+            checkpoint_dict.get(training.OPT_KEY)
+            if self._resume_from_checkpoint
+            else None
+        )
+        self._dataloader_state_dict = (
+            checkpoint_dict.get(training.DATALOADER_KEY)
+            if self._resume_from_checkpoint
+            else None
+        )
         import gc as _gc_post_policy
         try:
+            # Drop only MODEL_KEY (giant) — keep opt/dl refs we just hoisted.
+            if training.MODEL_KEY in checkpoint_dict:
+                checkpoint_dict[training.MODEL_KEY] = None
             checkpoint_dict.clear()
         except Exception:
             pass
@@ -828,12 +943,9 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
 
         self._optimizer = self._setup_optimizer(
             cfg_optimizer=cfg.optimizer,
-            opt_state_dict=(
-                checkpoint_dict[training.OPT_KEY]
-                if self._resume_from_checkpoint
-                else None
-            ),
+            opt_state_dict=self._opt_state_dict,
         )
+        self._opt_state_dict = None  # release reference once consumed
 
         # initialize loss
         self._loss_fn = config.instantiate(cfg.loss)
@@ -853,19 +965,16 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         # sampler and dataloader depend on the tokenizer and loss_fn and should be
         # setup after both of these are initialized
         collate_name = cfg.get(
-            "collate_fn", "torchtune.dev.grpo.data.padded_collate_rl"
+            "collate_fn", "torchtune.dev.rl.data.padded_collate_rl"
         )
         self._dataloader = self._setup_data(
             cfg_dataset=cfg.dataset,
             shuffle=cfg.shuffle,
             batch_size=cfg.batch_size,
             collate_fn=collate_name,
-            dataloader_state_dict=(
-                checkpoint_dict[training.DATALOADER_KEY]
-                if self._resume_from_checkpoint
-                else None
-            ),
+            dataloader_state_dict=self._dataloader_state_dict,
         )
+        self._dataloader_state_dict = None  # release reference once consumed
 
         # Setup eval dataset (if configured)
         cfg_eval_dataset = cfg.get("eval_dataset", None)
@@ -945,10 +1054,8 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             # present alongside FSDP collectives on the same XPU tile.
             global _colocate_vllm_mode
             _colocate_vllm_mode = True
-        elif self._vllm_mode == "dedicated_rank":
-            # Create _training_pg + _wsync_pg for weight sync with the vLLM rank.
-            # PG creation order must match _setup_dedicated_vllm_rank on rank N-1.
-            self._setup_dedicated_training_pgs(cfg)
+        # dedicated_rank PG setup happens at the top of setup() (in lockstep with
+        # the vLLM rank), not here.
 
     _setup_vllm_server_mode = _vllm_backend_module._setup_vllm_server_mode
     _setup_vllm_colocate_mode = _vllm_backend_module._setup_vllm_colocate_mode
@@ -1443,6 +1550,10 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                 f"EP v59: suppressed reduce_grads on {_n_all_suppressed} additional "
                 f"non-expert FSDPParamGroups (post-backward manual gloo AllReduce instead)",
             )
+            # v9: build per-FSDPParamGroup gloo PG map for the unsharded-grad release
+            # helper. Must happen AFTER fully_shard / shard_experts_for_ep so that all
+            # FSDPParamGroups are constructed.
+            self._ep_grad_release_pg_map = _ep_build_grad_release_pg_map(model)
 
         # Load checkpoint.
         # v41: expert meta params were pre-shrunk to [32,...] before fully_shard, so
@@ -1857,8 +1968,18 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             torch.distributed.barrier()
 
     def _broadcast_query_responses(self, query_responses: torch.Tensor) -> torch.Tensor:
-        """Broadcast rank-0 query_responses to all ranks via the world PG."""
-        torch.distributed.broadcast(query_responses, src=0)
+        """Broadcast rank-0 query_responses to training ranks.
+
+        In dedicated_rank mode the vLLM rank is outside `_training_pg` and
+        must NOT participate (it's busy generating / receiving weights).
+        Server / colocate modes still use the world PG.
+        """
+        _grp = (
+            self._training_pg
+            if (self._vllm_mode == "dedicated_rank" and getattr(self, "_training_pg", None) is not None)
+            else None
+        )
+        torch.distributed.broadcast(query_responses, src=0, group=_grp)
         return query_responses
 
     def _generate_with_vllm(
@@ -2133,16 +2254,29 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                 batch_input_ids, context_length
             )
         elif self._vllm_mode == "dedicated_rank":
-            bsz = batch_input_ids.shape[0]
-            total_len = context_length + self._max_generated_tokens
+            # Fan out qr to training ranks [0..N-2] over gloo. Each rank's
+            # own batch has its own padded context_length, so broadcast rank
+            # 0's actual qr shape first to keep gloo recv buffers aligned.
+            # The xccl _training_pg is unexercised (FSDP2 reduce_scatter is
+            # patched to gloo) so its first xccl collective returns
+            # fi_cq_readerr EPERM — gloo is the safe path here.
             if self._is_rank_zero:
-                query_responses_cpu = self._generate_with_dedicated_vllm(
+                qr_cpu = self._generate_with_dedicated_vllm(
                     batch_input_ids, context_length, None
                 )
-                query_responses = query_responses_cpu.to(self._device)
+                shape_obj = [list(qr_cpu.shape)]
             else:
-                query_responses = batch_input_ids.new_empty(bsz, total_len)
-            torch.distributed.broadcast(query_responses, src=0, group=self._training_pg)
+                shape_obj = [None]
+            torch.distributed.broadcast_object_list(
+                shape_obj, src=0, group=self._training_fanout_pg, device="cpu",
+            )
+            qr_shape = tuple(shape_obj[0])
+            if not self._is_rank_zero:
+                qr_cpu = torch.empty(
+                    qr_shape, dtype=batch_input_ids.dtype, device="cpu"
+                )
+            torch.distributed.broadcast(qr_cpu, src=0, group=self._training_fanout_pg)
+            query_responses = qr_cpu.to(self._device)
         elif self._vllm_mode == "server":
             if getattr(self, "_pending_async_query_responses", None) is not None:
                 # Phase 1 async: producer thread already issued HTTP on rank 0
@@ -2627,16 +2761,18 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                 padding_masks=~trajectory.response_padding_masks,
             )
 
-            # MEMPROBE: per-rank L0-truth snapshot before backward.
-            try:
-                import sys as _sys_sb
-                _mp_path_sb = "/lus/flare/projects/ModCon/ngetty/torchtune/experiments/multinode_32b"
-                if _mp_path_sb not in _sys_sb.path:
-                    _sys_sb.path.insert(0, _mp_path_sb)
-                from mem_probe import dump_mem as _dump_mem_sb
-                _dump_mem_sb(f"PRE-BWD step={self._steps_run} single-bwd")
-            except Exception:
-                _dump_mem_sb = None
+            # MEMPROBE: per-rank L0-truth snapshot before backward. Opt-in.
+            _dump_mem_sb = None
+            if os.environ.get("TORCHTUNE_MEM_PROBE"):
+                try:
+                    import sys as _sys_sb
+                    _mp_path_sb = "/lus/flare/projects/ModCon/ngetty/torchtune/experiments/multinode_32b"
+                    if _mp_path_sb not in _sys_sb.path:
+                        _sys_sb.path.insert(0, _mp_path_sb)
+                    from mem_probe import dump_mem as _dump_mem_sb
+                    _dump_mem_sb(f"PRE-BWD step={self._steps_run} single-bwd")
+                except Exception:
+                    _dump_mem_sb = None
 
             log.info("Rank %d: single-backward backward start", self.rank)
             _bwd_t0_sb = time.perf_counter()
@@ -2787,17 +2923,19 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                 # since AllToAll no longer uses XCCL at all.
                 log.info("Rank %d: chunk[%d:%d] backward start", self.rank, _cs, _ce)
                 _bwd_chunk_t0 = time.perf_counter()
-                # MEMPROBE v1: per-rank L0-truth memory snapshot before backward.
-                try:
-                    import sys as _sys, os as _os
-                    _mp_path = "/lus/flare/projects/ModCon/ngetty/torchtune/experiments/multinode_32b"
-                    if _mp_path not in _sys.path:
-                        _sys.path.insert(0, _mp_path)
-                    from mem_probe import dump_mem as _dump_mem
-                    _dump_mem(f"PRE-BWD step={self._steps_run} chunk[{_cs}:{_ce}]")
-                except Exception as _mp_e:
-                    log.warning("Rank %d: mem_probe import/PRE-BWD failed: %r", self.rank, _mp_e)
-                    _dump_mem = None
+                # MEMPROBE v1: per-rank L0-truth memory snapshot before backward. Opt-in.
+                _dump_mem = None
+                if os.environ.get("TORCHTUNE_MEM_PROBE"):
+                    try:
+                        import sys as _sys, os as _os
+                        _mp_path = "/lus/flare/projects/ModCon/ngetty/torchtune/experiments/multinode_32b"
+                        if _mp_path not in _sys.path:
+                            _sys.path.insert(0, _mp_path)
+                        from mem_probe import dump_mem as _dump_mem
+                        _dump_mem(f"PRE-BWD step={self._steps_run} chunk[{_cs}:{_ce}]")
+                    except Exception as _mp_e:
+                        log.warning("Rank %d: mem_probe import/PRE-BWD failed: %r", self.rank, _mp_e)
+                        _dump_mem = None
                 # v111 diag: log token dispatch counts for all ranks (first step only).
                 # _ep_dispatch is partial(ep_instance._token_dispatch, ...) — access ep_instance
                 # via _ep_dispatch.func.__self__ (bound method's __self__).
@@ -2865,6 +3003,42 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                 )
                 if self._device.type == "xpu":
                     torch.xpu.synchronize()
+                # v9: per-chunk release of FSDP2's unsharded grad pool into sharded
+                # `param.grad` as a DTensor. With v59 setting `reduce_grads=False`,
+                # FSDP2 never fires reduce_scatter; without this hook, unsharded
+                # grads accumulate across chunks (blocks G≥2) and across steps
+                # (blocks NSTEPS≥2). The chunk-N>0 call accumulates into the
+                # existing sharded grad. v9a probe (2026-04-30) confirmed
+                # `param.grad is None` and `_unsharded_param.grad` is ~593 MiB/param.
+                if (self._expert_parallel_degree > 1
+                        and getattr(self, "_ep_grad_release_pg_map", None)):
+                    _rel_t0 = time.perf_counter()
+                    _accumulate = (_cs > 0)
+                    try:
+                        _n_rel = _ep_release_fsdp_unsharded_grads(
+                            self._model,
+                            self._ep_grad_release_pg_map,
+                            accumulate_into_grad=_accumulate,
+                        )
+                        _rel_dt = time.perf_counter() - _rel_t0
+                        log.info(
+                            "Rank %d: EP v9 grad release chunk[%d:%d] accumulate=%s "
+                            "groups=%d in %.2fs",
+                            self.rank, _cs, _ce, _accumulate, _n_rel, _rel_dt,
+                        )
+                    except Exception as _rel_exc:
+                        log.error(
+                            "Rank %d: EP v9 grad release FAILED chunk[%d:%d]: %r",
+                            self.rank, _cs, _ce, _rel_exc,
+                        )
+                        raise
+                    if self._device.type == "xpu":
+                        torch.xpu.synchronize()
+                    try:
+                        if _dump_mem is not None:
+                            _dump_mem(f"POST-REL step={self._steps_run} chunk[{_cs}:{_ce}]")
+                    except Exception:
+                        pass
                 _bwd_total += time.perf_counter() - _bwd_chunk_t0
 
                 _chunk_losses.append(_c_loss.detach())
@@ -2898,7 +3072,18 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             #     rank 1 → REP {1,5,9}  (pairs (1,5),(1,9) — disjoint from SHARD)
             #   Since fast ranks 4,8 (etc.) are already waiting in their XCCL
             #   all_reduce for this call, the all_reduce completes immediately.
-            if self._expert_parallel_degree > 1 and self._dp_replicate > 1:
+            # v75 XCCL post-bwd grad sync is REDUNDANT under v9: the per-chunk
+            # _ep_release_fsdp_unsharded_grads helper already reduces grads on each
+            # FSDPParamGroup's correct gloo PG (dp_shard for expert groups, dp_replicate
+            # for non-expert/policy groups). Re-running XCCL all_reduce here on
+            # _XCCL_DP_REP_PG would (a) double-divide policy grads and (b) trip
+            # OFI EPERM (err=265) because the XCCL endpoint was left in a bad state
+            # after the long gloo bounce. Skip when v9 helper is active.
+            _v9_active = (
+                self._expert_parallel_degree > 1
+                and getattr(self, "_ep_grad_release_pg_map", None) is not None
+            )
+            if self._expert_parallel_degree > 1 and self._dp_replicate > 1 and not _v9_active:
                 _grad_sync_t0 = time.perf_counter()
                 _n_synced = _ep_post_backward_grad_sync_xccl(
                     self._model, self._dp_replicate
@@ -3276,6 +3461,27 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                     log.info("Rank %d: optimizer.step()", self.rank)
                     self._optimizer.step()
                     self._optimizer.zero_grad(set_to_none=True)
+                    # v9: defensive sweep — release any FSDP2 unsharded grad residue
+                    # the per-chunk hook missed. On a clean step this is a no-op
+                    # (logs a WARN if it finds residue, indicating a chunk-loop leak).
+                    if (self._expert_parallel_degree > 1
+                            and getattr(self, "_ep_grad_release_pg_map", None)):
+                        try:
+                            _n_swept = _ep_release_fsdp_unsharded_grads(
+                                self._model,
+                                self._ep_grad_release_pg_map,
+                                accumulate_into_grad=False,
+                                warn_on_residue=True,
+                            )
+                            log.info(
+                                "Rank %d: EP v9 post-step defensive sweep groups=%d",
+                                self.rank, _n_swept,
+                            )
+                        except Exception as _swp_exc:
+                            log.warning(
+                                "Rank %d: EP v9 post-step sweep raised %r (continuing)",
+                                self.rank, _swp_exc,
+                            )
                     if self._device.type == "xpu":
                         torch.xpu.synchronize()
                     _opt_time = time.perf_counter() - _opt_t0
@@ -3461,6 +3667,14 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                     and self._is_rank_zero
                     and getattr(self, "_gen_pg", None) is not None
                 ):
+                    # A2 bg send: drain in-flight broadcast on wsync_pg so the
+                    # vLLM rank's bg wsync thread receives it cleanly before we
+                    # shut down its main loop.
+                    if getattr(self, '_bg_send_done_evt', None) is not None:
+                        self._bg_send_done_evt.wait(timeout=300.0)
+                        if getattr(self, '_bg_send_error', None) is not None:
+                            log.warning("Rank 0 bg wsync send error at shutdown: %r",
+                                        self._bg_send_error)
                     try:
                         torch.distributed.broadcast_object_list(
                             [{"shutdown": True}], src=0, group=self._gen_pg
@@ -3527,11 +3741,27 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                 pass
         if self._is_rank_zero:
             self._metric_logger.log_dict(log_dict, step=self.global_step)
+            # Phase 2 Step 3: producer telemetry (dedicated/server async modes)
+            _prod = getattr(self, "_rollout_producer", None)
+            _last = getattr(self, "_last_rollout_item", None)
+            if _prod is not None and _last is not None:
+                _w_now = self._weight_versions.version if hasattr(self, "_weight_versions") else 0
+                _w_lag = max(0, _w_now - _last.weight_version)
+                _qsize = _prod.qsize()
+                _wait_ms = _prod.read_get_wait_ms()
+                _idle_ms = _prod.read_blocked_on_put_ms()
+                _async_tail = (
+                    "  prod_qsize=%d  weight_lag=%d  prod_wait_ms=%.1f  prod_idle_ms=%.1f"
+                    % (_qsize, _w_lag, _wait_ms, _idle_ms)
+                )
+            else:
+                _async_tail = ""
             # Also log key metrics to stdout for verification
             log.info(
                 "METRICS step=%d  loss=%.4f  policy_loss=%.4f  kl_loss=%.6f  "
                 "rewards=%.3f  successes=%.3f  grad_norm=%.4f  "
-                "clipfrac=%.4f  ratios=%.4f  approx_kl=%.6f  resp_len=%.1f",
+                "clipfrac=%.4f  ratios=%.4f  approx_kl=%.6f  resp_len=%.1f"
+                + _async_tail,
                 self.global_step,
                 log_dict["loss"].item() if hasattr(log_dict["loss"], "item") else log_dict["loss"],
                 log_dict["policy_loss"].item() if hasattr(log_dict["policy_loss"], "item") else log_dict["policy_loss"],
@@ -3563,7 +3793,7 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         all_response_lengths = []
         eval_grpo_samples = self._eval_grpo_samples or self.grpo_samples
 
-        collate_fn = _get_component_from_path("torchtune.dev.grpo.data.padded_collate_rl")
+        collate_fn = _get_component_from_path("torchtune.dev.rl.data.padded_collate_rl")
 
         for eval_idx, example in enumerate(self._eval_examples):
             batch = collate_fn([example], padding_idx=self._tokenizer.pad_id)
@@ -3724,7 +3954,8 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         if self._is_rank_zero:
             self._metric_logger.close()
         if (getattr(self, "_vllm_weight_sync_method", None) == "xccl" or
-                self._vllm_mode == "dedicated_rank"):
+                self._vllm_mode == "dedicated_rank" or
+                self._vllm_mode == "server"):
             # XCCL teardown race: in dedicated_rank mode, rank 11 exits its server
             # loop and destroys the XCCL wsync_pg communicator while rank 0 is still
             # in save_checkpoint(). Rank 11's teardown corrupts the shared-memory IPC

@@ -167,14 +167,136 @@ These items remain explicit Phase 2 work:
   pipelined version with `wsync_interval=k` already gets the throughput win).
   Becomes interesting when (a) gen ≫ grpo (larger models), (b) higher LR /
   faster-moving policies, or (c) the dedicated-rank vLLM path.
-- **Dedicated-rank vLLM async** — needs a gloo ring buffer to replace the
-  `broadcast_object_list` over `_training_pg`. This is the architectural
-  unblocker for 32B / 30B-MoE async runs.
 - **Telemetry** — `weight_version_lag`, `producer_idle_ms`, `producer_wait_ms`
   are tracked internally on the producer but not yet emitted in the metrics
   line. Defer until a workload actually saturates the queue.
 - **Failure handling** — producer exceptions propagate via `RolloutProducer.get`,
   but there's no queue-staleness watchdog yet.
+
+---
+
+## Phase 2 Step 1 — dedicated-rank gloo ring buffer (validated 2026-04-30)
+
+### What landed
+
+The dedicated-rank vLLM path now broadcasts weights over the existing
+`_wsync_pg` (2-rank gloo, `[0, vllm_rank]`) without dragging the rest of
+the training ranks through a `broadcast_object_list` on the world PG.
+Generation requests still use `_training_pg` (sized to 11 = N-1) for the
+fanout to consumers; only the wsync collective was lifted off the world PG.
+
+The architectural change that mattered for FSDP2:
+- `_compute_wsync_layout` now records the **global** (unsharded) shape /
+  numel for DTensor params, not the local shard shape.
+- `_sync_dedicated_vllm_weights` detects FSDP2 via DTensor isinstance and
+  replaces `summon_full_params` with a `_NullCtx`. The chunk-pack loop
+  calls `param.full_tensor()` collectively across the sharding mesh
+  (`_training_pg`), then only rank 0 packs the result into the chunk
+  buffer and broadcasts to vLLM.
+- `_compute_wsync_layout` lazy-builds `_tune_to_hf_map` so the dedicated
+  setup path doesn't need an explicit call (server / colocate paths still
+  build it eagerly in their own setup).
+
+### Files modified
+
+| File | Role |
+|---|---|
+| `torchtune/dev/rl/weight_sync.py` | `_NullCtx`, FSDP2 detection, collective full_tensor pack, lazy tune→HF build, rank-gated `get_backend` |
+| `recipes/dev/grpo_full_finetune_distributed_xpu.py` | FSDP2 dp_mesh from `_training_pg` (DeviceMesh.from_group), `_gen_pg` send/recv on dedicated-rank generation, shutdown sentinel |
+| `experiments/async_grpo/run_phase2_dedicated.sh` | Launcher (11 train + 1 vLLM, gloo loopback) |
+| `recipes/configs/dev/production/qwen3B_grpo_async_dedicated_xpu.yaml` | Dedicated-rank async config |
+
+### v10 validation run (Qwen2.5-3B, 5 steps, 11 train + 1 vLLM dedicated)
+
+| step | loss | ratios | clipfrac | grad_norm | wsync rank=0 |
+|---|---|---|---|---|---|
+| 1 | -0.144 | 1.0009 | 0.0002 | 0.71 | 5.09s |
+| 2 | -0.047 | 1.0000 | 0.0010 | 0.72 | 4.80s |
+| 3 | +0.061 | 1.0005 | 0.0004 | 0.43 | 4.87s |
+| 4 | -0.078 | 1.0013 | 0.0005 | 1.34 | 4.77s |
+| 5 | -0.079 | 1.0011 | 0.0005 | 0.53 | 4.99s |
+
+5/5 steps clean, exit=0. Ratios in [1.0000, 1.0013] match Phase 1 server-mode
+parity (was [0.9998, 1.0010], clipfrac ≤ 0.0011). Wsync sender side: ~5s
+total (pack 2.6s + d2h 0.13s + bcast 2.0s @ 3 GB/s gloo loopback). Receiver
+total includes idle wait for sender; the actual transfer time is the same
+~5s.
+
+### Bugs fixed during Step 1 bring-up
+
+1. **DTensor flatten on FSDP2 wsync** (v7) — `param.data.view(-1)` failed
+   on unevenly sharded DTensors. Fix: collective `full_tensor()` on every
+   training rank, only rank 0 keeps the materialized tensor.
+2. **`get_backend(_wsync_pg)` from non-members** (v8) — `_wsync_pg` is
+   `[0, N-1]`, but ranks 1..N-2 entered the wsync function and called
+   `get_backend` on it → "Invalid process group specified". Fix: gate the
+   `get_backend` call on `self.rank == 0`; non-members never touch the PG.
+3. **`tok_embeddings` not in vLLM model** (v9) — `_tune_to_hf_map` was
+   never built on the dedicated-rank setup path. Fix: lazy build inside
+   `_compute_wsync_layout` if the attribute is missing.
+
+### v12 stability run (Qwen2.5-3B, 20 steps, 11 train + 1 vLLM dedicated)
+
+20/20 steps clean. Ratios in [0.9998, 1.0014], clipfrac ≤ 0.0017,
+grad_norm 0.34–37.83 (transient spike at step 13 cooled by step 16, no
+divergence). First non-zero successes at step 12 (0.006) and step 19
+(0.017) — policy is responding to reward signal. Wsync rank=0 ~4.7s/step
+steady-state @ 3.2 GB/s gloo loopback.
+
+| step | ratios | clipfrac | grad_norm |
+|---|---|---|---|
+| 1   | 1.0000 | 0.0000 | 0.56 |
+| 5   | 1.0013 | 0.0005 | 0.70 |
+| 10  | 1.0001 | 0.0010 | 1.59 |
+| 12  | 1.0008 | 0.0000 | 24.78 |
+| 13  | 1.0005 | 0.0002 | 37.84 |
+| 16  | 1.0001 | 0.0007 | 3.09 |
+| 20  | 0.9998 | 0.0007 | 0.79 |
+
+### Step 4 (shutdown sentinel) — fixed (v13 validated)
+
+The vLLM rank's count-based `for step in range(num_steps)` loop in
+`weight_sync.py:_run_vllm_generation_server` exited before rank 0's
+sentinel arrived, producing a benign "Failed to send vLLM shutdown
+sentinel: Connection closed by peer" warning (observed in v10 and v12).
+
+Fix: switch to `while True:` with the sentinel as the only exit condition
+(weight_sync.py:551). The vLLM loop now blocks indefinitely on the next
+recv until either a real payload or `{"shutdown": True}` arrives —
+eliminating the race.
+
+v13 verify (3 steps): exit=0, "shutdown sentinel received at step 3"
+logged on rank 11, ZERO "Failed to send" warnings. Confirmed in v14 too
+(3 steps, exit=0, sentinel received).
+
+### Step 3 (telemetry) — instrumentation in place (v14 non-regression)
+
+Producer-side:
+- `RolloutProducer._time_blocked_on_put_s` accumulates time the producer
+  thread spent blocked on a full queue (back-pressure signal).
+- `RolloutProducer._time_get_wait_s` accumulates time the consumer spent
+  in `.get()` waiting for the next item (under-supply signal).
+- Both have read+reset accessors `read_blocked_on_put_ms()` and
+  `read_get_wait_ms()` so the metrics line shows per-step deltas.
+
+Consumer-side: the rank-0 `METRICS step=…` line in the recipe now appends
+`prod_qsize=N  weight_lag=K  prod_wait_ms=…  prod_idle_ms=…` whenever a
+producer is active. Empty tail when `_rollout_producer is None` (e.g.
+dedicated-rank mode where the producer is bypassed).
+
+v14 dedicated-mode 3-step run: clean exit, telemetry tail correctly empty,
+no regressions vs v12/v13.
+
+### Open
+
+- 32B 2-node dedicated-rank async smoke. Requires (a) new launcher with
+  `mpiexec` across 2 nodes, (b) new config (22 train + 2 vLLM TP=2 ranks
+  on the second node), (c) generalizing `_setup_dedicated_vllm_rank` for
+  the 2-node PG topology, (d) gloo backend tuned for cross-node (hsn0
+  not loopback). Defer until 32B-specific work allocates a 2-node block.
+- Server-mode telemetry validation (v15+). Requires HTTP vLLM
+  pre-launched; instrumentation already in place and verified
+  syntactically + as a no-op on dedicated mode.
 
 ---
 

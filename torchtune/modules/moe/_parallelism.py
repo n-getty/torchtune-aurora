@@ -108,6 +108,33 @@ _GLOO_EP_PG = None      # 4-rank gloo EP group; set from recipe (_GLOO_DP_SHARD_
 _GLOO_GLOBAL_PG = None  # 12-rank global gloo group; set from recipe (v150 — failed).
 
 
+def _ep_mem_probe(tag: str, n: int):
+    """v8g diagnostic: print rank-0 XPU L0-free + torch alloc/resv at each EP-OP boundary.
+
+    Goal: localize where L0 IPC handle pressure spikes through train fwd that crashed v3-v8a
+    around op #253-261. Pluggable allocator NOT in use on train ranks (XPU_USM_ALLOC_SO unset),
+    so torch.xpu.memory_stats and mem_get_info are valid here.
+    """
+    try:
+        if dist.get_rank() != 0:
+            return
+        import torch
+        free_b, total_b = torch.xpu.mem_get_info()
+        alloc_b = torch.xpu.memory_allocated()
+        resv_b = torch.xpu.memory_reserved()
+        gib = 1024 ** 3
+        print(
+            f"[MEMPROBE] op={n:>4d} {tag:<10s} "
+            f"l0_free={free_b/gib:6.2f}GiB "
+            f"torch_alloc={alloc_b/gib:6.2f}GiB "
+            f"torch_resv={resv_b/gib:6.2f}GiB "
+            f"l0_used={(total_b-free_b)/gib:6.2f}GiB",
+            flush=True,
+        )
+    except Exception as e:
+        print(f"[MEMPROBE] op={n} {tag} FAIL {e}", flush=True)
+
+
 def _ep_reduce_scatter(input: Tensor, group: dist.ProcessGroup, label: str = "RS") -> Tensor:
     """EP ReduceScatter via gloo CPU-bounce (v151).
 
@@ -125,6 +152,7 @@ def _ep_reduce_scatter(input: Tensor, group: dist.ProcessGroup, label: str = "RS
     n = _EP_OP_N; _EP_OP_N += 1
     r = dist.get_rank()
     print(f"[rank{r}] EP-OP #{n} ENTER {label}", flush=True)
+    _ep_mem_probe(f"ENTER-{label}", n)
     ep_degree = dist.get_world_size(group)
     ep_rank = dist.get_rank(group)
     out_rows = input.shape[0] // ep_degree
@@ -149,6 +177,7 @@ def _ep_reduce_scatter(input: Tensor, group: dist.ProcessGroup, label: str = "RS
         _c10d_reduce_scatter(out, input.contiguous(), op=dist.ReduceOp.SUM, group=group)
 
     print(f"[rank{r}] EP-OP #{n} COLL-DONE {label}", flush=True)
+    _ep_mem_probe(f"EXIT-{label}", n)
     print(f"[rank{r}] EP-OP #{n} EXIT {label}", flush=True)
     return out
 
@@ -167,6 +196,7 @@ def _ep_all_gather(out: Tensor, input: Tensor, group: dist.ProcessGroup, label: 
     n = _EP_OP_N; _EP_OP_N += 1
     r = dist.get_rank()
     print(f"[rank{r}] EP-OP #{n} ENTER {label}", flush=True)
+    _ep_mem_probe(f"ENTER-{label}", n)
 
     if input.device.type == "xpu" and _GLOO_EP_PG is not None:
         # gloo CPU-bounce: XPU → CPU → gloo all_gather_into_tensor → XPU
@@ -187,6 +217,7 @@ def _ep_all_gather(out: Tensor, input: Tensor, group: dist.ProcessGroup, label: 
         dist.all_gather_into_tensor(out, input.contiguous(), group=group)
 
     print(f"[rank{r}] EP-OP #{n} COLL-DONE {label}", flush=True)
+    _ep_mem_probe(f"EXIT-{label}", n)
     print(f"[rank{r}] EP-OP #{n} EXIT {label}", flush=True)
 
 
