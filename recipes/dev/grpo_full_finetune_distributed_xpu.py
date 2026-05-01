@@ -1026,6 +1026,20 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         self._reward_mode = cfg.get("reward_mode", "math")
         self._gene_reward_metric = cfg.get("gene_reward_metric", "f1")
 
+        # Honor cfg.reward_functions for math mode when declared. None falls
+        # back to the legacy hardcoded batched_rewards() path.
+        self._cfg_reward_functions = None
+        if self._reward_mode == "math" and cfg.get("reward_functions"):
+            from torchtune import config as _tt_config
+            self._cfg_reward_functions = [
+                _tt_config.instantiate(fn) for fn in cfg.reward_functions
+            ]
+            log.info(
+                "Reward: using %d cfg.reward_functions (%s)",
+                len(self._cfg_reward_functions),
+                [type(f).__name__ for f in self._cfg_reward_functions],
+            )
+
         # Sequence packing: bin-pack variable-length sequences to eliminate
         # padding waste in the training forward/backward pass.
         self._enable_packing = cfg.get("enable_packing", False)
@@ -2573,6 +2587,27 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             rewards, successes, metadata = sum_digits_batched_rewards(
                 self._tokenizer, responses, answers, device=self._device,
             )
+        elif self._cfg_reward_functions:
+            # Honor cfg.reward_functions when declared. Each Reward instance
+            # returns total_reward / successes shape [N=batch*grpo]; we stack
+            # along the function axis and align with the legacy [B, G, F]
+            # layout the rest of the recipe assumes.
+            decoded = [
+                self._tokenizer.decode(responses[b, g].tolist())
+                for b in range(batch_size) for g in range(grpo_size)
+            ]
+            flat_answers = [
+                answers[b] for b in range(batch_size) for _ in range(grpo_size)
+            ]
+            flat_completion_ids = responses.reshape(batch_size * grpo_size, -1)
+            r_stack, s_stack = [], []
+            for fn in self._cfg_reward_functions:
+                out = fn(flat_completion_ids, decoded, flat_answers)
+                r_stack.append(out.total_reward.to(self._device))
+                s_stack.append(out.successes.to(self._device))
+            rewards = torch.stack(r_stack, dim=-1).reshape(batch_size, grpo_size, -1)
+            successes = torch.stack(s_stack, dim=-1).reshape(batch_size, grpo_size, -1)
+            metadata = {"func_names": [type(fn).__name__ for fn in self._cfg_reward_functions]}
         else:
             rewards, successes, metadata = batched_rewards(
                 self._tokenizer, responses, answers, device=self._device
@@ -2601,6 +2636,8 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                 )
             except Exception as e:
                 log.warning("Could not decode sample response: %s", e)
+
+        self._log_batch_reward(rewards, successes)
 
         advantages = (rewards - rewards.mean(1, keepdim=True)) / (
             rewards.std(1, keepdim=True) + 1e-4
@@ -3893,6 +3930,52 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                 self._steps_run, avg_reward, avg_success, avg_resp_len, eval_time,
                 len(self._eval_examples),
             )
+
+    def _log_batch_reward(self, rewards: torch.Tensor, successes: torch.Tensor) -> None:
+        """Log batch-aggregated reward/success across all training ranks.
+
+        rewards/successes are shape [B, G] on each rank. Aggregates over the
+        full B*G*world batch and emits one line on rank 0:
+
+            BATCH_REWARD step=N reward_mean=… reward_std=… reward_min=… reward_max=… success=…
+
+        Single-line, parseable, gives the actual training signal (GRPO
+        loss is mean-zero by construction so doesn't move; KL is bounded;
+        reward is the only thing that should trend over a real run).
+        """
+        try:
+            r = rewards.detach().float()
+            s = successes.detach().float()
+            ws = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+            if ws > 1:
+                count = torch.tensor([float(r.numel())], device=r.device)
+                stats = torch.stack([r.sum(), (r * r).sum(), s.sum(), r.min(), r.max()])
+                torch.distributed.all_reduce(stats[:3], op=torch.distributed.ReduceOp.SUM)
+                torch.distributed.all_reduce(stats[3:4], op=torch.distributed.ReduceOp.MIN)
+                torch.distributed.all_reduce(stats[4:5], op=torch.distributed.ReduceOp.MAX)
+                torch.distributed.all_reduce(count, op=torch.distributed.ReduceOp.SUM)
+                n = count.item()
+                mean = (stats[0] / n).item()
+                var = max((stats[1] / n).item() - mean * mean, 0.0)
+                std = var ** 0.5
+                succ = (stats[2] / n).item()
+                rmin = stats[3].item()
+                rmax = stats[4].item()
+            else:
+                mean = r.mean().item()
+                std = r.std(unbiased=False).item() if r.numel() > 1 else 0.0
+                succ = s.mean().item()
+                rmin = r.min().item()
+                rmax = r.max().item()
+                n = float(r.numel())
+            if self._is_rank_zero:
+                log.info(
+                    "BATCH_REWARD step=%d n=%d reward_mean=%.4f reward_std=%.4f "
+                    "reward_min=%.4f reward_max=%.4f success=%.4f",
+                    self._steps_run, int(n), mean, std, rmin, rmax, succ,
+                )
+        except Exception as e:
+            log.warning("BATCH_REWARD log failed: %s", e)
 
     def cleanup(self) -> None:
         if self._vllm_client is not None and self._vllm_weight_sync and self._vllm_client.communicator is not None:

@@ -34,6 +34,38 @@ if _USE_IPEX_VARLEN:
 
 _log: logging.Logger = get_logger()
 
+# One-shot per-worker log: surfaces whether IPEX varlen actually engaged on
+# the first SDPA call. Dense Qwen3 GRPO passes an explicit causal mask, so
+# TORCHTUNE_USE_IPEX_VARLEN=1 will report "requested-but-skipped (mask is not
+# None)" on that path even though the env var is set.
+_VARLEN_LOG_DONE: bool = False
+
+
+def _log_varlen_status_once(mask, is_causal: bool, dropout_p: float, device_type: str) -> None:
+    global _VARLEN_LOG_DONE
+    if _VARLEN_LOG_DONE:
+        return
+    _VARLEN_LOG_DONE = True
+    if not _USE_IPEX_VARLEN:
+        _log.info("varlen=disabled (TORCHTUNE_USE_IPEX_VARLEN unset)")
+        return
+    if _ipex_varlen_attention is None:
+        _log.info("varlen=disabled (intel_extension_for_pytorch import failed)")
+        return
+    reasons = []
+    if mask is not None:
+        reasons.append("mask is not None")
+    if not is_causal:
+        reasons.append("is_causal=False")
+    if dropout_p != 0.0:
+        reasons.append(f"dropout_p={dropout_p}")
+    if device_type != "xpu":
+        reasons.append(f"device={device_type}")
+    if reasons:
+        _log.info("varlen=requested-but-skipped (%s)", ", ".join(reasons))
+    else:
+        _log.info("varlen=engaged")
+
 if _SUPPORTS_FLEX_ATTENTION:
     from torch.nn.attention.flex_attention import (
         BlockMask,
@@ -267,6 +299,7 @@ def _sdpa_or_flex_attention() -> Callable:
         is_causal: bool,
     ) -> torch.Tensor:
         # IPEX varlen branch: only valid for causal-only, no mask, no dropout, on XPU.
+        _log_varlen_status_once(mask, is_causal, dropout_p, q.device.type)
         if (
             _USE_IPEX_VARLEN
             and _ipex_varlen_attention is not None

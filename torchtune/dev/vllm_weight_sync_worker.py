@@ -321,6 +321,7 @@ class WeightSyncFromFileExtension:
         self, host: str, port: int, world_size: int, base_rank: int,
         use_two_hop: bool = False, wsync_method: str = "xccl_sendrecv",
         pool_size: int = 0,
+        topology: str = "replica_fanout", intra_world: int = 0,
     ) -> dict:
         """Create a cross-process XCCL group with the training rank.
 
@@ -392,15 +393,36 @@ class WeightSyncFromFileExtension:
             self._wsync_pg_reset_interval = int(os.environ.get("WSYNC_PG_RESET_INTERVAL", "0"))
 
             if use_two_hop:
-                intra_rank = tp_rank
-                intra_size = tp_size_local
+                # Intra PG sizing depends on topology:
+                #   replica_fanout (legacy): intra PG is per-replica TP only.
+                #     Each replica's intra PG has size=tp_size_local; cross is
+                #     per-replica (1 cross PG per replica on training side).
+                #   node_fanout (real 2-hop): all vLLM workers across the node
+                #     share one intra PG of size num_replicas*tp_size. Replica 0
+                #     (rank 0 in intra) bridges from the single cross PG to all
+                #     other vLLM workers via XeLink/XCCL — drops cross-NIC
+                #     traffic from N× to 1×.
+                if topology == "node_fanout":
+                    if intra_world <= 0:
+                        raise ValueError(
+                            "node_fanout requires intra_world > 0 from training side")
+                    intra_rank = replica_idx * tp_size_local + tp_rank
+                    intra_size = intra_world
+                    is_cross_root = (replica_idx == 0 and tp_rank == 0)
+                    cross_prefix_name = "wsync_cross_0"
+                else:
+                    intra_rank = tp_rank
+                    intra_size = tp_size_local
+                    is_cross_root = (tp_rank == 0)
+                    cross_prefix_name = f"wsync_cross_{replica_idx}"
+                self._wsync_topology = topology
                 self._wsync_cross_method = wsync_method
                 intra_method = os.environ.get("WSYNC_INTRA_METHOD", "xccl")
                 self._wsync_intra_method = intra_method
 
-                if tp_rank == 0:
+                if is_cross_root:
                     if pool_size > 0:
-                        # Dynamic sender pool: create N cross-PGs
+                        # Dynamic sender pool (legacy replica_fanout only)
                         self._xccl_cross_pgs = []
                         for i in range(pool_size):
                             prefix = f"wsync_sender_{i}"
@@ -421,7 +443,7 @@ class WeightSyncFromFileExtension:
                                 "(method=%s)", i, pool_size, wsync_method)
                         self._xccl_cross_pg = self._xccl_cross_pgs[0]
                     else:
-                        cross_prefixed = c10d.PrefixStore(f"wsync_cross_{replica_idx}", store)
+                        cross_prefixed = c10d.PrefixStore(cross_prefix_name, store)
                         if wsync_method == "gloo":
                             self._xccl_cross_pg = c10d.ProcessGroupGloo(
                                 store=cross_prefixed, rank=1, size=2,
@@ -435,11 +457,17 @@ class WeightSyncFromFileExtension:
                     self._is_intra_root = True
                     self._gloo_recv_buf = None
                     logger.info(
-                        "init_xccl_communicator: cross PG ready (rank 1/2, "
-                        "method=%s, pool=%d, intra root)",
-                        wsync_method, pool_size)
+                        "init_xccl_communicator: cross PG ready (topology=%s, "
+                        "rank 1/2, method=%s, pool=%d, intra root)",
+                        topology, wsync_method, pool_size)
 
-                intra_prefixed = c10d.PrefixStore(f"wsync_intra_{replica_idx}", store)
+                # node_fanout: single intra PG shared across all replicas (one prefix
+                # for the whole node). replica_fanout: per-replica intra PG.
+                intra_prefix_name = (
+                    "wsync_intra_node" if topology == "node_fanout"
+                    else f"wsync_intra_{replica_idx}"
+                )
+                intra_prefixed = c10d.PrefixStore(intra_prefix_name, store)
                 if intra_method == "gloo":
                     self._xccl_intra_pg = c10d.ProcessGroupGloo(
                         store=intra_prefixed, rank=intra_rank, size=intra_size,
@@ -452,8 +480,10 @@ class WeightSyncFromFileExtension:
                     )
                 self._gloo_intra_buf = None
                 logger.info(
-                    "init_xccl_communicator: intra PG ready (replica=%d, rank=%d/%d, method=%s, is_root=%s)",
-                    replica_idx, intra_rank, intra_size, intra_method, self._is_intra_root,
+                    "init_xccl_communicator: intra PG ready (topology=%s, replica=%d, "
+                    "rank=%d/%d, method=%s, is_root=%s)",
+                    topology, replica_idx, intra_rank, intra_size, intra_method,
+                    self._is_intra_root,
                 )
             else:
                 # Legacy flat broadcast: training rank 0 broadcasts to all vLLM ranks.

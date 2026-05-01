@@ -1,4 +1,12 @@
 # GRPO with vLLM server mode on Intel XPU (Aurora HPC) — Qwen3-32B
+#
+# 1-NODE SMOKE BASELINE — NOT THE FLAGSHIP.
+# For the production-mature 32B path, see:
+#   recipes/configs/dev/production/qwen32B_grpo_3node_24way_xpu.yaml
+#   docs/features/qwen3_32b_dense_grpo.md
+# This 1-node config remains useful for quick smoke tests on a single hold,
+# but does not match the documented best envelope (3-node 24-way pure FSDP).
+#
 # 32B model is too large for colocated vLLM (64 GiB model > 64 GiB tile).
 # Uses server mode: 2 tiles run vLLM (TP=2), 10 tiles run FSDP training.
 #

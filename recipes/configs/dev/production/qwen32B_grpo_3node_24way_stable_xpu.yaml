@@ -1,53 +1,55 @@
-# GRPO with replicated vLLM + HSDP on Aurora XPU (2+ nodes) — Qwen3-32B
+# Qwen3-32B GRPO — 3-Node 24-Way Pure FSDP, Stable Envelope (Aurora XPU)
 #
-# Each node runs: vLLM (tiles 10-11, TP=2) + 10 training ranks (tiles 0-9)
-# HSDP: FSDP within node (dp_shard=10), DDP across nodes (dp_replicate=2)
-# Each shard leader talks to its local vLLM at localhost.
+# Same topology as qwen32B_grpo_3node_24way_xpu.yaml; smaller mg for runs that
+# need predictable step time and don't need the full reasoning ceiling.
 #
-# Memory budget per training tile (64 GiB):
-#   FSDP shard (32B / 20 ranks): ~3.2 GiB (half of single-node)
-#   Ref FSDP shard: ~3.2 GiB
-#   Optimizer states (2× shard): ~6.4 GiB
-#   Activations + KV cache: ~10-15 GiB
-#   Total estimated: ~23-28 GiB — well within 64 GiB
+# Stable learning envelope (Smoke D, 2026-05-01):
+#   ~67s/step at G=8 fbs=8 max_gen=512. 10/10 clean exit=0.
+#   resp_len 182-511 (some prompts hit the 512 cap → reward collapse on those).
+#   Use this when per-step time predictability matters more than complete
+#   reasoning on hard prompts.
 #
-# Performance (G=8/fbs=8):
-#   Single-node: 22.8 s/step, 20.5 seqs/min
-#   2-node HSDP: 23.8 s/step, 39.3 seqs/min (3.1x single-node G=4 baseline)
+# Use the throughput sibling (qwen32B_grpo_3node_24way_xpu.yaml, mg=1024) when
+# you need full reasoning headroom — it eliminates the cap pathology at the
+# cost of ~85s/step and ~5 GiB tighter memory.
 #
-# Launch:
-#   bash recipes/dev/aurora_grpo_vllm_hsdp_multinode.sh
-#   (set MODEL_SRC, CONFIG overrides as needed)
+# Memory smoke envelope (status.md Test A, 2026-04-28) — superseded:
+#   ~41s/step at G=16 fbs=16 max_gen=128 was a memory smoke target. Rewards
+#   collapsed because every response was truncated before the closing answer
+#   tag. Kept here as a memory-pressure reference, not a learning target.
+#
+# Launch (from a held 3-node debug-scaling job):
+#   bash recipes/dev/run_qwen3_32b_grpo_3node.sh
+#   # (this YAML is the launcher's default config)
+# See docs/features/qwen3_32b_dense_grpo.md for the full exemplar.
 
-name: grpo_vllm_hsdp_qwen3_32b_xpu
+name: grpo_3node_24way_stable_qwen3_32b_xpu
 
-output_dir: /tmp/torchtune/grpo_vllm_hsdp_32b
-
+output_dir: /tmp/torchtune/grpo_3node_24way_stable_32b
 base_model_path: /lus/flare/projects/ModCon/ngetty/models/Qwen3-32B
 
-# HSDP: set by launcher (data_parallel_replicate_dim=NUM_NODES)
-data_parallel_replicate_dim: 2
+data_parallel_replicate_dim: 1
 
-# vLLM generation server (each node has its own at localhost)
 vllm_url: "http://localhost:8001"
 vllm_group_port: 51216
-vllm_weight_sync: false
+vllm_tensor_parallel_size: 4
 
-# Tokenizer
+vllm_weight_sync: true
+vllm_weight_sync_method: xccl
+vllm_weight_sync_interval: 2
+
 tokenizer:
   _component_: torchtune.models.qwen3.qwen3_tokenizer
   path: ${base_model_path}/vocab.json
   merges_file: ${base_model_path}/merges.txt
-  max_seq_len: 512
+  max_seq_len: 768  # prompt(~256) + max_gen(512); broadcast buffer needs full ceiling
 
-# Dataset
 dataset:
   _component_: torchtune.dev.rl.gsm8k.gsm8k_dataset
   partition: 1-9/10
 seed: 42
 shuffle: False
 
-# Model
 model:
   _component_: torchtune.models.qwen3.qwen3_32b
 
@@ -106,11 +108,11 @@ ref_checkpointer:
 resume_from_checkpoint: False
 save_every_n_epochs: 1
 
-# GRPO parameters — G=8/fbs=8 optimal (63% more seqs/min vs G=4/fbs=4)
+# Stable learning envelope (Smoke D): G=8 mg=512
 batch_size: 1
 grpo_samples: 8
 forward_batch_size: 8
-max_generated_tokens: 128
+max_generated_tokens: 512
 top_k: null
 temperature: 1.0
 
@@ -133,35 +135,31 @@ loss:
   kl_coeff: 0.01
   epsilon: 0.2
 
-# XPU device
 device: xpu
 
-# Memory management
 enable_activation_checkpointing: True
 compile: False
 
-# Precision
 dtype: bf16
 
 reward_functions:
-    - _component_: torchtune.dev.rl.rewards.FormattedMathCorrectnessReward
+    - _component_: torchtune.dev.rl.rewards.TaggedMathCorrectnessReward
       answer_tag: answer
-      positive_reward: 10.0
+      positive_reward: 100.0
+      partial_reward: 50.0
+      format_only_reward: 1.0
       negative_reward: 0.0
-    - _component_: torchtune.dev.rl.rewards.ThinkingAnswerFormattingReward
+    - _component_: torchtune.dev.rl.rewards.ThinkingTagPresenceReward
       think_tag: think
-      answer_tag: answer
       positive_reward: 1.0
       negative_reward: 0.0
 
-# Logging
 metric_logger:
   _component_: torchtune.training.metric_logging.DiskLogger
   log_dir: ${output_dir}/logs
 log_every_n_steps: 1
 log_peak_memory_stats: True
 
-# Profiler disabled
 profiler:
   _component_: torchtune.training.setup_torch_profiler
   enabled: False

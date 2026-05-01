@@ -247,7 +247,9 @@ class BioReasonHFTokenizer:
 
     def __init__(self, ckpt_dir: str):
         import sys, types, os
-        _BIOREASON_SRC = "/flare/ModCon/ngetty/BioReason-Pro"
+        _BIOREASON_SRC = os.environ.get(
+            "BIOREASON_SRC", "/flare/ModCon/ngetty/BioReason-Pro"
+        )
         for pkg_name, pkg_path in [
             ("bioreason2", f"{_BIOREASON_SRC}/bioreason2"),
             ("bioreason2.models", f"{_BIOREASON_SRC}/bioreason2/models"),

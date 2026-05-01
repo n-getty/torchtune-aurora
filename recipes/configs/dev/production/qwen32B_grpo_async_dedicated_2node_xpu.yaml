@@ -1,5 +1,13 @@
 # Phase 2 Step 5 prototype — Qwen3-32B, 2-node, dedicated-rank vLLM via gloo gen_pg.
 #
+# ASYNC PROTOTYPE, PAUSED. For the production-mature 32B sync path, see:
+#   recipes/configs/dev/production/qwen32B_grpo_3node_24way_xpu.yaml
+#   docs/features/qwen3_32b_dense_grpo.md
+# Phase 2 A2 (vLLM bg recv + bg send) is bandwidth-bound on Aurora — bg gloo
+# bcast contends with FSDP XCCL, ~25% wall-clock regression vs synchronous.
+# See memory: project_phase2_a2_paused.md.
+#
+#
 # Architecture (24 tiles total = 2 nodes x 12 tiles):
 #   ranks [0..22]: training (FSDP2, 23 ranks)
 #   rank 23: dedicated vLLM (last tile on node 2; TP=1 for now — 32B fits in

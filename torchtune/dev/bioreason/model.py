@@ -20,12 +20,40 @@ import torch.nn as nn
 
 logger = logging.getLogger(__name__)
 
-_BIOREASON_SRC = "/flare/ModCon/ngetty/BioReason-Pro"
-_BIOREASON_DEPS = "/lus/flare/projects/ModCon/ngetty/bioreason_deps"
-_PROJDIR = "/lus/flare/projects/ModCon/ngetty/torchtune"
+_DEFAULT_BIOREASON_SRC = "/flare/ModCon/ngetty/BioReason-Pro"
+_DEFAULT_BIOREASON_DEPS = "/lus/flare/projects/ModCon/ngetty/bioreason_deps"
+_DEFAULT_PROJDIR = "/lus/flare/projects/ModCon/ngetty/torchtune"
+
+
+def _resolve_bioreason_paths() -> tuple[str, str, str]:
+    """Resolve BioReason source/deps/project paths from env vars with defaults.
+
+    Honours BIOREASON_SRC, BIOREASON_DEPS, BIOREASON_PROJDIR. Resolution is lazy
+    (called from _ensure_paths) so the module imports cleanly on environments
+    without the BioReason checkout, e.g. CI and other dev machines.
+    """
+    src = os.environ.get("BIOREASON_SRC", _DEFAULT_BIOREASON_SRC)
+    deps = os.environ.get("BIOREASON_DEPS", _DEFAULT_BIOREASON_DEPS)
+    projdir = os.environ.get("BIOREASON_PROJDIR", _DEFAULT_PROJDIR)
+    return src, deps, projdir
+
+
+# Lazy: populated on first _ensure_paths() call. Plain assignment keeps the
+# module-level names for any downstream code that reads them after init.
+_BIOREASON_SRC = _DEFAULT_BIOREASON_SRC
+_BIOREASON_DEPS = _DEFAULT_BIOREASON_DEPS
+_PROJDIR = _DEFAULT_PROJDIR
 
 
 def _ensure_paths():
+    global _BIOREASON_SRC, _BIOREASON_DEPS, _PROJDIR
+    _BIOREASON_SRC, _BIOREASON_DEPS, _PROJDIR = _resolve_bioreason_paths()
+    for label, path in (("BIOREASON_SRC", _BIOREASON_SRC), ("BIOREASON_DEPS", _BIOREASON_DEPS)):
+        if not os.path.isdir(path):
+            raise FileNotFoundError(
+                f"{label}={path!r} does not exist. Set the env var to a valid "
+                f"BioReason checkout (or unset to use the default)."
+            )
     for p in [_BIOREASON_DEPS, _BIOREASON_SRC]:
         if p not in sys.path:
             sys.path.insert(0, p)

@@ -1302,16 +1302,30 @@ def _init_xccl_weight_sync(self) -> None:
     # replica's TP workers enter the XCCL PG constructor. All replicas must
     # join simultaneously (world_size barrier), so sequential posting would
     # deadlock: replica 0 waits for the full group while we never reach replica 1.
-    # 2-hop: training rank 0 sends to vLLM rank 1 (cross-node Slingshot),
-    # rank 1 distributes to ranks 2..N via intra-node XeLink broadcast.
-    # Reduces sync time from ~38s (12 sequential Slingshot sends) to ~3s.
     use_two_hop = num_replicas > 0  # always use when there are cross-node vLLM workers
     self._xccl_two_hop = use_two_hop
 
+    # WSYNC_TOPOLOGY selects the fanout shape:
+    #   replica_fanout (default, legacy) — 1 cross PG PER replica (size=2 each).
+    #     Training rank 0 broadcasts N times in parallel to N replicas. The
+    #     "intra PG" is per-replica TP (size = tp_size_local), so for TP=1
+    #     vLLM topologies (BioReason DP=12) it is a no-op and all 12 cross
+    #     broadcasts contend for the same hsn0 NIC on rank 0's side.
+    #   node_fanout (real 2-hop) — 1 cross PG total (size=2: training rank 0
+    #     ↔ replica 0). Replica 0 then broadcasts to all other vLLM workers
+    #     via a single intra-NODE PG of size=num_replicas*tp_size that all
+    #     vLLM workers join. Cross-NIC traffic drops by num_replicas (12×
+    #     for DP=12); intra-node fanout uses XeLink (~50 GB/s).
+    topology = os.environ.get("WSYNC_TOPOLOGY", "replica_fanout")
+    self._xccl_topology = topology
     # WSYNC_CROSS_METHOD selects the cross-PG backend:
-    #   xccl_sendrecv — XCCL PG with send/recv (RDMA, ~8 GB/s, may avoid CXI leak)
+    #   xccl_sendrecv — XCCL PG with send/recv (RDMA, ~8 GB/s, may hit CXI MR leak)
     #   gloo          — Gloo PG with broadcast (TCP, ~1.3 GB/s, no CXI leak)
     wsync_method = os.environ.get("WSYNC_CROSS_METHOD", "xccl_sendrecv")
+
+    # node_fanout sizing: vLLM workers form a single intra PG of size
+    # (num_replicas*tp_size); the worker-side init keys off this.
+    intra_world = num_replicas * tp_size if topology == "node_fanout" else tp_size
 
     vllm_errors = []
     def _post_replica(r_idx, url):
@@ -1321,7 +1335,8 @@ def _init_xccl_weight_sync(self) -> None:
                 f"{url}/collective_rpc",
                 json={
                     "method": "init_xccl_communicator",
-                    "args": [_xccl_host, xccl_port, world_size, base_rank, use_two_hop, wsync_method],
+                    "args": [_xccl_host, xccl_port, world_size, base_rank,
+                             use_two_hop, wsync_method, 0, topology, intra_world],
                 },
                 timeout=120,
             )
@@ -1344,11 +1359,11 @@ def _init_xccl_weight_sync(self) -> None:
         t.start()
 
     # Training enters PG constructor — unblocks vLLM side when all replicas join.
-    # 2-hop: one cross-PG per replica (size=2: training rank 0 ↔ replica TP-0).
     if use_two_hop:
-        self._xccl_wsync_pgs = []
-        for r_idx in range(num_replicas):
-            cross_prefixed = c10d.PrefixStore(f"wsync_cross_{r_idx}", store)
+        if topology == "node_fanout":
+            # Single cross PG: training rank 0 ↔ replica 0 (vLLM rank 1).
+            # Replica 0 fans out intra-node to ranks 2..N via the size-N intra PG.
+            cross_prefixed = c10d.PrefixStore("wsync_cross_0", store)
             if wsync_method == "gloo":
                 pg = c10d.ProcessGroupGloo(
                     store=cross_prefixed, rank=0, size=2,
@@ -1358,11 +1373,31 @@ def _init_xccl_weight_sync(self) -> None:
                 pg = c10d.ProcessGroupXCCL(
                     store=cross_prefixed, rank=0, size=2, options=opts,
                 )
-            self._xccl_wsync_pgs.append(pg)
-        self._xccl_wsync_pg = self._xccl_wsync_pgs[0]
-        self._wsync_cross_method = wsync_method
-        log.info("Rank %d: %d cross PG(s) created (method=%s)",
-                 self.rank, num_replicas, wsync_method)
+            self._xccl_wsync_pgs = [pg]
+            self._xccl_wsync_pg = pg
+            self._wsync_cross_method = wsync_method
+            log.info("Rank %d: node_fanout cross PG created (1 PG, method=%s, "
+                     "intra_world=%d on vLLM_NODE)",
+                     self.rank, wsync_method, intra_world)
+        else:
+            # replica_fanout (legacy): one cross-PG per replica.
+            self._xccl_wsync_pgs = []
+            for r_idx in range(num_replicas):
+                cross_prefixed = c10d.PrefixStore(f"wsync_cross_{r_idx}", store)
+                if wsync_method == "gloo":
+                    pg = c10d.ProcessGroupGloo(
+                        store=cross_prefixed, rank=0, size=2,
+                    )
+                else:
+                    opts = c10d.ProcessGroupXCCL.Options()
+                    pg = c10d.ProcessGroupXCCL(
+                        store=cross_prefixed, rank=0, size=2, options=opts,
+                    )
+                self._xccl_wsync_pgs.append(pg)
+            self._xccl_wsync_pg = self._xccl_wsync_pgs[0]
+            self._wsync_cross_method = wsync_method
+            log.info("Rank %d: %d cross PG(s) created (method=%s)",
+                     self.rank, num_replicas, wsync_method)
     else:
         opts = c10d.ProcessGroupXCCL.Options()
         prefixed = c10d.PrefixStore("wsync", store)
@@ -1407,6 +1442,21 @@ def _sync_weights_to_vllm_xccl(self) -> None:
 
     use_fsdp1 = getattr(self, '_use_fsdp1', False) and self._dp_replicate > 1
 
+    # BioReason: vLLM only loads the backbone (Qwen3-4B). Strip the
+    # 'backbone.' prefix and skip everything else (ESM3, GO encoder,
+    # projectors). Mirrors the raw_bytes _accept_and_rename above.
+    _is_bior = getattr(self, "_is_bioreason", False)
+
+    def _xccl_accept_and_rename(name: str):
+        """Return the vLLM-side name, or None to skip this param."""
+        if _is_bior:
+            clean = name.replace("_fsdp_wrapped_module.", "")
+            clean = clean.replace("_checkpoint_wrapped_module.", "")
+            if not clean.startswith("backbone."):
+                return None
+            return clean[len("backbone."):]
+        return self._tune_to_hf_map.get(name, name)
+
     if use_fsdp1:
         # FSDP1: state_dict() handles gathering; result is on CPU already
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, StateDictType
@@ -1415,7 +1465,9 @@ def _sync_weights_to_vllm_xccl(self) -> None:
         hf_state_dict = {}
         if self._is_shard_leader:
             for param_name, param in full_sd.items():
-                hf_name = self._tune_to_hf_map.get(param_name, param_name)
+                hf_name = _xccl_accept_and_rename(param_name)
+                if hf_name is None:
+                    continue
                 hf_state_dict[hf_name] = param.to(self._device)
         del full_sd
 
@@ -1633,7 +1685,10 @@ def _sync_weights_to_vllm_xccl(self) -> None:
                     param = param.full_tensor()
                     t_ft += time.perf_counter() - _ft0
                 if is_active:
-                    hf_name = self._tune_to_hf_map.get(param_name, param_name)
+                    hf_name = _xccl_accept_and_rename(param_name)
+                    if hf_name is None:
+                        del param
+                        continue
                     _c0 = time.perf_counter()
                     gpu_tensor = param.to(torch.bfloat16).contiguous()
                     t_cast += time.perf_counter() - _c0

@@ -496,8 +496,7 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
         else:
             query_responses = batch_input_ids.new_empty(bsz, total_len)
 
-        torch.distributed.broadcast(query_responses, src=0)
-        return query_responses
+        return self._broadcast_query_responses(query_responses)
 
     def _generate_with_colocated_vllm(
         self,
@@ -919,16 +918,35 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
         elif self._reward_mode == "bioreason":
             from torchtune.dev.bioreason.reward import bioreason_reward_fn as _br_reward
             _decoded, _expanded_answers = [], []
+            _resp_lens = []
+            _has_eos = []
             for _b in range(batch_size):
                 for _g in range(grpo_size):
                     _ids = responses[_b, _g]
                     _non_pad = _ids[_ids != self._tokenizer.pad_id]
                     _decoded.append(self._tokenizer.decode(_non_pad.cpu().tolist()))
                     _expanded_answers.append(answers[_b])
-            _rw, _succ = _br_reward(_decoded, _expanded_answers)
+                    _resp_lens.append(int(_non_pad.numel()))
+                    # Stop-token presence: does the (un-padded) response contain any
+                    # configured stop token? truncate_sequence_at_first_stop_token
+                    # zeros out everything after the stop, but the stop itself stays.
+                    _has_eos.append(
+                        bool(torch.isin(_non_pad, torch.tensor(self._stop_token_ids,
+                                                                device=_non_pad.device)).any().item())
+                    )
+            _rw, _succ, _br_diag = _br_reward(
+                _decoded, _expanded_answers, return_diagnostics=True,
+            )
             rewards = _rw.view(batch_size, grpo_size, 1)
             successes = _succ.float().view(batch_size, grpo_size, 1)
             metadata = {}
+            # Aggregate BioReason-specific diagnostics across ranks.
+            self._log_bioreason_diagnostics(
+                _br_diag,
+                response_lens=_resp_lens,
+                has_eos=_has_eos,
+                rewards_bg=_rw.view(batch_size, grpo_size),
+            )
         else:
             rewards, successes, metadata = batched_rewards(
                 self._tokenizer, responses, answers, device=self._device
@@ -954,6 +972,8 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
                 )
             except Exception as e:
                 log.warning("Could not decode sample response: %s", e)
+
+        self._log_batch_reward(rewards, successes)
 
         # BioReason-Pro authors' fix for low-variance reward collapse: pool
         # mean/std across the full B*G batch instead of per-prompt-group, so a
@@ -993,6 +1013,88 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
             answers=answers,
             prompt_embeds=prompt_embeds,  # None for text-only; [B*G, P, H] CPU for multimodal
         )
+
+    def _log_bioreason_diagnostics(
+        self,
+        diag: dict,
+        response_lens: list[int],
+        has_eos: list[bool],
+        rewards_bg: torch.Tensor,
+    ) -> None:
+        """All-reduce BioReason rollout diagnostics and emit one line on rank 0.
+
+        BIOREASON_DIAG step=N n=… go_emit=… nonzero_rew=…
+            mean_pred=… mean_tp=… len_mean=… len_p95=…
+            trunc_rate=… stop_rate=… group_std=… batch_std=…
+
+        Reasoning vs throughput trade-off: rollouts are ~32-34s and many of these
+        counters are tiny (B*G ≤ 32 typically), so building int32/float32 tensors
+        and one all-reduce adds <1ms per step.
+        """
+        try:
+            import torch.distributed as _dist
+            ws = _dist.get_world_size() if _dist.is_initialized() else 1
+            dev = self._device
+
+            pred = diag["pred_count"].to(dev).float()
+            tp = diag["tp_count"].to(dev).float()
+            has_pred = diag["has_pred"].to(dev).float()
+            lens = torch.tensor(response_lens, dtype=torch.float32, device=dev)
+            stops = torch.tensor(has_eos, dtype=torch.float32, device=dev)
+            rb = rewards_bg.to(dev).float()
+            nonzero = (rb > 0).float()
+            # Per-prompt-group reward std (mean over groups), and overall batch std.
+            if rb.shape[1] > 1:
+                group_stds = rb.std(dim=1, unbiased=False)
+            else:
+                group_stds = torch.zeros(rb.shape[0], device=dev)
+            # Truncation: response reached max_generated_tokens AND no stop token.
+            max_gen = float(self._max_generated_tokens)
+            trunc = ((lens >= max_gen) & (stops == 0)).float()
+
+            # Reduce sums + sum-of-squares for variance, plus a single scan
+            # tensor for length percentile (approximated as max).
+            local_n = float(lens.numel())
+            sums = torch.stack([
+                pred.sum(), tp.sum(), has_pred.sum(), nonzero.sum(),
+                lens.sum(), stops.sum(), trunc.sum(),
+                group_stds.sum(), torch.tensor(float(rb.shape[0]), device=dev),
+                rb.sum(), (rb * rb).sum(),
+            ])
+            count = torch.tensor([local_n], device=dev)
+            len_max = lens.max().unsqueeze(0) if lens.numel() else torch.tensor([0.0], device=dev)
+            if ws > 1:
+                _dist.all_reduce(sums, op=_dist.ReduceOp.SUM)
+                _dist.all_reduce(count, op=_dist.ReduceOp.SUM)
+                _dist.all_reduce(len_max, op=_dist.ReduceOp.MAX)
+            n = count.item()
+            if n <= 0:
+                return
+            n_groups = sums[8].item() or 1.0
+            r_sum = sums[9].item()
+            r_sqsum = sums[10].item()
+            r_mean = r_sum / n
+            batch_var = max(r_sqsum / n - r_mean * r_mean, 0.0)
+
+            if self._is_rank_zero:
+                log.info(
+                    "BIOREASON_DIAG step=%d n=%d go_emit=%.3f nonzero_rew=%.3f "
+                    "mean_pred=%.2f mean_tp=%.2f len_mean=%.1f len_max=%.0f "
+                    "trunc_rate=%.3f stop_rate=%.3f group_std=%.4f batch_std=%.4f",
+                    self._steps_run, int(n),
+                    sums[2].item() / n,        # go_emit
+                    sums[3].item() / n,        # nonzero_rew
+                    sums[0].item() / n,        # mean_pred
+                    sums[1].item() / n,        # mean_tp
+                    sums[4].item() / n,        # len_mean
+                    len_max.item(),
+                    sums[6].item() / n,        # trunc_rate
+                    sums[5].item() / n,        # stop_rate
+                    sums[7].item() / n_groups, # group_std (mean over groups)
+                    batch_var ** 0.5,          # batch_std
+                )
+        except Exception as e:
+            log.warning("BIOREASON_DIAG log failed: %s", e)
 
     def generate_trajectory_batched(
         self,
@@ -1349,6 +1451,15 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
                 _gen_time = time.perf_counter() - _step_t0
                 if not self._production_mode:
                     self._training_barrier()
+
+                # Start deferred XCCL broadcast now that vLLM generation is done.
+                # Mirrors base recipe lines 3286-3290; without this the deferred
+                # path clears _sync_done_event in step 1 but never fires the
+                # broadcast, so step-2 _wait_for_sync_complete() blocks forever.
+                if (getattr(self, "_vllm_mode", None) == "server"
+                        and getattr(self, "_vllm_weight_sync", False)
+                        and getattr(self, "_vllm_weight_sync_method", None) == "xccl"):
+                    self._start_deferred_broadcast()
 
                 grpo_stats: list[GRPOStats] = []
                 _grpo_t0 = time.perf_counter()

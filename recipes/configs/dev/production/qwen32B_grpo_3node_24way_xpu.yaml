@@ -1,52 +1,74 @@
-# GRPO learning run on GSM8K — Qwen3-32B on Aurora XPU (2-node HSDP)
-# Validates actual learning (accuracy improvement over time) with periodic eval.
+# Qwen3-32B GRPO — 3-Node 24-Way Pure FSDP, Throughput Envelope (Aurora XPU)
 #
-# Setup: 2 nodes, 10 tiles/node FSDP training (HSDP dp_replicate=2 dp_shard=10),
-#         2 tiles/node vLLM (TP=2, each node has local vLLM)
-# Estimated: ~19s/step (2-node), 200 steps + 10 evals ≈ 80 min training
+# Topology:
+#   Node 0 (vLLM only):     12 tiles → 3 vLLM replicas × TP=4
+#   Nodes 1-2 (training):   24 tiles total → pure 24-way FSDP (dp_replicate=1)
+#   Weight sync:            gloo cross-PG (CPU/TCP) + XCCL intra (interval=2)
 #
-# Hyperparams validated on 3B (93-step run):
-#   - lr: 5e-6 — KL-stable (no explosion like 1e-5)
-#   - kl_coeff: 0.05 — keeps KL < 0.012 (vs 0.826 explosion with 0.01)
-#   - eval_every_n_steps: 20, eval_max_examples: 10
+# Learning envelope (Smoke E, 2026-05-01):
+#   ~85s/step at G=8 fbs=8 max_gen=1024. 5/5 clean exit=0, resv=59 GiB stable.
+#   resp_len adapts to prompt difficulty (258-754), KL evolves 0.0005-0.0009.
+#   This is the EXEMPLAR for actual learning signal — Qwen3-32B needs >128
+#   tokens to close <answer> tags on GSM8K. mg=128 zeros reward by truncation.
 #
-# Launch (2-node, interactive on hold node):
-#   export MODEL_SRC=/lus/flare/projects/ModCon/ngetty/models/Qwen3-32B
-#   export NSTEPS=200
-#   export CONFIG=recipes/configs/dev/production/qwen32B_grpo_learning_run.yaml
-#   bash recipes/dev/aurora_grpo_vllm_hsdp_multinode.sh
+# Memory smoke envelope (status.md Test B, 2026-04-29) — superseded:
+#   ~53s/step at G=32 fbs=16 max_gen=128 (1.54× sample throughput vs G=16),
+#   but rewards collapsed to ~0 because every response was truncated before
+#   the closing answer tag. Kept for memory-pressure reference only.
+#
+# Hard envelope at G=8/mg=1024 (Smoke E):
+#   - resv saturates ~59 GiB (5 GiB headroom on 64 GiB tile)
+#   - mg=1024 ceiling unverified beyond — try mg=1536 with caution
+#   - G/fbs <= 2 still holds (CCL external memory explosion at 3 chunks)
+# At G>=16/mg>=128 the historical envelope still applies:
+#   - max_gen=192 marginal at G=16 (1.50 GiB free POST-BWD)
+#   - max_gen >= 256 OOMs step 1 at G=16/G=32
+#   - G=48+ hangs from CCL external explosion
+#   - G=64 hits XPU kernel indexing bug (not OOM)
+#
+# Launch (from a held 3-node debug-scaling job):
+#   CONFIG=recipes/configs/dev/production/qwen32B_grpo_3node_24way_xpu.yaml \
+#     bash recipes/dev/run_qwen3_32b_grpo_3node.sh
+# See docs/features/qwen3_32b_dense_grpo.md for the full exemplar.
+#
+# Required env (set by the launcher):
+#   TORCHTUNE_USE_CHUNKED_LOSS=1   # avoids OOM (per-chunk fwd+bwd)
+#   TORCHTUNE_PINNED_CPU_BUF=1     # gather 31s → 3.7s (8.5× speedup)
+#   WSYNC_CROSS_METHOD=gloo        # avoid CXI MR cache leak
+#   WSYNC_INTRA_METHOD=xccl
+#   GLOO_SOCKET_IFNAME=hsn0        # critical for gloo cross-PG bandwidth
 
-name: grpo_learning_run_qwen3_32b_xpu
+name: grpo_3node_24way_qwen3_32b_xpu
 
-output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/results/qwen32b_learning_run
+output_dir: /tmp/torchtune/grpo_3node_24way_32b
 base_model_path: /lus/flare/projects/ModCon/ngetty/models/Qwen3-32B
 
-# vLLM server mode
+# Pure 24-way FSDP — no DDP replication (3-node 24-way is the canonical envelope)
+data_parallel_replicate_dim: 1
+
+# vLLM dedicated node — URL set by launcher (one URL per DP replica)
 vllm_url: "http://localhost:8001"
 vllm_group_port: 51216
-vllm_weight_sync: false
+vllm_tensor_parallel_size: 4
+
+# Weight sync: 2-hop with gloo cross + XCCL intra, every 2 steps (deferred)
+vllm_weight_sync: true
+vllm_weight_sync_method: xccl
+vllm_weight_sync_interval: 2
 
 # Tokenizer
 tokenizer:
   _component_: torchtune.models.qwen3.qwen3_tokenizer
   path: ${base_model_path}/vocab.json
   merges_file: ${base_model_path}/merges.txt
-  max_seq_len: 1024
+  max_seq_len: 1280  # prompt(~256) + max_gen(1024); broadcast buffer needs full ceiling
 
-# Training dataset — 90% of GSM8K train
+# Dataset
 dataset:
   _component_: torchtune.dev.rl.gsm8k.gsm8k_dataset
   partition: 1-9/10
 seed: 42
-shuffle: True
-
-# Eval dataset — GSM8K test split (1319 examples, subsample to 10)
-eval_dataset:
-  _component_: torchtune.dev.rl.gsm8k.gsm8k_dataset
-  split: test
-eval_every_n_steps: 25
-eval_max_examples: 10
-eval_grpo_samples: 2
+shuffle: False
 
 # Model
 model:
@@ -106,20 +128,19 @@ ref_checkpointer:
 
 resume_from_checkpoint: False
 save_every_n_epochs: 1
-save_every_n_steps: 100  # Wrapped in try/except — will log error but not crash
 
-# GRPO parameters — same G=8/fbs=8 as production
+# GRPO parameters — learning envelope (Smoke E, 2026-05-01)
 batch_size: 1
 grpo_samples: 8
 forward_batch_size: 8
-max_generated_tokens: 512
+max_generated_tokens: 1024
 top_k: null
 temperature: 1.0
 
 ppo_epochs: 1
 gradient_accumulation_steps: 1
 
-num_steps: 200
+num_steps: 5
 
 clip_grad_norm: 1.0
 
@@ -129,41 +150,37 @@ optimizer:
   lr: 5e-6
 lr_scheduler:
   _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
-  num_warmup_steps: 10
+  num_warmup_steps: 2
 loss:
   _component_: torchtune.dev.rl.loss.GRPOSimpleLoss
-  kl_coeff: 0.05
+  kl_coeff: 0.01
   epsilon: 0.2
 
-# XPU device
 device: xpu
 
-# Memory management
 enable_activation_checkpointing: True
 compile: False
 
-# Precision
 dtype: bf16
 
 reward_functions:
-    - _component_: torchtune.dev.rl.rewards.FormattedMathCorrectnessReward
+    - _component_: torchtune.dev.rl.rewards.TaggedMathCorrectnessReward
       answer_tag: answer
-      positive_reward: 10.0
+      positive_reward: 100.0
+      partial_reward: 50.0
+      format_only_reward: 1.0
       negative_reward: 0.0
-    - _component_: torchtune.dev.rl.rewards.ThinkingAnswerFormattingReward
+    - _component_: torchtune.dev.rl.rewards.ThinkingTagPresenceReward
       think_tag: think
-      answer_tag: answer
       positive_reward: 1.0
       negative_reward: 0.0
 
-# Logging
 metric_logger:
   _component_: torchtune.training.metric_logging.DiskLogger
   log_dir: ${output_dir}/logs
 log_every_n_steps: 1
 log_peak_memory_stats: True
 
-# Profiler disabled
 profiler:
   _component_: torchtune.training.setup_torch_profiler
   enabled: False

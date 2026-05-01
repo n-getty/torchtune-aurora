@@ -10,9 +10,10 @@
 #     Loads bioreason-pro-sft as plain Qwen3-4B (aux .pt files ignored by vLLM).
 #     Validated 2026-04-29: all 12 reach startup, KV uniform 240-250K tokens.
 #
-# Wire format: base64(torch.save(bf16_tensor)) → POST /v1/completions {prompt_embeds: ...}.
-# Weight sync: raw_bytes path → /dev/shm + /collective_rpc → load_weights_from_raw.
+# Wire format: base64(torch.save(bf16_tensor)) -> POST /v1/completions {prompt_embeds: ...}.
+# Weight sync: XCCL node_fanout via /collective_rpc; set WSYNC_TOPOLOGY=node_fanout.
 # Backbone-only: state_dict() filtered to backbone.* and prefix stripped (vLLM has no aux).
+# Recommended launcher env: TORCHTUNE_USE_IPEX_VARLEN=1 for validated G=8 throughput.
 #
 # Launch (from login node, after 2-node hold job is R):
 #   bash experiments/bioreason/run_bioreason_2node_server.sh
@@ -44,7 +45,7 @@ shuffle: True
 resume_from_checkpoint: False
 
 # ── RL Hyperparameters ────────────────────────────────────────────────────────
-grpo_samples: 4
+grpo_samples: 8
 max_seq_len: 1024
 max_generated_tokens: 1024
 temperature: 0.8
@@ -55,7 +56,7 @@ epochs: 1
 num_steps: 1200
 ppo_epochs: 1
 batch_size: 1
-forward_batch_size: 2
+forward_batch_size: 8
 gradient_accumulation_steps: 1
 
 optimizer:
@@ -93,7 +94,7 @@ force_math_sdpa: false
 # launcher passes: vllm_url=http://VLLM_HOST:8001,http://VLLM_HOST:8002,...,http://VLLM_HOST:8012
 vllm_mode: server
 vllm_weight_sync: true
-vllm_weight_sync_method: raw_bytes
+vllm_weight_sync_method: xccl
 vllm_weight_sync_interval: 1
 vllm_max_model_len: 2048
 

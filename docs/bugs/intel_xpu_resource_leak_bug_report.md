@@ -4,6 +4,8 @@
 
 **Revalidated 2026-04-23 on frameworks/2025.3.1 (torch 2.10.0a0+git449b176, Level Zero 1.24.0, I915_25.2.29): bug still active, identical signature and crash counts.** FSDP2+RL+`empty_cache()` crashes at iter ~70-75 with `UR_RESULT_ERROR_OUT_OF_RESOURCES`; FSDP1 crashes at iter ~145-150; workaround (no `empty_cache()` in FSDP loops) stable through 250 iterations. Frame-version upgrade does NOT fix this. Logs: `experiments/empty_cache_revalidate/`.
 
+**Re-revalidated 2026-04-30 on torch 2.11.0+xpu stable (separate venv, same `oneapi/release/2025.3.1` module — Level Zero 1.24.0, I915_25.2.29): bug persists with bit-identical iteration counts.** FSDP2 crashes at iter 70 (was ~70-75 on 2.10), FSDP1 crashes at iter 145 (was ~145-150 on 2.10), workaround stable 250 iters in 40.1s. Confirms the leak lives in the L0 / SYCL UR allocator below PyTorch — torch version is irrelevant; only an OS-level driver / level-zero package upgrade can fix it. Logs: `experiments/empty_cache_revalidate/test{1,2,3}_*_nightly.log`.
+
 ## Summary
 
 When using PyTorch FSDP (both FSDP1 and FSDP2) on Intel Data Center GPU Max 1550 (XPU), calling `torch.xpu.empty_cache()` between FSDP forward passes causes `UR_RESULT_ERROR_OUT_OF_RESOURCES` after a deterministic number of iterations. The root cause is the interaction between `empty_cache()` and FSDP's `storage.resize_()` cycle: each `zeMemAllocDevice`/`zeMemFree` cycle through Level Zero leaks a UR handle.

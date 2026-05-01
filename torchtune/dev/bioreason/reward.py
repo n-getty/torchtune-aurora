@@ -56,7 +56,8 @@ def bioreason_reward_fn(
     answers: list[str],
     beta: float = 1.0,
     format_penalty: float = 0.1,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    return_diagnostics: bool = False,
+):
     """
     Compute per-completion rewards for BioReason GRPO.
 
@@ -66,12 +67,22 @@ def bioreason_reward_fn(
                  (one per prompt, repeated G times for G rollouts per prompt)
         beta: F-score beta (default 1.0 = F1)
         format_penalty: Penalty subtracted when completion contains no GO terms
+        return_diagnostics: When True, also return per-completion counts useful
+            for telemetry (predicted-term count, GT count, true-positive count).
 
     Returns:
         rewards: [N] float tensor of F_beta scores in [0, 1]
         successes: [N] bool tensor (reward > 0.5)
+        diagnostics (optional): dict with int32 tensors
+            - pred_count: [N] number of GO terms predicted
+            - gt_count:   [N] number of GO terms in ground truth
+            - tp_count:   [N] number of true positives (pred ∩ gt)
+            - has_pred:   [N] bool, predicted at least one GO term
     """
     rewards = []
+    pred_counts: list[int] = []
+    gt_counts: list[int] = []
+    tp_counts: list[int] = []
     for completion, answer in zip(completions, answers):
         predicted = extract_go_terms(completion)
         gt = extract_go_terms(answer)
@@ -83,10 +94,23 @@ def bioreason_reward_fn(
             score = max(0.0, score - format_penalty)
 
         rewards.append(score)
+        if return_diagnostics:
+            pred_counts.append(len(predicted))
+            gt_counts.append(len(gt))
+            tp_counts.append(len(predicted & gt))
 
     rewards_t = torch.tensor(rewards, dtype=torch.float32)
     successes_t = rewards_t > 0.5
-    return rewards_t, successes_t
+    if not return_diagnostics:
+        return rewards_t, successes_t
+
+    diagnostics = {
+        "pred_count": torch.tensor(pred_counts, dtype=torch.int32),
+        "gt_count": torch.tensor(gt_counts, dtype=torch.int32),
+        "tp_count": torch.tensor(tp_counts, dtype=torch.int32),
+        "has_pred": torch.tensor(pred_counts, dtype=torch.int32) > 0,
+    }
+    return rewards_t, successes_t, diagnostics
 
 
 def batch_level_advantages(

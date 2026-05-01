@@ -1,0 +1,112 @@
+Assessment
+The 32B dense GRPO work is technically mature in the runtime path, but not yet packaged as a clean reproducible exemplar in this checkout. The strongest documented baseline is the 3-node 24-way pure FSDP setup with pinned CPU staging, G=32, forward_batch_size=16, max_gen=128, deferred weight sync, and 1 vLLM node. The main gap is that the referenced exemplar launcher/config surface is missing or stale.
+Current Best Baselines
+From docs/status.md:
+Topology	Config
+2-node dedicated vLLM + 2-hop XCCL	G=16 fbs=4 max_gen=128
+2-node dedicated vLLM + gloo cross + XCCL intra	G=16 fbs=4 max_gen=128
+3-node 24-way FSDP + XCCL intra	G=16 fbs=16 max_gen=128
+3-node 24-way FSDP + pinned CPU buf	G=16 fbs=16 max_gen=128
+3-node 24-way FSDP + pinned CPU buf	G=32 fbs=16 max_gen=128
+3-node 24-way FSDP + pinned CPU buf	G=32 fbs=16 max_gen=192
+3-node 24-way FSDP	G>=48 or G/fbs > 2
+3-node 24-way FSDP	G=64
+The key performance story is already compelling:
+- Policy forward elimination saved ~12.3s per step for single-epoch sync GRPO.
+- forward_batch_size=16 saved ~6.6s by reducing FSDP model scans.
+- Deferred weight sync reduces visible overhead to ~0.3s on non-sync/even steps.
+- TORCHTUNE_PINNED_CPU_BUF=1 reduced gather from ~31s to ~3.7s.
+- Best throughput envelope is documented as G=32, fbs=16, max_gen=128.
+Reproducibility Gap
+The docs reference:
+- experiments/multinode_32b/run_32b_3node_24way.sh
+- experiments/multinode_32b/run_32b_2hop_production.sh
+- recipes/dev/aurora_grpo_vllm_hsdp_multinode.sh
+But in this checkout:
+- experiments/multinode_32b/* is absent.
+- recipes/dev/aurora_grpo_vllm_hsdp_multinode.sh is absent.
+- recipes/configs/dev/production/qwen32B_grpo_vllm_hsdp_multinode_xpu.yaml is older/stale relative to the current best 3-node baseline. It says G=8, fbs=8, vllm_weight_sync: false, and references the missing HSDP launcher.
+- recipes/configs/dev/production/qwen32B_grpo_learning_run.yaml similarly references the missing launcher and uses the older 2-node/local-vLLM HSDP framing.
+That means the framework has the ingredients, but a new user cannot currently reproduce the stated flagship 32B result by following checked-in files alone.
+Dense Code Path
+Primary runtime:
+- Recipe: recipes/dev/grpo_full_finetune_distributed_xpu.py
+- Dense model: torchtune.models.qwen3.qwen3_32b
+- Attention: torchtune/models/qwen3/_attention.py
+- SDPA/IPEX gate: torchtune/modules/attention_utils.py
+- Weight sync: torchtune/dev/rl/weight_sync.py
+Important implementation points:
+- The recipe creates padding-derived causal masks in generate_trajectory() via generation.get_causal_mask_from_padding_mask(...).
+- It passes those masks to policy, reference, and training forwards:
+  - self._model(query_responses, input_pos=position_ids, mask=masks)
+  - chunked path passes mask=masks[cs:ce]
+  - grpo_step() passes mask=trajectory.masks[_cs:_ce]
+- Qwen3 attention only enables causal SDPA with is_causal=True when mask is None:
+  - is_causal=self.kv_cache is None and mask is None and self.is_causal
+- Therefore dense GRPO normally calls SDPA with an explicit boolean mask, not the mask-free causal fast path.
+IPEX Varlen Diagnosis
+The IPEX varlen branch in attention_utils.py only engages when all are true:
+_USE_IPEX_VARLEN
+and _ipex_varlen_attention is not None
+and mask is None
+and is_causal
+and dropout_p == 0.0
+and q.device.type == "xpu"
+For dense 32B GRPO, mask is None is false in the normal path. That has two implications:
+1. If TORCHTUNE_USE_IPEX_VARLEN=1 regressed dense 32B, it likely did not regress by taking the intended varlen kernel in the dense training/ref path.
+2. The regression is more likely from one of:
+   - A different path invoking mask-free attention, such as some generation/cache path.
+   - IPEX import/runtime side effects after importing intel_extension_for_pytorch.llm.functional.varlen_attention.
+   - Shape/contiguity overhead if a local change removed masks to force varlen.
+   - Additional memory pressure from the varlen path’s .contiguous() q/k/v packing if it did engage somewhere.
+   - Different behavior between torchtune-native Qwen3 attention and BioReason’s HF backbone path.
+The BioReason win does not automatically transfer to dense 32B because BioReason uses BioReasonModel.forward(... attention_mask=...) around a HF backbone, while dense Qwen3 uses torchtune-native attention and explicit mask= tensors. They are not the same attention dispatch surface.
+Most Likely Why BioReason Benefited
+BioReason likely had more favorable characteristics for IPEX varlen:
+- It may hit a causal/no-mask HF attention path after HF preprocessing, even if attention_mask is passed at the wrapper level.
+- Its shape regime was documented as Qwen3-4B/BioReason-style, where the microbench showed lower transient memory and faster kernels.
+- Its previous limiter was memory/reserved-HBM pressure, so a 5 GiB lower steady-state reserve could unblock G=8.
+- Dense 32B 3-node is dominated by FSDP scans, collectives, gather/staging, and backward, so attention-kernel savings are a smaller fraction of total step time.
+Optimization Potential
+Highest confidence:
+1. Package the 3-node 24-way baseline as the canonical exemplar.
+2. Add a checked-in launcher equivalent to the documented run_32b_3node_24way.sh.
+3. Add a production YAML for the current best envelope:
+   - grpo_samples: 32
+   - forward_batch_size: 16
+   - max_generated_tokens: 128
+   - vllm_weight_sync: true
+   - vllm_weight_sync_interval: 2
+   - TORCHTUNE_PINNED_CPU_BUF=1
+   - TORCHTUNE_USE_CHUNKED_LOSS=1
+   - WSYNC_CROSS_METHOD=gloo
+   - WSYNC_INTRA_METHOD=xccl
+   - dp_replicate=1
+4. Preserve a conservative 3-node stability YAML:
+   - G=16
+   - fbs=16
+   - max_gen=128
+5. Document the hard envelope:
+   - G/fbs <= 2
+   - avoid G=64
+   - max_gen=192 is marginal
+   - max_gen=512 is at the memory limit
+6. Add a runtime log line for whether IPEX varlen is actually engaged. Right now TORCHTUNE_USE_IPEX_VARLEN=1 can be misleading because dense 32B may silently fall back due to mask is not None.
+Lower confidence but worth targeted experiments:
+1. Test a dense no-padding/no-mask fast path only when all sequences are unpadded and identical length. This would allow mask=None, is_causal=True, but must preserve response padding semantics and logprob masking.
+2. Evaluate whether creating dense masks can be avoided for pad_id-free batches. Many vLLM outputs are truncated to equal max_gen; if no EOS/pad appears, the full mask may be unnecessary.
+3. Profile attention share under the 3-node G=32/fbs=16 run. If attention is not a meaningful fraction, varlen is not worth destabilizing the exemplar.
+4. Revisit async GRPO for 32B once reproducibility is cleaned up. Docs show gen=77s vs grpo=110s in an earlier 2-node async prototype, implying ~30% overlap headroom, but the current best 3-node path may have a different balance.
+Recommended Exemplar Definition
+I would make the public “mature framework” exemplar be:
+- Primary: 3-node 24-way pure FSDP, one vLLM node, pinned CPU buffer, G=32/fbs=16/max_gen=128.
+- Secondary/stability: same topology with G=16/fbs=16/max_gen=128.
+- Legacy/short-run: 2-node dedicated-vLLM 2-hop XCCL if users only have 2 nodes and accept shorter stability horizons.
+The checked-in artifact should include:
+- One launcher in recipes/dev/ or a restored experiments/multinode_32b/ tree.
+- One production YAML for best throughput.
+- One production YAML for best stability.
+- A short table of expected timings and memory margins.
+- A warning that TORCHTUNE_USE_IPEX_VARLEN=1 is not expected to affect the standard dense path unless masks are eliminated.
+Bottom Line
+The 32B dense runtime path looks strong, and the documented best result is a credible flagship baseline. The weak point is reproducibility packaging: the documented launchers are not in the checkout, and the production YAMLs lag the best known 3-node configuration. The IPEX varlen regression should not be treated as an attention-kernel contradiction yet; dense 32B currently passes explicit masks, so the varlen branch should not normally engage. The next best move is to codify the 3-node G=32/fbs=16/max_gen=128 baseline as a checked-in, runnable exemplar and add logging to prove whether varlen is active or falling back.

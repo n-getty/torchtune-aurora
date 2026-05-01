@@ -644,7 +644,39 @@ Launcher had `export WSYNC_CROSS_METHOD=gloo` instead of
 PBS script was silently overridden, making XCCL cross-PG impossible to enable.
 v16 test ran with gloo cross despite `WSYNC_CROSS_METHOD=xccl` being set.
 
+### 20. XCCL gather paths missing BioReason backbone-prefix strip (2026-04-30, FIXED)
+
+`_sync_weights_to_vllm_xccl` (FSDP1 path ~line 1453, FSDP2 path ~line 1671)
+mapped tune→HF names with `self._tune_to_hf_map.get(...)` only — no FSDP
+wrapper strip and no `backbone.` strip. The validated `raw_bytes` path had
+the right logic in `_accept_and_rename` (line 995). On BioReason runs
+(model is `BioReasonModel` whose Qwen3 lives at `self.backbone`), the XCCL
+path sent `backbone.model.layers.…` to vLLM, which raises
+`ValueError: There is no module or parameter named 'backbone' in
+Qwen3ForCausalLM` at `vllm/model_executor/models/utils.py:326`.
+
+The vLLM RPC error never propagated back to train — train ranks hung
+in `optimizer.step()` waiting on the bg gloo broadcast that the dead
+vLLM workers would never complete. Originally misattributed to
+SSH-parent-death (v8-style); the launcher hardening was correct but
+addressed a different failure mode.
+
+Fix: add `_xccl_accept_and_rename` helper at the top of
+`_sync_weights_to_vllm_xccl`, mirroring the raw_bytes helper, and skip
+non-backbone params at both gather sites. Validated 5/5 + 10/10 + 5/5
+clean across replica_fanout / node_fanout / G=8+varlen on hold 8462930.
+See `docs/reports/bioreason_xccl_2hop_validated_20260430.md`.
+
 ---
+
+## Topology env vars (2026-04-30)
+
+| Env var | Default | Effect |
+|---------|---------|--------|
+| `WSYNC_METHOD` | per-config | `xccl` / `gloo` / `shm` / `raw_bytes` / `path` |
+| `WSYNC_TOPOLOGY` | `replica_fanout` | `replica_fanout` = legacy 1 cross PG per replica (DP-many parallel sends). `node_fanout` = real 2-hop: 1 cross PG total (size 2: train rank 0 ↔ vLLM rank 0) + 1 intra PG of size `num_replicas * tp_size` on the vLLM node. Cuts cross-node traffic 12× for DP=12. Validated on BioReason 4B 2-node, 10/10 clean. |
+| `WSYNC_CROSS_METHOD` | `gloo` | `gloo` (TCP/Slingshot) or `xccl` (RDMA) for the cross-node hop |
+| `WSYNC_INTRA_METHOD` | `xccl` | `xccl` (XeLink) or `gloo` (localhost SHM) for the intra-node hop |
 
 ## Key Files
 

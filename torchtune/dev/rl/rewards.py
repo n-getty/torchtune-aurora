@@ -253,6 +253,99 @@ def math_response_correct(
     return 0.0, 0.0
 
 
+class TaggedMathCorrectnessReward(Reward):
+    """Tag-extracting math correctness reward — config-honoring wrapper around
+    the hardcoded ``math_response_correct``. Use this when the model is
+    expected to emit ``<answer>...</answer>`` tags (the standard recipe
+    prompt format). Differs from ``FormattedMathCorrectnessReward`` in that
+    it parses the tag first, then runs math_verify on the tag contents only.
+    """
+
+    def __init__(
+        self,
+        answer_tag: str = "answer",
+        positive_reward: float = 100.0,
+        partial_reward: float = 50.0,
+        format_only_reward: float = 1.0,
+        negative_reward: float = 0.0,
+    ):
+        self.answer_tag = answer_tag
+        self.positive_reward = positive_reward
+        self.partial_reward = partial_reward
+        self.format_only_reward = format_only_reward
+        self.negative_reward = negative_reward
+
+    def __call__(
+        self,
+        completion_ids: torch.Tensor,
+        completions: list[str],
+        answers: list[str],
+    ) -> RewardOutput:
+        import math_verify
+
+        rewards = []
+        successes = []
+        for completion, answer in zip(completions, answers):
+            _, potential_answer = extract_tags(f"<think>{completion}")
+            if not potential_answer:
+                rewards.append(self.negative_reward)
+                successes.append(0.0)
+                continue
+            gold = math_verify.parse(answer)
+            attempt = math_verify.parse(potential_answer)
+            if math_verify.verify(gold, attempt):
+                rewards.append(self.positive_reward)
+                successes.append(1.0)
+            elif answer in potential_answer:
+                rewards.append(self.partial_reward)
+                successes.append(0.0)
+            else:
+                rewards.append(self.format_only_reward)
+                successes.append(0.0)
+        return RewardOutput(
+            reward_base_name="math_correctness",
+            total_reward=torch.tensor(rewards),
+            successes=torch.tensor(successes),
+        )
+
+
+class ThinkingTagPresenceReward(Reward):
+    """Lightweight format reward — config-honoring wrapper around the
+    hardcoded ``at_least_one_space_between_think_tags``. Returns
+    ``positive_reward`` when the completion has a non-empty ``<think>``
+    section; ``negative_reward`` otherwise. Less strict than
+    ``ThinkingAnswerFormattingReward``, which also requires the answer tag
+    and format ordering.
+    """
+
+    def __init__(
+        self,
+        think_tag: str = "think",
+        positive_reward: float = 1.0,
+        negative_reward: float = 0.0,
+    ):
+        self.think_tag = think_tag
+        self.positive_reward = positive_reward
+        self.negative_reward = negative_reward
+
+    def __call__(
+        self,
+        completion_ids: torch.Tensor,
+        completions: list[str],
+        answers: list[str],
+    ) -> RewardOutput:
+        rewards = []
+        for completion in completions:
+            cot, _ = extract_tags(f"<{self.think_tag}>{completion}")
+            rewards.append(self.positive_reward if cot else self.negative_reward)
+        rewards_t = torch.tensor(rewards)
+        return RewardOutput(
+            reward_base_name="format",
+            total_reward=rewards_t,
+            successes=(rewards_t == self.positive_reward).float(),
+        )
+
+
 def extract_tags(text: str) -> tuple[str, str]:
     """
     Parse XML-like tags from text. Returns a dictionary with keys 'think' and 'answer'.
