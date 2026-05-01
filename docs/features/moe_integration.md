@@ -247,8 +247,8 @@ After EP=4 partitioning: `(32, dim, hidden_dim)` per tile.
 | File | Change |
 |------|--------|
 | `torchtune/modules/moe/utils.py` | Added `_permute`, `_unpermute` (pure torch, no Triton) |
-| `torchtune/modules/moe/_parallelism.py` | Added `ExpertParallel`, `apply_ep_weight_sharding` |
-| `torchtune/modules/moe/__init__.py` | Exported `ExpertParallel`, `apply_ep_weight_sharding` |
+| `torchtune/modules/moe/_parallelism.py` | Added `ExpertParallel` (and the now-removed `apply_ep_weight_sharding`; expert weight slicing happens in the recipe pre-FSDP2, see "EP weight slice contract" below) |
+| `torchtune/modules/moe/__init__.py` | Exports `ExpertParallel`, `wire_ep_to_moe_modules` |
 | `torchtune/modules/moe/experts.py` | Fixed `_forward_no_grouped_mm` to use local expert count |
 | `torchtune/models/gemma4/_parallelism.py` | New: `gemma4_ep_plan()` returning EP plan for 30 MoE layers |
 | `torchtune/models/gemma4/__init__.py` | Exported `gemma4_ep_plan` |
@@ -257,10 +257,18 @@ After EP=4 partitioning: `(32, dim, hidden_dim)` per tile.
 
 | File | Purpose |
 |------|---------|
-| `recipes/dev/test_ep_smoke.py` | 4-subtest smoke test (imports, permute, all-to-all, forward) |
-| `recipes/dev/test_ep_correctness.py` | EP=2 vs replicated output comparison (bit-exact) |
-| `recipes/dev/test_ep_model_setup.py` | 12-tile EP=4/DP=3 topology validation with real checkpoint |
-| `recipes/dev/run_ep_smoke.sh` | Smoke test launcher |
+| `experiments/ep_parallelism/test_ep_smoke.py` | 4-subtest smoke test (imports, permute, all-to-all, forward) |
+| `experiments/ep_parallelism/test_ep_correctness.py` | EP=2 vs replicated output comparison (bit-exact) |
+| `experiments/ep_parallelism/test_ep_model_setup.py` | 12-tile EP=4/DP=3 topology validation with real checkpoint |
+| `experiments/ep_parallelism/test_experts_forward.py` | Expert forward kernel sanity |
+| `tests/torchtune/dev/rl/test_ep_slice_contract.py` | **CPU-safe regression**: recipe pre-FSDP2 expert slice formula must match `_token_dispatch`'s ownership formula (interleaved). Runs on a login node in seconds. |
+
+Recommended single-node smoke (held compute node, EP=2):
+
+```bash
+torchrun --standalone --nproc_per_node=2 \
+    experiments/ep_parallelism/test_ep_correctness.py
+```
 
 ---
 
@@ -302,20 +310,29 @@ module it:
 
 Gradient flow is automatic via `all_to_all_single_autograd`.
 
-### apply_ep_weight_sharding (`torchtune/modules/moe/_parallelism.py`)
+### EP weight slice contract (`recipes/dev/grpo_full_finetune_distributed_xpu.py`)
 
-After loading the full checkpoint, call this to slice each EP module's parameters to the
-local shard:
+Expert weight slicing is performed in the recipe **before** `load_from_full_model_state_dict`,
+operating on the full-precision tensor straight from the HF checkpoint. The slice formula
+must match `_token_dispatch`'s expert-ownership formula (interleaved):
 
 ```python
-n_sharded = apply_ep_weight_sharding(model)
-# → 30 modules × 3 params each (gate_proj, up_proj, down_proj)
-# → param.data[ep_rank * n_local : (ep_rank+1) * n_local].contiguous()
+# Recipe (pre-FSDP2): rank r owns experts r, r+ep_degree, r+2*ep_degree, ...
+model_sd[_sd_name] = _ft[_ep_rank::_ep_degree].contiguous()
+
+# Dispatch (_token_dispatch): for local expert i, global expert g = ep_rank + i*ep_degree
+g = ep_rank + local_exp_idx * ep_degree
 ```
 
-**Critical ordering constraint**: must be called AFTER `load_state_dict` but BEFORE
-`shard_model()`. After FSDP2 `fully_shard()`, named parameters are absorbed into flat
-buffers — `named_parameters(recurse=False)` returns nothing for FSDP2-sharded modules.
+**Critical**: any contiguous slice (`_ft[r*n_local : (r+1)*n_local]`) silently permutes
+tokens against weights and produces meaningless training. The CPU-safe regression
+`tests/torchtune/dev/rl/test_ep_slice_contract.py` enforces both formulas agree across
+several `(num_experts, ep_degree)` pairs.
+
+The previous `apply_ep_weight_sharding` helper (which performed the same slicing post-load)
+has been removed. Pre-load slicing in the recipe is preferred because the meta-param shape
+is set to `(n_local, dim, dim)` before `load_from_full_model_state_dict` runs, so FSDP2's
+shape check passes naturally.
 
 ### _permute / _unpermute (`torchtune/modules/moe/utils.py`)
 
@@ -409,9 +426,10 @@ model.load_state_dict(sd["model"], strict=False)
 #    `torchtune/modules/moe/_parallelism.py`.
 ```
 
-`apply_ep_weight_sharding` (post-load slicing) is no longer called from the
-recipe — the pre-FSDP2 meta-param + state_dict pre-slice replaces it. The
-function still exists for unit tests and ad-hoc scripts.
+`apply_ep_weight_sharding` (post-load slicing) was removed; the pre-FSDP2
+meta-param + state_dict pre-slice in the recipe replaces it. See the
+"EP weight slice contract" section above for the active formula and the
+CPU-safe regression test (`test_ep_slice_contract.py`) that guards it.
 
 ---
 

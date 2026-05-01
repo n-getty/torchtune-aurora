@@ -100,6 +100,7 @@ from torch.distributed.tensor.placement_types import Placement
 #
 #   If gloo barrier alone fails: try gloo barrier + XCCL barrier (belt-and-suspenders),
 #   or switch CCL_ATL_TRANSPORT=mpi which has stronger OFI CQ completion guarantees.
+import os
 import sys
 from torch.distributed.distributed_c10d import reduce_scatter_tensor as _c10d_reduce_scatter
 
@@ -107,14 +108,28 @@ _EP_OP_N = 0
 _GLOO_EP_PG = None      # 4-rank gloo EP group; set from recipe (_GLOO_DP_SHARD_PG mirror).
 _GLOO_GLOBAL_PG = None  # 12-rank global gloo group; set from recipe (v150 — failed).
 
+# Per-op tracing/MEMPROBE/DISPATCH/COMBINE prints are silent unless
+# TORCHTUNE_EP_DEBUG=1. SLOW-threshold prints in _ep_all_gather/_ep_reduce_scatter
+# remain unconditional — they only fire when a single op exceeds 1s d2h, 5s coll,
+# or 1s h2d, which is a real performance signal.
+_EP_DEBUG = os.environ.get("TORCHTUNE_EP_DEBUG", "0") == "1"
+
+# Opt-in: route _ep_all_gather and _ep_reduce_scatter through native XCCL on
+# the EP process group instead of the v151 gloo CPU-bounce. Default False
+# because v141-v150 hit a deterministic OFI CQ deadlock at op #259 (RS-BWD)
+# on this exact path. Use only after running the EP smokes (see plan); the
+# gloo path remains the safe production default.
+_EP_USE_XCCL = os.environ.get("TORCHTUNE_EP_USE_XCCL", "0") == "1"
+
 
 def _ep_mem_probe(tag: str, n: int):
-    """v8g diagnostic: print rank-0 XPU L0-free + torch alloc/resv at each EP-OP boundary.
+    """Rank-0 XPU L0-free + torch alloc/resv probe at each EP-OP boundary.
 
-    Goal: localize where L0 IPC handle pressure spikes through train fwd that crashed v3-v8a
-    around op #253-261. Pluggable allocator NOT in use on train ranks (XPU_USM_ALLOC_SO unset),
-    so torch.xpu.memory_stats and mem_get_info are valid here.
+    Originally added (v8g) to localize L0 IPC handle pressure spikes through
+    train fwd. Gated behind TORCHTUNE_EP_DEBUG=1; off by default.
     """
+    if not _EP_DEBUG:
+        return
     try:
         if dist.get_rank() != 0:
             return
@@ -151,13 +166,23 @@ def _ep_reduce_scatter(input: Tensor, group: dist.ProcessGroup, label: str = "RS
     global _EP_OP_N
     n = _EP_OP_N; _EP_OP_N += 1
     r = dist.get_rank()
-    print(f"[rank{r}] EP-OP #{n} ENTER {label}", flush=True)
-    _ep_mem_probe(f"ENTER-{label}", n)
+    if _EP_DEBUG:
+        print(f"[rank{r}] EP-OP #{n} ENTER {label}", flush=True)
+        _ep_mem_probe(f"ENTER-{label}", n)
     ep_degree = dist.get_world_size(group)
     ep_rank = dist.get_rank(group)
     out_rows = input.shape[0] // ep_degree
 
-    if input.device.type == "xpu" and _GLOO_EP_PG is not None:
+    if _EP_USE_XCCL and input.device.type == "xpu":
+        # Opt-in: native XCCL reduce_scatter on the EP group, on-device.
+        # See module-level _EP_USE_XCCL note for the v141-v150 deadlock history.
+        out = input.new_empty(out_rows, *input.shape[1:])
+        _t1 = _time.monotonic()
+        _c10d_reduce_scatter(out, input.contiguous(), op=dist.ReduceOp.SUM, group=group)
+        _t_coll = _time.monotonic() - _t1
+        if _t_coll > 5.0:
+            print(f"[rank{r}] EP-OP #{n} {label} SLOW xccl_coll={_t_coll:.2f}s shape={tuple(input.shape)}", flush=True)
+    elif input.device.type == "xpu" and _GLOO_EP_PG is not None:
         # gloo CPU-bounce: XPU → CPU → gloo all_reduce(SUM) → slice → XPU
         _t0 = _time.monotonic()
         input_cpu = input.contiguous().cpu()  # (ep_degree * s_local, dim)
@@ -176,9 +201,10 @@ def _ep_reduce_scatter(input: Tensor, group: dist.ProcessGroup, label: str = "RS
         out = input.new_empty(out_rows, *input.shape[1:])
         _c10d_reduce_scatter(out, input.contiguous(), op=dist.ReduceOp.SUM, group=group)
 
-    print(f"[rank{r}] EP-OP #{n} COLL-DONE {label}", flush=True)
-    _ep_mem_probe(f"EXIT-{label}", n)
-    print(f"[rank{r}] EP-OP #{n} EXIT {label}", flush=True)
+    if _EP_DEBUG:
+        print(f"[rank{r}] EP-OP #{n} COLL-DONE {label}", flush=True)
+        _ep_mem_probe(f"EXIT-{label}", n)
+        print(f"[rank{r}] EP-OP #{n} EXIT {label}", flush=True)
     return out
 
 
@@ -195,10 +221,19 @@ def _ep_all_gather(out: Tensor, input: Tensor, group: dist.ProcessGroup, label: 
     global _EP_OP_N
     n = _EP_OP_N; _EP_OP_N += 1
     r = dist.get_rank()
-    print(f"[rank{r}] EP-OP #{n} ENTER {label}", flush=True)
-    _ep_mem_probe(f"ENTER-{label}", n)
+    if _EP_DEBUG:
+        print(f"[rank{r}] EP-OP #{n} ENTER {label}", flush=True)
+        _ep_mem_probe(f"ENTER-{label}", n)
 
-    if input.device.type == "xpu" and _GLOO_EP_PG is not None:
+    if _EP_USE_XCCL and input.device.type == "xpu":
+        # Opt-in: native XCCL all_gather on the EP group, on-device.
+        # See module-level _EP_USE_XCCL note for the v141-v150 deadlock history.
+        _t1 = _time.monotonic()
+        dist.all_gather_into_tensor(out, input.contiguous(), group=group)
+        _t_coll = _time.monotonic() - _t1
+        if _t_coll > 5.0:
+            print(f"[rank{r}] EP-OP #{n} {label} SLOW xccl_coll={_t_coll:.2f}s shape={tuple(input.shape)}", flush=True)
+    elif input.device.type == "xpu" and _GLOO_EP_PG is not None:
         # gloo CPU-bounce: XPU → CPU → gloo all_gather_into_tensor → XPU
         _t0 = _time.monotonic()
         input_cpu = input.contiguous().cpu()  # (s_local, dim)
@@ -216,9 +251,10 @@ def _ep_all_gather(out: Tensor, input: Tensor, group: dist.ProcessGroup, label: 
         # Fallback: native XCCL all_gather (non-XPU or no gloo group configured)
         dist.all_gather_into_tensor(out, input.contiguous(), group=group)
 
-    print(f"[rank{r}] EP-OP #{n} COLL-DONE {label}", flush=True)
-    _ep_mem_probe(f"EXIT-{label}", n)
-    print(f"[rank{r}] EP-OP #{n} EXIT {label}", flush=True)
+    if _EP_DEBUG:
+        print(f"[rank{r}] EP-OP #{n} COLL-DONE {label}", flush=True)
+        _ep_mem_probe(f"EXIT-{label}", n)
+        print(f"[rank{r}] EP-OP #{n} EXIT {label}", flush=True)
 
 
 class _AllGatherRS(torch.autograd.Function):
@@ -234,9 +270,10 @@ class _AllGatherRS(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: Tensor):
-        # v153 diagnostic: confirm rank is about to call RS-BWD (op _EP_OP_N).
-        # If a rank prints COLL-DONE for AG-BWD but never prints this, it crashed between them.
-        print(f"[rank{dist.get_rank()}] PRE-RS-BWD ep_op={_EP_OP_N}", flush=True)
+        if _EP_DEBUG:
+            # v153 diagnostic: confirm rank is about to call RS-BWD (op _EP_OP_N).
+            # If a rank prints COLL-DONE for AG-BWD but never prints this, it crashed between them.
+            print(f"[rank{dist.get_rank()}] PRE-RS-BWD ep_op={_EP_OP_N}", flush=True)
         return _ep_reduce_scatter(grad_output, ctx.group, label="RS-BWD"), None
 
 
@@ -516,25 +553,6 @@ class ExpertParallel(ParallelStyle):
         self._ag_s_local: Optional[int] = None
         self._ag_all_ri: Optional[Tensor] = None
 
-    def _partition_fn(
-        self, name: str, mod: nn.Module, device_mesh: DeviceMesh
-    ) -> None:
-        """Shard expert weight matrices on dim 0 (num_experts) across EP ranks.
-
-        Interleaved assignment: rank r owns experts {r, r+ep_degree, r+2*ep_degree, ...}.
-        This distributes hot experts (typically clustered at low indices for pretrained
-        routers) evenly across all ranks.
-        """
-        ep_rank = device_mesh.get_local_rank()
-        ep_degree = device_mesh.shape[0]
-        for param_name, param in list(mod.named_parameters(recurse=False)):
-            full_data = param.data  # (num_experts, ...)
-            assert full_data.shape[0] % ep_degree == 0, (
-                f"num_experts ({full_data.shape[0]}) must be divisible by ep_degree ({ep_degree})"
-            )
-            local_data = full_data[ep_rank::ep_degree].contiguous()
-            mod.register_parameter(param_name, nn.Parameter(local_data))
-
     def _token_dispatch(
         self,
         mod: nn.Module,
@@ -585,7 +603,8 @@ class ExpertParallel(ParallelStyle):
         global _EP_OP_N
         n_ntpe = _EP_OP_N; _EP_OP_N += 1
         r_ntpe = dist.get_rank()
-        print(f"[rank{r_ntpe}] EP-OP #{n_ntpe} ENTER NTPE-AG", flush=True)
+        if _EP_DEBUG:
+            print(f"[rank{r_ntpe}] EP-OP #{n_ntpe} ENTER NTPE-AG", flush=True)
         if routed_input.device.type == "xpu" and _GLOO_EP_PG is not None:
             ntpe_cpu = num_tokens_per_expert.to(torch.long).contiguous().cpu()
             all_ntpe_cpu = torch.zeros(ep_degree * num_experts, dtype=torch.long, device="cpu")
@@ -595,7 +614,8 @@ class ExpertParallel(ParallelStyle):
             dist.all_gather_into_tensor(
                 all_ntpe_flat, num_tokens_per_expert.to(torch.long), group=group
             )
-        print(f"[rank{r_ntpe}] EP-OP #{n_ntpe} EXIT NTPE-AG", flush=True)
+        if _EP_DEBUG:
+            print(f"[rank{r_ntpe}] EP-OP #{n_ntpe} EXIT NTPE-AG", flush=True)
         all_ntpe = all_ntpe_flat.view(ep_degree, num_experts)
 
         # Cumulative token offsets within each rank's expert-sorted section.
@@ -659,15 +679,16 @@ class ExpertParallel(ParallelStyle):
         self._ag_all_ri = all_ri
         # Per-layer instrumentation: which layer index has empty dispatch on
         # which rank. Cheap (12 ranks * 30 layers * 2 chunks * 4 mb = ~3k lines).
-        try:
-            r = dist.get_rank()
-            n_local = int(gather_idx.shape[0])
-            print(
-                f"[rank{r}] EP-DISPATCH n_local={n_local} s_local={s_local} dispatched.shape={tuple(dispatched.shape)} requires_grad={dispatched.requires_grad} grad_fn={type(dispatched.grad_fn).__name__ if dispatched.grad_fn is not None else 'None'}",
-                flush=True,
-            )
-        except Exception:
-            pass
+        if _EP_DEBUG:
+            try:
+                r = dist.get_rank()
+                n_local = int(gather_idx.shape[0])
+                print(
+                    f"[rank{r}] EP-DISPATCH n_local={n_local} s_local={s_local} dispatched.shape={tuple(dispatched.shape)} requires_grad={dispatched.requires_grad} grad_fn={type(dispatched.grad_fn).__name__ if dispatched.grad_fn is not None else 'None'}",
+                    flush=True,
+                )
+            except Exception:
+                pass
         return dispatched, local_ntpe
 
     def _token_combine(
@@ -719,14 +740,15 @@ class ExpertParallel(ParallelStyle):
         if all_ri is not None and all_ri.requires_grad:
             partial_out = partial_out + all_ri.sum(dim=0, keepdim=True).expand_as(partial_out) * 0.0
         # Diagnostic: confirm partial_out has a grad-fn that reaches AllGather.
-        try:
-            r = dist.get_rank()
-            print(
-                f"[rank{r}] EP-COMBINE partial_out.shape={tuple(partial_out.shape)} requires_grad={partial_out.requires_grad} grad_fn={type(partial_out.grad_fn).__name__ if partial_out.grad_fn is not None else 'None'} n_local={int(gather_idx.shape[0])}",
-                flush=True,
-            )
-        except Exception:
-            pass
+        if _EP_DEBUG:
+            try:
+                r = dist.get_rank()
+                print(
+                    f"[rank{r}] EP-COMBINE partial_out.shape={tuple(partial_out.shape)} requires_grad={partial_out.requires_grad} grad_fn={type(partial_out.grad_fn).__name__ if partial_out.grad_fn is not None else 'None'} n_local={int(gather_idx.shape[0])}",
+                    flush=True,
+                )
+            except Exception:
+                pass
 
         # Stage 5b: ReduceScatter — sum partial outputs across EP ranks.
         # Rank r receives partial_out[r*s_local:(r+1)*s_local] summed over all EP ranks.
@@ -737,21 +759,19 @@ class ExpertParallel(ParallelStyle):
         return out
 
     def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
-        """Register All-to-All dispatch/combine on the expert module.
+        """Attach EP metadata onto a ``GroupedExperts`` module.
 
-        Weight sharding is NOT done here because checkpoint loading must happen
-        first. Call ``apply_ep_weight_sharding()`` explicitly after loading the
-        checkpoint but BEFORE calling ``shard_model()`` (FSDP2 wrapping).
+        Weight sharding is performed by the recipe directly on the checkpoint
+        state dict before ``load_from_full_model_state_dict`` (interleaved slice
+        ``_ft[_ep_rank::_ep_degree]`` — must match ``_token_dispatch``'s
+        ``g = ep_rank + local_exp_idx * ep_degree`` ownership formula).
 
-        We do NOT register forward hooks on ``GroupedExperts`` here because
-        FSDP2 ``fully_shard`` (called later) drops or shadows them — only the
-        FSDP2-internal pre-hook survives (``num_pre_hooks=1`` observation).
-
-        Instead we store this ``ExpertParallel`` instance and the mesh on the
-        ``GroupedExperts`` module. The recipe then calls
-        ``wire_ep_to_moe_modules(model)`` after both ``parallelize_module``
-        *and* ``shard_experts_for_ep`` to set ``_ep_dispatch``/``_ep_combine``
-        directly on each parent ``MoE`` instance — bypassing hooks entirely.
+        We do NOT register forward hooks here because FSDP2 ``fully_shard``
+        (called later) drops or shadows them. Instead we store this
+        ``ExpertParallel`` instance and the mesh on the module; the recipe
+        then calls ``wire_ep_to_moe_modules(model)`` after both
+        ``parallelize_module`` and ``fully_shard`` to set
+        ``_ep_dispatch``/``_ep_combine`` directly on each parent ``MoE``.
 
         Args:
             module: The ``GroupedExperts`` module to wrap.
@@ -760,8 +780,6 @@ class ExpertParallel(ParallelStyle):
         Returns:
             The wrapped module (EP metadata attached, weights still full-rank).
         """
-        # Store mesh and EP instance on GroupedExperts so wire_ep_to_moe_modules
-        # can retrieve them later.
         module._ep_device_mesh = device_mesh
         module._ep_instance = self
         return module
@@ -808,82 +826,3 @@ def wire_ep_to_moe_modules(model: nn.Module) -> int:
     return num_wired
 
 
-def apply_ep_weight_sharding(model: nn.Module) -> int:
-    """Slice expert weights to local shards after checkpoint loading.
-
-    Finds all modules that have an ``_ep_device_mesh`` attribute (set by
-    ``ExpertParallel._apply``) and slices their parameters along dim 0 so each
-    EP rank holds only its local expert slice.
-
-    Supports two modes:
-
-    * **Pre-FSDP2** (original): parameters are plain ``nn.Parameter`` tensors.
-      Replaces ``param.data`` with the local slice.
-    * **Post-FSDP2 with 1-rank solo FSDP2** (v40): parameters are DTensors whose
-      local tensor is the full expert weight (1-rank mesh, no communication split).
-      Directly replaces the ``_local_tensor`` attribute with the EP-local slice.
-      The FSDP2 all_gather for a 1-rank group is a no-op that just returns
-      ``_local_tensor`` directly, so this is sufficient for correct expert forward.
-
-    Args:
-        model: Model whose expert modules should be weight-sharded.
-
-    Returns:
-        Number of expert modules sharded.
-    """
-    from torch.distributed.tensor import DTensor
-    num_sharded = 0
-    for name, module in model.named_modules():
-        ep_mesh = getattr(module, "_ep_device_mesh", None)
-        if ep_mesh is None:
-            continue
-        ep_rank = ep_mesh.get_local_rank()
-        ep_degree = ep_mesh.shape[0]
-        params_found = list(module.named_parameters(recurse=False))
-        for param_name, param in params_found:
-            # Unwrap DTensor to get the underlying local data.
-            raw = param.data
-            if isinstance(raw, DTensor):
-                # Post-FSDP2 path (v40): param is a DTensor from 1-rank solo FSDP2.
-                # _local_tensor holds the full [num_experts, ...] data.
-                full_data = raw._local_tensor
-            else:
-                full_data = raw
-            assert full_data.shape[0] % ep_degree == 0, (
-                f"num_experts ({full_data.shape[0]}) must be divisible by ep_degree ({ep_degree})"
-            )
-            n_local = full_data.shape[0] // ep_degree
-            # v112: Interleaved expert assignment — rank r owns experts r, r+ep_degree, ...
-            # Contiguous assignment caused extreme routing imbalance (rank 0 got all hot experts).
-            local_slice = full_data[ep_rank::ep_degree].contiguous()
-            if isinstance(raw, DTensor):
-                # Post-FSDP2 path: overwrite _local_tensor and update the DTensorSpec's
-                # TensorMeta so that raw.shape == local_slice.shape. FSDP2 uses the
-                # global shape from _spec.tensor_meta to size the all_gather output buffer;
-                # if shape is stale ([128,...] while _local_tensor is [32,...]), FSDP2
-                # will allocate a [128,...] buffer but copy [32,...] data into it → crash.
-                # With a 1-rank mesh and Shard(0), global_shape == local_shape, so we
-                # set both to [n_local, ...].
-                raw._local_tensor = local_slice
-                try:
-                    from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
-                    new_shape = torch.Size([n_local] + list(full_data.shape[1:]))
-                    old_spec = raw._spec
-                    raw._spec = DTensorSpec(
-                        mesh=old_spec.mesh,
-                        placements=old_spec.placements,
-                        tensor_meta=TensorMeta(
-                            shape=new_shape,
-                            dtype=old_spec.tensor_meta.dtype,
-                            stride=local_slice.stride(),
-                        ),
-                    )
-                except Exception:
-                    # Fallback: leave _spec unchanged. The 1-rank no-op all_gather
-                    # may still work if FSDP2 doesn't validate shape strictly.
-                    pass
-            else:
-                # Pre-FSDP2 path: replace plain parameter data.
-                param.data = local_slice
-        num_sharded += 1
-    return num_sharded

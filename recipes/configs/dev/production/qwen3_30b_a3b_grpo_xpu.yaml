@@ -67,10 +67,13 @@ gene_reward_metric: f1
 
 # GRPO parameters
 # 30B MoE has ~3.3B active params → lighter memory than dense 32B.
-# Start conservative: batch=1, grpo_samples=4, fbs=2.
+# Validated production envelope: G=8 / fbs=8 (3/3 clean, 54.8s/step, 9.2 tok/s).
+# G=4 OOMs step 1 from allocator fragmentation; G=8's larger initial allocation
+# pre-shapes the block pool to match steady-state needs.
+# See docs/reports/moe_p0p1_experiments_20260427.md.
 batch_size: 1
-grpo_samples: 4
-forward_batch_size: 2
+grpo_samples: 8
+forward_batch_size: 8
 max_generated_tokens: 512
 top_k: null
 temperature: 1.0

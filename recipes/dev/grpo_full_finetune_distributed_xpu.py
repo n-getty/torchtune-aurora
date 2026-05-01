@@ -1583,6 +1583,11 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         # FSDPParam expects [32,...] tensors. Pre-slice model_sd expert params here so
         # load_from_full_model_state_dict copies the correct [32,...] EP shard.
         # Non-expert params: FSDP2 DTensors on dp_replicate (3-rank), auto-sliced.
+        # Slice MUST be interleaved [_ep_rank::_ep_degree] to match
+        # ExpertParallel._token_dispatch ownership formula
+        # (g = ep_rank + local_exp_idx * ep_degree). Contiguous slicing here would
+        # silently route tokens to the wrong experts on every EP rank — see
+        # tests/torchtune/dev/rl/test_ep_slice_contract.py.
         if _ep_active:
             _n_sd_sliced = 0
             for _sd_name in list(model_sd.keys()):
@@ -1592,12 +1597,13 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                         f"Expert param {_sd_name}: shape[0]={_ft.shape[0]} not divisible by ep_degree={_ep_degree}"
                     )
                     _n_local = _ft.shape[0] // _ep_degree
-                    model_sd[_sd_name] = _ft[_ep_rank * _n_local : (_ep_rank + 1) * _n_local].contiguous()
+                    model_sd[_sd_name] = _ft[_ep_rank::_ep_degree].contiguous()
                     _n_sd_sliced += 1
             utils.log_rank_zero(
                 log,
-                f"EP v41: pre-sliced {_n_sd_sliced} expert params in model_sd "
-                f"(full [128,...] → [{_n_local},...] for EP rank {_ep_rank}/{_ep_degree})",
+                f"EP: pre-sliced {_n_sd_sliced} expert params in model_sd "
+                f"(interleaved {_ft.shape[0]}→{_n_local} for EP rank {_ep_rank}/{_ep_degree}; "
+                f"rank r owns global experts r, r+{_ep_degree}, r+{2*_ep_degree}, ...)",
             )
         training.load_from_full_model_state_dict(
             model,
@@ -1606,8 +1612,7 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             strict=True,
             cpu_offload=fsdp_cpu_offload,
         )
-        # v41: EP weight slicing was done via model_sd pre-slicing above.
-        # apply_ep_weight_sharding is no longer called post-load.
+        # EP weight slicing was done via model_sd pre-slicing above (interleaved).
 
         # Ensure no params and buffers are on meta device
         training.validate_no_params_on_meta_device(model)

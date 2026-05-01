@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import math
+import os
 import time
 from typing import Callable
 
@@ -18,6 +19,9 @@ from .utils import should_use_grouped_mm
 
 # v111 diag: count expert forward calls to log token load on first call only.
 _EXPERT_FWD_CALL_COUNT: int = 0
+
+# Gate EP forensic prints behind TORCHTUNE_EP_DEBUG=1 (mirrors _parallelism.py).
+_EP_DEBUG = os.environ.get("TORCHTUNE_EP_DEBUG", "0") == "1"
 
 
 class GroupedExperts(nn.Module):
@@ -80,7 +84,7 @@ class GroupedExperts(nn.Module):
         total = x.shape[0]
         # v111 diag: log expert token load on first expert forward call per run.
         # Print to stderr with flush so it bypasses SSH pipe buffering.
-        if _call_n == 1:
+        if _EP_DEBUG and _call_n == 1:
             try:
                 _rank = dist.get_rank() if dist.is_initialized() else -1
             except Exception:
@@ -98,11 +102,12 @@ class GroupedExperts(nn.Module):
             # exits backward early → asymmetric #238 deadlock (v158-v160 root
             # cause). Use a no-op gather+sum+broadcast: 0 tokens means 0 cost
             # but the grad-fn chain stays alive.
-            try:
-                _r = dist.get_rank() if dist.is_initialized() else -1
-            except Exception:
-                _r = -1
-            print(f"[v161-EXPERT-EMPTY] rank={_r} call#={_call_n} total=0", flush=True)
+            if _EP_DEBUG:
+                try:
+                    _r = dist.get_rank() if dist.is_initialized() else -1
+                except Exception:
+                    _r = -1
+                print(f"[v161-EXPERT-EMPTY] rank={_r} call#={_call_n} total=0", flush=True)
             x_zero = x.reshape(0, self.dim) if x.numel() == 0 else x.new_empty(0, self.dim)
             # Anchor: 0.0 * (gate_proj.sum() + down_proj.sum() + up_proj.sum()).
             # Adding a 0-d tensor of value 0 broadcast to (0, dim) is a no-op on
