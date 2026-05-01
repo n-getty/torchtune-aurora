@@ -1914,6 +1914,17 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         pg = getattr(self, '_training_pg', None) if self._vllm_mode == "dedicated_rank" else None
         torch.distributed.barrier(group=pg)
 
+    def _extract_batch_kwargs(self, batch: dict) -> dict:
+        """Hook for subclasses to forward extra batch fields into
+        ``generate_trajectory_batched``. Default returns an empty dict, so the
+        base recipe calls ``generate_trajectory_batched(tokens, answers)``.
+
+        Why a hook (not subclass-overrides train()): preserving the train loop
+        in one place is the only way to avoid silently re-introducing the
+        missing-weight-sync class of bug (see project_bioreason_train_missing_wsync).
+        """
+        return {}
+
     def save_checkpoint(
         self,
         epoch: int,
@@ -3304,8 +3315,12 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                 # (in _start_deferred_broadcast below), runs during GRPO/backward.
                 # vLLM generates with the latest available weights (no contention).
 
+                # Subclass hook: extra kwargs (e.g. multimodal protein_sequences)
+                # forwarded into generate_trajectory_batched. Default returns {}.
+                _extra_gen_kwargs = self._extract_batch_kwargs(batch)
+
                 _step_t0 = time.perf_counter()
-                trajectory = self.generate_trajectory_batched(tokens, answers)
+                trajectory = self.generate_trajectory_batched(tokens, answers, **_extra_gen_kwargs)
                 if self._device.type == "xpu":
                     torch.xpu.synchronize()
                 _gen_time = time.perf_counter() - _step_t0
