@@ -2,10 +2,12 @@
 # Each rank runs its own in-process vLLM engine alongside training.
 #
 # Memory budget per tile (64 GiB, ~48 GiB usable after driver/L0 overhead):
-#   Training (FSDP shard + ref shard + optimizer + activations): ~20-25 GiB
+#   Training ZeRO-3 (reshard_after_forward=True): params sharded (1.6 GiB) + unsharded
+#     only during each chunk fwd+bwd (16 GiB peak, freed between chunks)
+#   Optimizer state (fp32 AdamW, sharded 1/10): ~9.6 GiB
 #   vLLM model (full, stays on GPU): ~16 GiB
 #   KV cache: freed during training, reallocated before generation
-#   Total estimated: ~40-45 GiB — fits within 64 GiB
+#   Total peak during fwd/bwd: ~16+9.6+1.6+16 = ~43 GiB; between chunks: ~27 GiB
 #
 # Launch:
 #   bash recipes/dev/run_grpo_colocate_xpu.sh [num_tiles] \
@@ -20,6 +22,7 @@ base_model_path: /lus/flare/projects/ModCon/ngetty/models/Qwen3-8B
 
 # Colocated vLLM — in-process engine per rank
 vllm_mode: "colocate"
+reshard_after_forward: true  # ZeRO-3: free full params between chunks; saves ~14 GiB vs ZeRO-2 default
 vllm_gpu_memory_utilization: 0.08
 vllm_max_model_len: 512
 

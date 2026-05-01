@@ -992,6 +992,14 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
                 rewards.std(1, keepdim=True) + 1e-4
             )
             advantages = advantages.reshape(batch_size * grpo_size)
+        # Log advantage stats so log parsers can confirm whether group_std=0 batches
+        # produced zero advantages (pure KL update) or nonzero advantages (real policy
+        # gradient).  Cross-reference with BIOREASON_DIAG group_std and METRICS kl_loss.
+        if self._is_rank_zero:
+            log.info(
+                "BIOREASON_ADV step=%d adv_abs_max=%.4f adv_std=%.4f",
+                self._steps_run, advantages.abs().max().item(), advantages.std().item(),
+            )
         del responses
         device_empty_cache(self._device)
 
@@ -1033,7 +1041,12 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
         """
         try:
             import torch.distributed as _dist
-            ws = _dist.get_world_size() if _dist.is_initialized() else 1
+            # In dedicated_rank mode the vLLM rank is in _run_vllm_generation_server()
+            # and never joins training collectives.  Use _training_pg so only training
+            # ranks participate; None falls back to the default world group (correct for
+            # server/colocate modes where every world rank is a training rank).
+            pg = getattr(self, "_training_pg", None)
+            ws = _dist.get_world_size(group=pg) if _dist.is_initialized() else 1
             dev = self._device
 
             pred = diag["pred_count"].to(dev).float()
@@ -1064,9 +1077,9 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
             count = torch.tensor([local_n], device=dev)
             len_max = lens.max().unsqueeze(0) if lens.numel() else torch.tensor([0.0], device=dev)
             if ws > 1:
-                _dist.all_reduce(sums, op=_dist.ReduceOp.SUM)
-                _dist.all_reduce(count, op=_dist.ReduceOp.SUM)
-                _dist.all_reduce(len_max, op=_dist.ReduceOp.MAX)
+                _dist.all_reduce(sums, op=_dist.ReduceOp.SUM, group=pg)
+                _dist.all_reduce(count, op=_dist.ReduceOp.SUM, group=pg)
+                _dist.all_reduce(len_max, op=_dist.ReduceOp.MAX, group=pg)
             n = count.item()
             if n <= 0:
                 return
@@ -1077,6 +1090,10 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
             batch_var = max(r_sqsum / n - r_mean * r_mean, 0.0)
 
             if self._is_rank_zero:
+                # step= is the pre-increment count (steps completed before this
+                # trajectory).  Parsers that cross-reference with BATCH_REWARD or
+                # training logs should use the same 0-based convention: step N here
+                # corresponds to base-recipe step N before _steps_run += 1.
                 log.info(
                     "BIOREASON_DIAG step=%d n=%d go_emit=%.3f nonzero_rew=%.3f "
                     "mean_pred=%.2f mean_tp=%.2f len_mean=%.1f len_max=%.0f "

@@ -1,0 +1,176 @@
+# Qwen3-4B LoRA-GRPO — 2-node server mode (paper-aligned hyperparameters)
+#
+# Goal: paper-comparable LoRA-GRPO run on Aurora using BioReason-Pro paper's
+# exact hyperparameters (r=16, lr=3e-5, KL β=1e-4, batch=192, G=24, T=1.0).
+#
+# Topology (mirrors bioreason_4b_grpo_2node_server_xpu.yaml):
+#   Node 0 (TRAIN_NODE): 11 training ranks, FSDP1 SHARD_GRAD_OP.
+#   Node 1 (VLLM_NODE): 12 vLLM HTTP servers (DP=12, ports 8001-8012, TP=1 each).
+#     Loads Qwen3-4B base weights + LoRA adapter via /v1/load_lora_adapter.
+#
+# Weight sync: LoRA hot-swap via shared-FS PEFT adapter dir + HTTP POST.
+#   rank 0 gathers adapter SD → writes /lus/flare/.../lora_grpo/step_N/ →
+#   POSTs /v1/load_lora_adapter to all 12 vLLM tiles (ThreadPool fan-out).
+#   No separate ref model — use disable_adapter() context instead (~8 GiB saved).
+#
+# Recipe: recipes/dev/lora_grpo_full_finetune_distributed_xpu.py
+# Launcher: experiments/lora_grpo/run_qwen3_4b_lora_2node.sh
+# Docs: docs/features/lora_grpo_primer.md
+#
+# NOTE: Qwen3-4B weights must be downloaded before first run.
+# Placeholder path: /lus/flare/projects/ModCon/ngetty/models/Qwen3-4B
+# Update base_model_path if stored elsewhere.
+
+name: lora_grpo_qwen3_4b_2node_server
+output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/outputs/lora_grpo_qwen3_4b_2node_v1
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+base_model_path: /lus/flare/projects/ModCon/ngetty/models/Qwen3-4B
+
+model:
+  _component_: torchtune.models.qwen3.lora_qwen3_4b_base
+  lora_attn_modules: ['q_proj', 'k_proj', 'v_proj', 'output_proj']
+  apply_lora_to_mlp: true
+  apply_lora_to_output: false          # tied embeddings on Qwen3-4B
+  lora_rank: 16                        # paper r=16
+  lora_alpha: 32                       # 2× rank (PEFT default scaling)
+  lora_dropout: 0.0
+
+# ── Tokenizer ─────────────────────────────────────────────────────────────────
+tokenizer:
+  _component_: torchtune.models.qwen3.qwen3_tokenizer
+  path: ${base_model_path}/vocab.json
+  merges_file: ${base_model_path}/merges.txt
+  max_seq_len: ${max_seq_len}
+
+# ── Checkpointer (base weights — adapter weights saved separately) ─────────────
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [
+    model-00001-of-00004.safetensors,
+    model-00002-of-00004.safetensors,
+    model-00003-of-00004.safetensors,
+    model-00004-of-00004.safetensors,
+  ]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: QWEN3
+
+# No ref_checkpointer — LoRA recipe uses disable_adapter() context instead.
+
+# ── Dataset ───────────────────────────────────────────────────────────────────
+dataset:
+  _component_: torchtune.dev.rl.gsm8k.gsm8k_dataset
+  partition: 1-9/10
+
+seed: 42
+shuffle: true
+resume_from_checkpoint: false
+
+# ── RL Hyperparameters (paper-aligned) ────────────────────────────────────────
+grpo_samples: 24                       # paper G=24
+max_seq_len: 1024
+max_generated_tokens: 512
+temperature: 1.0                       # paper T=1.0
+top_k: null
+
+# ── Training ──────────────────────────────────────────────────────────────────
+epochs: 1
+num_steps: 200
+ppo_epochs: 1
+batch_size: 8                          # ppo_batch_size = batch_size * grpo_samples = 192 (paper)
+forward_batch_size: 8
+gradient_accumulation_steps: 1
+
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 3.0e-5                           # paper lr
+  weight_decay: 0.01
+  fused: false
+
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  num_warmup_steps: 10
+
+clip_grad_norm: 1.0
+
+# ── Loss ──────────────────────────────────────────────────────────────────────
+loss:
+  _component_: torchtune.dev.rl.loss.GRPOLoss
+  kl_coeff: 1.0e-4                     # paper β=1e-4
+  epsilon: 0.2
+
+# ── Reward (GSM8K math — engine validation) ───────────────────────────────────
+reward_functions:
+  - _component_: torchtune.dev.rl.rewards.FormattedMathCorrectnessReward
+    answer_tag: answer
+    positive_reward: 10.0
+    negative_reward: 0.0
+  - _component_: torchtune.dev.rl.rewards.ThinkingAnswerFormattingReward
+    think_tag: think
+    answer_tag: answer
+    positive_reward: 1.0
+    negative_reward: 0.0
+
+# ── LoRA publish config ────────────────────────────────────────────────────────
+lora:
+  publish_every_steps: 1              # sync adapter to vLLM after every optimizer step
+  max_loras: 2                        # one live + one in-flight for double-buffering
+  shm_root: /lus/flare/projects/ModCon/ngetty/torchtune/outputs/lora_grpo_qwen3_4b_2node_v1/adapters  # save_checkpoint only
+  tmpfs_transfer: true                # write to TRAIN_NODE /dev/shm, rsync to VLLM_NODE /dev/shm
+  train_shm: /dev/shm/lora_adapters
+  vllm_shm: /dev/shm/lora_adapters
+
+# ── vLLM rollout (server mode, DP=12) ─────────────────────────────────────────
+# vllm_url is filled at runtime by the launcher.
+vllm_mode: server
+vllm_weight_sync: false               # LoRA recipe uses _publish_lora_to_vllm instead
+vllm_max_model_len: 1536
+vllm_max_num_seqs: 64
+
+vllm:
+  mode: server
+  enable_lora: true
+  max_lora_rank: 16
+  max_loras: 2
+
+# ── Distributed / FSDP ────────────────────────────────────────────────────────
+# FSDP1 SHARD_GRAD_OP: adapter tensors are tiny (~80 MB total);
+# top-level-only wrap (BioReason-validated topology); no per-module wrap overhead.
+fsdp_shard_strategy: SHARD_GRAD_OP
+enable_activation_checkpointing: false  # not needed for adapter-only training
+
+# Save only adapter weights at each checkpoint.
+save_adapter_weights_only: true
+
+# ── XPU ───────────────────────────────────────────────────────────────────────
+device: xpu
+dtype: bf16
+compile: false
+force_math_sdpa: false               # no-op on XPU; kept for config parity
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+log_every_n_steps: 1
+log_peak_memory_stats: true
+save_every_n_epochs: 1
+
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+
+# ── Profiler ──────────────────────────────────────────────────────────────────
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: false
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: true
+  cuda: false
+  profile_memory: false
+  with_stack: false
+  record_shapes: false
+  with_flops: false
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1

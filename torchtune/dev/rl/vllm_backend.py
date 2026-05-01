@@ -24,6 +24,26 @@ from torchtune import utils
 
 log = utils.get_logger("DEBUG")
 
+
+def _lora_engine_kwargs(cfg) -> dict:
+    """Extract LoRA-related kwargs for vLLM engine construction from cfg.
+
+    Reads ``cfg.vllm.enable_lora``, ``cfg.vllm.max_lora_rank``,
+    ``cfg.vllm.max_loras``.  Returns an empty dict when LoRA is not requested
+    so existing recipes without a ``vllm`` config block are unaffected.
+    """
+    vllm_cfg = cfg.get("vllm", None)
+    if vllm_cfg is None:
+        return {}
+    get = vllm_cfg.get if hasattr(vllm_cfg, "get") else lambda k, d=None: d
+    if not get("enable_lora", False):
+        return {}
+    return {
+        "enable_lora": True,
+        "max_lora_rank": int(get("max_lora_rank", 16)),
+        "max_loras": int(get("max_loras", 2)),
+    }
+
 def _init_vllm_early(self, cfg):
     """Initialize colocated vLLM engine(s) before the training PG.
 
@@ -183,6 +203,7 @@ def _init_vllm_early_dedicated(self, cfg):
         disable_custom_all_reduce=True,
         enable_sleep_mode=False,
         enable_prompt_embeds=True,
+        **_lora_engine_kwargs(cfg),
     )
 
     # Restore TORCH_COMPILE_DISABLE so training ranks can use torch.compile.
@@ -309,6 +330,7 @@ def _init_vllm_tp1(self, cfg, rank, world_size, local_rank,
         llm_kwargs["enable_sleep_mode"] = True
     if cfg.get("vllm_enable_prompt_embeds", False):
         llm_kwargs["enable_prompt_embeds"] = True
+    llm_kwargs.update(_lora_engine_kwargs(cfg))
 
     self._vllm_llm = LLM(**llm_kwargs)
 
@@ -473,6 +495,7 @@ def _init_vllm_tp(self, cfg, rank, world_size, local_rank, tp_size,
     )
     if vllm_mode == "colocate_sleep":
         llm_kwargs["enable_sleep_mode"] = True
+    llm_kwargs.update(_lora_engine_kwargs(cfg))
 
     self._vllm_llm = LLM(**llm_kwargs)
 

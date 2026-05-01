@@ -111,6 +111,7 @@ from torchtune.dev.rl.generation import generate
 from torchtune.dev.rl.rewards import batched_rewards, gene_recall_batched_rewards
 from torchtune.dev.rl.types import GRPOStats, GRPOTrajectory
 from torchtune.modules import local_kv_cache
+from torchtune.modules.attention_utils import _compute_maskfree_causal
 from torchtune.recipe_interfaces import FTRecipeInterface
 from torchtune.training import (
     device_record_memory_history,
@@ -496,10 +497,14 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                 _default_pg.bound_device_id = _orig_bound_device_id
             # v75: Get the XCCL dp_replicate process group from the device mesh.
             _XCCL_DP_REP_PG = self._dp_mesh.get_group("dp_replicate")
+            # Iter2: also expose the XCCL dp_shard PG so the v9 grad-release
+            # helper can take an opt-in on-device fast path (TORCHTUNE_EP_GRAD_RELEASE_XCCL=1).
+            _XCCL_DP_SHARD_PG = self._dp_mesh.get_group("dp_shard")
             # Register PG handles in distributed.py so patch functions can use them.
             set_process_groups(
                 _GLOO_DP_REP_PG, _GLOO_DP_SHARD_PG, _GLOO_GLOBAL_PG, _XCCL_DP_REP_PG,
                 _n_dp_rep, _n_dp_shd,
+                xccl_dp_shard_pg=_XCCL_DP_SHARD_PG,
             )
             log.info(
                 "Created gloo dp_replicate (%d-rank), dp_shard (%d-rank), global gloo. "
@@ -513,6 +518,12 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             # For replicated vLLM, each shard leader talks to its local vLLM.
             self._shard_rank = torch.distributed.get_rank(self._shard_pg)
             self._is_shard_leader = (self._shard_rank == 0)
+            # XCCL wsync leader = single global rank 0. With dp_replicate>1,
+            # multiple shard leaders would each try to bind TCPStore as master
+            # on the same port → EADDRINUSE. Only rank 0 owns the vLLM XCCL
+            # cross-PG; other shard leaders still participate in FSDP gathers
+            # but skip the HTTP/broadcast/store-bind work.
+            self._is_xccl_leader = (self.rank == 0)
             # Global rank of this shard group's leader (for broadcast src).
             # torch.distributed.broadcast requires global rank as src, even with group.
             shard_ranks = torch.distributed.get_process_group_ranks(self._shard_pg)
@@ -527,6 +538,7 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             self._shard_pg = None
             self._shard_rank = self.rank
             self._is_shard_leader = self._is_rank_zero
+            self._is_xccl_leader = self._is_rank_zero
 
             # v206: non-HSDP single-replicate path also needs a gloo group for the
             # _xpu_reduce_scatter_via_allreduce patch to use as CPU-bounce backend.
@@ -579,6 +591,7 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                 self._shard_pg = self._dp_mesh.get_group("dp_shard")
                 self._shard_rank = torch.distributed.get_rank(self._shard_pg)
                 self._is_shard_leader = (self._shard_rank == 0)
+                self._is_xccl_leader = (self.rank == 0)
                 shard_ranks = torch.distributed.get_process_group_ranks(self._shard_pg)
                 self._shard_leader_global_rank = shard_ranks[0]
                 # Register the existing gloo PG (built in the non-HSDP branch above
@@ -594,6 +607,7 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                         None,                              # xccl_dp_rep_pg — unused at dp_replicate=1
                         1,                                 # dp_rep_degree
                         self.world_size,                   # dp_shard_degree
+                        xccl_dp_shard_pg=self._shard_pg,   # iter2 grad-release fast path
                     )
                 except Exception as _e:
                     log.warning(
@@ -817,13 +831,13 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         checkpoint_dict = self.load_checkpoint(cfg_checkpointer=cfg.checkpointer)
         if self._resume_from_checkpoint:
             self._update_recipe_state(checkpoint_dict)
-        # Reshard parameters after forward to avoid keeping the full unsharded
-        # model in memory. For 31B+ with FSDP-10/12, full unshard = 62+ GiB
-        # which exceeds tile capacity. Always reshard except in colocate mode
-        # (non-sleep) where model stays on GPU anyway.
-        # Can be overridden via config: reshard_after_forward: false
-        reshard_policy = cfg.get("reshard_after_forward",
-                                 self._vllm_mode != "colocate")
+        # Always default to ZeRO-3 (reshard_after_forward=True). The previous default
+        # of False for colocate mode was wrong: vLLM in colocate mode holds its own
+        # separate copy of weights, so keeping FSDP params unsharded provides no benefit
+        # but costs 14 GiB/tile (full 8B model always on-device), pushing alloc to 55+
+        # GiB and causing catastrophic CCL stalls (300+ s per backward). Validated
+        # 2026-05-01: ZeRO-3 colocate gives 4.2 s backward vs 354 s with ZeRO-2.
+        reshard_policy = cfg.get("reshard_after_forward", True)
         # MEMPROBE: baseline (pre-policy). Default-off; opt in via TORCHTUNE_MEM_PROBE=1.
         # Imports the experiment-local probe at experiments/multinode_32b/mem_probe.py.
         _dump_mem_init = None
@@ -2055,12 +2069,14 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         """
         bsz = batch_input_ids.shape[0]
         total_len = context_length + self._max_generated_tokens
-        # Strip padding and convert to Python lists for HTTP
+        # Strip padding and convert to Python lists for HTTP.
+        # Truncate to vllm_max_model_len - max_generated_tokens.
+        max_prompt_len = self._vllm_max_model_len - self._max_generated_tokens
         prompts = []
         for i in range(bsz):
             ids = batch_input_ids[i].cpu().tolist()
             ids = [t for t in ids if t != self._tokenizer.pad_id]
-            prompts.append(ids)
+            prompts.append(ids[-max_prompt_len:] if len(ids) > max_prompt_len else ids)
 
         gen_kwargs = dict(
             n=1,  # prompts already expanded by grpo_samples
@@ -2139,12 +2155,25 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         )
 
         # Text-only: strip padding and pass token ID lists.
+        # Truncate to vllm_max_model_len - max_generated_tokens so the block
+        # table never overflows when prompt_len + gen_len > max_model_len.
+        max_prompt_len = self._vllm_max_model_len - self._max_generated_tokens
         raw_prompts = []
         for i in range(bsz):
             ids = batch_input_ids[i].cpu().tolist()
             ids = [t for t in ids if t != self._tokenizer.pad_id]
-            raw_prompts.append(ids)
+            raw_prompts.append(ids[-max_prompt_len:] if len(ids) > max_prompt_len else ids)
         vllm_prompts = [{"prompt_token_ids": p} for p in raw_prompts]
+
+        if self.rank == 0:
+            prompt_lens = [len(p) for p in raw_prompts]
+            log.debug(
+                "vLLM generate: bsz=%d max_model_len=%d max_gen=%d "
+                "prompt_lens min=%d max=%d (max+gen=%d)",
+                bsz, self._vllm_max_model_len, self._max_generated_tokens,
+                min(prompt_lens), max(prompt_lens),
+                max(prompt_lens) + self._max_generated_tokens,
+            )
 
         t0 = time.perf_counter()
         outputs = self._vllm_llm.generate(
@@ -2423,9 +2452,35 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         query_response_padding_masks = query_responses != self._tokenizer.pad_id
 
         # step 1.1 create attention masks and position IDs
-        masks = generation.get_causal_mask_from_padding_mask(
-            query_response_padding_masks
+        #
+        # TORCHTUNE_MASKFREE_CAUSAL=1 skips explicit mask construction so that
+        # TORCHTUNE_USE_IPEX_VARLEN=1 can actually engage (varlen requires mask=None).
+        # Safe when: XPU device, no runtime packing, and NO prompt padding (right-padded
+        # responses are fine because causal attention cannot see future/later positions).
+        # Mid-sequence prompt padding is caught by a runtime guard and falls back to
+        # the explicit mask with a warning. See tests/torchtune/dev/rl/test_varlen_maskfree_parity.py.
+        _maskfree_causal, _maskfree_skip_reason = _compute_maskfree_causal(
+            env_set=os.environ.get("TORCHTUNE_MASKFREE_CAUSAL") == "1",
+            device_type=self._device.type,
+            packing_enabled=getattr(self, "_enable_packing", False),
+            query_responses=query_responses,
+            context_length=context_length,
+            pad_id=self._tokenizer.pad_id,
         )
+        if _maskfree_skip_reason == "prompt padding detected":
+            log.warning(
+                "TORCHTUNE_MASKFREE_CAUSAL=1 but batch has prompt padding "
+                "(variable-length prompts in this batch); falling back to explicit mask. "
+                "Mask-free is only safe when all prompts are the same length."
+            )
+
+        if _maskfree_causal:
+            masks = None
+            log.info("Rank %d: maskfree causal forward engaged (mask=None)", self.rank)
+        else:
+            masks = generation.get_causal_mask_from_padding_mask(
+                query_response_padding_masks
+            )
         position_ids = generation.get_position_ids_from_padding_mask(
             query_response_padding_masks
         )
@@ -2470,7 +2525,7 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                         chunk_logits = self._model(
                             query_responses[cs:ce],
                             input_pos=position_ids[cs:ce],
-                            mask=masks[cs:ce],
+                            mask=None if masks is None else masks[cs:ce],
                         )
                         if self.rank == 0 and self._device.type == "xpu":
                             log.info("Rank 0: POST-chunk[%d:%d] memory: alloc=%.2f GiB, resv=%.2f GiB",
@@ -2550,7 +2605,7 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                 chunk_ref_logits = self._ref_model(
                     query_responses[cs:ce],
                     input_pos=position_ids[cs:ce],
-                    mask=masks[cs:ce],
+                    mask=None if masks is None else masks[cs:ce],
                 )
                 chunk_ref_logits = rlhf.truncate_sequence_for_logprobs(chunk_ref_logits, context_length)
                 ref_logprobs_chunks.append(
@@ -2922,7 +2977,7 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                 _c_logits = self._model(
                     trajectory.query_responses[_cs:_ce],
                     input_pos=trajectory.position_ids[_cs:_ce],
-                    mask=trajectory.masks[_cs:_ce],
+                    mask=None if trajectory.masks is None else trajectory.masks[_cs:_ce],
                 )
                 _c_logits = rlhf.truncate_sequence_for_logprobs(_c_logits, context_length)
                 _c_pi_lp = rlhf.batched_logits_to_logprobs(
@@ -3966,14 +4021,18 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         try:
             r = rewards.detach().float()
             s = successes.detach().float()
-            ws = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+            # In dedicated_rank mode the vLLM rank does not participate in training
+            # collectives; use _training_pg so the all_reduce only spans training ranks.
+            # None falls back to the default world group for server/colocate modes.
+            pg = getattr(self, "_training_pg", None)
+            ws = torch.distributed.get_world_size(group=pg) if torch.distributed.is_initialized() else 1
             if ws > 1:
                 count = torch.tensor([float(r.numel())], device=r.device)
                 stats = torch.stack([r.sum(), (r * r).sum(), s.sum(), r.min(), r.max()])
-                torch.distributed.all_reduce(stats[:3], op=torch.distributed.ReduceOp.SUM)
-                torch.distributed.all_reduce(stats[3:4], op=torch.distributed.ReduceOp.MIN)
-                torch.distributed.all_reduce(stats[4:5], op=torch.distributed.ReduceOp.MAX)
-                torch.distributed.all_reduce(count, op=torch.distributed.ReduceOp.SUM)
+                torch.distributed.all_reduce(stats[:3], op=torch.distributed.ReduceOp.SUM, group=pg)
+                torch.distributed.all_reduce(stats[3:4], op=torch.distributed.ReduceOp.MIN, group=pg)
+                torch.distributed.all_reduce(stats[4:5], op=torch.distributed.ReduceOp.MAX, group=pg)
+                torch.distributed.all_reduce(count, op=torch.distributed.ReduceOp.SUM, group=pg)
                 n = count.item()
                 mean = (stats[0] / n).item()
                 var = max((stats[1] / n).item() - mean * mean, 0.0)

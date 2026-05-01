@@ -1100,7 +1100,10 @@ def _init_sender_pool(self) -> None:
 
     if pool_size <= 0:
         self._wsync_sender_pool = None
-        if self._is_shard_leader:
+        # WS3.5: only ONE rank (global rank 0) drives the XCCL wsync init.
+        # With dp_replicate>1, _is_shard_leader is true on multiple ranks
+        # which would race to bind TCPStore is_master=True on the same port.
+        if getattr(self, "_is_xccl_leader", self._is_shard_leader):
             self._init_xccl_weight_sync()
         self._wsync_pool_init_done = True
         return
@@ -1131,7 +1134,9 @@ def _init_sender_pool(self) -> None:
     vllm_errors = []
     replica_threads = []
 
-    if self._is_shard_leader:
+    # WS3.5: gate TCPStore master + vLLM HTTP POSTs on global rank 0 only.
+    _is_xccl_leader = getattr(self, "_is_xccl_leader", self._is_shard_leader)
+    if _is_xccl_leader:
         store = dist.TCPStore(
             host_name="0.0.0.0",
             port=xccl_port,
@@ -1182,7 +1187,7 @@ def _init_sender_pool(self) -> None:
     torch.distributed.barrier()
 
     if is_sender:
-        if not self._is_shard_leader:
+        if not _is_xccl_leader:
             sender_store = dist.TCPStore(
                 host_name=_xccl_host,
                 port=xccl_port,
@@ -1236,7 +1241,7 @@ def _init_sender_pool(self) -> None:
             self.rank, pool_index, wsync_method,
         )
 
-    if self._is_shard_leader:
+    if _is_xccl_leader:
         for t in replica_threads:
             t.join(timeout=120)
         if vllm_errors:
@@ -1438,7 +1443,10 @@ def _sync_weights_to_vllm_xccl(self) -> None:
         active_sender = pool[self._wsync_round % len(pool)]
         is_active = (self.rank == active_sender)
     else:
-        is_active = self._is_shard_leader
+        # WS3.5: legacy single-sender path drives one cross-PG; only the
+        # global XCCL leader (rank 0) can broadcast. With dp_replicate>1
+        # multiple shard leaders would race for the same vLLM-side rank.
+        is_active = getattr(self, "_is_xccl_leader", self._is_shard_leader)
 
     use_fsdp1 = getattr(self, '_use_fsdp1', False) and self._dp_replicate > 1
 
@@ -1463,7 +1471,9 @@ def _sync_weights_to_vllm_xccl(self) -> None:
         with FSDP.state_dict_type(self._model, StateDictType.FULL_STATE_DICT):
             full_sd = self._model.state_dict()
         hf_state_dict = {}
-        if self._is_shard_leader:
+        # WS3.5: only the XCCL leader (global rank 0) keeps and broadcasts.
+        _is_xccl_leader = getattr(self, "_is_xccl_leader", self._is_shard_leader)
+        if _is_xccl_leader:
             for param_name, param in full_sd.items():
                 hf_name = _xccl_accept_and_rename(param_name)
                 if hf_name is None:
@@ -1475,7 +1485,7 @@ def _sync_weights_to_vllm_xccl(self) -> None:
             torch.distributed.barrier()
         t_gather = time.perf_counter() - t0
 
-        if self._is_shard_leader:
+        if _is_xccl_leader:
             tensors_meta = []
             total_elements = 0
             for hf_name, tensor in hf_state_dict.items():
@@ -1558,7 +1568,8 @@ def _sync_weights_to_vllm_xccl(self) -> None:
                 t_ag += time.perf_counter() - tb0
                 del local_flat
 
-                if self._is_shard_leader:
+                # WS3.5: only XCCL leader broadcasts to vLLM.
+                if getattr(self, "_is_xccl_leader", self._is_shard_leader):
                     # Reconstruct full params from interleaved AllGather output.
                     # For param_i with local_numel=lnu at local_offset=cum_lnu:
                     #   full_param = cat(full_batch[r*_lb_numel+cum : r*_lb_numel+cum+lnu]

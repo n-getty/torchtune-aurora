@@ -85,8 +85,19 @@ _GLOO_DP_REP_PG = None    # gloo mirror of dp_replicate_pg (3 ranks)
 _GLOO_DP_SHARD_PG = None  # gloo mirror of dp_shard_pg (4 ranks)
 _GLOO_GLOBAL_PG = None    # gloo global group (all ranks); barrier before post-bwd AllReduce
 _XCCL_DP_REP_PG = None   # XCCL dp_replicate group (3 ranks, XPU fabric)
+_XCCL_DP_SHARD_PG = None # XCCL dp_shard group (XPU fabric); used by iter2 grad-release fast path
 _DP_REP_DEGREE = 1        # dp_replicate world size
 _DP_SHARD_DEGREE = 1      # dp_shard world size
+
+# Iter2 opt-in: route _ep_release_fsdp_unsharded_grads's per-param all_reduce
+# through native XCCL on the XPU dp_shard PG instead of the gloo CPU-bounce
+# (D2H → gloo all_reduce → H2D → chunk). Default off for the same reason
+# TORCHTUNE_EP_USE_XCCL is opt-in: native XCCL on the EP fabric historically
+# deadlocked at op #259 (RS-BWD), and although iter1 showed that no longer
+# reproduces on this codebase, the safer rollout is the same A/B opt-in
+# pattern. When unset the helper takes the gloo path unchanged.
+import os as _os_iter2
+_EP_GRAD_RELEASE_XCCL = _os_iter2.environ.get("TORCHTUNE_EP_GRAD_RELEASE_XCCL", "0") == "1"
 
 # ---------------------------------------------------------------------------
 # Saved originals — captured BEFORE monkey-patching (imported by recipe too)
@@ -609,16 +620,54 @@ def _ep_release_fsdp_unsharded_grads(
                         break
 
             if degree > 1:
-                grad_cpu = grad_full.contiguous().cpu()
-                _orig_all_reduce(
-                    grad_cpu, op=torch.distributed.ReduceOp.SUM, group=gloo_pg,
+                # Iter2 opt-in: native XCCL all_reduce on XPU when the dp_shard
+                # XCCL PG is registered AND the gloo PG matches dp_shard. The
+                # chunk/pad/slice logic stays identical — we just skip the
+                # CPU bounce. The gloo PG (parameter `gloo_pg`) is still
+                # consulted for which mesh this fsdp_param belongs to; for
+                # dp_replicate>1 we keep the gloo path because we have no
+                # XCCL dp_replicate group on the same mesh shape.
+                use_xccl = (
+                    _EP_GRAD_RELEASE_XCCL
+                    and _XCCL_DP_SHARD_PG is not None
+                    and gloo_pg is _GLOO_DP_SHARD_PG
+                    and grad_full.device.type == "xpu"
                 )
-                grad_cpu.div_(degree)
-                local_rank_in_pg = torch.distributed.get_rank(gloo_pg)
-                # FSDP2 shards via torch.chunk along shard_dim — chunks may be
-                # uneven on the last rank if dim_size % degree != 0.
-                chunks = list(torch.chunk(grad_cpu, degree, dim=shard_dim))
-                local_chunk = chunks[local_rank_in_pg]
+                if use_xccl:
+                    grad_xpu = grad_full.contiguous()
+                    _orig_all_reduce(
+                        grad_xpu, op=torch.distributed.ReduceOp.SUM,
+                        group=_XCCL_DP_SHARD_PG,
+                    )
+                    grad_xpu.div_(degree)
+                    local_rank_in_pg = torch.distributed.get_rank(_XCCL_DP_SHARD_PG)
+                    chunks = list(torch.chunk(grad_xpu, degree, dim=shard_dim))
+                    if local_rank_in_pg < len(chunks):
+                        local_chunk = chunks[local_rank_in_pg]
+                    else:
+                        empty_shape = list(grad_xpu.shape)
+                        empty_shape[shard_dim] = 0
+                        local_chunk = torch.zeros(empty_shape, dtype=grad_xpu.dtype, device=grad_xpu.device)
+                else:
+                    grad_cpu = grad_full.contiguous().cpu()
+                    _orig_all_reduce(
+                        grad_cpu, op=torch.distributed.ReduceOp.SUM, group=gloo_pg,
+                    )
+                    grad_cpu.div_(degree)
+                    local_rank_in_pg = torch.distributed.get_rank(gloo_pg)
+                    # FSDP2 shards via torch.chunk along shard_dim — chunks may be
+                    # uneven on the last rank if dim_size % degree != 0, and may
+                    # produce fewer than `degree` chunks when degree > dim_size
+                    # (e.g. EP=16 with norm-weight grads of shape [hidden_dim]).
+                    # FSDP2's sharded_size already accounts for these padded ranks;
+                    # produce a 0-length local_chunk and let the pad block fill it.
+                    chunks = list(torch.chunk(grad_cpu, degree, dim=shard_dim))
+                    if local_rank_in_pg < len(chunks):
+                        local_chunk = chunks[local_rank_in_pg]
+                    else:
+                        empty_shape = list(grad_cpu.shape)
+                        empty_shape[shard_dim] = 0
+                        local_chunk = torch.zeros(empty_shape, dtype=grad_cpu.dtype, device=grad_cpu.device)
             else:
                 local_chunk = grad_full.contiguous().cpu()
 
@@ -630,7 +679,9 @@ def _ep_release_fsdp_unsharded_grads(
                 if cur < tgt:
                     pad_shape = list(local_chunk.shape)
                     pad_shape[shard_dim] = tgt - cur
-                    pad = torch.zeros(pad_shape, dtype=local_chunk.dtype)
+                    # Match local_chunk's device — under TORCHTUNE_EP_GRAD_RELEASE_XCCL
+                    # local_chunk lives on XPU, so a CPU pad would fail torch.cat.
+                    pad = torch.zeros(pad_shape, dtype=local_chunk.dtype, device=local_chunk.device)
                     local_chunk = torch.cat([local_chunk, pad], dim=shard_dim)
                 else:
                     local_chunk = local_chunk.narrow(shard_dim, 0, tgt)
@@ -822,18 +873,24 @@ def set_process_groups(
     xccl_dp_rep_pg,
     dp_rep_degree: int,
     dp_shard_degree: int,
+    xccl_dp_shard_pg=None,
 ) -> None:
     """Register process group handles used by distributed op patches.
 
     Called from GRPOFullFinetuneDistributedXPU._init_distributed() after all gloo
     and XCCL process groups have been created. The registered handles are used by
     _xpu_reduce_scatter_via_allreduce, _ep_post_backward_grad_sync[_xccl], etc.
+
+    `xccl_dp_shard_pg` is optional and only consumed by the iter2 opt-in
+    `_ep_release_fsdp_unsharded_grads` XCCL path (TORCHTUNE_EP_GRAD_RELEASE_XCCL=1).
+    Pass `device_mesh.get_group("dp_shard")` from the recipe.
     """
     global _GLOO_DP_REP_PG, _GLOO_DP_SHARD_PG, _GLOO_GLOBAL_PG, _XCCL_DP_REP_PG
-    global _DP_REP_DEGREE, _DP_SHARD_DEGREE
+    global _XCCL_DP_SHARD_PG, _DP_REP_DEGREE, _DP_SHARD_DEGREE
     _GLOO_DP_REP_PG = gloo_dp_rep_pg
     _GLOO_DP_SHARD_PG = gloo_dp_shard_pg
     _GLOO_GLOBAL_PG = gloo_global_pg
     _XCCL_DP_REP_PG = xccl_dp_rep_pg
+    _XCCL_DP_SHARD_PG = xccl_dp_shard_pg
     _DP_REP_DEGREE = dp_rep_degree
     _DP_SHARD_DEGREE = dp_shard_degree

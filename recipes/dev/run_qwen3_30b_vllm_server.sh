@@ -22,14 +22,28 @@ unset VIRTUAL_ENV
 
 export ZE_FLAT_DEVICE_HIERARCHY=FLAT
 unset PYTORCH_ALLOC_CONF
+# WS3 (2026-05-01): VLLM_SERVER_DEV_MODE=1 unlocks /collective_rpc HTTP route
+# (vllm/entrypoints/serve/rpc/api_router.py:59 returns early without it).
+# Without this the worker extension is loaded but the recipe hits 404 when
+# POSTing init_xccl_communicator / receive_weights_xccl / load_weights_from_*.
+export VLLM_SERVER_DEV_MODE=1
 
 # Avoid user-site shadowing framework transformers/huggingface-hub
 # (frameworks/2025.3.1 transformers requires huggingface-hub<1.0; user-site has 1.7.1)
 FW_SITE=/opt/aurora/25.190.0/frameworks/aurora_frameworks-2025.3.1/lib/python3.12/site-packages
-export PYTHONNOUSERSITE=1
-export PYTHONPATH=${PROJDIR}:${FW_SITE}
+# WS3 (2026-05-01): include _usercustomize_vllm so vLLM workers register the
+# torchtune.dev.vllm_weight_sync_worker HTTP routes (init_xccl_communicator,
+# receive_weights_xccl, etc). Without it the recipe hits 404 on wsync init.
+VLLM_CUSTOMIZATION="${PROJDIR}/recipes/dev/_usercustomize_vllm"
+# WS3: unset PYTHONNOUSERSITE so Python autoloads usercustomize.py from
+# _usercustomize_vllm/ (registry SIGSEGV patch + transformers shim). With
+# PYTHONNOUSERSITE=1 the patches don't load and vLLM 0.15 crashes during
+# model architecture inspection. See feedback_usercustomize_eager_vllm_import.md.
+export PYTHONNOUSERSITE=
+export PYTHONPATH=${PROJDIR}:${VLLM_CUSTOMIZATION}:${FW_SITE}
 export HF_DATASETS_OFFLINE=1
 export HF_HUB_OFFLINE=1
+WORKER_EXT="torchtune.dev.vllm_weight_sync_worker.WeightSyncFromFileExtension"
 
 VLLM_BASE_PORT=${1:-8001}
 MODEL_PATH=/lus/flare/projects/ModCon/ngetty/models/Qwen3-30B-A3B
@@ -89,6 +103,7 @@ for r in $(seq 0 $((N_REPLICAS - 1))); do
         --gpu-memory-utilization 0.80 \
         --max-model-len ${VLLM_MAX_MODEL_LEN} \
         --distributed-executor-backend mp \
+        --worker-extension-cls ${WORKER_EXT} \
         > "${VLLM_LOG}" 2>&1 &
     VLLM_PIDS+=($!)
     echo "  Replica ${r} PID: ${VLLM_PIDS[-1]}"

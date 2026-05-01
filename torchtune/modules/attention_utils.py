@@ -66,6 +66,41 @@ def _log_varlen_status_once(mask, is_causal: bool, dropout_p: float, device_type
     else:
         _log.info("varlen=engaged")
 
+
+def _reset_varlen_log_for_testing() -> None:
+    """Reset the one-shot varlen log flag. Test use only."""
+    global _VARLEN_LOG_DONE
+    _VARLEN_LOG_DONE = False
+
+
+def _compute_maskfree_causal(
+    env_set: bool,
+    device_type: str,
+    packing_enabled: bool,
+    query_responses: torch.Tensor,
+    context_length: int,
+    pad_id: int,
+) -> "tuple[bool, Optional[str]]":
+    """Returns (use_maskfree, skip_reason_or_None).
+
+    Evaluates whether the maskfree causal forward path should be used for the
+    current batch (TORCHTUNE_MASKFREE_CAUSAL guard logic). Safe only when XPU,
+    no packing, and no prompt-side padding (right-padded responses are fine
+    because causal attention cannot see later positions).
+    """
+    if not env_set or device_type != "xpu" or packing_enabled:
+        reason = (
+            "env not set" if not env_set
+            else "device != xpu" if device_type != "xpu"
+            else "packing enabled"
+        )
+        return False, reason
+    has_prompt_pad = (query_responses[:, :context_length] == pad_id).any().item()
+    if has_prompt_pad:
+        return False, "prompt padding detected"
+    return True, None
+
+
 if _SUPPORTS_FLEX_ATTENTION:
     from torch.nn.attention.flex_attention import (
         BlockMask,
@@ -264,10 +299,16 @@ def _sdpa_or_flex_attention() -> Callable:
         v_packed = v.transpose(1, 2).contiguous().view(b * s, h, d)
 
         cache_key = (b, h, s, d, q.dtype, str(q.device))
-        out = _varlen_out_cache.get(cache_key)
-        if out is None or out.shape != q_packed.shape:
+        # Under autograd (training fwd), allocate fresh to avoid version-counter
+        # conflicts across chunks in the chunked grpo_step backward loop.
+        # No-grad paths (ref fwd, rollout logprobs) reuse the persistent buffer.
+        if torch.is_grad_enabled():
             out = torch.empty_like(q_packed)
-            _varlen_out_cache[cache_key] = out
+        else:
+            out = _varlen_out_cache.get(cache_key)
+            if out is None or out.shape != q_packed.shape:
+                out = torch.empty_like(q_packed)
+                _varlen_out_cache[cache_key] = out
         alibi = _varlen_alibi_cache.get(cache_key)
         if alibi is None:
             alibi = torch.zeros(h, dtype=torch.float32, device=q.device)
