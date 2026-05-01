@@ -220,3 +220,4 @@ recipes/configs/dev/experimental/
 # Local-only agent + reference material (not committed)
 AGENTS.md
 docs/context/
+docs/reports/
