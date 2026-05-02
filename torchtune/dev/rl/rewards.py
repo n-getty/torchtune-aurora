@@ -373,17 +373,30 @@ _GENE_STOP_WORDS = {
 }
 _GENE_PATTERN = re.compile(r"\b([A-Z][A-Z0-9]{1,9})\b")
 _GENES_TAG_RE = re.compile(r"<genes>(.*?)</genes>", re.DOTALL | re.IGNORECASE)
+# Matches "Gene symbols: TP53, BRCA1, ..." line (the formal answer format)
+_GENE_SYMBOLS_LINE_RE = re.compile(
+    r"Gene symbols\s*:\s*([A-Z][A-Z0-9,\s\-]*)", re.IGNORECASE
+)
 
 
 def _extract_genes(text: str) -> set:
     """Extract gene symbols from text.
 
-    If the text contains a <genes>...</genes> tag (from the reasoning prompt
-    format), parse only the tag contents. Falls back to scanning the full
-    text during early training when the model hasn't learned the format yet.
+    Priority order:
+    1. <genes>...</genes> tag (legacy reasoning format)
+    2. "Gene symbols: TP53, BRCA1, ..." line (current prompt format)
+    3. Full-text scan fallback (used when neither format is present, e.g. truncated outputs)
+
+    Parsing only the formal answer section (cases 1 or 2) creates meaningful
+    within-group reward variance for GRPO: completions that reach the gene list
+    get precise F1, those that are truncated before it fall back to noisy full-scan F1.
     """
     m = _GENES_TAG_RE.search(text)
-    source = m.group(1) if m else text
+    if m:
+        source = m.group(1)
+    else:
+        gs = _GENE_SYMBOLS_LINE_RE.search(text)
+        source = gs.group(1) if gs else text
     candidates = _GENE_PATTERN.findall(source)
     return {g for g in candidates if g not in _GENE_STOP_WORDS}
 

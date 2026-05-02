@@ -231,6 +231,97 @@ def write_peft_adapter_dir(
     os.rename(tmp_path, path)
 
 
+def peft_to_torchtune_state_dict(peft_sd: dict) -> dict:
+    """Translate a PEFT adapter state dict back to torchtune format.
+
+    Inverse of :func:`torchtune_to_peft_state_dict`.  Used to load a
+    previously-saved PEFT adapter checkpoint into a torchtune LoRA model.
+
+    PEFT key format::
+        base_model.model.model.layers.{i}.self_attn.q_proj.lora_A.weight
+
+    torchtune key format::
+        layers.{i}.attn.q_proj.lora_a.weight
+
+    Args:
+        peft_sd: PEFT-format state dict (from adapter_model.safetensors).
+
+    Returns:
+        torchtune-format state dict (only LoRA adapter keys).
+    """
+    _HF_TO_TUNE: dict[str, str] = {v: k for k, v in _TUNE_MODULE_TO_HF.items()}
+    tune_sd: dict[str, torch.Tensor] = {}
+    skipped = []
+
+    _prefix = "base_model.model.model."
+    for peft_key, tensor in peft_sd.items():
+        if not peft_key.startswith(_prefix):
+            skipped.append(peft_key)
+            continue
+        rest = peft_key[len(_prefix):]  # layers.{i}.self_attn.q_proj.lora_A.weight
+        m = re.match(r"^(layers\.\d+)\.(.+)\.(lora_[AB]\.weight)$", rest)
+        if m is None:
+            skipped.append(peft_key)
+            continue
+        layer_part = m.group(1)   # layers.{i}
+        hf_module = m.group(2)    # self_attn.q_proj
+        lora_suffix = m.group(3)  # lora_A.weight
+        tune_module = _HF_TO_TUNE.get(hf_module)
+        if tune_module is None:
+            skipped.append(peft_key)
+            continue
+        tune_suffix = lora_suffix.replace("lora_A.", "lora_a.").replace("lora_B.", "lora_b.")
+        tune_key = f"{layer_part}.{tune_module}.{tune_suffix}"
+        tune_sd[tune_key] = tensor.bfloat16()
+
+    if skipped:
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "peft_to_torchtune_state_dict: skipped %d unrecognized keys: %s",
+            len(skipped), skipped[:5],
+        )
+    return tune_sd
+
+
+def load_peft_adapter_into_model(model, adapter_dir: str) -> int:
+    """Load a saved PEFT adapter directory into a torchtune LoRA model.
+
+    Reads ``adapter_model.safetensors`` (or ``adapter_model.bin`` fallback),
+    converts keys to torchtune format, and loads with ``strict=False``.
+
+    Args:
+        model: Unwrapped torchtune LoRA model (pre-FSDP).
+        adapter_dir: Path to PEFT adapter directory.
+
+    Returns:
+        Number of adapter tensors loaded.
+    """
+    st_path = os.path.join(adapter_dir, "adapter_model.safetensors")
+    bin_path = os.path.join(adapter_dir, "adapter_model.bin")
+
+    if os.path.exists(st_path):
+        from safetensors.torch import load_file as _load_safetensors
+        peft_sd = _load_safetensors(st_path, device="cpu")
+    elif os.path.exists(bin_path):
+        peft_sd = torch.load(bin_path, map_location="cpu")
+    else:
+        raise FileNotFoundError(
+            f"No adapter_model.safetensors or adapter_model.bin in {adapter_dir}"
+        )
+
+    tune_sd = peft_to_torchtune_state_dict(peft_sd)
+    missing, unexpected = model.load_state_dict(tune_sd, strict=False)
+    # Filter missing to only non-adapter keys (base weights are expected missing)
+    adapter_missing = [k for k in missing if "lora_" in k]
+    if adapter_missing:
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "load_peft_adapter_into_model: %d adapter keys NOT loaded: %s",
+            len(adapter_missing), adapter_missing[:5],
+        )
+    return len(tune_sd)
+
+
 def make_lora_request(name: str, lora_int_id: int, path: str):
     """Create a vLLM ``LoRARequest`` for offline engine use.
 

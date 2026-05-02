@@ -70,6 +70,7 @@ from torchtune.dev.rl.generation import generate
 from torchtune.dev.rl.rewards import batched_rewards
 from torchtune.dev.rl.types import GRPOStats, GRPOTrajectory
 from torchtune.modules import local_kv_cache
+from torchtune.modules.attention_utils import _compute_maskfree_causal
 from torchtune.modules.peft import (
     disable_adapter,
     get_adapter_params,
@@ -98,6 +99,7 @@ from torchtune.dev.rl.lora_helpers import (
     write_peft_adapter_dir,
     load_lora_adapter_http,
     unload_lora_adapter_http,
+    load_peft_adapter_into_model,
     _ATTN_TARGET_MODULES,
     _MLP_TARGET_MODULES,
 )
@@ -272,7 +274,12 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
         cfg: DictConfig,
         model_sd: dict[str, Any],
     ) -> nn.Module:
-        """Build LoRA-wrapped Qwen3 model with FSDP1 SHARD_GRAD_OP.
+        """Build LoRA-wrapped Qwen3 model with FSDP1.
+
+        Sharding strategy is configurable via cfg.fsdp_sharding_strategy or the
+        LORA_FSDP_FULL_SHARD=1 env var (both select FULL_SHARD).  Default is
+        SHARD_GRAD_OP (ZeRO-2).  For 8B+, FULL_SHARD reduces unsharded-param
+        residency at the cost of extra all-gathers — try it when hitting UR:40.
 
         Loads base weights (strict=False — LoRA params are randomly init'd),
         then wraps with FSDP1 at the top level only.
@@ -302,6 +309,14 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
                      len(lora_missing), len(unexpected))
         del model_sd
 
+        # If resuming from a PEFT adapter checkpoint, load adapter weights before FSDP wrap.
+        # Adapter params are on CPU at this point (not yet moved to device).
+        _adapter_ckpt_dir = cfg.get("lora_adapter_checkpoint_dir", None)
+        if _adapter_ckpt_dir:
+            utils.log_rank_zero(log, f"LoRA-GRPO: loading adapter weights from {_adapter_ckpt_dir}")
+            n_loaded = load_peft_adapter_into_model(model, _adapter_ckpt_dir)
+            utils.log_rank_zero(log, f"LoRA-GRPO: loaded {n_loaded} adapter tensors from checkpoint")
+
         # Move to device
         model = model.to(device=self._device, dtype=self._dtype)
 
@@ -325,14 +340,49 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
             buffer_dtype=self._dtype,
         )
 
-        # SHARD_GRAD_OP: keep params in memory after forward (no reshard).
-        # Correct for LoRA: adapter params are tiny (~80 MB), base is frozen/sharded.
+        # Select sharding strategy: FULL_SHARD (ZeRO-3) reduces unsharded-param
+        # residency at the cost of more all-gathers; SHARD_GRAD_OP (ZeRO-2) keeps
+        # full params after forward.  For 8B+, FULL_SHARD is safer for UR:40.
+        # Accept both `fsdp_sharding_strategy` (canonical) and the legacy
+        # `fsdp_shard_strategy` (used by every shipped LoRA YAML before 2026-05-02).
+        # Without this, only LORA_FSDP_FULL_SHARD=1 actually moved the lever and
+        # YAML overrides were silent no-ops.
+        _cfg_strat = cfg.get("fsdp_sharding_strategy", None)
+        if _cfg_strat is None and "fsdp_shard_strategy" in cfg:
+            _cfg_strat = cfg.get("fsdp_shard_strategy")
+            utils.log_rank_zero(
+                log,
+                "LoRA-GRPO: 'fsdp_shard_strategy' is deprecated; please rename to "
+                "'fsdp_sharding_strategy' in your YAML.",
+            )
+        if _cfg_strat is None:
+            _cfg_strat = "SHARD_GRAD_OP"
+        if os.environ.get("LORA_FSDP_FULL_SHARD") == "1":
+            _cfg_strat = "FULL_SHARD"
+        _sharding_strategy = ShardingStrategy.FULL_SHARD if _cfg_strat == "FULL_SHARD" else ShardingStrategy.SHARD_GRAD_OP
+        utils.log_rank_zero(log, f"LoRA-GRPO: FSDP1 sharding_strategy={_sharding_strategy.name}")
+
+        # Exclude LoRA adapter params (lora_a / lora_b) from FSDP sharding.
+        # Base linear weights inside LoRALinear ARE still FSDP-sharded for memory efficiency.
+        # Adapter params are tiny (~5 MB total) — replication across 11 tiles is cheap.
+        # Without this, each FSDP forward all-gathers adapter params creating L0 IPC handles
+        # that accumulate across steps → UR:40 / banned:1 PDE on Aurora XPU.
+        _lora_adapter_params = [
+            p for n, p in model.named_parameters()
+            if "lora_a" in n or "lora_b" in n
+        ]
+        utils.log_rank_zero(
+            log,
+            f"LoRA-GRPO: FSDP ignored_states={len(_lora_adapter_params)} adapter params "
+            f"(replicated, not sharded; reduces IPC handle accumulation)",
+        )
         model = FSDP(
             model,
-            sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
+            sharding_strategy=_sharding_strategy,
             mixed_precision=mp_policy,
             use_orig_params=True,
             limit_all_gathers=True,
+            ignored_states=_lora_adapter_params,
         )
 
         if self._enable_activation_checkpointing:
@@ -343,7 +393,7 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
 
         utils.log_rank_zero(
             log,
-            f"LoRA-GRPO: FSDP1 SHARD_GRAD_OP model setup took {time.perf_counter() - init_start:.2f}s",
+            f"LoRA-GRPO: FSDP1 {_sharding_strategy.name} model setup took {time.perf_counter() - init_start:.2f}s",
         )
         if self._is_rank_zero:
             try:
@@ -451,7 +501,29 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
         # Load checkpoint (base model weights)
         checkpoint_dict = self.load_checkpoint(cfg_checkpointer=cfg.checkpointer)
         if self._resume_from_checkpoint:
-            self._update_recipe_state(checkpoint_dict)
+            _adapter_ckpt_dir = cfg.get("lora_adapter_checkpoint_dir", None)
+            _recipe_state_path = (
+                os.path.join(_adapter_ckpt_dir, "recipe_state.pt")
+                if _adapter_ckpt_dir else None
+            )
+            if _recipe_state_path and os.path.exists(_recipe_state_path):
+                _rstate = torch.load(_recipe_state_path, map_location="cpu")
+                self._epochs_run = _rstate.get(training.EPOCHS_KEY, 0)
+                self._steps_run = _rstate.get(training.STEPS_KEY, 0)
+                utils.log_rank_zero(
+                    log,
+                    f"LoRA-GRPO: resumed from adapter checkpoint "
+                    f"(epochs={self._epochs_run}, steps={self._steps_run})",
+                )
+            else:
+                try:
+                    self._update_recipe_state(checkpoint_dict)
+                except KeyError:
+                    utils.log_rank_zero(
+                        log,
+                        "LoRA-GRPO: resume_from_checkpoint=True but no recipe state in checkpoint; "
+                        "starting from step 0 (set lora_adapter_checkpoint_dir to load recipe_state.pt)",
+                    )
 
         self._opt_state_dict = (
             checkpoint_dict.get(training.OPT_KEY)
@@ -745,14 +817,35 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
         batch_input_ids: torch.Tensor,
         context_length: int,
     ) -> torch.Tensor:
-        """Call vLLM server for generation, broadcast results to all ranks."""
+        """Call vLLM server for generation, broadcast results to all ranks.
+
+        Broadcasts a success/failure flag before the data broadcast so that when
+        rank 0 fails (e.g. vLLM EngineCore crash), all other ranks are unblocked
+        and exit cleanly instead of hanging at the data broadcast barrier.
+        """
         bsz = batch_input_ids.shape[0]
         total_len = context_length + self._max_generated_tokens
 
+        _ok = torch.zeros(1, device=self._device, dtype=torch.int32)
+        _exc: Exception | None = None
+
         if self._is_rank_zero:
-            query_responses = self._call_vllm_http(batch_input_ids, context_length)
+            try:
+                query_responses = self._call_vllm_http(batch_input_ids, context_length)
+                _ok.fill_(1)
+            except Exception as _e:
+                _exc = _e
         else:
             query_responses = batch_input_ids.new_empty(bsz, total_len)
+
+        # Broadcast success flag so failing rank 0 unblocks all other ranks.
+        torch.distributed.broadcast(_ok, src=0)
+
+        if _ok.item() == 0:
+            if _exc is not None:
+                raise _exc
+            raise RuntimeError("vLLM generation failed on rank 0; exiting")
+
         return self._broadcast_query_responses(query_responses)
 
     def _call_vllm_http(
@@ -859,10 +952,29 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
 
         query_response_padding_masks = query_responses != self._tokenizer.pad_id
 
-        # Attention masks and position IDs
-        masks = generation.get_causal_mask_from_padding_mask(
-            query_response_padding_masks, target_seq_len=context_length + self._max_generated_tokens
+        # Attention masks and position IDs.
+        # TORCHTUNE_MASKFREE_CAUSAL=1: skip explicit mask construction so that
+        # TORCHTUNE_USE_IPEX_VARLEN=1 can engage (varlen requires mask=None).
+        # Guard: XPU only, no packing, no prompt-side padding.
+        _maskfree, _mf_reason = _compute_maskfree_causal(
+            env_set=os.environ.get("TORCHTUNE_MASKFREE_CAUSAL") == "1",
+            device_type=self._device.type,
+            packing_enabled=False,
+            query_responses=query_responses,
+            context_length=context_length,
+            pad_id=self._tokenizer.pad_id,
         )
+        if _mf_reason == "prompt padding detected":
+            log.warning(
+                "TORCHTUNE_MASKFREE_CAUSAL=1 but batch has prompt padding; "
+                "falling back to explicit mask."
+            )
+        if _maskfree:
+            masks = None
+        else:
+            masks = generation.get_causal_mask_from_padding_mask(
+                query_response_padding_masks, target_seq_len=context_length + self._max_generated_tokens
+            )
         position_ids = generation.get_position_ids_from_padding_mask(query_response_padding_masks)
 
         # Step 2: policy logprobs (adapter-enabled forward)
@@ -881,7 +993,7 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
                     chunk_logits = self._model(
                         query_responses[cs:ce],
                         input_pos=position_ids[cs:ce],
-                        mask=masks[cs:ce],
+                        mask=None if masks is None else masks[cs:ce],
                     )
                     chunk_logits = chunk_logits[:, context_length - 1:]
                     chunks.append(
@@ -909,7 +1021,7 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
                         chunk_ref = self._model(
                             query_responses[cs:ce],
                             input_pos=position_ids[cs:ce],
-                            mask=masks[cs:ce],
+                            mask=None if masks is None else masks[cs:ce],
                         )
                         chunk_ref = rlhf.truncate_sequence_for_logprobs(chunk_ref, context_length)
                         ref_chunks.append(
@@ -1052,9 +1164,22 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
         _chunked = os.environ.get("TORCHTUNE_USE_CHUNKED_LOSS") == "1"
 
         if _chunked:
-            # Per-chunk forward + backward (avoids OOM on long sequences)
+            # Per-chunk forward + backward (avoids OOM on long sequences).
+            # Matches base GRPO recipe: correct grad scaling + FSDP1 no_sync suppression.
+            num_fwd_chunks = (num_seqs + fwd_bs - 1) // fwd_bs
+            grad_scale = num_fwd_chunks * max(1, self._gradient_accumulation_steps)
+
+            # Suppress FSDP1 grad sync (reduce-scatter) for all but the final chunk.
+            # Each backward() fires a reduce-scatter without this; with no_sync we
+            # accumulate gradients locally and fire exactly once on the last chunk.
+            _use_fsdp1_no_sync = (
+                num_fwd_chunks > 1
+                and hasattr(self._model, 'no_sync')
+            )
+
             for cs in range(0, num_seqs, fwd_bs):
                 ce = min(cs + fwd_bs, num_seqs)
+                _is_last_chunk = (ce >= num_seqs)
                 chunk_logits = self._model(
                     trajectory.query_responses[cs:ce],
                     input_pos=trajectory.position_ids[cs:ce],
@@ -1070,12 +1195,15 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
                     if trajectory.logprobs is not None
                     else chunk_pi_lp.detach()
                 )
+                # NOTE: padding_masks=True means "include this token in loss" (base recipe
+                # convention). response_padding_masks is True for PAD/truncated tokens, so
+                # invert it here. Bug in the original: was passing without ~.
                 chunk_loss, _, chunk_kl, *_ = self._loss_fn(
                     chunk_old_lp,
                     chunk_pi_lp,
                     trajectory.ref_logprobs[cs:ce],
                     trajectory.advantages[cs:ce],
-                    trajectory.response_padding_masks[cs:ce],
+                    padding_masks=~trajectory.response_padding_masks[cs:ce],
                 )
                 if self._is_rank_zero and cs == 0 and self._device.type == "xpu":
                     try:
@@ -1087,11 +1215,16 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
                         )
                     except Exception:
                         pass
-                (chunk_loss / (num_seqs / fwd_bs)).backward()
+                if _use_fsdp1_no_sync and not _is_last_chunk:
+                    with self._model.no_sync():
+                        (chunk_loss / grad_scale).backward()
+                else:
+                    (chunk_loss / grad_scale).backward()
                 total_loss += chunk_loss.detach()
                 total_kl += chunk_kl.detach()
         else:
             # Single forward + backward
+            grad_scale = max(1, self._gradient_accumulation_steps)
             logits = self._model(
                 trajectory.query_responses,
                 input_pos=trajectory.position_ids,
@@ -1103,14 +1236,17 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
             old_logprobs = (
                 trajectory.logprobs if trajectory.logprobs is not None else pi_logprobs.detach()
             )
+            # NOTE: padding_masks=True means "include this token in loss" (base recipe
+            # convention). response_padding_masks is True for PAD/truncated tokens, so
+            # invert it here. Bug in the original: was passing without ~.
             loss, _, kl_loss, *_ = self._loss_fn(
                 old_logprobs,
                 pi_logprobs,
                 trajectory.ref_logprobs,
                 trajectory.advantages,
-                trajectory.response_padding_masks,
+                padding_masks=~trajectory.response_padding_masks,
             )
-            loss.backward()
+            (loss / grad_scale).backward()
             total_loss = loss.detach()
             total_kl = kl_loss.detach()
 
@@ -1153,6 +1289,12 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
                 os.makedirs(save_dir, exist_ok=True)
                 write_peft_adapter_dir(peft_sd, adapter_config, save_dir)
                 log.info("Rank 0: adapter checkpoint saved to %s (epoch=%d)", save_dir, epoch)
+                recipe_state_path = os.path.join(save_dir, "recipe_state.pt")
+                torch.save(
+                    {training.EPOCHS_KEY: epoch, training.STEPS_KEY: self._steps_run},
+                    recipe_state_path,
+                )
+                log.info("Rank 0: recipe state saved to %s (steps_run=%d)", recipe_state_path, self._steps_run)
             else:
                 self._checkpointer.save_checkpoint(
                     {training.MODEL_KEY: full_sd},
@@ -1164,8 +1306,38 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
     # Training loop
     # -------------------------------------------------------------------------
 
+    def _warmup_vllm(self) -> None:
+        """Rank-0-only: verify vLLM EngineCore is functional before training starts.
+
+        Sends a trivial 1-token generate request.  Raises immediately on failure —
+        the EngineCore process does not self-restart after a crash (Aurora XPU stale
+        L0 driver state), so sleeping and retrying is useless.  The launcher is
+        responsible for restarting vLLM if the EngineCore is broken.
+        """
+        if not self._is_rank_zero or not self._vllm_clients:
+            return
+        _dummy = [self._tokenizer.bos_id or 1]
+        try:
+            self._vllm_client.generate(
+                prompts=[_dummy], n=1, max_tokens=1,
+                temperature=self._temperature, top_k=self._top_k or 0,
+            )
+            log.info("LoRA-GRPO: vLLM warm-up OK")
+        except RuntimeError as _e:
+            raise RuntimeError(
+                f"vLLM EngineCore failed warm-up (node may have stale L0 state): {_e}"
+            ) from _e
+
     def train(self) -> None:
         """Main training loop."""
+        # Verify vLLM EngineCore is functional before entering the training loop.
+        # On Aurora XPU, the EngineCore can appear healthy but crash on the first
+        # inference call due to stale L0 driver state from prior jobs on the same node.
+        # Rank 0 retries up to 3× with 60s waits; all ranks barrier after.
+        if self._is_rank_zero:
+            self._warmup_vllm()
+        torch.distributed.barrier()
+
         # Initialize LoRA adapter publish before training (step 0)
         # so vLLM generates with base model weights on first step.
         if self._is_rank_zero:
@@ -1195,19 +1367,27 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
                     tokens = batch["tokens"].to(self._device)
                     answers = batch.get("answers", [""] * tokens.shape[0])
 
-                    # Join pending adapter publish thread before generating
-                    # (adapter must be fully loaded in vLLM before we send requests)
+                    # Join pending adapter publish thread before generating.
+                    # A stale adapter in vLLM corrupts GRPO semantics (generation
+                    # policy diverges from training policy), so we fail fast here.
                     if self._publish_thread is not None:
                         _join_t0 = time.perf_counter()
                         self._publish_thread.join(timeout=120)
-                        if self._publish_thread.is_alive():
-                            log.error("Rank 0: adapter publish thread timed out — vLLM may use stale adapter")
-                        if self._publish_error is not None:
-                            log.error("Rank 0: adapter publish failed: %s", self._publish_error)
-                            self._publish_error = None
+                        _timed_out = self._publish_thread.is_alive()
+                        _pub_err = self._publish_error
                         self._publish_thread = None
+                        self._publish_error = None
                         if self._is_rank_zero:
                             log.info("Rank 0: publish join %.2fs", time.perf_counter() - _join_t0)
+                        if _timed_out:
+                            raise RuntimeError(
+                                "Adapter publish thread timed out (120s) — vLLM adapter "
+                                "may not have been updated. Aborting to avoid stale-policy training."
+                            )
+                        if _pub_err is not None:
+                            raise RuntimeError(
+                                f"Adapter publish failed before generation: {_pub_err}"
+                            )
 
                     # Generate trajectory (server mode, may use base or LoRA adapter)
                     _gen_t0 = time.perf_counter()
@@ -1221,6 +1401,36 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
                     for _ppo_epoch in range(self._ppo_epochs):
                         grpo_metrics = self.grpo_step(trajectory)
                     _grpo_time = time.perf_counter() - _grpo_t0
+
+                    # All-reduce adapter param gradients across data-parallel ranks.
+                    # Adapter params are in FSDP ignored_states (replicated, not sharded),
+                    # so FSDP does NOT sync their grads automatically — we must do it here.
+                    # Single flat all-reduce instead of one-per-param (504 CCL ops → 1).
+                    _ar_t0 = time.perf_counter()
+                    _world_size = torch.distributed.get_world_size()
+                    if _world_size > 1:
+                        _adapter_grads = [
+                            _ap.grad for _ap in adapter_optimizer_params(self._model)
+                            if _ap.grad is not None
+                        ]
+                        if _adapter_grads:
+                            _flat = torch.cat([g.flatten() for g in _adapter_grads])
+                            torch.distributed.all_reduce(_flat)
+                            _flat.div_(_world_size)
+                            _offset = 0
+                            for _g in _adapter_grads:
+                                _n = _g.numel()
+                                _g.copy_(_flat[_offset: _offset + _n].view_as(_g))
+                                _offset += _n
+                            del _flat
+                            if self._is_rank_zero:
+                                _ar_mb = sum(g.numel() * g.element_size() for g in _adapter_grads) / 1e6
+                                log.info(
+                                    "ADAPTER_AR step=%d %.1fMB in %.2fs (%d params synced)",
+                                    self._steps_run, _ar_mb,
+                                    time.perf_counter() - _ar_t0, len(_adapter_grads),
+                                )
+                            del _adapter_grads
 
                     # Clip gradients
                     _clip_t0 = time.perf_counter()
@@ -1292,6 +1502,14 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
                         self._metric_logger.log_dict(metrics, step=self.global_step)
 
                     pbar.update(1)
+
+                    # Mid-epoch step checkpoint
+                    if (
+                        self._save_every_n_steps is not None
+                        and self._steps_run % self._save_every_n_steps == 0
+                    ):
+                        self.save_checkpoint(epoch=curr_epoch)
+                        _saved_this_epoch = True
 
                     if training_completed:
                         break
