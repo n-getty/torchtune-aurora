@@ -1,0 +1,161 @@
+# Qwen3-0.6B LoRA-GRPO — GSM8K 20-step LEARNING validation
+#
+# Purpose: prove the LoRA-GRPO pipeline actually LEARNS, not just runs.
+# Sibling of qwen3_0_6b_lora_grpo_2node_smoke_xpu.yaml, which only validates
+# plumbing at num_steps=3.
+#
+# Pass criteria (all must hold):
+#   1. exit=0 across 20 steps.
+#   2. Adapter L2 norm changes monotonically (non-zero param updates reaching all ranks).
+#   3. Reward mean trends upward (not necessarily monotone — GRPO is noisy).
+#   4. ratios stay near 1.0 (on-policy regime; vLLM has the freshest adapter).
+#
+# Topology: same as 0.6B smoke (1 train + 1 vLLM node, DP=12, TP=1).
+# Recipe: recipes/dev/lora_grpo_full_finetune_distributed_xpu.py
+# Launcher: experiments/lora_grpo/run_qwen3_4b_lora_2node.sh with MODEL_PATH override.
+
+name: lora_grpo_qwen3_0_6b_gsm8k_validation
+output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/outputs/lora_grpo_qwen3_0_6b_gsm8k_validation_v1
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+base_model_path: /lus/flare/projects/ModCon/ngetty/models/Qwen3-0.6B
+
+model:
+  _component_: torchtune.models.qwen3.lora_qwen3_0_6b_base
+  lora_attn_modules: ['q_proj', 'k_proj', 'v_proj', 'output_proj']
+  apply_lora_to_mlp: true
+  apply_lora_to_output: false
+  lora_rank: 16
+  lora_alpha: 32
+  lora_dropout: 0.0
+
+# ── Tokenizer ─────────────────────────────────────────────────────────────────
+tokenizer:
+  _component_: torchtune.models.qwen3.qwen3_tokenizer
+  path: ${base_model_path}/vocab.json
+  merges_file: ${base_model_path}/merges.txt
+  max_seq_len: ${max_seq_len}
+
+# ── Checkpointer ──────────────────────────────────────────────────────────────
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [model.safetensors]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: QWEN3
+
+# ── Dataset ───────────────────────────────────────────────────────────────────
+dataset:
+  _component_: torchtune.dev.rl.gsm8k.gsm8k_dataset
+  partition: 1-9/10
+
+seed: 42
+shuffle: true
+resume_from_checkpoint: false
+
+# ── RL Hyperparameters ────────────────────────────────────────────────────────
+# G=8 is enough variance for clean advantages on a 0.6B model without burning
+# the validation hold on rollout time. Paper G=24 is for the 4B+ ladder.
+grpo_samples: 8
+max_seq_len: 512
+max_generated_tokens: 256
+temperature: 1.0
+top_k: null
+
+# ── Training (20-step learning probe) ─────────────────────────────────────────
+epochs: 1
+num_steps: 20
+ppo_epochs: 1
+batch_size: 4                          # ppo_batch_size = batch_size * grpo_samples = 32
+forward_batch_size: 4
+gradient_accumulation_steps: 1
+
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 3.0e-5
+  weight_decay: 0.01
+  fused: false
+
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  num_warmup_steps: 2
+
+clip_grad_norm: 1.0
+
+# ── Loss ──────────────────────────────────────────────────────────────────────
+loss:
+  _component_: torchtune.dev.rl.loss.GRPOLoss
+  kl_coeff: 1.0e-4
+  epsilon: 0.2
+
+# ── Reward (GSM8K math correctness + thinking format) ────────────────────────
+reward_functions:
+  - _component_: torchtune.dev.rl.rewards.FormattedMathCorrectnessReward
+    answer_tag: answer
+    positive_reward: 10.0
+    negative_reward: 0.0
+  - _component_: torchtune.dev.rl.rewards.ThinkingAnswerFormattingReward
+    think_tag: think
+    answer_tag: answer
+    positive_reward: 1.0
+    negative_reward: 0.0
+
+# ── LoRA publish config ────────────────────────────────────────────────────────
+lora:
+  publish_every_steps: 1
+  max_loras: 2
+  shm_root: ${output_dir}/adapters
+  tmpfs_transfer: true
+  train_shm: /dev/shm/lora_adapters
+  vllm_shm: /dev/shm/lora_adapters
+  # Per-step adapter L2 norm before/after opt.step + vLLM model name log.
+  # Used by the validation ladder to prove learning is happening.
+  log_validation_metrics: true
+
+# ── vLLM rollout (server mode) ────────────────────────────────────────────────
+vllm_mode: server
+vllm_weight_sync: false
+vllm_max_model_len: 768
+vllm_max_num_seqs: 32
+
+vllm:
+  mode: server
+  enable_lora: true
+  max_lora_rank: 16
+  max_loras: 2
+
+# ── Distributed / FSDP ────────────────────────────────────────────────────────
+fsdp_sharding_strategy: SHARD_GRAD_OP   # canonical key (recipe accepts both)
+enable_activation_checkpointing: false
+save_adapter_weights_only: true
+
+# ── XPU ───────────────────────────────────────────────────────────────────────
+device: xpu
+dtype: bf16
+compile: false
+force_math_sdpa: false                  # no-op on XPU; kept for config parity
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+log_every_n_steps: 1
+log_peak_memory_stats: true
+save_every_n_epochs: 1
+
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: false
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: true
+  cuda: false
+  profile_memory: false
+  with_stack: false
+  record_shapes: false
+  with_flops: false
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1

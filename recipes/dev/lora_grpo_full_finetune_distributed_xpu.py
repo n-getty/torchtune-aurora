@@ -619,6 +619,13 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
         self._async_generation_enabled = False
         self._async_generation_max_staleness = 1
 
+        # Validation instrumentation (opt-in; off by default to keep prod logs clean).
+        # Set `lora.log_validation_metrics: true` in the YAML to log per-step
+        # adapter L2 norm before/after optimizer.step() and the vLLM client _model_name
+        # used for each generation. Used for the LoRA learning-validation ladder.
+        _lora_cfg = cfg.get("lora", {})
+        self._log_validation_metrics = bool(_lora_cfg.get("log_validation_metrics", False))
+
         # vLLM server clients
         self._setup_vllm_server_mode()
 
@@ -1389,6 +1396,14 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
                                 f"Adapter publish failed before generation: {_pub_err}"
                             )
 
+                    # Validation: log which adapter (or base model) vLLM will use this step.
+                    if self._log_validation_metrics and self._is_rank_zero and self._vllm_clients:
+                        _names = sorted({getattr(c, "_model_name", "<unset>") for c in self._vllm_clients})
+                        log.info(
+                            "VALMET step=%d vllm_model_names=%s (n_distinct=%d)",
+                            self._steps_run, _names, len(_names),
+                        )
+
                     # Generate trajectory (server mode, may use base or LoRA adapter)
                     _gen_t0 = time.perf_counter()
                     with torch.no_grad():
@@ -1440,6 +1455,19 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
                         torch.nn.utils.clip_grad_norm_(adapter_params, self._clip_grad_norm)
                     _clip_time = time.perf_counter() - _clip_t0
 
+                    # Validation: adapter L2 norm BEFORE optimizer step (rank 0 only).
+                    # All ranks have identical adapter params (replicated + manual all-reduce
+                    # above), so rank-0-only is sufficient.
+                    _adapter_norm_before = None
+                    if self._log_validation_metrics and self._is_rank_zero:
+                        with torch.no_grad():
+                            _ap = list(adapter_optimizer_params(self._model))
+                            if _ap:
+                                _sq = torch.zeros((), device=self._device, dtype=torch.float32)
+                                for _p in _ap:
+                                    _sq += _p.detach().float().pow(2).sum()
+                                _adapter_norm_before = float(_sq.sqrt().item())
+
                     # Optimizer step
                     _opt_t0 = time.perf_counter()
                     self._optimizer.step()
@@ -1447,6 +1475,24 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
                     if self._device.type == "xpu":
                         torch.xpu.synchronize()
                     _opt_time = time.perf_counter() - _opt_t0
+
+                    # Validation: adapter L2 norm AFTER optimizer step + delta.
+                    # Non-zero delta proves the optimizer actually updated adapter params
+                    # (catches: dead grads, frozen params, ignored adapter list mismatch).
+                    if self._log_validation_metrics and self._is_rank_zero and _adapter_norm_before is not None:
+                        with torch.no_grad():
+                            _ap = list(adapter_optimizer_params(self._model))
+                            _sq = torch.zeros((), device=self._device, dtype=torch.float32)
+                            for _p in _ap:
+                                _sq += _p.detach().float().pow(2).sum()
+                            _adapter_norm_after = float(_sq.sqrt().item())
+                        log.info(
+                            "VALMET step=%d adapter_l2_before=%.6e adapter_l2_after=%.6e delta=%.6e",
+                            self._steps_run,
+                            _adapter_norm_before,
+                            _adapter_norm_after,
+                            _adapter_norm_after - _adapter_norm_before,
+                        )
 
                     # LoRA publish: Phase A (sync FSDP gather, all ranks),
                     # Phase B (async IO + rsync + HTTP, rank 0 background thread)
