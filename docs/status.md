@@ -1,6 +1,6 @@
 # Project Status — Aurora RL (torchtune XPU)
 
-Last updated: 2026-05-01 (**BioReason 2-node 200-step stability proof — 200/200 steps clean, exit=0, ~53s/step, resv=58.17 GiB FLAT for ~173 min** on the post-refactor recipe + IPEX varlen + XCCL `node_fanout`. The engine works; the algorithm does not yet learn — reward statistically flat across all four quarters, 7/200 grad-norm spikes (4 immediately follow `group_std=0` batches), `clip_grad_norm: 1.0` keeps the run stable. See `docs/reports/bioreason_4b_200step_stability_20260501.md` and `memory/project_bioreason_200step_baseline.md` for tuning levers. Earlier: BioReason 2-node XCCL wsync end-to-end VALIDATED — backbone-prefix bug fixed in `_sync_weights_to_vllm_xccl`; `WSYNC_TOPOLOGY=node_fanout` real 2-hop validated 10/10 clean at G=4 and 5/5 clean at G=8 + IPEX varlen on hold 8462930)
+Last updated: 2026-05-02 (**EP=8 FULL CHAIN AUTOMATED** — WS11 banned:1 PDE root cause: CCL_ZE_CACHE=65536 caches stale IPC handles after free_unsharded_param() between chunks; fix: threshold=0. Unified sequencer (monitor blgah6auj) auto-submits: WS12 validation after LoRA v5 completes, WS13 capacity (40 steps, TRAIN_TIMEOUT=13200s) after WS12 passes, LoRA v6→v7 in parallel. hold_qwen3_ep8_v10f.sh timeout fix applied (TRAIN_TIMEOUT env var). **LoRA gene_recall v2 RUNNING** (job 8465533, step ~14-16, mean reward 0.25-0.45 — learning confirmed). Earlier: **WS10 CRASHED** — generation confirmed working (reward_mean=0.5065 success=0.75), crash in grpo_step scatter_add with MAX_GEN=1024 sequences (~1474 tok) exceeding L0 command queue capacity. **EP=8 WS9 12-step COMPLETE** — 3 root causes found. Earlier: **EP=8 WS9 12-step COMPLETE** — 3 root causes found; WS8.7 PASSED — `fsdp_cpu_offload=True` + CPUOffloadPolicy + ZeRO-3 fixes chunk[1:2] OOM (PRE-fwd[1:2] 34.38→20.15 GiB); step=0 TIMING=195.8s 2× faster than WS6/WS7 due to opt 202s→28.8s; F1=0.4310 at init; WS9 12-step run submitted (job 8465417). Also: **Dense Qwen3-8B varlen+maskfree validated — `TORCHTUNE_USE_IPEX_VARLEN=1 + TORCHTUNE_MASKFREE_CAUSAL=1` delivers 32–45% grpo_step speedup at G=4, 41–57% at G=8; −2 to −4 GiB/tile reserved; 5-step memory stable at 60.5 GiB (within 64 GiB limit). Previous "no benefit" verdict was wrong — it measured backward-only. The speedup is in the policy forward. See `docs/reports/varlen_maskfree_dense_qwen3_20260502.md`. Next: test on 32B. Earlier: BioReason 2-node 200-step stability proof — 200/200 steps clean, exit=0, ~53s/step, resv=58.17 GiB FLAT**)
 
 This document synthesizes the current state of the vLLM weight sync implementation,
 active training runs, open issues, and prioritized next steps. It is a living companion
@@ -24,6 +24,7 @@ to `docs/features/vllm_weight_sync.md`, `docs/features/moe_integration.md`, and 
     - **XCCL weight sync end-to-end validated (NEW 2026-04-30, hold 8462930)**: Two fixes shipped together. (1) `_sync_weights_to_vllm_xccl` (FSDP1 ~line 1453, FSDP2 ~line 1671) was missing the `backbone.` prefix strip that the `raw_bytes` path already had (`_accept_and_rename` at line 995). vLLM crashed `load_weights` with `ValueError: There is no module or parameter named 'backbone' in Qwen3ForCausalLM`; train ranks then hung in `optimizer.step()` waiting on the bg gloo broadcast that the dead vLLM workers would never complete. Originally misattributed to v8 SSH-parent-death; the launcher hardening was correct but addressed a different failure mode. Fix: `_xccl_accept_and_rename` helper, applied at both gather sites, default-safe (only triggers when `_is_bioreason`). (2) `WSYNC_TOPOLOGY=node_fanout` (real 2-hop: 1 cross PG total + 1 intra PG of size `num_replicas*tp_size`) validated as drop-in alternative to legacy `replica_fanout` — cuts cross-node traffic 12× for DP=12. Validation matrix on hold 8462930: A (replica_fanout, NSTEPS=2) 2/2 clean; B (node_fanout, NSTEPS=2) 2/2 clean; C (node_fanout, NSTEPS=10) **10/10 clean, 37s/step steady-state**, KL stable 0.0016-0.0035; D (node_fanout + IPEX varlen, G=8 NSTEPS=5) **5/5 clean, ~49s/step, 1.32× wall for 2× rollout vs G=4, no OOM, no banned:1**. XCCL communicator init ~30ms in all three. See `docs/reports/bioreason_xccl_2hop_validated_20260430.md` and `docs/features/vllm_weight_sync.md` (bug #20 + topology env-var table).
     - **`force_math_sdpa` is a no-op on XPU (NEW 2026-04-30)**: The config flag in `grpo_full_finetune_distributed_xpu.py:307-311` calls `torch.backends.cuda.enable_flash_sdp(False)` which only affects the CUDA dispatcher, not the XPU SDPA path. Validated micro-bench: identical timing AND identical peak memory regardless of the flag. Don't vary it expecting behavioral change on XPU. See `memory/feedback_force_math_sdpa_xpu_noop.md`.
     - **200-step stability proof (NEW 2026-05-01, capacity batch)**: `experiments/bioreason/batch_bioreason_2node.sh` (self-terminating PBS wrapper around `run_bioreason_2node_server.sh`) submitted to `capacity` with NSTEPS=200, G=8, fbs=8, IPEX varlen, XCCL `node_fanout`. **200/200 steps clean, exit=0** in ~173 min (mean **53.58s/step**, median 53.00s, range 44–61s). Memory plateau **FLAT** for the entire run: `resv=58.17 GiB` / `alloc=13.34 GiB` from step 2 through step 199. Sane-step (193/200) means: `grad_norm=3.64`, `kl_loss=0.0032`, `ratios=1.0000` throughout. **Engine validated; learning is not happening yet** — reward statistically flat across all four quarters (`nonzero_rew` 0.34→0.40→0.32→0.40, `mean_tp` 0.57→0.76→0.51→0.60), `resp_len` pinned at 1024 cap (82–87% truncation). 7/200 (3.5%) grad-norm spikes; **4 of them immediately follow a step with `group_std=0`** (degenerate GRPO advantage from zero-variance reward batch); `clip_grad_norm: 1.0` keeps the actual update bounded so recovery is universal. Tuning levers identified: skip optimizer step when `group_std==0`, bump LR (1e-6 too small for sparse GO-term reward), raise `max_generated_tokens` past 1024, lower `kl_coeff` from 0.01 (a 1e3 KL spike currently dominates loss). Spike count is now part of the smoke test — any algorithm change regressing >10/200 should be reverted. See `docs/reports/bioreason_4b_200step_stability_20260501.md` and `memory/project_bioreason_200step_baseline.md`.
+- **Dense Qwen3 GRPO varlen+maskfree (UPDATED 2026-05-02)**: `TORCHTUNE_USE_IPEX_VARLEN=1 + TORCHTUNE_MASKFREE_CAUSAL=1` validated on Qwen3-8B 10-tile colocate (ZeRO-3). The maskfree flag suppresses the explicit causal mask that dense Qwen3 recipes build in `generate_trajectory()`, so `mask=None` reaches attention layers and varlen can engage. **Previous "no benefit" verdict (2026-05-01) was wrong** — it measured backward-chunk timing only; the speedup is in the policy **forward** pass. Validated results: G=4: step 0 = no gain (IPEX JIT compile, one-time), step 1+ = **32% faster wall-clock, grpo_step 45% faster, −2.06 GiB/tile reserved**. G=8: step 1+ = **41% faster wall-clock, grpo_step 57% faster, −4.28 GiB/tile**. 5-step stability (G=4): memory stabilizes at 60.5 GiB/tile FLAT from step 3, within 64 GiB limit. ratios=1.0000 (bit-exact). Speedup and memory savings **scale with G** (more sequences = more mask allocations eliminated). Long-gen config (`max_model_len=1024, max_gen=600`) crashes with banned:1 PDE on all nodes — vLLM block allocator XPU bug; safe envelope is default `max_model_len=512/max_gen=256`. New test coverage: `tests/torchtune/dev/rl/test_varlen_{guard_and_logging,buffer_cache,maskfree_parity}.py`. See `docs/reports/varlen_maskfree_dense_qwen3_20260502.md`. **32B dedicated-vLLM result (2026-05-02): NO speedup** — grpo_step flat at ~8s in both legs (19s wall-clock), PRE-STEP reserved −0.18 GiB only. Root cause: 32B cross-node FSDP is communication-dominated (64 layers × AllGather+ReduceScatter at 2.5 GB/s XCCL); attention-level savings swamped. varlen engages correctly (bit-exact, exit=0) but provides no benefit. Do not add `TORCHTUNE_MASKFREE_CAUSAL=1` to 32B production runs expecting speedup. See `docs/reports/varlen_32b_dedicated_20260502.md`. **Architectural boundary**: varlen helps when attention is dominant (single-node XeLink, small/mid models); not when cross-node AllGather dominates (2.5 GB/s XCCL, large models).
 - **Async GRPO**: **PAUSED 2026-04-30**, infrastructure complete and validated. Resume after sync production runs and other baselines are hardened. Status:
   - Phase 1 (server-mode, RolloutProducer overlap) validated on Qwen2.5-3B; 50-step k=1 convergence run clean.
   - Phase 2 dedicated-rank (Steps 1+3+4): Qwen2.5-3B 1-node 20/20 clean, ratios in [0.9998, 1.0014]. Step 5 32B 2-node sync smoke validated (5/5 clean, ~241s/step on baseline pair: gen 77s + grpo 110s + wsync 42s).
@@ -762,6 +763,212 @@ Full writeup: `docs/reports/qwen3_ep_v10_20260430.md`. Memories:
 Launchers: `experiments/ep_parallelism/hold_qwen3_ep8_v10{a,b,b2,c,d,e,f}.sh`.
 Underlying recipe: `recipes/dev/run_qwen3_30b_ep8_vllm_2node.sh`.
 
+## Qwen3-30B-A3B EP=8 XCCL Weight Sync Status (2026-05-02)
+
+WS progression: WS3 (deferred hang) → WS4 (sync mode works) → WS5 (tensors_meta bug) → **WS6 FULLY VALIDATED** → **WS7 FULLY VALIDATED (4-step, rc=0, job 8465287)** → **WS8 FAILED (2 issues)** → **WS8.5 FAILED (banned:1 PDE at chunk[1:2])** → **WS8.6 FAILED (same PDE — varlen not root cause)** → **WS8.7 PASSED (fsdp_cpu_offload=True + ZeRO-3 fixes OOM, job 8465400, rc=0)** → **WS9 12-step COMPLETE (job 8465417, 3 root causes found: policy_loss=0, resp_len=511, kl_loss explosion)** → **WS10 CRASHED** (job 8465458, UR:40 at scatter_add in _token_combine — MAX_GEN=1024 sequences too long for L0 command queue; generation succeeded, reward_mean=0.5065 success=0.75 confirmed) → **WS11 CRASHED** (job 8465485, MAX_GEN=768 fix — but new crash: banned:1 PDE at chunk[1:2] fwd, different from WS10 UR:40) → **WS12 QUEUED** (CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD=0 fix).
+
+| WS    | Date       | Config                        | Result                          |
+|-------|------------|-------------------------------|-------------------------------|
+| WS3   | 2026-05-01 | deferred=true                 | step 0 ok, step 1 hangs (dp_shard contention) |
+| WS4   | 2026-05-01 | deferred=false (inline wsync) | accept probe rc=0, step 0 loss=0.0736 |
+| WS5   | 2026-05-02 | same as WS4                   | XCCL recv hang at batch 99 (tensors_meta=966 vs 531) |
+| WS6   | 2026-05-02 | tensors_meta fix              | **FULLY PASSED** (1 PROBE + 3 MEASUREMENT, all rc=0, n_expert_ready=1 every batch, memory FLAT) |
+| WS7   | 2026-05-02 | 1 PROBE + 4 MEASUREMENT steps | **FULLY PASSED** (1P+4M, all rc=0, n_expert_ready=1 every batch, memory FLAT, timing 395-396s/step stable) |
+| WS8   | 2026-05-02 | 1 PROBE + 5 MEASUREMENT steps | **FAILED** (job 8465300, 2 issues — see WS8 section) |
+| WS8.5 | 2026-05-02 | NSTEPS=1, MAX_GEN=512         | **FAILED** (job 8465315, banned:1 PDE at chunk[1:2] fwd; F1=0.4310 confirmed before crash) |
+| WS8.6 | 2026-05-02 | NSTEPS=1, MAX_GEN=512, varlen fix | **FAILED** (job 8465328, same banned:1 PDE — varlen NOT root cause; true cause = OOM) |
+| WS8.7 | 2026-05-02 | NSTEPS=1, MAX_GEN=512, fsdp_cpu_offload=True | **PASSED** (job 8465400, rc=0, TIMING step=0 total=195.8s, F1=0.4310, PRE-fwd[1:2]=20.15 GiB < 64 GiB) |
+| WS9   | 2026-05-02 | 12-step capacity (MAX_GEN=512, debug-scaling) | **COMPLETE** (job 8465417, rc=0, 12 steps, ~186s/step) — 3 root causes found: policy_loss=0, resp_len=511, kl_loss explosion |
+| WS10  | 2026-05-02 | 12-step + reward fix + MAX_GEN=1024 + loss.kl_coeff=0.001 | **CRASHED** (job 8465458, UR:40 at scatter_add — seq too long for L0; gen OK: reward_mean=0.5065 success=0.75) |
+| WS11  | 2026-05-02 | WS10 + MAX_GEN=768 (UR:40 fix: reduce seq len in scatter_add) | **CRASHED** (job 8465485, banned:1 PDE at chunk[1:2] fwd — NOT UR:40; new root cause identified) |
+| WS12  | 2026-05-02 | WS11 + CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD=0 (IPC handle stale fix) | **QUEUED** (auto-submit after LoRA chain v5) |
+
+### WS6 PROBE + MEASUREMENT metrics (job 8465267, 2026-05-02, rc=0):
+- PROBE step=0: TIMING total=423.5s gen=6.7s grpo=181.4s opt=202.1s other=33.2s
+- MEASUREMENT step=0: TIMING total=422.1s gen=6.6s grpo=179.8s opt=202.0s other=33.5s
+- MEASUREMENT step=1: TIMING total=396.2s gen=4.4s grpo=177.5s opt=181.2s other=32.9s
+- MEASUREMENT step=2: TIMING total=396.7s gen=4.5s grpo=178.0s opt=181.3s other=32.9s
+- Memory FLAT across all 4 steps: allocated=15.73-17.00 GiB, reserved=47-52 GiB ✓
+- n_expert_ready=1 on ALL diagnostic batches (9,19,...,89 of 99) for steps 0+1 ✓
+  - WS5 had n_expert_ready=0 for ALL batches; tensors_meta fix is working correctly
+- "Probe rc=0 Measurement rc=0" in PBS output ✓; train_wall=1337s
+- varlen=engaged on all 8 ranks ✓
+- WSYNC-RECV diagnostics go to `/tmp/torchtune/vllm_qwen3_30b_replica_N.log` on VLLM_NODE (NOT in training tee log)
+
+### WS7 PROBE+MEASUREMENT metrics (job 8465287, 2026-05-02, FULLY VALIDATED):
+- PROBE step=0: TIMING total=420.6s gen=6.2s grpo=179.2s opt=202.2s other=33.0s ✓
+- MEASUREMENT step=0: TIMING total=423.5s gen=7.2s grpo=180.4s opt=202.1s other=33.7s ✓
+- MEASUREMENT step=1: TIMING total=395.7s gen=4.7s grpo=176.6s opt=181.1s other=33.4s ✓
+- MEASUREMENT step=2: TIMING total=396.1s gen=4.6s grpo=177.3s opt=181.2s other=32.9s ✓
+- MEASUREMENT step=3: TIMING total=396.2s gen=4.6s grpo=177.5s opt=181.2s other=32.8s ✓ (steps 1/2/3 within 0.5s)
+- Memory FLAT ALL 4 steps: allocated=15.73-17.00 GiB, reserved=47-52 GiB ✓
+- n_expert_ready=1 on ALL TP workers (TP0/1/2/3), ALL diagnostic batches, ALL 4 steps ✓
+  - WSYNC-RECV done 99/99 batches: total_recv=24.3s (step 0), 23.7s (steps 1-3) ✓
+- varlen=engaged on all 8 ranks ✓
+- "Probe rc=0 Measurement rc=0" in PBS output ✓
+- WS8 submitted: `experiments/ep_parallelism/submit_qwen3_ep8_ws8.sh` (job 8465300, 1P+5M, MAX_GEN=128 for gene_recall signal)
+
+### WS8 FAILURE (job 8465300, 2026-05-02):
+
+**Failure 1: MAX_GEN=128 too short for gene_recall**
+- Qwen3-30B-A3B is a reasoning model; it uses ALL 128 tokens on chain-of-thought ("Okay, let's tackle this problem...") before outputting gene names.
+- Gene_recall prompts ~870 tokens. Model needs ~400-600 tokens total (reasoning + "Gene symbols: TP53, BRCA1, ...").
+- `BATCH_REWARD step=0 n=32 reward_mean=0.0000` — all 32 trajectories F1=0 (no gene names extracted).
+- `_extract_genes` fallback regex `[A-Z][A-Z0-9]{1,9}` WOULD work IF model reached the "Gene symbols:" line.
+- **Fix**: Increase MAX_GEN to 512. 870+512=1382 < VLLM_MAX_MODEL_LEN=2048 (no truncation). Shipped in `submit_qwen3_ep8_ws8p5.sh` and `submit_qwen3_ep8_capacity_50step.sh`.
+
+**Failure 2: XCCL wsync hang after communicator init (x4311 chassis nodes)**
+- After `_init_xccl_weight_sync()` completed ("XCCL weight sync communicator ready" at 13:22:42 UTC), all 8 training processes hung in `i915_gem_wait_user_fence_ioctl` (GPU fence wait).
+- vLLM replicas received `init_xccl_communicator` (200 OK) but NEVER received `receive_weights_xccl` HTTP call.
+- Root cause: `ProcessGroupXCCL` constructor (called only on rank 0) may leave pending GPU ops on x4311 chassis hardware/firmware. The subsequent FSDP2 dp_shard AllGather (via `full_tensor()` on all 8 ranks) deadlocked.
+- WS7 on x4217 chassis was unaffected. Node-specific XCCL driver/firmware interaction.
+- **Fix**: Added `torch.xpu.synchronize()` after `_init_sender_pool()` returns in `_sync_weights_to_vllm_xccl` (first wsync call only). Flushes any pending GPU state from XCCL PG creation before starting FSDP2 gather.
+- Location: `torchtune/dev/rl/weight_sync.py` in `_sync_weights_to_vllm_xccl`.
+
+### WS8.5 FAILURE (job 8465315, 2026-05-02):
+
+**F1 confirmed (good news)**: `BATCH_REWARD step=0 n=32 reward_mean=0.4310 reward_std=0.0355` — F1=0.43 from untrained model with MAX_GEN=512. The `_extract_genes` fallback regex picks up gene symbols from reasoning text even before the "Gene symbols:" line.
+
+**Crash**: `Segmentation fault from GPU at 0xff000004a4074000, ctx_id: 1 (CCS) type: 0 (NotPresent), level: 1 (PDE), access: 1 (Write), banned: 1` at `grpo_step chunk[1:2] fwd` start.
+
+**Root cause**: `torch_ipex::varlen_fwd` has no registered autograd kernel. When called under `torch.is_grad_enabled()` (training forward with MASKFREE_CAUSAL=1 → mask=None), the backward uses PyTorch's autograd fallthrough which produces silently incorrect behavior and left corrupt GPU state. The FSDP2 AllGather at the start of chunk[1:2] accessed this corrupted state → banned:1 PDE abort.
+
+**Warning in output (was present, now explains crash)**:
+```
+UserWarning: torch_ipex::varlen_fwd: an autograd kernel was not registered to the Autograd key(s)
+but we are trying to backprop through it. This may lead to silently incorrect behavior.
+```
+
+**Fix** (`torchtune/modules/attention_utils.py`, 2026-05-02):
+- Added `and not torch.is_grad_enabled()` to the varlen branch condition in `_sdpa_call`
+- Training forward now uses standard PyTorch SDPA (correct gradients guaranteed)
+- No-grad paths (ref forward, rollout logprobs) still use IPEX varlen for speed
+- Log updated: grad-enabled case now says "varlen=no-grad-only (training fwd uses SDPA; ref/rollout use varlen)"
+- Test `test_engaged_xpu_mock` updated to `test_engaged_xpu_mock_no_grad` (with `torch.no_grad()`) + new `test_no_grad_only_xpu_mock_with_grad` test; 124/124 pass.
+
+**WS8.6 probe**: `experiments/ep_parallelism/submit_qwen3_ep8_ws8p6.sh` (NSTEPS=1, MAX_GEN=512, debug queue, job 8465328). Varlen fix is CORRECT for gradient safety but did NOT fix the crash.
+
+### WS8.6 FAILURE (job 8465328, 2026-05-02): TRUE ROOT CAUSE = OOM
+
+**Varlen fix works, OOM does not**. WS8.6 confirmed the varlen no-autograd fix was correctly applied: "varlen=engaged" appears for all 8 ranks on no-grad paths. But the crash is identical banned:1 PDE at chunk[1:2] forward — same address pattern, same timing. The PyTorch SDPA in training forward produces correct gradients but the OOM still fires.
+
+**Memory trace from WS8.6 output**:
+```
+PRE-train-fwd[0:1] alloc=17.38 GiB, resv=26.40 GiB   (ZeRO-2 params + tiny activation residuals)
+POST-train-fwd[0:1] alloc=55.84 GiB, resv=61.52 GiB  (peak during chunk[0:1] fwd)
+pre-bwd (no empty_cache): alloc=55.84 GiB, resv=61.52 GiB
+PRE-train-fwd[1:2] alloc=34.38 GiB, resv=54.20 GiB   (after chunk[0:1] bwd + EP grad release)
+→ Segmentation fault from GPU at 0xff... banned:1 PDE                          (chunk[1:2] fwd OOM)
+```
+
+**Root cause analysis**:
+- ZeRO-2 (`reshard_after_forward=False`) keeps all 9.39 GiB of expert+non-expert params on GPU throughout forward.
+- WS6/WS7 succeeded at MAX_GEN=32 (seqlen≈902 tokens): fwd activation delta ≈ 25 GiB → peak 34 GiB + 25 = ~59 GiB < 64 GiB ✓
+- MAX_GEN=512 (seqlen≈1382 tokens): fwd activation delta ≈ 38.46 GiB → 34.38 + 38.46 = **72.84 GiB > 64 GiB** ✗
+- The extra 17 GiB between PRE-fwd[0:1]=17.38 GiB and PRE-fwd[1:2]=34.38 GiB is accumulated grad tensors from chunk[0:1] backward + EP grad release. These stay on GPU (correct — they're needed for optimizer step).
+- The 38.46 GiB delta during chunk[1:2] fwd is FSDP2 ZeRO-2 unshard buffers + layer activations. With 48 layers, even a few alloc/free cycles across layers accumulate to this delta.
+
+**Fix (WS8.7)**: `fsdp_cpu_offload=True` + `reshard_after_forward=True` for 2-node EP=8:
+- Expert solo FSDP2 (1-rank): `reshard_after_forward=fsdp_cpu_offload` → expert params (7.26 GiB) return to CPU after each layer
+- Policy non-expert FSDP2 (dp_replicate=1): use ZeRO-3 (safe: 1-rank dp_replicate is a no-op all-gather, no XCCL → no OFI conflict)
+- **Predicted PRE-fwd[1:2]**: ~17 GiB (only grad tensors; params on CPU between chunks)
+- **Predicted chunk[1:2] fwd delta**: ~1-2 GiB (one layer's params loaded at a time + activations)
+- **Predicted peak**: ~20 GiB << 64 GiB ✓
+- Recipe changes: `grpo_full_finetune_distributed_xpu.py` lines ~1426-1429 (expert solo raf=fsdp_cpu_offload) and ~1538-1558 (policy non-expert raf=True when dp_replicate=1 AND fsdp_cpu_offload=True)
+
+**WS8.7 probe**: `experiments/ep_parallelism/submit_qwen3_ep8_ws8p7.sh` (NSTEPS=1, MAX_GEN=512, debug queue, job 8465400, fsdp_cpu_offload=true). **PASSED** — see WS8.7 metrics section below.
+
+### WS8.7 PASSED (job 8465400, 2026-05-02, rc=0):
+
+**Fix validated**: `fsdp_cpu_offload=True` + `CPUOffloadPolicy` + `ZeRO-3` (dp_replicate=1) eliminates chunk[1:2] OOM.
+
+**Memory profile** (rank 0, step 0, 4 chunks):
+```
+PRE-train-fwd[0:1]  alloc=10.27 GiB  (vs 17.38 GiB WS8.6: −7.11 GiB from CPU-offloaded params) ✓
+POST-train-fwd[0:1] alloc=41.97 GiB  (vs 55.84 GiB WS8.6: −13.87 GiB from per-layer ZeRO-3 load) ✓
+PRE-train-fwd[1:2]  alloc=20.15 GiB  (vs 34.38 GiB WS8.6 → OOM: now SAFE, 44 GiB margin) ✓
+POST-train-fwd[1:2] alloc=41.95 GiB  (previously OOM/crash, now COMPLETES) ✓
+PRE-train-fwd flat across chunks 1-4: 20.15 GiB constant ✓
+```
+
+**Timing (TIMING step=0)**:
+- total=195.8s | gen=32.9s | grpo=96.6s | clip=3.8s | opt=28.8s | other=33.8s
+- **2× faster than WS6/WS7** (422s/step → 195.8s) due to:
+  - CPUOffloadPolicy eliminates AdamWBf16 D2H/H2D copies: opt 202s → 28.8s
+  - MAX_GEN=512 adds 26s gen vs MAX_GEN=32 (negligible vs opt savings)
+
+**F1 reward**: `BATCH_REWARD step=0 n=32 reward_mean=0.4310 reward_std=0.0355`
+
+**Key validations**:
+- CPUOffloadPolicy + reduce_grads=False compatible: _ep_release found groups=97 across all 4 chunks ✓
+- ZeRO-3 safe for dp_replicate=1: 1-rank all-gather is no-op, no OFI/XCCL conflict ✓
+- n_expert_ready=1 on all batches (wsync working) ✓
+- varlen=engaged on no-grad paths for all 8 ranks ✓
+
+### WS9 12-step run (job 8465417, 2026-05-02):
+
+**Root causes found — GRPO is not learning in WS9:**
+1. `policy_loss=0.0000` every step: `_extract_genes` (full-text scan) gives all G=4 completions of the same query near-identical F1 → zero within-group variance → GRPO advantage ≈ 0 → no policy gradient.
+2. `resp_len=511.0` every step: MAX_GEN=512 → all sequences hit max length during chain-of-thought reasoning, never reaching the formal "Gene symbols:" line. The reasoning chain fills the context.
+3. `kl_loss` explosion (89→120→44→327→1288): precision artifact from different chunking (ref: fwd_bs=1, policy: fwd_bs=2 per chunk in GRPOSimpleLoss) causing BF16 numerical differences. With `kl_coeff=0.01`, KL dominated the entire gradient (policy_loss=0 provided no signal). grad_norm up to 2117 (all clipped to 1.0 so damage limited, but direction is wrong).
+4. F1 oscillation (0.18→0.21→0.28→0.41→0.37→0.46→0.48→0.41→...): dataset batch difficulty variance (different queries per step), not model improvement or degradation. Trend: KL gradient pulled model toward ref distribution → F1 recovered to ~0.40 (SFT baseline level) after initial dip.
+
+**WS9 data (all 12 steps completed):**
+| Step | F1    | std   | success | METRICS kl_loss | policy_loss |
+|------|-------|-------|---------|-----------------|-------------|
+| 0    | 0.4310| 0.0355| 0.00    | —               | —           |
+| 1    | 0.1759| 0.0312| 0.00    | 89.9            | 0.0         |
+| 2    | 0.2096| 0.0738| 0.00    | 120.4           | 0.0         |
+| 3    | 0.2846| 0.0059| 0.00    | 43.8            | 0.0         |
+| 4    | 0.4111| 0.0192| 0.00    | 326.9           | 0.0         |
+| 5    | 0.3694| 0.0529| 0.00    | 235.2           | 0.0         |
+| 6    | 0.4576| 0.0559| 0.50    | 25.4            | 0.0         |
+| 7    | 0.4808| 0.1633| 0.50    | 26.5            | 0.0         |
+| 8    | 0.4083| 0.1210| 0.25    | 1287.7          | -0.0        |
+| 9    | 0.4738| 0.1120| 0.25    | 34.2            | -0.0        |
+| 10   | 0.2663| 0.0651| 0.00    | 17.7            | -0.0        |
+| 11   | 0.4917| 0.0319| 0.25    | 439.2           | 0.0         |
+
+Note: TIMING step=11 not captured (banned:1 PDE crash after step 11's generation — teardown crash; all 12 training steps completed). Checkpoints at step 6 saved.
+
+**Fixes applied for WS10** (submit_qwen3_ep8_ws10.sh):
+1. `_extract_genes` now parses "Gene symbols:" line specifically → within-group F1 variance (note: key fix is MAX_GEN=1024 enabling `<genes>` tag completion per `_GENES_TAG_RE` priority 1)
+2. `MAX_GEN=1024, tokenizer.max_seq_len=2048, dataset.max_seq_len=2048` → room for reasoning (~600 tokens) + `<genes>TP53, BRCA1, MYC</genes>` tag; VLLM_MAX_MODEL_LEN=2048 hardcoded, recipe truncates prompts to 2048-1024=1024 tokens if needed
+3. `loss.kl_coeff=0.001` (10× lower) → precision-artifact KL less dominant; GRPO signal can take over
+
+**WS10 result** (job 8465458, 2026-05-02): CRASHED. Generation succeeded — BATCH_REWARD step=0: reward_mean=0.5065 reward_std=0.0193 success=0.75. Then grpo_step policy forward crashed:
+```
+RuntimeError: level_zero backend failed with error: 40 (UR_RESULT_ERROR_OUT_OF_RESOURCES)
+at _parallelism.py:731: partial_out.scatter_add(0, idx_exp, routed_output)
+```
+Root cause: With MAX_GEN=1024, each completion has ~1474 tokens (prompt~450 + resp~1024). FBS=1 → 1 completion per forward chunk. The scatter_add tensor (ep_degree*s_local, d_model) = (8*~184, 4096) for T=1474 hits L0 command queue limit. WS9 at T~962 (MAX_GEN=512) was safe.
+
+Note: AC is ALREADY enabled in the YAML (enable_activation_checkpointing: True, line 138). Not the fix.
+
+**WS11 fix** (MAX_GEN=768): prompt~450 + resp~768 = ~1218 tokens/completion. Between WS9 safe (962) and WS10 crash (1474). 768 tokens still gives room for `<genes>` tag: ~400 reasoning + ~50 tag ≈ 450 tokens minimum needed.
+
+**WS11 RESULT — CRASHED (new banned:1 PDE, different root cause than WS10)**
+
+WS11 (job 8465485, MAX_GEN=768, 2026-05-02) fixed the UR:40 scatter_add crash from WS10 but introduced a NEW crash: `banned:1 PDE` at grpo_step `chunk[1:2] fwd`. This is NOT the same as the WS8.5/WS8.6 banned:1 (which was activation OOM). 
+
+Root cause analysis:
+- WS11 ran chunk[0:1] cleanly: BATCH_REWARD step=0 reward_mean=0.5020 success=0.75, chunk[0:1] bwd completed (all ranks 46.6-76.9s), EP grad release (gloo CPU-bounce, 19.79-49.89s).
+- Crash at chunk[1:2] fwd START with `banned:1 PDE` at address 0xff010002e27f3000.
+- Key insight: `_ep_release_fsdp_unsharded_grads()` calls `free_unsharded_param()` between chunks. This releases the backbone FSDP2 AllGather output buffers (unsharded params). 
+- With `CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD=65536` (in `run_qwen3_30b_ep8_vllm_2node.sh`), CCL caches IPC handles for those freed VAs indefinitely.
+- When chunk[1:2] fwd starts, FSDP2 re-AllGathers the backbone. The allocator may recycle the freed VAs for new tensors. CCL then accesses the new allocation via the stale IPC handle → banned:1 PDE.
+- WS9 (MAX_GEN=512) worked because smaller sequences → less allocator pressure → VAs not recycled between chunks. WS11 (MAX_GEN=768) has larger activations → more allocator pressure → VAs recycled → stale handles.
+
+**WS12 fix**: `CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD=0` (no IPC handle caching). With threshold=0, handles are closed immediately after each AllGather; no stale handles can exist when VAs are recycled. `run_qwen3_30b_ep8_vllm_2node.sh` line 44 made conditional: `${CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD:-65536}`. WS12 sets 0 before calling the run script.
+
+### tensors_meta fix (weight_sync.py line 1801):
+```python
+if not _is_moe:
+    tensors_meta.append({"name": hf_name, "shape": ..., "numel": ...})
+```
+Before fix: non-expert MoE params added in main loop (wrong) AND after fuse_experts_for_vllm (correct) → 966 duplicate entries → receiver expects 100 batches but sender sends 99 → XCCL recv hangs.
+After fix: tensors_meta=531=cpu_batches=n_params → 99 batches → no hang.
+
 ---
 
 ## Prioritized Next Steps
@@ -787,14 +994,39 @@ Underlying recipe: `recipes/dev/run_qwen3_30b_ep8_vllm_2node.sh`.
 - **Next**: Validate DP>1 per-replica PGs (VLLM_DP=3); long production run (50+ steps)
 - Script: `experiments/multinode_32b/run_32b_3node_24way.sh`
 
-**4. Qwen3-30B-A3B EP=4 — unblock G≥2 / NSTEPS≥2 (CODE CHANGE) (NEW 2026-04-30)**
+**4. Qwen3-8B LoRA-GRPO 50-step capacity run (Phase 8, 2026-05-02)**
+- `FSDP(ignored_states=lora_adapter_params)` fix eliminates UR:40/banned:1 (validated Phase 1-7)
+- Phase 7 (job 8465243): 12 steps clean, reserved FLAT 57.30 GiB, rewards 5.78-9.38
+- Phase 8a (job 8465279): **COMPLETE (exit=0)**, steps 12-23, reserved FLAT 57.30 GiB, rewards mean~8.0 (noisy, high GSM8K success 50-97%)
+- Phase 8b (job 8465292): **COMPLETE (exit=0)**, steps 24-35, reserved FLAT 57.30 GiB, rewards mean 7.5-9.8 (mean~8.6 avg), 75-97% success
+- Phase 8c (job 8465303): **COMPLETE (exit=0 at 14:11 UTC)**, steps 36-47, rewards 5.0-9.8 (natural batch variance, mean 7-10), reserved FLAT 57.30 GiB, checkpoint at steps_run=48
+- Phase 8d (job 8465319): **COMPLETE (exit=0 at 15:03 UTC)**, steps 48-61 (14 steps, FINAL), rewards mean~8.7 (5.94-10.0, step 49 peak=10.0/1.00 success), reserved FLAT 57.30 GiB
+- **62-step capacity run COMPLETE** — all phases exit=0, memory FLAT 57.30 GiB throughout
+- Recipe: `recipes/dev/lora_grpo_full_finetune_distributed_xpu.py`; Launcher: `experiments/lora_grpo/run_qwen3_4b_lora_2node.sh`
+- **GSM8K SATURATED**: reward=8.59 at step 0 → 8.73 avg at steps 48-61; model was already ≥70% accurate at SFT init. No clear learning signal — reward variance (2-4.5) larger than trend.
+- **LoRA gene_recall v1 COMPLETE** (job 8465476, 2026-05-02, killed at walltime after step ~10):
+  - Step timing: 242-250s/step (gen=191-198s, grpo=33-35s). gen dominated by 4 sequential vLLM calls × 42s each = 168s.
+  - **GRPO gradient signal confirmed**: loss steps 1-8: -0.0005→-0.0038→+0.0013→+0.0114→+0.0027→+0.0032→+0.0022→+0.0067 (oscillating around zero, trending positive = model learning)
+  - **Memory FLAT**: reserved=48.27 GiB from step 1 through step 8; active 37.5-39.4 GiB; 15 GiB headroom (SAFE)
+  - KL stable: 0.016-0.018 throughout (kl_coeff=0.001 keeps contribution negligible)
+  - Reward per-step avg: 0.126→0.446→0.161→0.476→0.230→0.374→0.225→0.213 (high variance from query difficulty; needs 50+ steps to see trend)
+  - Best group: JAK-STAT at step 3 mean=0.819 F1; "!!" format yields F1>0 via `_GENE_SYMBOLS_LINE_RE` fallback
+  - Checkpoint saved at epoch_0/adapter_model.safetensors (step 6, steps_run=6, 174 MiB)
+  - **v2 AUTO-SUBMITTED** (job 8465533, queued 18:09:23 UTC) — auto-submit fired when WS11 started running
+- **LoRA gene_recall CHAIN**: v1 (steps 1-6 checkpoint) → v2 (job 8465533, Q) → v3 → v4 → v5 (each debug-scaling 1h job adds 10 steps; ~57 min total per run)
+  - Scripts prepared: v2_dbg through v5_dbg; chain auto-submit monitors armed for v3, v4, v5
+  - NSTEPS computed dynamically from recipe_state.pt steps_run + 10 (fits in 1h)
+- Config: `recipes/configs/dev/production/qwen3_8b_lora_grpo_gene_recall_xpu.yaml`; Launcher: `experiments/lora_grpo/submit_lora_8b_gene_recall_v2_dbg.sh`
+- **Key limitation**: ModCon project only has access to debug-scaling (1h walltime). Chaining 10-step jobs; need ~5 chains for 50-step capacity run.
+
+**5. Qwen3-30B-A3B EP=4 — unblock G≥2 / NSTEPS≥2 (CODE CHANGE) (NEW 2026-04-30)**
 - v8 series reached first `loss=` line (G=1/fbs=1/NSTEPS=1) but is not yet trainable: G≥2 needed for advantage variance, NSTEPS≥2 needed to actually train.
 - Both blocked by v59's `reduce_grads=False` keeping ~18.5 GiB FSDP2 unsharded grads alive across chunk and step boundaries.
 - Concrete patch: in `recipes/dev/grpo_full_finetune_distributed_xpu.py`, add explicit `fully_shard`-aware reduce_scatter immediately after each chunk's bwd (~line 2945-2954) AND after the optimizer step (~line 3047, 3322), sequenced with the existing deferred dp_replicate all_reduce so grads aren't double-reduced.
 - Validation plan once landed: rerun v8m_b config (G=2 mg=16) and v8n config (NSTEPS=2) on a fresh 3-node hold; need PRE-STEP N alloc to drop back near params-only (~14 GiB) and chunk[1:2] PRE-FWD alloc to drop by ~18.5 GiB.
 - Full diagnosis: `docs/reports/qwen3_ep_v8_3node_20260430.md`. Memory: `project_qwen3_ep_v8_3node.md`.
 
-**5. Gemma4 31B gene recall — fix training stability first**
+**6. Gemma4 31B gene recall — fix training stability first**
 - Root cause 1: no SFT warm-up for `<genes>` format → add 5–10 SFT examples as prompt prefix, or cold-start with supervised fine-tuning on 20 examples
 - Root cause 2: max_generated_tokens=512 causes all responses to be truncated → reduce to 256, or better: fix EOS generation by adjusting stop tokens config
 - Root cause 3: lr too high for warm-up — step 2 grad_norm=3968 suggests initial lr is too aggressive; try linear warm-up over 20 steps
@@ -802,31 +1034,31 @@ Underlying recipe: `recipes/dev/run_qwen3_30b_ep8_vllm_2node.sh`.
 
 ### Tier 2: Infrastructure improvements
 
-**6. 3B gene recall: improve convergence**
+**7. 3B gene recall: improve convergence**
 - Current: 130 steps, noisy reward, peak 43.75% success, no monotonic improvement
 - Options: increase G (16→32), curriculum (easy genes first), SFT warm-up, longer runs (500+)
 - Checkpoints available in `outputs/gene_recall_production/ref/` for resume
 
-**7. 50-100 step 32B validation**
+**8. 50-100 step 32B validation**
 - 24 steps shows steady state; a longer run would confirm indefinite stability
 - Use `experiments/multinode_32b/run_32b_2hop_production.sh` with NSTEPS=100, longer walltime
 
-**8. ~~Single large memmove for 31B~~ (SUPERSEDED)**
+**9. ~~Single large memmove for 31B~~ (SUPERSEDED)**
 - 2-hop XCCL replaced SHM for 32B weight sync. SHM memmove optimization no longer on critical path.
 - SHM still used for 3B but sync is already hidden (1.4s waited). Low priority.
 
-**9. ~~Test XCCL broadcast as SHM replacement~~ (DONE)**
+**10. ~~Test XCCL broadcast as SHM replacement~~ (DONE)**
 - 2-hop XCCL is now the production weight sync method for 32B (9.1s sync, 7.9 GB/s).
 - Implemented in `vllm_weight_sync_worker.py` + recipe. SHM eliminated for 32B.
 
 ### Tier 3: Research / deferred
 
-**10. 1-step gather overlap** (reduce 31B waited from 13s to ~7s)
+**11. 1-step gather overlap** (reduce 31B waited from 13s to ~7s)
 - Restructure training loop to start gather immediately after optimizer step
 - Feed gathered weights to vLLM during GRPO forward of the SAME step
 - 1-step weight lag is standard in RL — no algorithmic concern
 
-**11. EP backward AllToAll resolution** (deferred)
+**12. EP backward AllToAll resolution** (deferred)
 - v133 (gloo all_reduce) result pending
 - If v133 fails: consider abandoning gloo entirely; pre-allocate fixed XPU buffers and use XCCL with static tensor shapes (avoids variable-shape AllToAll entirely)
 - Only pursue if EP at large batch sizes shows > 30% throughput improvement
