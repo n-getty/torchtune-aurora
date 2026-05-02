@@ -63,6 +63,10 @@ def _log_varlen_status_once(mask, is_causal: bool, dropout_p: float, device_type
         reasons.append(f"device={device_type}")
     if reasons:
         _log.info("varlen=requested-but-skipped (%s)", ", ".join(reasons))
+    elif torch.is_grad_enabled():
+        # Training forward: varlen has no autograd kernel; falls back to SDPA.
+        # No-grad paths (ref fwd, rollout logprobs) will use varlen.
+        _log.info("varlen=no-grad-only (training fwd uses SDPA; ref/rollout use varlen)")
     else:
         _log.info("varlen=engaged")
 
@@ -339,7 +343,12 @@ def _sdpa_or_flex_attention() -> Callable:
         dropout_p: float,
         is_causal: bool,
     ) -> torch.Tensor:
-        # IPEX varlen branch: only valid for causal-only, no mask, no dropout, on XPU.
+        # IPEX varlen branch: only valid for causal-only, no mask, no dropout, on XPU,
+        # and only for no-grad paths (ref fwd, rollout logprobs).
+        # torch_ipex::varlen_fwd has no registered autograd kernel; running it under
+        # torch.is_grad_enabled() uses PyTorch's autograd fallthrough which may produce
+        # silently incorrect gradients and has been observed to trigger banned:1 PDE GPU
+        # faults on Aurora (WS8.5, 2026-05-02). Training forward uses standard SDPA.
         _log_varlen_status_once(mask, is_causal, dropout_p, q.device.type)
         if (
             _USE_IPEX_VARLEN
@@ -348,6 +357,7 @@ def _sdpa_or_flex_attention() -> Callable:
             and is_causal
             and dropout_p == 0.0
             and q.device.type == "xpu"
+            and not torch.is_grad_enabled()
         ):
             return _ipex_varlen_call(q, k, v)
 

@@ -159,13 +159,25 @@ class TestVarlenLogStatus(unittest.TestCase):
             self._log(None, True, 0.0, "cpu")  # no-op: _VARLEN_LOG_DONE=True
         self.assertEqual(len(cm.records), 1, f"Expected 1 log, got {len(cm.records)}")
 
-    def test_engaged_xpu_mock(self):
-        """All conditions met on 'xpu' → 'varlen=engaged'."""
+    def test_engaged_xpu_mock_no_grad(self):
+        """All conditions met on 'xpu' in no-grad mode → 'varlen=engaged'."""
+        import torch
+        with mock.patch.object(au, '_USE_IPEX_VARLEN', True), \
+             mock.patch.object(au, '_ipex_varlen_attention', object()), \
+             self.assertLogs(level='INFO') as cm, \
+             torch.no_grad():
+            self._log(None, True, 0.0, "xpu")
+        self.assertIn("varlen=engaged", " ".join(cm.output))
+
+    def test_no_grad_only_xpu_mock_with_grad(self):
+        """All conditions met on 'xpu' but grad enabled → 'varlen=no-grad-only' (training fwd guard)."""
+        import torch
+        assert torch.is_grad_enabled(), "grad must be enabled for this test"
         with mock.patch.object(au, '_USE_IPEX_VARLEN', True), \
              mock.patch.object(au, '_ipex_varlen_attention', object()), \
              self.assertLogs(level='INFO') as cm:
             self._log(None, True, 0.0, "xpu")
-        self.assertIn("varlen=engaged", " ".join(cm.output))
+        self.assertIn("varlen=no-grad-only", " ".join(cm.output))
 
 
 if __name__ == "__main__":
