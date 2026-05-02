@@ -17,6 +17,7 @@
 
 import io
 import os
+import re
 import struct
 import threading
 import time
@@ -1436,6 +1437,12 @@ def _sync_weights_to_vllm_xccl(self) -> None:
     # Init sender pool on first call (ALL ranks participate)
     if not hasattr(self, '_wsync_pool_init_done'):
         self._init_sender_pool()
+        # Flush any GPU state from XCCL communicator init (ProcessGroupXCCL
+        # constructor may leave pending GPU ops on some hardware/firmware combos
+        # that deadlock the subsequent FSDP2 dp_shard AllGather). Observed on
+        # x4311 chassis nodes (WS8 job 8465300); WS7 nodes unaffected.
+        if self._device.type == "xpu" and torch.xpu.is_available():
+            torch.xpu.synchronize()
 
     # Determine active sender for this round
     pool = self._wsync_sender_pool
@@ -1645,6 +1652,7 @@ def _sync_weights_to_vllm_xccl(self) -> None:
             # CPU, build batches from CPU tensors. Keeps GPU peak at ~1 GiB
             # (one batch) instead of ~60 GiB (full model). Critical for 32B+
             # models where the full model exceeds single-tile 64 GiB capacity.
+            _ep_deg = getattr(self, '_expert_parallel_degree', 1)
             if is_active:
                 tensors_meta = []
                 cpu_batches: list = []
@@ -1653,6 +1661,11 @@ def _sync_weights_to_vllm_xccl(self) -> None:
                 if _is_moe:
                     hf_state_dict = {}
 
+                if _ep_deg > 1 and _is_moe:
+                    # Post EP all-gather, fused expert tensors are ep_degree× larger than
+                    # the pre-allocated pinned buffer (sized from local 16-expert shards).
+                    # Disable pinned buf for EP MoE to avoid overflow and flush-path mixing.
+                    _USE_PINNED_BUF = False
                 if not _USE_PINNED_BUF:
                     batch_parts_cpu: list = []
 
@@ -1688,6 +1701,16 @@ def _sync_weights_to_vllm_xccl(self) -> None:
                 _buf_offset = 0
                 _batch_start = 0
 
+            # EP expert streaming: all-gather EP-sharded slices across shard group,
+            # fuse per layer immediately to avoid accumulating 128-expert tensors on GPU.
+            # With ep_degree=8, each rank holds 16 experts; full model needs 128.
+            # Streaming fuse (gate+up+down → w13/w2 per layer) keeps GPU peak at ~1.4 GiB.
+            # _ep_deg already computed above (before pinned-buf allocation).
+            _ep_expert_re = re.compile(r"\.mlp\.experts\.(gate_proj|up_proj|down_proj)")
+            _ep_layer_re = re.compile(r"layers\.(\d+)\.")
+            if is_active and _ep_deg > 1 and _is_moe:
+                _ep_stream_buf: dict = {}  # layer_idx -> {proj -> bf16 tensor}
+
             for param_name, param in sharded_sd.items():
                 if param.is_cpu:
                     param = param.to(self._device)
@@ -1695,6 +1718,29 @@ def _sync_weights_to_vllm_xccl(self) -> None:
                     _ft0 = time.perf_counter()
                     param = param.full_tensor()
                     t_ft += time.perf_counter() - _ft0
+                # EP expert all-gather: each rank holds an interleaved slice of experts
+                # (rank r owns global experts r, r+ep_d, r+2*ep_d, …).  Gather all slices
+                # so the active sender has the full expert tensor.  Collective: all ranks
+                # participate regardless of is_active.
+                _ep_is_expert = False
+                if _ep_deg > 1 and _is_moe and getattr(self, '_shard_pg', None) is not None:
+                    _cpn = param_name.replace("_fsdp_wrapped_module.", "").replace(
+                        "_checkpoint_wrapped_module.", "")
+                    if _ep_expert_re.search(_cpn):
+                        _ep_is_expert = True
+                        _ep_local_t = param.to(self._device).contiguous()
+                        _ep_parts_t = [torch.empty_like(_ep_local_t) for _ in range(_ep_deg)]
+                        torch.distributed.all_gather(_ep_parts_t, _ep_local_t,
+                                                     group=self._shard_pg)
+                        if is_active:
+                            # Unshuffle interleaved → contiguous:
+                            # stack → [ep_d, n_local, …] → transpose → [n_local, ep_d, …]
+                            # → reshape → [total_experts, …]
+                            _ep_stk = torch.stack(_ep_parts_t, dim=0)
+                            param = _ep_stk.transpose(0, 1).reshape(
+                                -1, *_ep_stk.shape[2:]).contiguous()
+                            del _ep_stk
+                        del _ep_local_t, _ep_parts_t
                 if is_active:
                     hf_name = _xccl_accept_and_rename(param_name)
                     if hf_name is None:
@@ -1703,11 +1749,67 @@ def _sync_weights_to_vllm_xccl(self) -> None:
                     _c0 = time.perf_counter()
                     gpu_tensor = param.to(torch.bfloat16).contiguous()
                     t_cast += time.perf_counter() - _c0
-                    tensors_meta.append({
-                        "name": hf_name,
-                        "shape": list(gpu_tensor.shape),
-                        "numel": gpu_tensor.numel(),
-                    })
+                    if _ep_is_expert:
+                        # Streaming EP fuse: accumulate gate/up/down per layer; fuse+stage
+                        # to CPU when all 3 projections for a layer have arrived.  Keeps GPU
+                        # peak at ~3 expert tensors instead of 48 layers × 128 experts.
+                        _m_proj = _ep_expert_re.search(hf_name)
+                        _m_lid = _ep_layer_re.search(hf_name)
+                        if _m_proj and _m_lid:
+                            _lid = _m_lid.group(1)
+                            _ep_stream_buf.setdefault(_lid, {})[_m_proj.group(1)] = gpu_tensor
+                            if len(_ep_stream_buf[_lid]) == 3:
+                                _d = _ep_stream_buf.pop(_lid)
+                                _w13 = torch.cat([_d["gate_proj"], _d["up_proj"]], dim=1)
+                                _w2 = _d["down_proj"]
+                                del _d
+                                for _fhname, _ftensor in [
+                                    (f"model.layers.{_lid}.mlp.experts.w13_weight", _w13),
+                                    (f"model.layers.{_lid}.mlp.experts.w2_weight", _w2),
+                                ]:
+                                    _fpn = _ftensor.numel()
+                                    tensors_meta.append({
+                                        "name": _fhname,
+                                        "shape": list(_ftensor.shape),
+                                        "numel": _fpn,
+                                    })
+                                    if _USE_PINNED_BUF:
+                                        if batch_numel > 0 and batch_numel + _fpn > _BATCH_MAX_NUMEL:
+                                            torch.xpu.synchronize()
+                                            cpu_batches.append(
+                                                self._pinned_cpu_buf[_batch_start:_buf_offset])
+                                            _batch_start = _buf_offset
+                                            batch_numel = 0
+                                            n_batches += 1
+                                        self._pinned_cpu_buf[_buf_offset:_buf_offset + _fpn].copy_(
+                                            _ftensor.flatten(), non_blocking=True)
+                                        _buf_offset += _fpn
+                                    else:
+                                        _fcpu = _ftensor.flatten().cpu()
+                                        if batch_numel > 0 and batch_numel + _fpn > _BATCH_MAX_NUMEL:
+                                            cpu_batches.append(torch.cat(batch_parts_cpu))
+                                            batch_parts_cpu = []
+                                            batch_numel = 0
+                                            n_batches += 1
+                                        batch_parts_cpu.append(_fcpu)
+                                    batch_numel += _fpn
+                                    n_params += 1
+                                del _w13, _w2
+                        del param  # gpu_tensor stays alive in _ep_stream_buf if layer incomplete
+                        continue   # skip normal staging path; outer del param already done
+                    # For MoE, non-expert params go to hf_state_dict and are
+                    # added to tensors_meta + cpu_batches after fuse_experts_for_vllm.
+                    # Adding to tensors_meta here would duplicate every non-expert
+                    # entry for EP mode (which appends rather than resets tensors_meta),
+                    # causing tensors_meta (966) vs cpu_batches (531) desync → n_expert_ready=0.
+                    # Non-EP mode resets tensors_meta at line 1882, so the duplicate
+                    # is discarded anyway — skip for clarity.
+                    if not _is_moe:
+                        tensors_meta.append({
+                            "name": hf_name,
+                            "shape": list(gpu_tensor.shape),
+                            "numel": gpu_tensor.numel(),
+                        })
                     if _is_moe:
                         hf_state_dict[hf_name] = gpu_tensor
                     elif _USE_PINNED_BUF:
@@ -1753,38 +1855,76 @@ def _sync_weights_to_vllm_xccl(self) -> None:
             if is_active:
                 if _is_moe:
                     from torchtune.models.qwen3_moe._convert_weights import fuse_experts_for_vllm
-                    hf_state_dict = fuse_experts_for_vllm(hf_state_dict)
-                    tensors_meta = []
-                    for hf_name, tensor in hf_state_dict.items():
-                        tensors_meta.append({
-                            "name": hf_name,
-                            "shape": list(tensor.shape),
-                            "numel": tensor.numel(),
-                        })
-                        pn = tensor.numel()
-                        if _USE_PINNED_BUF:
-                            if batch_numel > 0 and batch_numel + pn > _BATCH_MAX_NUMEL:
-                                torch.xpu.synchronize()
-                                cpu_batches.append(self._pinned_cpu_buf[_batch_start:_buf_offset])
-                                _batch_start = _buf_offset
-                                batch_numel = 0
-                                n_batches += 1
-                            _d2h0 = time.perf_counter()
-                            self._pinned_cpu_buf[_buf_offset:_buf_offset + pn].copy_(
-                                tensor.flatten(), non_blocking=True)
-                            t_d2h += time.perf_counter() - _d2h0
-                            _buf_offset += pn
-                        else:
-                            cpu_tensor = tensor.flatten().cpu()
-                            if batch_numel > 0 and batch_numel + pn > _BATCH_MAX_NUMEL:
-                                cpu_batches.append(torch.cat(batch_parts_cpu))
-                                batch_parts_cpu = []
-                                batch_numel = 0
-                                n_batches += 1
-                            batch_parts_cpu.append(cpu_tensor)
-                        batch_numel += pn
-                        n_params += 1
-                    del hf_state_dict
+                    if _ep_deg > 1:
+                        # EP mode: expert params already streamed + fused above (tensors_meta
+                        # already has w13/w2 entries).  hf_state_dict has only non-expert
+                        # params (attention, norms, embeddings).  Pass through fuse (no-op
+                        # for non-expert keys) and APPEND — do NOT reset tensors_meta.
+                        hf_state_dict = fuse_experts_for_vllm(hf_state_dict)
+                        for hf_name, tensor in hf_state_dict.items():
+                            pn = tensor.numel()
+                            tensors_meta.append({
+                                "name": hf_name,
+                                "shape": list(tensor.shape),
+                                "numel": pn,
+                            })
+                            if _USE_PINNED_BUF:
+                                if batch_numel > 0 and batch_numel + pn > _BATCH_MAX_NUMEL:
+                                    torch.xpu.synchronize()
+                                    cpu_batches.append(
+                                        self._pinned_cpu_buf[_batch_start:_buf_offset])
+                                    _batch_start = _buf_offset
+                                    batch_numel = 0
+                                    n_batches += 1
+                                self._pinned_cpu_buf[_buf_offset:_buf_offset + pn].copy_(
+                                    tensor.flatten(), non_blocking=True)
+                                _buf_offset += pn
+                            else:
+                                cpu_tensor = tensor.flatten().cpu()
+                                if batch_numel > 0 and batch_numel + pn > _BATCH_MAX_NUMEL:
+                                    cpu_batches.append(torch.cat(batch_parts_cpu))
+                                    batch_parts_cpu = []
+                                    batch_numel = 0
+                                    n_batches += 1
+                                batch_parts_cpu.append(cpu_tensor)
+                            batch_numel += pn
+                            n_params += 1
+                        del hf_state_dict
+                    else:
+                        # Non-EP MoE: fuse all experts, reset tensors_meta from fused output.
+                        hf_state_dict = fuse_experts_for_vllm(hf_state_dict)
+                        tensors_meta = []
+                        for hf_name, tensor in hf_state_dict.items():
+                            tensors_meta.append({
+                                "name": hf_name,
+                                "shape": list(tensor.shape),
+                                "numel": tensor.numel(),
+                            })
+                            pn = tensor.numel()
+                            if _USE_PINNED_BUF:
+                                if batch_numel > 0 and batch_numel + pn > _BATCH_MAX_NUMEL:
+                                    torch.xpu.synchronize()
+                                    cpu_batches.append(
+                                        self._pinned_cpu_buf[_batch_start:_buf_offset])
+                                    _batch_start = _buf_offset
+                                    batch_numel = 0
+                                    n_batches += 1
+                                _d2h0 = time.perf_counter()
+                                self._pinned_cpu_buf[_buf_offset:_buf_offset + pn].copy_(
+                                    tensor.flatten(), non_blocking=True)
+                                t_d2h += time.perf_counter() - _d2h0
+                                _buf_offset += pn
+                            else:
+                                cpu_tensor = tensor.flatten().cpu()
+                                if batch_numel > 0 and batch_numel + pn > _BATCH_MAX_NUMEL:
+                                    cpu_batches.append(torch.cat(batch_parts_cpu))
+                                    batch_parts_cpu = []
+                                    batch_numel = 0
+                                    n_batches += 1
+                                batch_parts_cpu.append(cpu_tensor)
+                            batch_numel += pn
+                            n_params += 1
+                        del hf_state_dict
 
                 if _USE_PINNED_BUF:
                     if batch_numel > 0:
@@ -2157,13 +2297,18 @@ def _start_deferred_broadcast(self) -> None:
     log.info("Rank %d: starting deferred XCCL broadcast (post-gen)", self.rank)
 
     post_errors = []
+    # Timeout for receive_weights_xccl_streaming HTTP response. This call blocks
+    # until vLLM finishes receiving AND loading all weights into the model GPU.
+    # For 30B MoE with 128 experts, weight loading (XCCL recv + permute + GPU copy)
+    # can take >10 min. 1800s gives 30 min headroom for production-envelope runs.
+    _wsync_http_timeout = int(os.environ.get("TORCHTUNE_WSYNC_HTTP_TIMEOUT", "1800"))
     def _post_manifest(url):
         try:
             r = requests.post(
                 f"{url}/collective_rpc",
                 json={"method": "receive_weights_xccl_streaming",
                       "args": [meta_json]},
-                timeout=600,
+                timeout=_wsync_http_timeout,
             )
             if r.status_code != 200:
                 post_errors.append(
@@ -2236,7 +2381,7 @@ def _start_deferred_broadcast(self) -> None:
             del bg_cpu_batches
 
             for mt in bg_manifest_threads:
-                mt.join(timeout=600)
+                mt.join(timeout=_wsync_http_timeout + 60)
 
             if bg_post_errors:
                 log.error("Rank %d: XCCL async broadcast errors: %s",

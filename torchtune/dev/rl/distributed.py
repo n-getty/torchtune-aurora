@@ -754,9 +754,10 @@ def _ep_build_grad_release_pg_map(model) -> dict:
             mapping[id(pg_obj)] = _GLOO_DP_REP_PG
         elif _GLOO_DP_SHARD_PG is not None:
             mapping[id(pg_obj)] = _GLOO_DP_SHARD_PG
-            log.warning(
+            log.debug(
                 "_ep_build_grad_release_pg_map: FSDPParamGroup '%s' mesh_size=%s "
-                "matches neither dp_shard (%d) nor dp_replicate (%d); defaulting to dp_shard PG",
+                "matches neither dp_shard (%d) nor dp_replicate (%d); defaulting to dp_shard PG"
+                " (benign for CPUOffloadPolicy non-expert groups with reduce_grads=True)",
                 _name, mesh_size, _DP_SHARD_DEGREE, _DP_REP_DEGREE,
             )
 

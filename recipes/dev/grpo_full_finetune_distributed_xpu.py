@@ -660,6 +660,12 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         # Weight sync method: "raw_bytes" (file-based, default) or "shm" (POSIX shared memory,
         # faster for large models — eliminates the file read step on the vLLM side).
         self._vllm_weight_sync_method = cfg.get("vllm_weight_sync_method", "raw_bytes")
+        # Deferred broadcast: when True (default), XCCL wsync stages weights at end of step N
+        # and broadcasts to vLLM during step N+1's GRPO/backward window (overlap optimization).
+        # Required for dense FSDP throughput; BREAKS for EP modes because the broadcast contends
+        # with `_ep_release_fsdp_unsharded_grads` on the same dp_shard XCCL fabric (see
+        # docs/reports/MoE_EP_status.md section #5 — WS3 hang). EP yamls must set this to False.
+        self._vllm_weight_sync_deferred = cfg.get("vllm_weight_sync_deferred", True)
 
         # Async generation (Phase 0/1/2) — see docs plan eventual-juggling-prism.md.
         # Phase 0: `always_compute_rollout_logprobs` forces the policy fwd at rollout
@@ -1400,6 +1406,7 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             # is not needed. Expert dispatch is wired by parallelize_module above.
             if not eval_mode:
                 from torch.distributed._composable.fsdp import fully_shard as _fully_shard
+                from torch.distributed._composable.fsdp import CPUOffloadPolicy as _SoloCPUOffload
                 from torchtune.modules.moe.experts import GroupedExperts as _GE
                 from torchtune.models.qwen3_moe._experts import GroupedExpertsHF as _GEHF
                 _solo_expert_classes = (_GE, _GEHF)
@@ -1419,8 +1426,16 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                 _solo_wrapped_mods = []
                 for _ename, _emod in model.named_modules():
                     if isinstance(_emod, _solo_expert_classes):
-                        # reshard_after_forward=False: no-op (1-rank group, nothing to gather)
-                        _fully_shard(_emod, mesh=_solo_mesh, reshard_after_forward=False)
+                        # fsdp_cpu_offload=True: CPUOffloadPolicy + reshard_after_forward=True
+                        # so expert params (7.26 GiB) stay on CPU between layer forwards and
+                        # between grpo_step chunks. FSDP2 pre-hook does CPU→GPU copy per layer;
+                        # post-hook (reshard=True) returns to CPU. 1-rank solo mesh: no XCCL
+                        # → always safe. grads also land on CPU (sharded_param.device=CPU).
+                        # fsdp_cpu_offload=False: reshard=False, no offload_policy (unchanged)
+                        _solo_kwargs = {"mesh": _solo_mesh, "reshard_after_forward": fsdp_cpu_offload}
+                        if fsdp_cpu_offload:
+                            _solo_kwargs["offload_policy"] = _SoloCPUOffload()
+                        _fully_shard(_emod, **_solo_kwargs)
                         _solo_wrapped_mods.append(_emod)
                         _n_solo_wrapped += 1
                 utils.log_rank_zero(
@@ -1530,13 +1545,30 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                     "reshard_after_forward=True. Per-layer CPU→XPU copy, no XCCL."
                 )
             else:
-                # Policy model: dp_replicate ZeRO-2.
+                # Policy model: dp_replicate mesh for non-expert FSDP2.
                 fsdp2_mesh = self._dp_mesh["dp_replicate"]
-                fsdp2_raf = False
-                log.info(
-                    "EP active: using reshard_after_forward=False (ZeRO-2) for non-expert "
-                    "FSDP2 on dp_replicate mesh to prevent XCCL conflict with EP AllToAll."
-                )
+                _dp_rep_size = fsdp2_mesh.size()
+                if fsdp_cpu_offload and _dp_rep_size == 1:
+                    # 2-node EP=8 (dp_replicate=1): dp_replicate all-gather is 1-rank no-op
+                    # — no XCCL, no OFI conflict with EP AllToAll backward.
+                    # With fsdp_cpu_offload=True + ZeRO-3: non-expert params return to CPU
+                    # after each layer's forward, preventing ~2 GiB residual on GPU and
+                    # dropping PRE-fwd[1:2] from ~34 GiB to ~17 GiB → chunk[1:2] fits in 64 GiB.
+                    fsdp2_raf = True
+                    log.info(
+                        "EP active (dp_replicate=1, fsdp_cpu_offload=True): ZeRO-3 safe — "
+                        "1-rank dp_replicate has no XCCL. Using reshard_after_forward=True "
+                        "to release non-expert params to CPU between forward chunks."
+                    )
+                else:
+                    # 3-node+ (dp_replicate>1): ZeRO-2 to prevent XCCL/OFI conflict between
+                    # dp_replicate all-gather and EP AllToAll backward.
+                    fsdp2_raf = False
+                    log.info(
+                        "EP active (dp_replicate=%d): using reshard_after_forward=False (ZeRO-2) "
+                        "to prevent XCCL conflict between dp_replicate all-gather and EP AllToAll.",
+                        _dp_rep_size,
+                    )
         else:
             fsdp2_mesh = self._dp_mesh
             fsdp2_raf = reshard_after_forward
@@ -3397,8 +3429,11 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
 
                 # Start deferred XCCL broadcast now that vLLM generation is done.
                 # Broadcast runs during GRPO/backward below (vLLM idle, no contention).
+                # Skipped in synchronous mode — the broadcast already ran end-of-step N
+                # (see post-optimizer wsync block below), so there are no deferred args.
                 if (self._vllm_mode == "server" and self._vllm_weight_sync
-                        and self._vllm_weight_sync_method == "xccl"):
+                        and self._vllm_weight_sync_method == "xccl"
+                        and self._vllm_weight_sync_deferred):
                     self._start_deferred_broadcast()
 
                 grpo_stats: list[GRPOStats] = []
@@ -3673,6 +3708,15 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                         # This ensures the XCCL PG is free and vLLM has applied the previous weights.
                         self._wait_for_sync_complete()
                         self._sync_weights_to_vllm()
+                        # Synchronous wsync (EP path): broadcast immediately after gather and
+                        # block until vLLM has the new weights, so step N+1 generation runs on
+                        # fresh weights. Default deferred mode overlaps the broadcast with the
+                        # next step's GRPO/backward, which contends with EP grad-release on the
+                        # dp_shard XCCL fabric — see docs/reports/MoE_EP_status.md section #5.
+                        if (self._vllm_weight_sync_method == "xccl"
+                                and not self._vllm_weight_sync_deferred):
+                            self._start_deferred_broadcast()
+                            self._wait_for_sync_complete()
 
                 # Stop tracking memory
                 if (

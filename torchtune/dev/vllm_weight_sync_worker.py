@@ -261,47 +261,120 @@ class WeightSyncFromFileExtension:
     def _load_fused_moe_experts(self, fused_data: dict) -> None:
         """Copy pre-fused MoE w13/w2 weights directly to vLLM params.
 
-        Receives pre-fused tensors from the training side (gate+up already
-        concatenated into w13), so no per-expert stacking is needed. Just
-        TP-shard, detect IPEX transpose, and copy.
+        Receives pre-fused GLOBAL tensors from training (gate+up already
+        concatenated into w13). vLLM may shard those tensors via:
+          - tensor parallelism (TP) along the intermediate dim, and/or
+          - expert parallelism (EP) along the expert dim.
+        Both are read off the FusedMoE module itself (``expert_map``,
+        ``local_num_experts``, ``tp_rank``, ``tp_size``) instead of guessed
+        from ``dist.get_rank()`` — those guesses are wrong when vLLM has
+        folded TP into EP (e.g. tp_=4 + DP_=2 → ep_size=8, tp_size=1).
 
         Args:
             fused_data: {layer_idx: {"w13": tensor, "w2": tensor}}
-                w13: [E, 2*intermediate, hidden]  (gate || up on dim=1)
-                w2:  [E, hidden, intermediate]     (down)
+                w13: [E_global, 2*intermediate, hidden]  (gate || up on dim=1)
+                w2:  [E_global, hidden, intermediate]     (down)
         """
         import torch
-        import torch.distributed as dist
-
-        tp_rank = dist.get_rank() if dist.is_initialized() else 0
-        tp_size = dist.get_world_size() if dist.is_initialized() else 1
 
         params = dict(self.model_runner.model.named_parameters())
+        model = self.model_runner.model
 
         for layer_idx in sorted(fused_data.keys()):
             w13 = fused_data[layer_idx]["w13"]
             w2 = fused_data[layer_idx]["w2"]
-
-            inter = w13.shape[1] // 2
-            inter_per_tp = inter // tp_size
-
-            gate_shard = w13[:, tp_rank * inter_per_tp:(tp_rank + 1) * inter_per_tp, :]
-            up_shard = w13[:, inter + tp_rank * inter_per_tp:inter + (tp_rank + 1) * inter_per_tp, :]
-            w13_tp = torch.cat([gate_shard, up_shard], dim=1)
-
-            w2_tp = w2[:, :, tp_rank * inter_per_tp:(tp_rank + 1) * inter_per_tp]
 
             w13_key = f"model.layers.{layer_idx}.mlp.experts.w13_weight"
             w2_key = f"model.layers.{layer_idx}.mlp.experts.w2_weight"
             w13_param = params[w13_key]
             w2_param = params[w2_key]
 
-            num_experts = w13.shape[0]
-            e_local = w13_param.shape[0]
-            if e_local < num_experts:
-                ep_start = tp_rank * e_local
-                w13_tp = w13_tp[ep_start:ep_start + e_local]
-                w2_tp = w2_tp[ep_start:ep_start + e_local]
+            # Resolve the FusedMoE layer to read its actual EP/TP layout.
+            try:
+                moe_layer = model.get_submodule(
+                    f"model.layers.{layer_idx}.mlp.experts"
+                )
+            except AttributeError:
+                moe_layer = None
+
+            global_e = w13.shape[0]
+            local_e = w13_param.shape[0]
+            expert_map = getattr(moe_layer, "expert_map", None)
+            moe_tp_rank = getattr(moe_layer, "tp_rank", 0) or 0
+            moe_tp_size = getattr(moe_layer, "tp_size", 1) or 1
+            moe_ep_rank = getattr(moe_layer, "ep_rank", 0) or 0
+            moe_ep_size = getattr(moe_layer, "ep_size", 1) or 1
+            moe_local_n = getattr(moe_layer, "local_num_experts", local_e)
+
+            if layer_idx == 0:
+                em_summary = (
+                    f"len={expert_map.numel()} owned={(expert_map >= 0).sum().item()}"
+                    if expert_map is not None
+                    else "None"
+                )
+                logger.info(
+                    "MOE-DIAG L%d: w13_src=%s w2_src=%s w13_param=%s w2_param=%s "
+                    "moe_tp=(%d/%d) moe_ep=(%d/%d) local_n=%s expert_map=%s",
+                    layer_idx, list(w13.shape), list(w2.shape),
+                    list(w13_param.shape), list(w2_param.shape),
+                    moe_tp_rank, moe_tp_size,
+                    moe_ep_rank, moe_ep_size,
+                    moe_local_n, em_summary,
+                )
+
+            # --- EP slice along expert dim 0 ---------------------------------
+            if local_e < global_e:
+                if expert_map is not None:
+                    # Authoritative: expert_map[g] = local_idx if owned else -1.
+                    em = expert_map.to("cpu")
+                    owned_global = (em >= 0).nonzero(as_tuple=True)[0]
+                    if owned_global.numel() != local_e:
+                        raise RuntimeError(
+                            f"layer {layer_idx}: expert_map says "
+                            f"{owned_global.numel()} owned, param has {local_e}"
+                        )
+                    perm = torch.empty(local_e, dtype=torch.long)
+                    perm[em[owned_global].long()] = owned_global
+                    w13 = w13.index_select(0, perm)
+                    w2 = w2.index_select(0, perm)
+                else:
+                    # Fallback: contiguous EP partition (vLLM's default in
+                    # ``determine_expert_map``). Derive ep_rank from sizes.
+                    if global_e % local_e != 0:
+                        raise RuntimeError(
+                            f"layer {layer_idx}: cannot derive EP rank from "
+                            f"global={global_e} local={local_e}"
+                        )
+                    ep_size_inferred = global_e // local_e
+                    # Without expert_map we cannot know which slab — log so
+                    # the operator can wire ``expert_map`` if this fires.
+                    raise RuntimeError(
+                        f"layer {layer_idx}: FusedMoE has no expert_map but "
+                        f"global={global_e} > local={local_e} "
+                        f"(inferred ep_size={ep_size_inferred}). vLLM "
+                        f"build appears to predate expert_map; refuse to "
+                        f"silently mis-shard."
+                    )
+
+            # --- TP slice along intermediate dim -----------------------------
+            inter = w13.shape[1] // 2
+            inter_per_tp = inter // moe_tp_size
+            if moe_tp_size == 1:
+                w13_tp = w13
+                w2_tp = w2
+            else:
+                gate_shard = w13[
+                    :, moe_tp_rank * inter_per_tp:(moe_tp_rank + 1) * inter_per_tp, :
+                ]
+                up_shard = w13[
+                    :,
+                    inter + moe_tp_rank * inter_per_tp:inter + (moe_tp_rank + 1) * inter_per_tp,
+                    :,
+                ]
+                w13_tp = torch.cat([gate_shard, up_shard], dim=1)
+                w2_tp = w2[
+                    :, :, moe_tp_rank * inter_per_tp:(moe_tp_rank + 1) * inter_per_tp
+                ]
 
             device = w13_param.device
             is_transposed = w13_param.shape[1] != w13_tp.shape[1]
@@ -310,8 +383,8 @@ class WeightSyncFromFileExtension:
                 w13_param.data.copy_(w13_tp.to(device).transpose(1, 2).contiguous())
                 w2_param.data.copy_(w2_tp.to(device).transpose(1, 2).contiguous())
             else:
-                w13_param.data.copy_(w13_tp)
-                w2_param.data.copy_(w2_tp)
+                w13_param.data.copy_(w13_tp.to(device))
+                w2_param.data.copy_(w2_tp.to(device))
 
     # ------------------------------------------------------------------
     # XCCL broadcast weight sync
@@ -625,6 +698,39 @@ class WeightSyncFromFileExtension:
                     logger.info("XCCL recv buf allocated: %d elements, data_ptr=0x%x",
                                 buf_numel, self._xccl_recv_buf.data_ptr())
 
+                # Stash incomplete MoE w13/w2 pairs across batches: the trainer's
+                # greedy batching can split a layer's w13_weight and w2_weight
+                # into different broadcast batches. _load_fused_moe_experts
+                # requires both keys, so we hold the lonely tensor (cloned, since
+                # _xccl_recv_buf is reused next iter) until its pair arrives.
+                fused_pending: dict = {}
+                _recv_load_error = None  # deferred: recv all batches before raising
+
+                # Compute expected batch count (same greedy algorithm as sender)
+                # for diagnostic comparison with trainer's logged n_batches.
+                _diag_batches = 0
+                _diag_i = 0
+                _diag_bn = 0
+                while _diag_i < n_params:
+                    _diag_inner_bn = 0
+                    while _diag_i < n_params:
+                        _pn = tensors_meta[_diag_i]["numel"]
+                        if _diag_inner_bn > 0 and _diag_inner_bn + _pn > batch_max_numel:
+                            break
+                        _diag_inner_bn += _pn
+                        _diag_i += 1
+                    _diag_batches += 1
+                logger.info(
+                    "WSYNC-RECV: n_params=%d expected_batches=%d batch_max_numel=%d",
+                    n_params, _diag_batches, batch_max_numel,
+                )
+                # Log first 6 tensors_meta names+numel for ordering diagnosis
+                _diag_head = [
+                    f"{e['name']} ({e['numel']})" for e in tensors_meta[:6]
+                ]
+                logger.info("WSYNC-RECV first 6 entries: %s", " | ".join(_diag_head))
+
+                _batch_idx = 0
                 i = 0
                 while i < n_params:
                     batch_start = i
@@ -672,13 +778,13 @@ class WeightSyncFromFileExtension:
                                 self._xccl_intra_pg.broadcast(recv_buf, root=0).wait()
                     else:
                         self._xccl_pg.broadcast(recv_buf, root=0).wait()
-                    t_bcast_total += time.perf_counter() - t_b0
+                    t_bcast_i = time.perf_counter() - t_b0
+                    t_bcast_total += t_bcast_i
 
                     # Split flat buffer back into per-param tensors, routing
                     # fused MoE experts to _load_fused_moe_experts (GPU-direct)
                     offset = 0
                     non_expert_weights = []
-                    fused_data = {}
                     _fused_re = re.compile(
                         r"model\.layers\.(\d+)\.mlp\.experts\.(w13|w2)_weight"
                     )
@@ -689,20 +795,70 @@ class WeightSyncFromFileExtension:
                         if m:
                             layer_idx = int(m.group(1))
                             kind = m.group(2)
-                            fused_data.setdefault(layer_idx, {})[kind] = tensor
+                            # Clone: recv_buf is reused next iteration.
+                            fused_pending.setdefault(layer_idx, {})[kind] = tensor.clone()
                         else:
                             non_expert_weights.append((entry["name"], tensor))
                         offset += n
+
+                    # Apply layers whose w13+w2 are both present.
+                    fused_ready = {
+                        li: kv for li, kv in fused_pending.items()
+                        if "w13" in kv and "w2" in kv
+                    }
+                    for li in fused_ready:
+                        del fused_pending[li]
+
                     t_l0 = time.perf_counter()
-                    if non_expert_weights:
-                        self.model_runner.model.load_weights(weights=non_expert_weights)
-                    if fused_data:
-                        self._load_fused_moe_experts(fused_data)
-                    t_load_total += time.perf_counter() - t_l0
-                    del non_expert_weights, fused_data
+                    # Catch load errors but continue receiving remaining batches
+                    # so the trainer's send loop is not left hanging. The error
+                    # is raised after all batches are consumed.
+                    try:
+                        if non_expert_weights:
+                            self.model_runner.model.load_weights(weights=non_expert_weights)
+                        if fused_ready:
+                            self._load_fused_moe_experts(fused_ready)
+                    except Exception as _le:
+                        if _recv_load_error is None:
+                            logger.error(
+                                "receive_weights_xccl_streaming: load error (continuing recv "
+                                "to unblock trainer): %s", _le)
+                            _recv_load_error = _le
+                    t_load_i = time.perf_counter() - t_l0
+                    t_load_total += t_load_i
+                    # Log first batch and every 10th to diagnose recv vs load breakdown
+                    if _batch_idx == 0 or _batch_idx % 10 == 9:
+                        _gb_i = batch_numel * 2 / 1024**3
+                        logger.info(
+                            "WSYNC-RECV batch %d/%d: numel=%d (%.2f GiB) recv=%.3fs load=%.3fs "
+                            "n_expert_ready=%d n_non_expert=%d",
+                            _batch_idx, _diag_batches, batch_numel, _gb_i,
+                            t_bcast_i, t_load_i, len(fused_ready), len(non_expert_weights),
+                        )
+                    _batch_idx += 1
+                    del non_expert_weights, fused_ready
+
+                logger.info(
+                    "WSYNC-RECV done: %d batches (expected %d) total_recv=%.1fs total_load=%.1fs",
+                    _batch_idx, _diag_batches, t_bcast_total, t_load_total,
+                )
+
+                # Final flush: any layers still pending after all batches must
+                # have a missing pair — fail loudly rather than silently skip.
+                if fused_pending:
+                    incomplete = {li: list(kv.keys()) for li, kv in fused_pending.items()}
+                    raise RuntimeError(
+                        f"XCCL streaming MoE: {len(fused_pending)} layers missing w13 or w2 "
+                        f"after all batches: {incomplete}"
+                    )
+                # Deferred load error: all batches received (trainer unblocked), now raise.
+                if _recv_load_error is not None:
+                    raise _recv_load_error
 
             else:
-                # Legacy: one broadcast per param
+                # Legacy: one broadcast per param. Same w13/w2 split-across-flush
+                # hazard as the batched path, so accumulate across apply_every flushes.
+                fused_leg_pending: dict = {}
                 weights_batch = []
                 for idx, entry in enumerate(tensors_meta):
                     recv_buf = torch.empty(
@@ -750,21 +906,35 @@ class WeightSyncFromFileExtension:
                             r"model\.layers\.(\d+)\.mlp\.experts\.(w13|w2)_weight"
                         )
                         non_expert = []
-                        fused_leg = {}
                         for wname, wtensor in weights_batch:
                             m = _fused_re_leg.match(wname)
                             if m:
                                 li = int(m.group(1))
-                                fused_leg.setdefault(li, {})[m.group(2)] = wtensor
+                                # Legacy path uses fresh recv_buf per param, so
+                                # no clone needed.
+                                fused_leg_pending.setdefault(li, {})[m.group(2)] = wtensor
                             else:
                                 non_expert.append((wname, wtensor))
+                        fused_ready = {
+                            li: kv for li, kv in fused_leg_pending.items()
+                            if "w13" in kv and "w2" in kv
+                        }
+                        for li in fused_ready:
+                            del fused_leg_pending[li]
                         if non_expert:
                             self.model_runner.model.load_weights(weights=non_expert)
-                        if fused_leg:
-                            self._load_fused_moe_experts(fused_leg)
+                        if fused_ready:
+                            self._load_fused_moe_experts(fused_ready)
                         t_load_total += time.perf_counter() - t_l0
-                        del weights_batch, non_expert, fused_leg
+                        del weights_batch, non_expert, fused_ready
                         weights_batch = []
+
+                if fused_leg_pending:
+                    incomplete = {li: list(kv.keys()) for li, kv in fused_leg_pending.items()}
+                    raise RuntimeError(
+                        f"XCCL streaming MoE (legacy): {len(fused_leg_pending)} layers "
+                        f"missing w13 or w2 after all params: {incomplete}"
+                    )
 
             torch.xpu.synchronize(self._xccl_device)
 

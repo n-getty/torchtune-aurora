@@ -159,8 +159,12 @@ launch_vllm_on_node() {
         unset VIRTUAL_ENV
         export ZE_FLAT_DEVICE_HIERARCHY=FLAT
         unset PYTORCH_ALLOC_CONF
-        export PYTHONNOUSERSITE=1
-        export PYTHONPATH=${PROJDIR}:${FW_SITE}
+        # WS5: wsync requires VLLM_SERVER_DEV_MODE (unlocks /collective_rpc),
+        # _usercustomize_vllm on PYTHONPATH (registers WeightSyncFromFileExtension
+        # routes), and PYTHONNOUSERSITE unset (so usercustomize.py autoloads).
+        export VLLM_SERVER_DEV_MODE=1
+        export PYTHONNOUSERSITE=
+        export PYTHONPATH=${PROJDIR}:${PROJDIR}/recipes/dev/_usercustomize_vllm:${FW_SITE}
         export HF_DATASETS_OFFLINE=1
         export HF_HUB_OFFLINE=1
         export ZE_AFFINITY_MASK=8,9,10,11
@@ -181,6 +185,7 @@ launch_vllm_on_node() {
             --gpu-memory-utilization 0.80 \
             --max-model-len 2048 \
             --distributed-executor-backend mp \
+            --worker-extension-cls torchtune.dev.vllm_weight_sync_worker.WeightSyncFromFileExtension \
             > ${log_file} 2>&1 < /dev/null &
         echo \"vLLM launched on \$(hostname) PID \$!\"
     "
