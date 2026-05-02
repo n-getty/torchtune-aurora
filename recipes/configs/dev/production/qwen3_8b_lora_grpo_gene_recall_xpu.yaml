@@ -1,0 +1,158 @@
+# Qwen3-8B LoRA-GRPO — 2-node server mode, gene_recall task
+#
+# Same topology as GSM8K config (qwen3_8b_lora_grpo_2node_server_xpu.yaml):
+#   Node 0 (TRAIN_NODE): 11 training ranks, FSDP1 SHARD_GRAD_OP.
+#   Node 1 (VLLM_NODE): 12 vLLM HTTP servers (DP=12, ports 8001-8012, TP=1 each).
+#
+# Why gene_recall instead of GSM8K:
+#   Qwen3-8B starts at ~85%+ accuracy on GSM8K → near-saturated → policy_loss≈0.
+#   gene_recall starting F1 ≈ 0.30-0.40 → more headroom for GRPO learning.
+#   The model must output <genes>TP53, BRCA1, ...</genes> format.
+#
+# Key changes from GSM8K config:
+#   - dataset: gene_recall_dataset (JSONL with cancer biology narratives)
+#   - reward: GeneRecallReward (F1 between predicted and reference gene sets)
+#   - max_generated_tokens: 1024 (room for reasoning + <genes> tag at the end)
+#   - vllm_max_model_len: 2048 (prompt ≤ 1024 + response ≤ 1024)
+#   - vllm_max_num_seqs: 4 (safe limit — 8+ causes banned:1 PDE via IPC handle OOM)
+
+name: lora_grpo_qwen3_8b_gene_recall
+output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/outputs/lora_grpo_qwen3_8b_gene_recall_v1
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+base_model_path: /lus/flare/projects/ModCon/ngetty/models/Qwen3-8B
+
+model:
+  _component_: torchtune.models.qwen3.lora_qwen3_8b_base
+  lora_attn_modules: ['q_proj', 'k_proj', 'v_proj', 'output_proj']
+  apply_lora_to_mlp: true
+  apply_lora_to_output: false
+  lora_rank: 16
+  lora_alpha: 32
+  lora_dropout: 0.0
+
+# ── Tokenizer ─────────────────────────────────────────────────────────────────
+tokenizer:
+  _component_: torchtune.models.qwen3.qwen3_tokenizer
+  path: ${base_model_path}/vocab.json
+  merges_file: ${base_model_path}/merges.txt
+  max_seq_len: ${max_seq_len}
+
+# ── Checkpointer ──────────────────────────────────────────────────────────────
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [
+    model-00001-of-00005.safetensors,
+    model-00002-of-00005.safetensors,
+    model-00003-of-00005.safetensors,
+    model-00004-of-00005.safetensors,
+    model-00005-of-00005.safetensors,
+  ]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: QWEN3
+
+# ── Dataset ───────────────────────────────────────────────────────────────────
+dataset:
+  _component_: torchtune.dev.rl.gene_recall.gene_recall_dataset
+  data_files: /lus/flare/projects/ModCon/ngetty/hackathon_rl/prepared_data/gene_recall_train.jsonl
+  max_seq_len: ${max_seq_len}
+
+seed: 42
+shuffle: true
+resume_from_checkpoint: false
+
+# ── RL Hyperparameters ────────────────────────────────────────────────────────
+grpo_samples: 8                        # G=8 completions per query
+max_seq_len: 1024                      # prompt truncation (gene_recall prompts ~300-600 tokens)
+max_generated_tokens: 1024             # room for reasoning (~600) + <genes> tag (~50)
+temperature: 1.0
+top_k: null
+
+# ── Training ──────────────────────────────────────────────────────────────────
+epochs: 1
+num_steps: 50
+ppo_epochs: 1
+batch_size: 4                          # ppo_batch_size = batch_size * grpo_samples = 32
+forward_batch_size: 1
+gradient_accumulation_steps: 1
+
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 3.0e-5
+  weight_decay: 0.01
+  fused: false
+
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  num_warmup_steps: 5
+
+clip_grad_norm: 1.0
+
+# ── Loss ──────────────────────────────────────────────────────────────────────
+loss:
+  _component_: torchtune.dev.rl.loss.GRPOLoss
+  kl_coeff: 1.0e-3                     # 10× lower than EP=8 gene_recall WS9 (1e-2)
+  epsilon: 0.2
+
+# ── Reward ────────────────────────────────────────────────────────────────────
+reward_functions:
+  - _component_: torchtune.dev.rl.rewards.GeneRecallReward
+    reward_metric: f1
+
+# ── LoRA publish config ────────────────────────────────────────────────────────
+lora:
+  publish_every_steps: 1
+  max_loras: 2
+  shm_root: /lus/flare/projects/ModCon/ngetty/torchtune/outputs/lora_grpo_qwen3_8b_gene_recall_v1/adapters
+  tmpfs_transfer: true
+  train_shm: /dev/shm/lora_adapters
+  vllm_shm: /dev/shm/lora_adapters
+
+# ── vLLM rollout (server mode, DP=12) ─────────────────────────────────────────
+vllm_mode: server
+vllm_weight_sync: false
+vllm_max_model_len: 2048              # prompt ≤ 1024 + response ≤ 1024 = 2048
+vllm_max_num_seqs: 4                  # SAFE LIMIT: 8+ causes banned:1 PDE (IPC handle OOM)
+
+vllm:
+  mode: server
+  enable_lora: true
+  max_lora_rank: 16
+  max_loras: 2
+
+# ── Distributed / FSDP ────────────────────────────────────────────────────────
+fsdp_shard_strategy: SHARD_GRAD_OP
+enable_activation_checkpointing: false
+save_adapter_weights_only: true
+
+# ── XPU ───────────────────────────────────────────────────────────────────────
+device: xpu
+dtype: bf16
+compile: false
+force_math_sdpa: false
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+log_every_n_steps: 1
+log_peak_memory_stats: true
+save_every_n_epochs: 1
+
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: false
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: true
+  cuda: false
+  profile_memory: false
+  with_stack: false
+  record_shapes: false
+  with_flops: false
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1

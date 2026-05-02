@@ -1,0 +1,163 @@
+# Qwen3-8B LoRA-GRPO — minimal isolation smoke (batch=1, G=1, fbs=1)
+#
+# Purpose: determine whether 8B LoRA can complete a single training backward
+# at all, without any generation or vLLM complexity.  Use for the P0 diagnostic
+# from the feedback review:
+#   batch_size: 1, grpo_samples: 1, forward_batch_size: 1, max_generated_tokens: 128
+#
+# Two variants via env override:
+#   Default:              SHARD_GRAD_OP (ZeRO-2)  — current default, hits UR:40
+#   LORA_FSDP_FULL_SHARD=1:  FULL_SHARD (ZeRO-3)  — diagnostic A/B
+#
+# Launcher: experiments/lora_grpo/run_qwen3_4b_lora_2node.sh
+#   MODEL_PATH=/lus/.../Qwen3-8B CONFIG=recipes/configs/dev/smoke/qwen3_8b_lora_grpo_isolation_xpu.yaml
+#   NSTEPS=2 GRPO_SAMPLES=1 FORWARD_BATCH_SIZE=1 MAX_GEN_TOKENS=128
+
+name: lora_grpo_qwen3_8b_isolation_smoke
+output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/outputs/lora_grpo_qwen3_8b_isolation
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+base_model_path: /lus/flare/projects/ModCon/ngetty/models/Qwen3-8B
+
+model:
+  _component_: torchtune.models.qwen3.lora_qwen3_8b_base
+  lora_attn_modules: ['q_proj', 'k_proj', 'v_proj', 'output_proj']
+  apply_lora_to_mlp: true
+  apply_lora_to_output: false
+  lora_rank: 16
+  lora_alpha: 32
+  lora_dropout: 0.0
+
+# ── Tokenizer ─────────────────────────────────────────────────────────────────
+tokenizer:
+  _component_: torchtune.models.qwen3.qwen3_tokenizer
+  path: ${base_model_path}/vocab.json
+  merges_file: ${base_model_path}/merges.txt
+  max_seq_len: ${max_seq_len}
+
+# ── Checkpointer ──────────────────────────────────────────────────────────────
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [
+    model-00001-of-00005.safetensors,
+    model-00002-of-00005.safetensors,
+    model-00003-of-00005.safetensors,
+    model-00004-of-00005.safetensors,
+    model-00005-of-00005.safetensors,
+  ]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: QWEN3
+
+# ── Dataset ───────────────────────────────────────────────────────────────────
+dataset:
+  _component_: torchtune.dev.rl.gsm8k.gsm8k_dataset
+  partition: 1-9/10
+
+seed: 42
+shuffle: true
+resume_from_checkpoint: false
+
+# ── RL Hyperparameters ────────────────────────────────────────────────────────
+grpo_samples: 1                        # minimum: 1 sample per prompt
+max_seq_len: 384                       # short context for isolation test
+max_generated_tokens: 128              # minimum: short generations
+temperature: 1.0
+top_k: null
+
+# ── Training ──────────────────────────────────────────────────────────────────
+epochs: 1
+num_steps: 2                           # 2 steps: enough to confirm backward + 1 publish cycle
+ppo_epochs: 1
+batch_size: 1                          # minimum: 1 prompt → ppo_batch_size = 1 * 1 = 1
+forward_batch_size: 1                  # minimum fbs: 1 chunk per backward
+gradient_accumulation_steps: 1
+
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 3.0e-5
+  weight_decay: 0.01
+  fused: false
+
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  num_warmup_steps: 1
+
+clip_grad_norm: 1.0
+
+# ── Loss ──────────────────────────────────────────────────────────────────────
+loss:
+  _component_: torchtune.dev.rl.loss.GRPOLoss
+  kl_coeff: 1.0e-4
+  epsilon: 0.2
+
+# ── Reward ────────────────────────────────────────────────────────────────────
+reward_functions:
+  - _component_: torchtune.dev.rl.rewards.FormattedMathCorrectnessReward
+    answer_tag: answer
+    positive_reward: 10.0
+    negative_reward: 0.0
+  - _component_: torchtune.dev.rl.rewards.ThinkingAnswerFormattingReward
+    think_tag: think
+    answer_tag: answer
+    positive_reward: 1.0
+    negative_reward: 0.0
+
+# ── LoRA publish config ────────────────────────────────────────────────────────
+lora:
+  publish_every_steps: 1
+  max_loras: 2
+  shm_root: /lus/flare/projects/ModCon/ngetty/torchtune/outputs/lora_grpo_qwen3_8b_isolation/adapters
+  tmpfs_transfer: true
+  train_shm: /dev/shm/lora_adapters
+  vllm_shm: /dev/shm/lora_adapters
+
+# ── vLLM rollout (server mode) ────────────────────────────────────────────────
+vllm_mode: server
+vllm_weight_sync: false
+vllm_max_model_len: 512               # short for isolation: 384 prompt + 128 gen
+vllm_max_num_seqs: 4                  # CRITICAL: >4 causes banned:1 PDE (XPU KV-cache IPC handle exhaustion)
+
+vllm:
+  mode: server
+  enable_lora: true
+  max_lora_rank: 16
+  max_loras: 2
+
+# ── Distributed / FSDP ────────────────────────────────────────────────────────
+# Default: SHARD_GRAD_OP.  Override with fsdp_sharding_strategy: FULL_SHARD
+# or env LORA_FSDP_FULL_SHARD=1 to test ZeRO-3 (reduces unsharded param residency).
+fsdp_sharding_strategy: SHARD_GRAD_OP
+enable_activation_checkpointing: true  # AC=true to reduce peak memory during backward
+save_adapter_weights_only: true
+
+# ── XPU ───────────────────────────────────────────────────────────────────────
+device: xpu
+dtype: bf16
+compile: false
+force_math_sdpa: false
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+log_every_n_steps: 1
+log_peak_memory_stats: true
+save_every_n_epochs: 1
+
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: false
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: true
+  cuda: false
+  profile_memory: false
+  with_stack: false
+  record_shapes: false
+  with_flops: false
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1
