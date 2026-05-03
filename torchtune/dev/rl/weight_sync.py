@@ -1711,9 +1711,237 @@ def _sync_weights_to_vllm_xccl(self) -> None:
             if is_active and _ep_deg > 1 and _is_moe:
                 _ep_stream_buf: dict = {}  # layer_idx -> {proj -> bf16 tensor}
 
+            # WS6 opt-in: batch the 3 expert projections of each layer into a
+            # single all_gather_into_tensor on _shard_pg. Reduces wsync_gather
+            # collective count from 3*L to L (e.g. 144 → 48 for Qwen3-30B-A3B
+            # EP=16). Bit-exact equivalent — see
+            # tests/torchtune/dev/rl/test_ep_wsync_layer_batch_equivalence.py.
+            _LAYER_BATCH_AG = os.environ.get(
+                "TORCHTUNE_EP_WSYNC_LAYER_BATCH", "0") == "1"
+            _layer_batch_active = (
+                _LAYER_BATCH_AG and _ep_deg > 1 and _is_moe
+                and getattr(self, '_shard_pg', None) is not None
+            )
+            # Pending local shards keyed by layer_id (string). Populated on
+            # ALL ranks (both is_active and others) — the AG is a collective.
+            _lb_pending: dict = {} if _layer_batch_active else None
+            _lb_logged_engaged = False
+
+            # WS7 opt-in: replace AllGather with gather(dst=active_rank). Only
+            # the is_active rank consumes the full expert tensor; the other
+            # _ep_deg-1 ranks discard. AllGather pays N-way fan-out for 1-way
+            # consumption; gather sends N-1 shards into the root NIC for the
+            # same final bytes. Bit-exact equivalent — see
+            # tests/torchtune/dev/rl/test_ep_wsync_gather_root_equivalence.py.
+            _GATHER_ROOT = os.environ.get(
+                "TORCHTUNE_EP_WSYNC_GATHER_ROOT", "0") == "1"
+            _gather_root_active = (
+                _GATHER_ROOT and _ep_deg > 1 and _is_moe
+                and getattr(self, '_shard_pg', None) is not None
+            )
+            _gr_active_shard_rank = 0  # is_active rank == rank 0 of _shard_pg
+            _gr_logged_engaged = False
+
+            # WS8 opt-in: cast expert shards to fp8 (E4M3) with per-output-row
+            # scales before the per-projection AllGather, AllGather fp8+scale
+            # only, and decompress on the active rank back to bf16. Cuts wire
+            # bytes ~2× on _shard_pg (the ~70s wsync_gather floor at EP=16).
+            # Numerics: per-element err bounded by row_amax/4 (E4M3 has 3
+            # mantissa bits + per-row scaling). NOT bit-exact — do not enable
+            # this on workloads where rollouts are sensitive to weight noise
+            # without first running a KL-drift check.
+            #
+            # Scope: ONLY expert gate_proj/up_proj/down_proj. Norms, attention,
+            # router, embedding stay bf16 (per MoE_status_feedback.md §10).
+            # Mutually exclusive with WS6/WS7 below — they exit early on the
+            # expert path so this branch only triggers when LAYER_BATCH and
+            # GATHER_ROOT are both off.
+            #
+            # See tests/torchtune/dev/rl/test_ep_wsync_fp8_wire_equivalence.py
+            # for the round-trip + unshuffle pin-down.
+            _FP8_WIRE = os.environ.get(
+                "TORCHTUNE_EP_WSYNC_FP8_WIRE", "0") == "1"
+            _fp8_wire_active = (
+                _FP8_WIRE and _ep_deg > 1 and _is_moe
+                and getattr(self, '_shard_pg', None) is not None
+                and not _layer_batch_active and not _gather_root_active
+                and hasattr(torch, 'float8_e4m3fn')
+            )
+            if _FP8_WIRE and not _fp8_wire_active:
+                log.info(
+                    "Rank %d: TORCHTUNE_EP_WSYNC_FP8_WIRE=1 requested but "
+                    "skipping (ep_deg=%d, is_moe=%s, _shard_pg=%s, "
+                    "layer_batch=%s, gather_root=%s, e4m3=%s)",
+                    self.rank, _ep_deg, _is_moe,
+                    getattr(self, '_shard_pg', None) is not None,
+                    _layer_batch_active, _gather_root_active,
+                    hasattr(torch, 'float8_e4m3fn'),
+                )
+            _fp8_logged_engaged = False
+
             for param_name, param in sharded_sd.items():
                 if param.is_cpu:
                     param = param.to(self._device)
+
+                # WS6 layer-batched EP path: short-circuit expert params before
+                # the per-projection AG. Buffer locally; on the 3rd projection
+                # of a layer, emit one batched AG, slice, unshuffle, and hand
+                # each per-projection full tensor back to the existing fuse
+                # path via _ep_stream_buf (is_active only).
+                if _layer_batch_active:
+                    _lb_cpn = param_name.replace(
+                        "_fsdp_wrapped_module.", "").replace(
+                        "_checkpoint_wrapped_module.", "")
+                    _lb_m_proj = _ep_expert_re.search(_lb_cpn)
+                    _lb_m_lid = _ep_layer_re.search(_lb_cpn)
+                    if _lb_m_proj and _lb_m_lid:
+                        if hasattr(param, "_local_tensor"):
+                            _ft0 = time.perf_counter()
+                            param = param.full_tensor()
+                            t_ft += time.perf_counter() - _ft0
+                        _c0 = time.perf_counter()
+                        _lb_local = param.to(self._device).to(
+                            torch.bfloat16).contiguous()
+                        t_cast += time.perf_counter() - _c0
+                        _lb_proj = _lb_m_proj.group(1)
+                        _lb_lid = _lb_m_lid.group(1)
+                        # Resolve the hf-side param name once now so the
+                        # is_active fuse-path entry matches the per-projection
+                        # path bit-for-bit. Non-active ranks won't use it.
+                        _lb_hf = _xccl_accept_and_rename(param_name) if is_active else None
+                        _lb_pending.setdefault(_lb_lid, {})[_lb_proj] = (
+                            _lb_hf, _lb_local, tuple(_lb_local.shape))
+                        del param
+
+                        if len(_lb_pending[_lb_lid]) == 3:
+                            _bundle = _lb_pending.pop(_lb_lid)
+                            _g_hf, _g_loc, _g_sh = _bundle["gate_proj"]
+                            _u_hf, _u_loc, _u_sh = _bundle["up_proj"]
+                            _d_hf, _d_loc, _d_sh = _bundle["down_proj"]
+                            _n_g = _g_loc.numel()
+                            _n_u = _u_loc.numel()
+                            _n_d = _d_loc.numel()
+                            _local_cat = torch.cat([
+                                _g_loc.flatten(), _u_loc.flatten(), _d_loc.flatten()
+                            ])
+                            _cat_size = _local_cat.numel()
+                            if _gather_root_active:
+                                # WS7: gather(dst=active). Root materializes
+                                # _out_cat; other ranks send only their local.
+                                _shard_rank_lb = torch.distributed.get_rank(
+                                    self._shard_pg)
+                                if _shard_rank_lb == _gr_active_shard_rank:
+                                    _gather_list = [
+                                        torch.empty_like(_local_cat)
+                                        for _ in range(_ep_deg)
+                                    ]
+                                    torch.distributed.gather(
+                                        _local_cat, gather_list=_gather_list,
+                                        dst=_gr_active_shard_rank,
+                                        group=self._shard_pg)
+                                    _out_cat = torch.cat(_gather_list)
+                                    del _gather_list
+                                else:
+                                    torch.distributed.gather(
+                                        _local_cat, gather_list=None,
+                                        dst=_gr_active_shard_rank,
+                                        group=self._shard_pg)
+                                    _out_cat = None
+                                if not _gr_logged_engaged:
+                                    log.info(
+                                        "Rank %d: EP wsync layer-batched gather-to-root engaged",
+                                        self.rank)
+                                    _gr_logged_engaged = True
+                            else:
+                                _out_cat = torch.empty(
+                                    _ep_deg * _cat_size,
+                                    dtype=torch.bfloat16, device=self._device,
+                                )
+                                torch.distributed.all_gather_into_tensor(
+                                    _out_cat, _local_cat, group=self._shard_pg)
+                            del _local_cat, _g_loc, _u_loc, _d_loc
+
+                            if not _lb_logged_engaged:
+                                log.info(
+                                    "Rank %d: EP wsync layer-batched AG engaged "
+                                    "(3-proj per call)", self.rank)
+                                _lb_logged_engaged = True
+
+                            if is_active:
+                                # Slice each rank's chunk into per-projection
+                                # sub-tensors, then stack + interleave-unshuffle
+                                # — same final shape as the per-projection path.
+                                _g_parts, _u_parts, _d_parts = [], [], []
+                                for _r in range(_ep_deg):
+                                    _b = _r * _cat_size
+                                    _g_parts.append(
+                                        _out_cat[_b:_b + _n_g].reshape(_g_sh))
+                                    _u_parts.append(
+                                        _out_cat[_b + _n_g:_b + _n_g + _n_u].reshape(_u_sh))
+                                    _d_parts.append(
+                                        _out_cat[_b + _n_g + _n_u:_b + _n_g + _n_u + _n_d].reshape(_d_sh))
+                                for _hf, _parts in (
+                                    (_g_hf, _g_parts),
+                                    (_u_hf, _u_parts),
+                                    (_d_hf, _d_parts),
+                                ):
+                                    if _hf is None:
+                                        continue
+                                    _stk = torch.stack(_parts, dim=0)
+                                    _full = _stk.transpose(0, 1).reshape(
+                                        -1, *_stk.shape[2:]).contiguous()
+                                    del _stk
+                                    # Hand off to the existing _ep_stream_buf
+                                    # fuse path (mirrors the per-projection
+                                    # branch below). The fuse trigger fires on
+                                    # the 3rd projection identically.
+                                    _m_proj_full = _ep_expert_re.search(_hf)
+                                    _m_lid_full = _ep_layer_re.search(_hf)
+                                    if _m_proj_full and _m_lid_full:
+                                        _lid_full = _m_lid_full.group(1)
+                                        _ep_stream_buf.setdefault(
+                                            _lid_full, {})[_m_proj_full.group(1)] = _full
+                                        if len(_ep_stream_buf[_lid_full]) == 3:
+                                            _d_inner = _ep_stream_buf.pop(_lid_full)
+                                            _w13 = torch.cat(
+                                                [_d_inner["gate_proj"], _d_inner["up_proj"]], dim=1)
+                                            _w2 = _d_inner["down_proj"]
+                                            del _d_inner
+                                            for _fhname, _ftensor in [
+                                                (f"model.layers.{_lid_full}.mlp.experts.w13_weight", _w13),
+                                                (f"model.layers.{_lid_full}.mlp.experts.w2_weight", _w2),
+                                            ]:
+                                                _fpn = _ftensor.numel()
+                                                tensors_meta.append({
+                                                    "name": _fhname,
+                                                    "shape": list(_ftensor.shape),
+                                                    "numel": _fpn,
+                                                })
+                                                if _USE_PINNED_BUF:
+                                                    if batch_numel > 0 and batch_numel + _fpn > _BATCH_MAX_NUMEL:
+                                                        torch.xpu.synchronize()
+                                                        cpu_batches.append(
+                                                            self._pinned_cpu_buf[_batch_start:_buf_offset])
+                                                        _batch_start = _buf_offset
+                                                        batch_numel = 0
+                                                        n_batches += 1
+                                                    self._pinned_cpu_buf[_buf_offset:_buf_offset + _fpn].copy_(
+                                                        _ftensor.flatten(), non_blocking=True)
+                                                    _buf_offset += _fpn
+                                                else:
+                                                    _fcpu = _ftensor.flatten().cpu()
+                                                    if batch_numel > 0 and batch_numel + _fpn > _BATCH_MAX_NUMEL:
+                                                        cpu_batches.append(torch.cat(batch_parts_cpu))
+                                                        batch_parts_cpu = []
+                                                        batch_numel = 0
+                                                        n_batches += 1
+                                                    batch_parts_cpu.append(_fcpu)
+                                                batch_numel += _fpn
+                                                n_params += 1
+                                            del _w13, _w2
+                            del _out_cat
+                        continue  # expert param handled by layer-batch path
+
                 if hasattr(param, "_local_tensor"):
                     _ft0 = time.perf_counter()
                     param = param.full_tensor()
@@ -1729,18 +1957,108 @@ def _sync_weights_to_vllm_xccl(self) -> None:
                     if _ep_expert_re.search(_cpn):
                         _ep_is_expert = True
                         _ep_local_t = param.to(self._device).contiguous()
-                        _ep_parts_t = [torch.empty_like(_ep_local_t) for _ in range(_ep_deg)]
-                        torch.distributed.all_gather(_ep_parts_t, _ep_local_t,
-                                                     group=self._shard_pg)
-                        if is_active:
-                            # Unshuffle interleaved → contiguous:
-                            # stack → [ep_d, n_local, …] → transpose → [n_local, ep_d, …]
-                            # → reshape → [total_experts, …]
-                            _ep_stk = torch.stack(_ep_parts_t, dim=0)
-                            param = _ep_stk.transpose(0, 1).reshape(
-                                -1, *_ep_stk.shape[2:]).contiguous()
-                            del _ep_stk
-                        del _ep_local_t, _ep_parts_t
+                        if _gather_root_active:
+                            # WS7: gather(dst=active). Root reassembles from
+                            # _ep_deg shards; non-root ranks just send.
+                            _shard_rank_pp = torch.distributed.get_rank(
+                                self._shard_pg)
+                            if _shard_rank_pp == _gr_active_shard_rank:
+                                _ep_parts_t = [
+                                    torch.empty_like(_ep_local_t)
+                                    for _ in range(_ep_deg)
+                                ]
+                                torch.distributed.gather(
+                                    _ep_local_t, gather_list=_ep_parts_t,
+                                    dst=_gr_active_shard_rank,
+                                    group=self._shard_pg)
+                                _ep_stk = torch.stack(_ep_parts_t, dim=0)
+                                param = _ep_stk.transpose(0, 1).reshape(
+                                    -1, *_ep_stk.shape[2:]).contiguous()
+                                del _ep_stk, _ep_parts_t
+                            else:
+                                torch.distributed.gather(
+                                    _ep_local_t, gather_list=None,
+                                    dst=_gr_active_shard_rank,
+                                    group=self._shard_pg)
+                            if not _gr_logged_engaged:
+                                log.info(
+                                    "Rank %d: EP wsync per-proj gather-to-root engaged",
+                                    self.rank)
+                                _gr_logged_engaged = True
+                        elif _fp8_wire_active:
+                            # WS8: cast local shard to E4M3 with per-row
+                            # scale, AllGather fp8 + scale, decompress on
+                            # active rank. Reduces wire bytes ~2× on
+                            # _shard_pg vs the bf16 baseline below.
+                            _ep_local_bf = _ep_local_t.to(torch.bfloat16)
+                            _ep_local_f32 = _ep_local_bf.to(torch.float32)
+                            # Per-output-row scaling (last dim is the
+                            # row dim for both gate/up [E, I, H] and down
+                            # [E, H, I]; the row whose error matters is
+                            # the GEMM input dim).
+                            _row_amax = _ep_local_f32.abs().amax(
+                                dim=-1, keepdim=True)
+                            _scale_local = (_row_amax / 448.0).clamp(min=1e-12)
+                            _ep_local_fp8 = (
+                                (_ep_local_f32 / _scale_local).clamp(-448.0, 448.0)
+                                .to(torch.float8_e4m3fn).contiguous())
+                            del _ep_local_bf, _ep_local_f32
+                            _scale_local_f32 = _scale_local.to(torch.float32).contiguous()
+                            del _scale_local
+
+                            _ep_fp8_parts = [
+                                torch.empty_like(_ep_local_fp8)
+                                for _ in range(_ep_deg)
+                            ]
+                            _ep_scale_parts = [
+                                torch.empty_like(_scale_local_f32)
+                                for _ in range(_ep_deg)
+                            ]
+                            torch.distributed.all_gather(
+                                _ep_fp8_parts, _ep_local_fp8,
+                                group=self._shard_pg)
+                            torch.distributed.all_gather(
+                                _ep_scale_parts, _scale_local_f32,
+                                group=self._shard_pg)
+                            del _ep_local_fp8, _scale_local_f32
+                            if is_active:
+                                # Per-rank dequantize (shape preserved),
+                                # then unshuffle identically to bf16 path.
+                                _bf16_parts = []
+                                for _f8p, _scp in zip(_ep_fp8_parts,
+                                                      _ep_scale_parts):
+                                    _bf16_parts.append(
+                                        (_f8p.to(torch.float32) * _scp)
+                                        .to(torch.bfloat16))
+                                _ep_stk = torch.stack(_bf16_parts, dim=0)
+                                param = _ep_stk.transpose(0, 1).reshape(
+                                    -1, *_ep_stk.shape[2:]).contiguous()
+                                del _ep_stk, _bf16_parts
+                            del _ep_fp8_parts, _ep_scale_parts
+                            if not _fp8_logged_engaged:
+                                log.info(
+                                    "Rank %d: EP wsync per-proj fp8 wire engaged "
+                                    "(local bytes %d → %d + %d scale)",
+                                    self.rank,
+                                    _ep_local_t.numel() * _ep_local_t.element_size(),
+                                    _ep_local_t.numel() * 1,
+                                    int(_row_amax.numel() * 4),
+                                )
+                                _fp8_logged_engaged = True
+                        else:
+                            _ep_parts_t = [torch.empty_like(_ep_local_t) for _ in range(_ep_deg)]
+                            torch.distributed.all_gather(_ep_parts_t, _ep_local_t,
+                                                         group=self._shard_pg)
+                            if is_active:
+                                # Unshuffle interleaved → contiguous:
+                                # stack → [ep_d, n_local, …] → transpose → [n_local, ep_d, …]
+                                # → reshape → [total_experts, …]
+                                _ep_stk = torch.stack(_ep_parts_t, dim=0)
+                                param = _ep_stk.transpose(0, 1).reshape(
+                                    -1, *_ep_stk.shape[2:]).contiguous()
+                                del _ep_stk
+                            del _ep_parts_t
+                        del _ep_local_t
                 if is_active:
                     hf_name = _xccl_accept_and_rename(param_name)
                     if hf_name is None:
@@ -1851,6 +2169,19 @@ def _sync_weights_to_vllm_xccl(self) -> None:
                         batch_numel += pn
                         n_params += 1
                 del param
+
+            # WS6: sanity check that no layer-batched expert pairs are
+            # dangling. If they are, a layer didn't have all 3 projections
+            # in sharded_sd (unexpected for Qwen3-30B-A3B; would silently
+            # drop weights from the wsync round).
+            if _layer_batch_active and _lb_pending:
+                _dangling = sorted(_lb_pending.keys())
+                raise RuntimeError(
+                    f"EP wsync layer-batch path: {len(_dangling)} layer(s) had "
+                    f"incomplete projection set after param loop: {_dangling[:8]}. "
+                    "This means the model state_dict is missing one of "
+                    "{gate_proj, up_proj, down_proj} for those layers."
+                )
 
             if is_active:
                 if _is_moe:

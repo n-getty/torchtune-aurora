@@ -1,0 +1,167 @@
+# Qwen3-30B-A3B GRPO with Expert Parallelism EP=16/dp_replicate=1 on Aurora XPU.
+#
+# Topology (split-tile-per-node):
+#   - 2 train nodes × 8 train tiles = 16 train ranks (EP=16, dp_shard=16, dp_replicate=1)
+#   - Each train node also runs 1×TP=4 vLLM server on tiles 8-11
+#   - Total: 2 vLLM TP=4 servers (4 vLLM tiles per node, 8 vLLM tiles total)
+#
+# Cross-node EP layout: with 16 train ranks, ALL 16 belong to ONE EP group
+# spanning both nodes. Every EP collective straddles hsn0. EP=8 (3-node) had
+# 1-of-3 EP groups straddling; here it's 1-of-1. Default path is gloo CPU
+# bounce via _GLOO_EP_PG; XCCL is opt-in via TORCHTUNE_EP_USE_XCCL=1
+# (unvalidated for cross-node EP — likely regresses).
+#
+# WS5 (2026-05-02, hold 8465623): first real EP=16 GRPO measurement.
+# 3/3 clean steps at 140s/step steady-state. Active config (validated):
+#   - vllm_weight_sync: true, vllm_weight_sync_deferred: false (sync XCCL
+#     wsync; broadcast inline end-of-step so dp_shard XCCL fabric is idle
+#     during wsync — avoids the WS3 EP=8 deferred-broadcast hang).
+#   - optimizer: torch.optim.AdamW(fused=True) (on-device, BF16 moments per
+#     WS4 probe). EP=16 paper memory math: ~7 GiB optimizer state per rank
+#     fits in headroom; collapses opt phase 87.5s → ~0s vs CPU AdamWBf16.
+# Per-step wall is now dominated by `other` (~92s); breakdown is the next
+# work item — see TIMING_DETAIL line in recipe and
+# docs/reports/MoE_EP_status.md "Next steps" section.
+#
+# Launch (2 train nodes, vLLM colocated on tiles 8-11 of each train node):
+#   bash experiments/ep_parallelism/run_qwen3_ep16_ws5.sh [num_steps]
+
+name: grpo_ep16_qwen3_30b_a3b_xpu
+
+output_dir: /tmp/torchtune/grpo_ep16_qwen3_30b_a3b
+base_model_path: /lus/flare/projects/ModCon/ngetty/models/Qwen3-30B-A3B
+data_dir: /lus/flare/projects/ModCon/ngetty/hackathon_rl/prepared_data
+
+# Expert Parallelism — single EP group across both train nodes
+expert_parallel_degree: 16
+data_parallel_replicate_dim: 1   # dp_shard derived = world_size / dp_replicate = 16
+
+# vLLM — 2 TP=4 replicas (one per train node, on tiles 8-11)
+# URL list passed in by launcher via VLLM_URLS env override
+vllm_url: "http://${oc.env:VLLM_HOST_0}:8001,http://${oc.env:VLLM_HOST_1}:8001"
+vllm_group_port: 51216
+# WS5: sync XCCL wsync (validated EP=8 attempt 6, 2026-05-02). vLLM gets
+# fresh weights every step on the trainer's _xccl_wsync_pg, broadcast inline
+# end-of-step (dp_shard idle so no fabric contention).
+vllm_weight_sync: true
+vllm_weight_sync_method: xccl
+vllm_weight_sync_interval: 1
+vllm_weight_sync_deferred: false
+vllm_tensor_parallel_size: 4
+
+# Tokenizer
+tokenizer:
+  _component_: torchtune.models.qwen3_moe.qwen3_moe_tokenizer
+  path: ${base_model_path}/vocab.json
+  merges_file: ${base_model_path}/merges.txt
+  max_seq_len: 512
+
+# Dataset — gene recall JSONL (the validated Qwen3 RL task)
+dataset:
+  _component_: torchtune.dev.rl.gene_recall.gene_recall_dataset
+  data_files: ${data_dir}/gene_recall_train.jsonl
+  max_seq_len: 512
+seed: 42
+shuffle: True
+
+# Model
+model:
+  _component_: torchtune.models.qwen3_moe.qwen3_30b_a3b
+
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files:
+    filename_format: model-{}-of-{}.safetensors
+    max_filename: "00016"
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: QWEN3_MOE
+
+ref_checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files:
+    filename_format: model-{}-of-{}.safetensors
+    max_filename: "00016"
+  recipe_checkpoint: null
+  output_dir: ${output_dir}/ref
+  model_type: QWEN3_MOE
+
+resume_from_checkpoint: False
+save_every_n_epochs: 100
+save_final_checkpoint: false
+
+# Reward
+reward_mode: gene_recall
+gene_reward_metric: f1
+
+# GRPO parameters — match v10f production envelope (G=4, NSTEPS=3, max_gen=32)
+batch_size: 1
+grpo_samples: 4
+forward_batch_size: 1
+max_generated_tokens: 32
+top_k: null
+temperature: 1.0
+
+ppo_epochs: 1
+gradient_accumulation_steps: 1
+
+num_steps: 3
+epochs: 1
+
+clip_grad_norm: 1.0
+
+# WS5 step 2: on-device fused AdamW. WS5 step 1 probe validated that
+# fused=True keeps moments BF16 on XPU for every Qwen3-30B-A3B shape class
+# (rmsnorm, attn_qkv, expert gate_up/down, embedding). EP=16 paper memory
+# math: ~7 GiB optimizer state per rank fits in headroom.
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 5e-6
+  fused: true
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  num_warmup_steps: 2
+loss:
+  _component_: torchtune.dev.rl.loss.GRPOSimpleLoss
+  kl_coeff: 0.01
+  epsilon: 0.2
+
+device: xpu
+
+# AC required for EP correctness — non-expert FSDP2 still AllGathers full layers,
+# but split AC keeps the MoE block (router + experts) outside the recomputed region
+# so num_tokens_per_expert is stable across FWD/BWD.
+enable_activation_checkpointing: True
+compile: False
+
+# Disable FSDP2 AllGather prefetch to avoid overlap with EP gloo CPU-bounce in dp_shard
+disable_prefetch: true
+
+dtype: bf16
+
+# Ref model on CPU (vLLM handles generation; ref forward only)
+ref_cpu_offload: true
+expert_cpu_offload: false
+
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+log_every_n_steps: 1
+log_peak_memory_stats: True
+
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: False
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: True
+  cuda: False
+  profile_memory: False
+  with_stack: False
+  record_shapes: False
+  with_flops: False
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1

@@ -386,6 +386,142 @@ class WeightSyncFromFileExtension:
                 w13_param.data.copy_(w13_tp.to(device))
                 w2_param.data.copy_(w2_tp.to(device))
 
+    def _load_fused_moe_experts_sharded(self, sharded_data: dict) -> None:
+        """WS10 receiver — assemble per-trainer-rank expert shards via expert_map.
+
+        See ``docs/reports/MoE_EP_status_ws8_ws10_design.md`` §WS10 and
+        ``tests/torchtune/dev/rl/test_sharded_vllm_moe_sync_equivalence.py``.
+
+        Trainer EP rank R owns interleaved global expert ids
+        ``[R, R+ep_d, R+2*ep_d, ..., R+(n_local-1)*ep_d]``. For each
+        (layer, projection), every trainer rank's shard is broadcast over
+        ``_xccl_wsync_pg``; this method walks each shard's local index,
+        derives the global id, looks it up in the FusedMoE ``expert_map``,
+        and scatter-copies into the local param when owned (``>= 0``).
+
+        Args:
+            sharded_data: ``{layer_idx: {"w13": {R: shard, ...},
+                                         "w2":  {R: shard, ...},
+                                         "ep_degree": int,
+                                         "n_local_trainer": int}}``
+                Each shard is ``[n_local_trainer, ...]`` from trainer rank R.
+        """
+        import torch
+
+        params = dict(self.model_runner.model.named_parameters())
+        model = self.model_runner.model
+
+        for layer_idx in sorted(sharded_data.keys()):
+            entry = sharded_data[layer_idx]
+            w13_shards = entry["w13"]
+            w2_shards = entry["w2"]
+            ep_degree = int(entry["ep_degree"])
+            n_local_trainer = int(entry["n_local_trainer"])
+
+            if len(w13_shards) != ep_degree or len(w2_shards) != ep_degree:
+                raise RuntimeError(
+                    f"layer {layer_idx}: sharded payload incomplete — "
+                    f"w13 has {len(w13_shards)}/{ep_degree} ranks, "
+                    f"w2 has {len(w2_shards)}/{ep_degree} ranks"
+                )
+
+            w13_key = f"model.layers.{layer_idx}.mlp.experts.w13_weight"
+            w2_key = f"model.layers.{layer_idx}.mlp.experts.w2_weight"
+            w13_param = params[w13_key]
+            w2_param = params[w2_key]
+
+            try:
+                moe_layer = model.get_submodule(
+                    f"model.layers.{layer_idx}.mlp.experts"
+                )
+            except AttributeError:
+                moe_layer = None
+
+            expert_map = getattr(moe_layer, "expert_map", None)
+            if expert_map is None:
+                raise RuntimeError(
+                    f"layer {layer_idx}: WS10 sharded receive requires "
+                    f"FusedMoE.expert_map; got None"
+                )
+            moe_tp_rank = getattr(moe_layer, "tp_rank", 0) or 0
+            moe_tp_size = getattr(moe_layer, "tp_size", 1) or 1
+            em_cpu = expert_map.to("cpu")
+            global_n = em_cpu.numel()
+            local_n_vllm = w13_param.shape[0]
+            device = w13_param.device
+
+            # Stage as bf16 global tensors then reuse the existing TP/transpose
+            # logic in _load_fused_moe_experts. Shape matches today's payload.
+            sample_w13 = next(iter(w13_shards.values()))
+            sample_w2 = next(iter(w2_shards.values()))
+            w13_global = torch.empty(
+                global_n, *sample_w13.shape[1:], dtype=sample_w13.dtype,
+            )
+            w2_global = torch.empty(
+                global_n, *sample_w2.shape[1:], dtype=sample_w2.dtype,
+            )
+            n_filled_w13 = 0
+            n_filled_w2 = 0
+            for trainer_rank, shard_w13 in w13_shards.items():
+                R = int(trainer_rank)
+                for src_local_i in range(shard_w13.shape[0]):
+                    g = R + src_local_i * ep_degree
+                    if g < global_n:
+                        w13_global[g].copy_(shard_w13[src_local_i])
+                        n_filled_w13 += 1
+                shard_w2 = w2_shards[trainer_rank]
+                for src_local_i in range(shard_w2.shape[0]):
+                    g = R + src_local_i * ep_degree
+                    if g < global_n:
+                        w2_global[g].copy_(shard_w2[src_local_i])
+                        n_filled_w2 += 1
+
+            if n_filled_w13 != global_n or n_filled_w2 != global_n:
+                raise RuntimeError(
+                    f"layer {layer_idx}: sharded assembly under-filled — "
+                    f"w13 {n_filled_w13}/{global_n} w2 {n_filled_w2}/{global_n}"
+                )
+
+            # Slice EP via expert_map — same logic as _load_fused_moe_experts.
+            owned_global = (em_cpu >= 0).nonzero(as_tuple=True)[0]
+            if owned_global.numel() != local_n_vllm:
+                raise RuntimeError(
+                    f"layer {layer_idx}: expert_map owned={owned_global.numel()} "
+                    f"!= param local={local_n_vllm}"
+                )
+            perm = torch.empty(local_n_vllm, dtype=torch.long)
+            perm[em_cpu[owned_global].long()] = owned_global
+            w13_ep = w13_global.index_select(0, perm)
+            w2_ep = w2_global.index_select(0, perm)
+
+            # TP slice along intermediate dim.
+            inter = w13_ep.shape[1] // 2
+            inter_per_tp = inter // moe_tp_size
+            if moe_tp_size == 1:
+                w13_tp = w13_ep
+                w2_tp = w2_ep
+            else:
+                gate_shard = w13_ep[
+                    :, moe_tp_rank * inter_per_tp:(moe_tp_rank + 1) * inter_per_tp, :
+                ]
+                up_shard = w13_ep[
+                    :,
+                    inter + moe_tp_rank * inter_per_tp:inter + (moe_tp_rank + 1) * inter_per_tp,
+                    :,
+                ]
+                w13_tp = torch.cat([gate_shard, up_shard], dim=1)
+                w2_tp = w2_ep[
+                    :, :, moe_tp_rank * inter_per_tp:(moe_tp_rank + 1) * inter_per_tp
+                ]
+
+            is_transposed = w13_param.shape[1] != w13_tp.shape[1]
+            if is_transposed:
+                w13_param.data.copy_(w13_tp.to(device).transpose(1, 2).contiguous())
+                w2_param.data.copy_(w2_tp.to(device).transpose(1, 2).contiguous())
+            else:
+                w13_param.data.copy_(w13_tp.to(device))
+                w2_param.data.copy_(w2_tp.to(device))
+
     # ------------------------------------------------------------------
     # XCCL broadcast weight sync
     # ------------------------------------------------------------------
@@ -704,6 +840,12 @@ class WeightSyncFromFileExtension:
                 # requires both keys, so we hold the lonely tensor (cloned, since
                 # _xccl_recv_buf is reused next iter) until its pair arrives.
                 fused_pending: dict = {}
+                # WS10 sharded MoE: same pattern, but each trainer rank's shard
+                # arrives as its own entry tagged with trainer_ep_rank/ep_degree.
+                # We accumulate all (R, kind) pairs for each layer and dispatch
+                # to _load_fused_moe_experts_sharded once both kinds have all
+                # ep_degree shards present. Off-path (no tags) -> empty dict.
+                sharded_pending: dict = {}
                 _recv_load_error = None  # deferred: recv all batches before raising
 
                 # Compute expected batch count (same greedy algorithm as sender)
@@ -795,8 +937,19 @@ class WeightSyncFromFileExtension:
                         if m:
                             layer_idx = int(m.group(1))
                             kind = m.group(2)
-                            # Clone: recv_buf is reused next iteration.
-                            fused_pending.setdefault(layer_idx, {})[kind] = tensor.clone()
+                            trainer_ep_rank = entry.get("trainer_ep_rank")
+                            ep_degree = entry.get("ep_degree")
+                            if trainer_ep_rank is not None and ep_degree is not None:
+                                # WS10 sharded payload — accumulate per-rank shards.
+                                lyr = sharded_pending.setdefault(layer_idx, {
+                                    "w13": {}, "w2": {},
+                                    "ep_degree": int(ep_degree),
+                                    "n_local_trainer": int(entry.get("n_local", entry["shape"][0])),
+                                })
+                                lyr[kind][int(trainer_ep_rank)] = tensor.clone()
+                            else:
+                                # Clone: recv_buf is reused next iteration.
+                                fused_pending.setdefault(layer_idx, {})[kind] = tensor.clone()
                         else:
                             non_expert_weights.append((entry["name"], tensor))
                         offset += n
@@ -808,6 +961,13 @@ class WeightSyncFromFileExtension:
                     }
                     for li in fused_ready:
                         del fused_pending[li]
+                    # WS10: apply layers whose w13+w2 each have all ep_degree shards.
+                    sharded_ready = {}
+                    for li, lyr in list(sharded_pending.items()):
+                        ep_d = lyr["ep_degree"]
+                        if (len(lyr["w13"]) == ep_d and len(lyr["w2"]) == ep_d):
+                            sharded_ready[li] = lyr
+                            del sharded_pending[li]
 
                     t_l0 = time.perf_counter()
                     # Catch load errors but continue receiving remaining batches
@@ -818,6 +978,8 @@ class WeightSyncFromFileExtension:
                             self.model_runner.model.load_weights(weights=non_expert_weights)
                         if fused_ready:
                             self._load_fused_moe_experts(fused_ready)
+                        if sharded_ready:
+                            self._load_fused_moe_experts_sharded(sharded_ready)
                     except Exception as _le:
                         if _recv_load_error is None:
                             logger.error(
@@ -836,7 +998,7 @@ class WeightSyncFromFileExtension:
                             t_bcast_i, t_load_i, len(fused_ready), len(non_expert_weights),
                         )
                     _batch_idx += 1
-                    del non_expert_weights, fused_ready
+                    del non_expert_weights, fused_ready, sharded_ready
 
                 logger.info(
                     "WSYNC-RECV done: %d batches (expected %d) total_recv=%.1fs total_load=%.1fs",
@@ -851,6 +1013,17 @@ class WeightSyncFromFileExtension:
                         f"XCCL streaming MoE: {len(fused_pending)} layers missing w13 or w2 "
                         f"after all batches: {incomplete}"
                     )
+                if sharded_pending:
+                    incomplete = {
+                        li: {"w13_ranks": sorted(lyr["w13"].keys()),
+                             "w2_ranks": sorted(lyr["w2"].keys()),
+                             "ep_degree": lyr["ep_degree"]}
+                        for li, lyr in sharded_pending.items()
+                    }
+                    raise RuntimeError(
+                        f"XCCL streaming MoE (WS10 sharded): {len(sharded_pending)} layers "
+                        f"missing per-rank shards after all batches: {incomplete}"
+                    )
                 # Deferred load error: all batches received (trainer unblocked), now raise.
                 if _recv_load_error is not None:
                     raise _recv_load_error
@@ -859,7 +1032,9 @@ class WeightSyncFromFileExtension:
                 # Legacy: one broadcast per param. Same w13/w2 split-across-flush
                 # hazard as the batched path, so accumulate across apply_every flushes.
                 fused_leg_pending: dict = {}
+                sharded_leg_pending: dict = {}
                 weights_batch = []
+                sharded_batch = []  # (layer_idx, kind, R, ep_d, n_local, tensor)
                 for idx, entry in enumerate(tensors_meta):
                     recv_buf = torch.empty(
                         entry["numel"], device=self._xccl_device, dtype=torch.bfloat16,
@@ -897,7 +1072,7 @@ class WeightSyncFromFileExtension:
                         self._xccl_pg.broadcast(recv_buf, root=0).wait()
                     t_bcast_total += time.perf_counter() - t_b0
 
-                    weights_batch.append((entry["name"], recv_buf.reshape(entry["shape"])))
+                    weights_batch.append((entry, recv_buf.reshape(entry["shape"])))
 
                     if len(weights_batch) >= apply_every or idx == n_params - 1:
                         t_l0 = time.perf_counter()
@@ -906,13 +1081,25 @@ class WeightSyncFromFileExtension:
                             r"model\.layers\.(\d+)\.mlp\.experts\.(w13|w2)_weight"
                         )
                         non_expert = []
-                        for wname, wtensor in weights_batch:
+                        for wentry, wtensor in weights_batch:
+                            wname = wentry["name"]
                             m = _fused_re_leg.match(wname)
                             if m:
                                 li = int(m.group(1))
-                                # Legacy path uses fresh recv_buf per param, so
-                                # no clone needed.
-                                fused_leg_pending.setdefault(li, {})[m.group(2)] = wtensor
+                                kind = m.group(2)
+                                R = wentry.get("trainer_ep_rank")
+                                ep_d = wentry.get("ep_degree")
+                                if R is not None and ep_d is not None:
+                                    lyr = sharded_leg_pending.setdefault(li, {
+                                        "w13": {}, "w2": {},
+                                        "ep_degree": int(ep_d),
+                                        "n_local_trainer": int(wentry.get("n_local", wentry["shape"][0])),
+                                    })
+                                    lyr[kind][int(R)] = wtensor
+                                else:
+                                    # Legacy path uses fresh recv_buf per param, so
+                                    # no clone needed.
+                                    fused_leg_pending.setdefault(li, {})[kind] = wtensor
                             else:
                                 non_expert.append((wname, wtensor))
                         fused_ready = {
@@ -921,12 +1108,20 @@ class WeightSyncFromFileExtension:
                         }
                         for li in fused_ready:
                             del fused_leg_pending[li]
+                        sharded_ready_leg = {}
+                        for li, lyr in list(sharded_leg_pending.items()):
+                            ep_d = lyr["ep_degree"]
+                            if (len(lyr["w13"]) == ep_d and len(lyr["w2"]) == ep_d):
+                                sharded_ready_leg[li] = lyr
+                                del sharded_leg_pending[li]
                         if non_expert:
                             self.model_runner.model.load_weights(weights=non_expert)
                         if fused_ready:
                             self._load_fused_moe_experts(fused_ready)
+                        if sharded_ready_leg:
+                            self._load_fused_moe_experts_sharded(sharded_ready_leg)
                         t_load_total += time.perf_counter() - t_l0
-                        del weights_batch, non_expert, fused_ready
+                        del weights_batch, non_expert, fused_ready, sharded_ready_leg
                         weights_batch = []
 
                 if fused_leg_pending:

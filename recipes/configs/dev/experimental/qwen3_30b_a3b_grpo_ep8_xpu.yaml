@@ -1,0 +1,169 @@
+# Qwen3-30B-A3B GRPO with Expert Parallelism EP=8/DP_replicate=3 on Aurora XPU.
+#
+# Same model + dataset as qwen3_30b_a3b_grpo_ep4_xpu.yaml; differs in topology:
+#   EP=8, dp_replicate=3, dp_shard=8 (vs EP=4, dp_replicate=6, dp_shard=4).
+#
+# Why EP=8: at EP=4 the per-tile sharded-param footprint (~16 GiB grad pool +
+# ~10 GiB FP32 optimizer state) didn't fit Aurora's ~7 GiB headroom after the v9
+# release helper materialized real grads (see project_qwen3_ep_v9_helper.md).
+# Doubling the EP/dp_shard mesh halves both: ~8 GiB grad pool + ~5 GiB optimizer
+# state. This should fit headroom and let us drop the AdamWBf16 CPU-side update
+# back to plain torch.optim.AdamW on device.
+#
+# Topology: EP=8, dp_replicate=3, dp_shard=8
+#   - 24 train tiles total (2 train nodes × 12 tiles)
+#   - 3 DP replicas, each = 8 tiles
+#   - Each tile owns 128 / 8 = 16 experts (interleaved assignment)
+#   - 2 of 3 EP groups stay within a single node (tiles [0-7] and [16-23]);
+#     1 EP group straddles nodes (tiles [8-15] = last 4 of node-1 + first 4 of
+#     node-2). EP gloo collectives on the straddling group go through hsn0.
+#   - Non-expert FSDP: across 8 dp_shard tiles, replicated 3× over dp_replicate
+#
+# Launch (1 dedicated vLLM node + 2 train nodes):
+#   bash recipes/dev/run_qwen3_30b_ep8_vllm_3node.sh [num_steps]
+
+name: grpo_ep8_qwen3_30b_a3b_xpu
+
+output_dir: /tmp/torchtune/grpo_ep8_qwen3_30b_a3b
+base_model_path: /lus/flare/projects/ModCon/ngetty/models/Qwen3-30B-A3B
+data_dir: /lus/flare/projects/ModCon/ngetty/hackathon_rl/prepared_data
+
+# Expert Parallelism
+expert_parallel_degree: 8
+data_parallel_replicate_dim: 3   # dp_replicate; dp_shard derived = world_size / dp_replicate
+
+# vLLM: 3 TP=4 replicas on dedicated node, ports 8001-8003
+vllm_url: "http://${oc.env:VLLM_ADDR}:8001,http://${oc.env:VLLM_ADDR}:8002,http://${oc.env:VLLM_ADDR}:8003"
+vllm_tensor_parallel_size: 4   # WS3: each replica is TP=4 → wsync world = 1 + 3*4 = 13
+vllm_group_port: 51216
+# WS3 (2026-05-01): XCCL weight sync wired for MoE — `_sync_weights_to_vllm_xccl`
+# at torchtune/dev/rl/weight_sync.py:1744 calls `fuse_experts_for_vllm()` and
+# the vLLM worker routes fused experts via `_load_fused_moe_experts` at
+# torchtune/dev/vllm_weight_sync_worker.py:700. Promotes EP=8 from a perf
+# smoke (stale SFT-init vLLM) to validated GRPO training.
+vllm_weight_sync: true
+vllm_weight_sync_method: xccl
+vllm_weight_sync_interval: 1
+# WS4 (2026-05-01): synchronous wsync mode — broadcast runs end-of-step on the trainer's
+# wsync PG (separate from dp_shard XCCL), then rank 0 blocks until vLLM has the new weights
+# before step N+1 generation. Required for EP: the default deferred-broadcast pattern fires
+# the broadcast DURING step N+1 grad-release on the same dp_shard XCCL fabric used by
+# `_ep_release_fsdp_unsharded_grads`, which deterministically hangs (WS3, hold 8464081).
+# Cost vs deferred: ~7-15s per step (the broadcast is no longer overlapped with backward).
+# See docs/reports/MoE_EP_status.md section #5.
+vllm_weight_sync_deferred: false
+
+# Tokenizer
+tokenizer:
+  _component_: torchtune.models.qwen3_moe.qwen3_moe_tokenizer
+  path: ${base_model_path}/vocab.json
+  merges_file: ${base_model_path}/merges.txt
+  max_seq_len: 512
+
+# Dataset — gene recall JSONL (the validated Qwen3 RL task)
+dataset:
+  _component_: torchtune.dev.rl.gene_recall.gene_recall_dataset
+  data_files: ${data_dir}/gene_recall_train.jsonl
+  max_seq_len: 512
+seed: 42
+shuffle: True
+
+# Model
+model:
+  _component_: torchtune.models.qwen3_moe.qwen3_30b_a3b
+
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files:
+    filename_format: model-{}-of-{}.safetensors
+    max_filename: "00016"
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: QWEN3_MOE
+
+ref_checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files:
+    filename_format: model-{}-of-{}.safetensors
+    max_filename: "00016"
+  recipe_checkpoint: null
+  output_dir: ${output_dir}/ref
+  model_type: QWEN3_MOE
+
+resume_from_checkpoint: False
+save_every_n_epochs: 100
+save_final_checkpoint: false
+
+# Reward
+reward_mode: gene_recall
+gene_reward_metric: f1
+
+# GRPO parameters — start conservative
+batch_size: 1
+grpo_samples: 4
+forward_batch_size: 2
+max_generated_tokens: 128
+top_k: null
+temperature: 1.0
+
+ppo_epochs: 1
+gradient_accumulation_steps: 1
+
+num_steps: 5
+epochs: 1
+
+clip_grad_norm: 1.0
+
+# Plain on-device AdamW — EP=8 halves sharded params to ~625M, FP32 optimizer
+# state ~5 GiB per rank, fits the post-v9-release ~7 GiB headroom.
+# Switch to torchtune.dev.bioreason.optim.AdamWBf16 if OOM persists at v10 step 1.
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 5e-6
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  num_warmup_steps: 2
+loss:
+  _component_: torchtune.dev.rl.loss.GRPOSimpleLoss
+  kl_coeff: 0.01
+  epsilon: 0.2
+
+device: xpu
+
+# AC required for EP correctness — non-expert FSDP2 still AllGathers full layers,
+# but split AC keeps the MoE block (router + experts) outside the recomputed region
+# so num_tokens_per_expert is stable across FWD/BWD.
+enable_activation_checkpointing: True
+compile: False
+
+# Disable FSDP2 AllGather prefetch to avoid overlap with EP gloo CPU-bounce in dp_shard
+disable_prefetch: true
+
+dtype: bf16
+
+# Ref model on CPU (vLLM handles generation; ref forward only)
+ref_cpu_offload: true
+expert_cpu_offload: false
+
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+log_every_n_steps: 1
+log_peak_memory_stats: True
+
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: False
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: True
+  cuda: False
+  profile_memory: False
+  with_stack: False
+  record_shapes: False
+  with_flops: False
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1

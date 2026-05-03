@@ -1,0 +1,159 @@
+# Qwen3-4B DENSE GRPO — 2-node server mode (perf comparison vs LoRA)
+#
+# Purpose: provide an apples-to-apples step-time baseline against
+# qwen3_4b_lora_grpo_2node_server_xpu.yaml. SAME envelope, no LoRA.
+#
+# Topology (mirrors LoRA YAML):
+#   Node 0 (TRAIN_NODE): 11 training ranks, FSDP1 SHARD_GRAD_OP.
+#   Node 1 (VLLM_NODE):  12 vLLM HTTP servers (DP=12, ports 8001-8012, TP=1 each).
+#     Loads Qwen3-4B base; weight sync via XCCL broadcast (no LoRA hot-swap).
+#
+# Recipe: recipes/dev/grpo_full_finetune_distributed_xpu.py  (base, NOT lora_*)
+# Launcher: experiments/lora_grpo/run_qwen3_4b_dense_2node.sh
+
+name: grpo_qwen3_4b_dense_2node_server
+output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/outputs/grpo_qwen3_4b_dense_2node_v1
+base_model_path: /lus/flare/projects/ModCon/ngetty/models/Qwen3-4B
+
+data_parallel_replicate_dim: 1
+
+# vllm_url is filled in at runtime by the launcher. Leave port group fixed.
+vllm_url: "http://localhost:8001"
+vllm_group_port: 51216
+vllm_tensor_parallel_size: 1
+
+vllm_weight_sync: true
+vllm_weight_sync_method: xccl
+vllm_weight_sync_interval: 1
+
+# ── Model (DENSE, no LoRA) ────────────────────────────────────────────────────
+model:
+  _component_: torchtune.models.qwen3.qwen3_4b_base
+
+# ── Tokenizer ─────────────────────────────────────────────────────────────────
+tokenizer:
+  _component_: torchtune.models.qwen3.qwen3_tokenizer
+  path: ${base_model_path}/vocab.json
+  merges_file: ${base_model_path}/merges.txt
+  max_seq_len: ${max_seq_len}
+
+# ── Checkpointers (policy + ref both load the same base) ──────────────────────
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [
+    model-00001-of-00003.safetensors,
+    model-00002-of-00003.safetensors,
+    model-00003-of-00003.safetensors,
+  ]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: QWEN3
+
+ref_checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [
+    model-00001-of-00003.safetensors,
+    model-00002-of-00003.safetensors,
+    model-00003-of-00003.safetensors,
+  ]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}/ref
+  model_type: QWEN3
+
+# ── Dataset (matches LoRA run) ────────────────────────────────────────────────
+dataset:
+  _component_: torchtune.dev.rl.gsm8k.gsm8k_dataset
+  partition: 1-9/10
+
+seed: 42
+shuffle: true
+resume_from_checkpoint: false
+
+# ── RL Hyperparameters (MATCHES LoRA YAML; envelope set by launcher) ─────────
+grpo_samples: 8
+max_seq_len: 1024
+max_generated_tokens: 512
+temperature: 1.0
+top_k: null
+
+# ── Training (envelope must match the LoRA run for fair comparison) ──────────
+epochs: 1
+num_steps: 5
+ppo_epochs: 1
+batch_size: 8
+forward_batch_size: 2          # 4 OOMs at lm_head (vocab=151936 × fp32 cast)
+gradient_accumulation_steps: 1
+
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 3.0e-5
+  weight_decay: 0.01
+  fused: false
+
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  num_warmup_steps: 2
+
+clip_grad_norm: 1.0
+
+# ── Loss ──────────────────────────────────────────────────────────────────────
+loss:
+  _component_: torchtune.dev.rl.loss.GRPOLoss
+  kl_coeff: 1.0e-4
+  epsilon: 0.2
+
+# ── Reward (same as LoRA YAML for fair gen-token-distribution match) ─────────
+reward_functions:
+  - _component_: torchtune.dev.rl.rewards.FormattedMathCorrectnessReward
+    answer_tag: answer
+    positive_reward: 10.0
+    negative_reward: 0.0
+  - _component_: torchtune.dev.rl.rewards.ThinkingAnswerFormattingReward
+    think_tag: think
+    answer_tag: answer
+    positive_reward: 1.0
+    negative_reward: 0.0
+
+# ── vLLM rollout (server mode, DP=12 by default) ─────────────────────────────
+vllm_mode: server
+vllm_max_model_len: 1536
+vllm_max_num_seqs: 64
+
+# ── Distributed / FSDP ────────────────────────────────────────────────────────
+# ZeRO-3: reshard params after forward to free HBM. ZeRO-2 OOMed on the lm_head
+# fp32 cast; full-FT 4B simply doesn't have headroom to keep unsharded params
+# resident across the chunk loop.
+reshard_after_forward: true
+enable_activation_checkpointing: true
+
+# ── XPU ───────────────────────────────────────────────────────────────────────
+device: xpu
+dtype: bf16
+compile: false
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+log_every_n_steps: 1
+log_peak_memory_stats: true
+save_every_n_epochs: 1
+
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+
+# ── Profiler ──────────────────────────────────────────────────────────────────
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: false
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: true
+  cuda: false
+  profile_memory: false
+  with_stack: false
+  record_shapes: false
+  with_flops: false
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1

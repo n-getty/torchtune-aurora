@@ -1,0 +1,142 @@
+# Qwen3-30B-A3B GRPO with Expert Parallelism EP=4/DP=3 on Aurora XPU.
+#
+# 30.5B total, ~3.3B active (128 experts, top-8 softmax). Same EP topology as the
+# Gemma4 26B-A4B EP config, but reuses the Qwen3 MoE production model + gene_recall
+# dataset (the only end-to-end-validated Qwen3 RL task).
+#
+# Topology: EP=4, DP=3 (dp_replicate=3, dp_shard=4)
+#   - 3 DP replicas, each = 4 tiles
+#   - Each tile owns 128 / 4 = 32 experts (interleaved assignment)
+#   - EP collectives: AllGather/ReduceScatter via gloo CPU-bounce on the 4-tile dp_shard
+#     group (Aurora oneCCL OFI deadlocks on EP AllToAll; see torchtune/modules/moe/_parallelism.py)
+#   - Non-expert FSDP: across 4 dp_shard tiles, replicated 3× over dp_replicate
+#
+# Launch (dedicated 12-tile training node + dedicated vLLM node):
+#   bash recipes/dev/run_qwen3_30b_a3b_ep4_vllm_2node.sh [num_steps]
+
+name: grpo_ep4_qwen3_30b_a3b_xpu
+
+output_dir: /tmp/torchtune/grpo_ep4_qwen3_30b_a3b
+base_model_path: /lus/flare/projects/ModCon/ngetty/models/Qwen3-30B-A3B
+data_dir: /lus/flare/projects/ModCon/ngetty/hackathon_rl/prepared_data
+
+# Expert Parallelism
+expert_parallel_degree: 4
+data_parallel_replicate_dim: 3   # dp_replicate; dp_shard derived = world_size / dp_replicate
+
+# vLLM: 3 TP=4 replicas on dedicated node, ports 8001-8003
+vllm_url: "http://${oc.env:VLLM_ADDR}:8001,http://${oc.env:VLLM_ADDR}:8002,http://${oc.env:VLLM_ADDR}:8003"
+vllm_group_port: 51216
+vllm_weight_sync: false
+
+# Tokenizer
+tokenizer:
+  _component_: torchtune.models.qwen3_moe.qwen3_moe_tokenizer
+  path: ${base_model_path}/vocab.json
+  merges_file: ${base_model_path}/merges.txt
+  max_seq_len: 512
+
+# Dataset — gene recall JSONL (the validated Qwen3 RL task)
+dataset:
+  _component_: torchtune.dev.rl.gene_recall.gene_recall_dataset
+  data_files: ${data_dir}/gene_recall_train.jsonl
+  max_seq_len: 512
+seed: 42
+shuffle: True
+
+# Model
+model:
+  _component_: torchtune.models.qwen3_moe.qwen3_30b_a3b
+
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files:
+    filename_format: model-{}-of-{}.safetensors
+    max_filename: "00016"
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: QWEN3_MOE
+
+ref_checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files:
+    filename_format: model-{}-of-{}.safetensors
+    max_filename: "00016"
+  recipe_checkpoint: null
+  output_dir: ${output_dir}/ref
+  model_type: QWEN3_MOE
+
+resume_from_checkpoint: False
+save_every_n_epochs: 100
+save_final_checkpoint: false
+
+# Reward
+reward_mode: gene_recall
+gene_reward_metric: f1
+
+# GRPO parameters — start conservative for first EP run
+batch_size: 1
+grpo_samples: 4
+forward_batch_size: 2
+max_generated_tokens: 128
+top_k: null
+temperature: 1.0
+
+ppo_epochs: 1
+gradient_accumulation_steps: 1
+
+num_steps: 5
+epochs: 1
+
+clip_grad_norm: 1.0
+
+optimizer:
+  _component_: torchtune.dev.bioreason.optim.AdamWBf16
+  lr: 5e-6
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  num_warmup_steps: 2
+loss:
+  _component_: torchtune.dev.rl.loss.GRPOSimpleLoss
+  kl_coeff: 0.01
+  epsilon: 0.2
+
+device: xpu
+
+# AC required for EP correctness — non-expert FSDP2 still AllGathers full layers,
+# but split AC keeps the MoE block (router + experts) outside the recomputed region
+# so num_tokens_per_expert is stable across FWD/BWD.
+enable_activation_checkpointing: True
+compile: False
+
+# Disable FSDP2 AllGather prefetch to avoid overlap with EP gloo CPU-bounce in dp_shard
+disable_prefetch: true
+
+dtype: bf16
+
+# Ref model on CPU (vLLM handles generation; ref forward only)
+ref_cpu_offload: true
+expert_cpu_offload: false
+
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+log_every_n_steps: 1
+log_peak_memory_stats: True
+
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: False
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: True
+  cuda: False
+  profile_memory: False
+  with_stack: False
+  record_shapes: False
+  with_flops: False
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1

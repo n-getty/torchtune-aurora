@@ -532,8 +532,14 @@ class ExpertParallel(ParallelStyle):
         AllGather backward = ReduceScatter
         ReduceScatter backward = AllGather
 
-    No AllToAll, no split tracking, no OFI CQ drain. AllGather/ReduceScatter are
-    natively optimized in oneCCL (topology-aware, L0 IPC) and used by FSDP2 on Aurora.
+    No AllToAll, no split tracking. Default transport on Aurora is the gloo
+    CPU-bounce path in `_ep_all_gather` / `_ep_reduce_scatter` (the recipe
+    monkey-patches `dist.reduce_scatter_tensor` to work around CCL's
+    ze_handle_manager IPC bug on FSDP2 sub-allocated grads). Native XCCL on
+    `_shard_pg` is opt-in via `TORCHTUNE_EP_USE_XCCL=1` (see CLAUDE.md);
+    EP=8 v10f measured -3.9% with XCCL EP AG/RS alone, EP=16 phase B was
+    null over Slingshot. The dominant XCCL win on the EP path is grad-release
+    (`TORCHTUNE_EP_GRAD_RELEASE_XCCL=1`, -34.5% on v10f).
 
     Usage::
 

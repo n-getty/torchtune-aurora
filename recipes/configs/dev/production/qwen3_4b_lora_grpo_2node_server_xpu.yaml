@@ -48,10 +48,9 @@ checkpointer:
   _component_: torchtune.training.FullModelHFCheckpointer
   checkpoint_dir: ${base_model_path}
   checkpoint_files: [
-    model-00001-of-00004.safetensors,
-    model-00002-of-00004.safetensors,
-    model-00003-of-00004.safetensors,
-    model-00004-of-00004.safetensors,
+    model-00001-of-00003.safetensors,
+    model-00002-of-00003.safetensors,
+    model-00003-of-00003.safetensors,
   ]
   recipe_checkpoint: null
   output_dir: ${output_dir}
@@ -81,6 +80,7 @@ num_steps: 200
 ppo_epochs: 1
 batch_size: 8                          # ppo_batch_size = batch_size * grpo_samples = 192 (paper)
 forward_batch_size: 8
+gen_batch_size: 8                      # outer chunk for trajectory gen → 1 vLLM call/step (decoupled from fwd_bs)
 gradient_accumulation_steps: 1
 
 optimizer:
@@ -121,6 +121,9 @@ lora:
   tmpfs_transfer: true                # write to TRAIN_NODE /dev/shm, rsync to VLLM_NODE /dev/shm
   train_shm: /dev/shm/lora_adapters
   vllm_shm: /dev/shm/lora_adapters
+  # Per-step adapter L2 norm before/after opt.step + vLLM model name log.
+  # Used by the validation ladder to prove learning is happening.
+  log_validation_metrics: true
 
 # ── vLLM rollout (server mode, DP=12) ─────────────────────────────────────────
 # vllm_url is filled at runtime by the launcher.

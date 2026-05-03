@@ -596,7 +596,27 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
         self._max_generated_tokens = cfg.max_generated_tokens
         self.batch_size = cfg.batch_size
         self._forward_batch_size = cfg.forward_batch_size
+        # Outer-loop chunk for trajectory generation. Defaults to batch_size so
+        # all G*batch_size streams hit vLLM in one HTTP call (max throughput).
+        # Lower it (e.g. to forward_batch_size) only if the resulting tensors
+        # don't fit in HBM. policy_fwd / ref_fwd remain chunked at fwd_bs inside
+        # generate_trajectory regardless of this value.
+        self._gen_batch_size = cfg.get("gen_batch_size", cfg.batch_size)
         self._ppo_epochs = cfg.ppo_epochs
+        # Rollout-time policy logprobs gate. Mirrors dense recipe behavior:
+        # required when ppo_epochs > 1 (multi-epoch updates mutate weights between
+        # epochs so old_logprobs must come from the rollout-time policy) or when
+        # explicitly forced via always_compute_rollout_logprobs (off-policy /
+        # async setups). Otherwise we skip the no-grad policy fwd in
+        # generate_trajectory and grpo_step falls back to chunk_pi_lp.detach()
+        # (ratios collapse to 1, identical to pre-async behavior). Saves ~13%
+        # of step time at 4B (policy_fwd ~8.3s out of 64.4s).
+        self._always_compute_rollout_logprobs = cfg.get(
+            "always_compute_rollout_logprobs", False
+        )
+        self._compute_rollout_logprobs_required = (
+            self._ppo_epochs > 1 or self._always_compute_rollout_logprobs
+        )
         self._total_steps = cfg.num_steps
 
         # Reward
@@ -984,32 +1004,40 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
             )
         position_ids = generation.get_position_ids_from_padding_mask(query_response_padding_masks)
 
-        # Step 2: policy logprobs (adapter-enabled forward)
+        # Step 2: policy logprobs (adapter-enabled forward).
+        # Only required when ppo_epochs > 1 or always_compute_rollout_logprobs
+        # is set. In single-epoch sync GRPO (default), we skip this and let
+        # grpo_step's per-chunk policy fwd produce both pi_logprobs and
+        # old_logprobs (via .detach()) — ratios collapse to 1 either way.
+        # Saves ~13% of step time at 4B.
         fwd_bs = self._forward_batch_size
         _policy_fwd_t0 = time.perf_counter()
-        with torch.no_grad():
-            if fwd_bs >= num_seqs:
-                policy_logits = self._model(query_responses, input_pos=position_ids, mask=masks)
-                policy_logits = rlhf.truncate_sequence_for_logprobs(policy_logits, context_length)
-                logprobs = rlhf.batched_logits_to_logprobs(policy_logits, responses, self._temperature)
-                del policy_logits
-            else:
-                chunks = []
-                for cs in range(0, num_seqs, fwd_bs):
-                    ce = min(cs + fwd_bs, num_seqs)
-                    chunk_logits = self._model(
-                        query_responses[cs:ce],
-                        input_pos=position_ids[cs:ce],
-                        mask=None if masks is None else masks[cs:ce],
-                    )
-                    chunk_logits = chunk_logits[:, context_length - 1:]
-                    chunks.append(
-                        rlhf.batched_logits_to_logprobs(chunk_logits, responses[cs:ce], self._temperature)
-                    )
-                    del chunk_logits
-                logprobs = torch.cat(chunks, dim=0)
-        if self._device.type == "xpu":
-            torch.xpu.synchronize()
+        if self._compute_rollout_logprobs_required:
+            with torch.no_grad():
+                if fwd_bs >= num_seqs:
+                    policy_logits = self._model(query_responses, input_pos=position_ids, mask=masks)
+                    policy_logits = rlhf.truncate_sequence_for_logprobs(policy_logits, context_length)
+                    logprobs = rlhf.batched_logits_to_logprobs(policy_logits, responses, self._temperature)
+                    del policy_logits
+                else:
+                    chunks = []
+                    for cs in range(0, num_seqs, fwd_bs):
+                        ce = min(cs + fwd_bs, num_seqs)
+                        chunk_logits = self._model(
+                            query_responses[cs:ce],
+                            input_pos=position_ids[cs:ce],
+                            mask=None if masks is None else masks[cs:ce],
+                        )
+                        chunk_logits = chunk_logits[:, context_length - 1:]
+                        chunks.append(
+                            rlhf.batched_logits_to_logprobs(chunk_logits, responses[cs:ce], self._temperature)
+                        )
+                        del chunk_logits
+                    logprobs = torch.cat(chunks, dim=0)
+            if self._device.type == "xpu":
+                torch.xpu.synchronize()
+        else:
+            logprobs = None
         _policy_fwd_time = time.perf_counter() - _policy_fwd_t0
 
         # Step 3: ref logprobs via disable_adapter (no separate ref model)
@@ -1045,10 +1073,17 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
             self.rank, _vllm_time, _policy_fwd_time, _ref_fwd_time,
         )
 
-        # Step 4: truncate at first stop token
+        # Step 4: truncate at first stop token.
+        # truncate_sequence_at_first_stop_token only marks tokens *after* the first stop
+        # as padding. vLLM may return a completion shorter than max_generated_tokens with
+        # no stop token (length cutoff or stop fired but the kernel returned without
+        # signaling); in that case the synthetic pad_id bytes we wrote at line 912 stay
+        # padding_mask=False and would be counted as real tokens in loss/KL. OR the
+        # pad-id positions in so they are excluded from the loss.
         (response_padding_masks, responses) = rlhf.truncate_sequence_at_first_stop_token(
             responses, self._stop_token_ids, self._tokenizer.pad_id
         )
+        response_padding_masks = response_padding_masks | (responses == self._tokenizer.pad_id)
 
         # Step 5: rewards
         responses = responses.reshape(batch_size, grpo_size, -1)
@@ -1095,14 +1130,19 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
                 self._steps_run, rewards_mean, rewards_std, successes.float().mean().item(),
             )
 
-        # Advantages
-        advantages = (rewards - rewards.mean(1, keepdim=True)) / (rewards.std(1, keepdim=True) + 1e-4)
+        # Advantages. Use unbiased=False so std at G=1 is 0 (not NaN). For G>=2
+        # the population vs sample std differs by sqrt((G-1)/G) — a constant per
+        # batch — and gets normalized away by the +1e-4 floor / downstream loss.
+        advantages = (rewards - rewards.mean(1, keepdim=True)) / (
+            rewards.std(1, keepdim=True, unbiased=False) + 1e-4
+        )
         advantages = advantages.reshape(batch_size * grpo_size)
         del responses
         device_empty_cache(self._device)
 
-        # Mask padding
-        logprobs.masked_fill_(response_padding_masks, 1.0)
+        # Mask padding (logprobs is None when rollout-time policy fwd was skipped).
+        if logprobs is not None:
+            logprobs.masked_fill_(response_padding_masks, 1.0)
         ref_logprobs.masked_fill_(response_padding_masks, 1.0)
 
         return GRPOTrajectory(
@@ -1124,12 +1164,17 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
         input_ids: torch.Tensor,
         answers: list[str],
     ) -> GRPOTrajectory:
-        """Generate trajectories in forward_batch_size micro-batches."""
+        """Generate trajectories in gen_batch_size micro-batches.
+
+        gen_batch_size defaults to batch_size (one vLLM HTTP call per step).
+        policy/ref forwards inside generate_trajectory chunk independently at
+        forward_batch_size for memory.
+        """
         trajectories: list[GRPOTrajectory] = []
         with torch.no_grad():
-            for batch_start in range(0, self.batch_size, self._forward_batch_size):
-                batch_input_ids = input_ids[batch_start: batch_start + self._forward_batch_size]
-                batch_answers = answers[batch_start: batch_start + self._forward_batch_size]
+            for batch_start in range(0, self.batch_size, self._gen_batch_size):
+                batch_input_ids = input_ids[batch_start: batch_start + self._gen_batch_size]
+                batch_answers = answers[batch_start: batch_start + self._gen_batch_size]
                 device_empty_cache(self._device)
                 trajectories.append(self.generate_trajectory(batch_input_ids, batch_answers))
                 device_empty_cache(self._device)
@@ -1493,6 +1538,45 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
                             _adapter_norm_after,
                             _adapter_norm_after - _adapter_norm_before,
                         )
+
+                    # Validation: rank-equality checksum on adapter params.
+                    # Adapter params are FSDP-ignored (replicated) and grads are
+                    # manually all-reduced (~line 1444). After optimizer.step(), all
+                    # ranks should hold bit-identical adapter weights. We verify by
+                    # building a deterministic float64 hash on each rank, then
+                    # all-reducing min/max and asserting they match.
+                    #
+                    # The opt-in bit is reused (lora.log_validation_metrics) so this
+                    # only runs in the validation ladder; production runs stay quiet.
+                    if self._log_validation_metrics and torch.distributed.get_world_size() > 1:
+                        with torch.no_grad():
+                            _ap_all = list(adapter_optimizer_params(self._model))
+                            if _ap_all:
+                                # Hash = sum-of-product-with-positional-weights in float64.
+                                # Cheap, deterministic, sensitive to any single-element drift.
+                                _hash = torch.zeros((), device=self._device, dtype=torch.float64)
+                                for _i, _p in enumerate(_ap_all):
+                                    _flat = _p.detach().to(torch.float64).flatten()
+                                    _idx = torch.arange(_flat.numel(), device=self._device, dtype=torch.float64)
+                                    _hash += (_flat * (_idx + float(_i + 1))).sum()
+                                _h_min = _hash.clone()
+                                _h_max = _hash.clone()
+                                torch.distributed.all_reduce(_h_min, op=torch.distributed.ReduceOp.MIN)
+                                torch.distributed.all_reduce(_h_max, op=torch.distributed.ReduceOp.MAX)
+                                _spread = float((_h_max - _h_min).abs().item())
+                                if self._is_rank_zero:
+                                    if _spread > 0.0:
+                                        log.error(
+                                            "VALMET_RANK_DIVERGENCE step=%d hash_spread=%.6e "
+                                            "(adapter params NOT identical across ranks — "
+                                            "manual all-reduce or optimizer state diverged)",
+                                            self._steps_run, _spread,
+                                        )
+                                    else:
+                                        log.info(
+                                            "VALMET_RANK_EQUAL step=%d hash=%.6e (all ranks match)",
+                                            self._steps_run, float(_h_min.item()),
+                                        )
 
                     # LoRA publish: Phase A (sync FSDP gather, all ranks),
                     # Phase B (async IO + rsync + HTTP, rank 0 background thread)
