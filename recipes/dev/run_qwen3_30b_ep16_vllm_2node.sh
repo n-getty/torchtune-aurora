@@ -77,7 +77,7 @@ WORLD=$((NPROC * NNODES))
 NSTEPS=${1:-3}
 VLLM_PORT=8001
 MODEL_PATH=/lus/flare/projects/ModCon/ngetty/models/Qwen3-30B-A3B
-CONFIG=${PROJDIR}/recipes/configs/dev/experimental/qwen3_30b_a3b_grpo_ep16_xpu.yaml
+CONFIG=${CONFIG:-${PROJDIR}/recipes/configs/dev/experimental/qwen3_30b_a3b_grpo_ep16_xpu.yaml}
 
 NODE0=$(hostname)
 NODE1=${TRAIN_NODE2}
@@ -136,7 +136,11 @@ stage_model "${NODE1}"
 # Per-rank wrapper that pins ZE_AFFINITY_MASK to $LOCAL_RANK and execs the recipe.
 # torchrun sets LOCAL_RANK before forking each child; the wrapper must be
 # present on both nodes (shared FS).
-WRAPPER=${LOG_DIR}/_ep16_train_rank_wrapper_${SMOKE_TAG}.sh
+# Use launch-unique wrapper path: re-running on the same hold while a prior
+# instance's process table entries linger leaves the kernel briefly considering
+# the wrapper image "busy as text" → ETXTBSY on the next `cat >`. PID + epoch
+# guarantees a fresh inode every launch.
+WRAPPER=${LOG_DIR}/_ep16_train_rank_wrapper_${SMOKE_TAG}_$$_$(date +%s).sh
 cat > ${WRAPPER} <<'WRAPPEREOF'
 #!/bin/bash
 # Per-rank wrapper: pin to tile $LOCAL_RANK then exec the recipe.

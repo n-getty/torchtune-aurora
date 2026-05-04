@@ -1099,6 +1099,19 @@ def _init_sender_pool(self) -> None:
     log.info("Rank %d: _init_sender_pool raw=%r pool_size=%d world=%d",
              self.rank, raw_pool, pool_size, self.world_size)
 
+    # Pre-compute the shared inputs needed by BOTH the legacy branches AND
+    # the WS10 sharded-PG construction below. WS10 must run regardless of
+    # WSYNC_SENDER_POOL_SIZE — without this, EP runs (which default
+    # pool_size=0) would never construct sharded PGs.
+    _ws10_sharded_gate = (
+        os.environ.get("TORCHTUNE_EP_WSYNC_SHARDED", "0") == "1"
+    )
+    _ws10_ep_d_pre = getattr(self, "_expert_parallel_degree", 1)
+    _ws10_should_build = (
+        _ws10_sharded_gate and _ws10_ep_d_pre > 1
+        and getattr(self, "_shard_rank", None) is not None
+    )
+
     if pool_size <= 0:
         self._wsync_sender_pool = None
         # WS3.5: only ONE rank (global rank 0) drives the XCCL wsync init.
@@ -1106,6 +1119,12 @@ def _init_sender_pool(self) -> None:
         # which would race to bind TCPStore is_master=True on the same port.
         if getattr(self, "_is_xccl_leader", self._is_shard_leader):
             self._init_xccl_weight_sync()
+        # WS10 sharded PG construction needs the shared TCPStore + URLs that
+        # are set up inside _init_xccl_weight_sync on the leader. Construct
+        # sharded PGs HERE before returning so EP runs (legacy single-sender
+        # path, pool_size=0) get the same PGs as the multi-sender branch.
+        if _ws10_should_build:
+            self._build_ws10_sharded_pgs()
         self._wsync_pool_init_done = True
         return
 
@@ -1250,9 +1269,165 @@ def _init_sender_pool(self) -> None:
                 f"vLLM sender pool init failed: {vllm_errors}")
 
     torch.distributed.barrier()
+
+    if _ws10_should_build:
+        self._build_ws10_sharded_pgs()
     self._wsync_pool_init_done = True
     log.info("Rank %d: sender pool init complete (pool_size=%d)",
              self.rank, pool_size)
+
+
+def _build_ws10_sharded_pgs(self) -> None:
+    """WS10 Commit A: construct per-EP-rank sharded cross PGs.
+
+    Called by ``_init_sender_pool`` on ALL trainer ranks (not just senders).
+    Builds one 2-rank cross PG per trainer EP shard rank R in
+    ``[0..ep_d-1]``, each peered with the vLLM root with prefix
+    ``wsync_sharded_R{R}``. The current rank participates only if its
+    ``_shard_rank`` is in that range; otherwise it's a no-op (PGs are
+    constructed by the other ranks; this rank holds an empty dict).
+
+    Receiver-side construction lives in
+    ``vllm_weight_sync_worker.py:init_xccl_sharded_pgs``.
+
+    No bytes flow over these PGs in Commit A — Commit B wires them into
+    the deferred broadcast loop. Default backend is gloo (per WS-Varlen
+    XCCL+OFI deadlock history); override via
+    ``TORCHTUNE_EP_WSYNC_SHARDED_METHOD=xccl_broadcast``.
+    """
+    import datetime
+    import threading
+    import torch.distributed as dist
+    import torch.distributed.distributed_c10d as c10d
+    import requests
+
+    self._xccl_wsync_sharded_pgs = {}
+    self._xccl_wsync_sharded_method = None
+
+    _ep_d = getattr(self, "_expert_parallel_degree", 1)
+    _shard_rank = getattr(self, "_shard_rank", None)
+    if _ep_d <= 1 or _shard_rank is None:
+        return
+
+    xccl_port = getattr(self, "_vllm_xccl_port", 51217)
+    tp_size = getattr(self, "_vllm_tp_size", 1)
+    num_replicas = len(self._vllm_urls)
+    world_size = 1 + num_replicas * tp_size
+
+    import socket as _socket
+    _xccl_host = (
+        os.environ.get("TORCHTUNE_XCCL_HOST")
+        or os.environ.get("MASTER_ADDR")
+        or _socket.gethostname()
+    )
+    _is_xccl_leader = getattr(self, "_is_xccl_leader", self._is_shard_leader)
+    _ws10_method = os.environ.get(
+        "TORCHTUNE_EP_WSYNC_SHARDED_METHOD", "gloo")
+    self._xccl_wsync_sharded_method = _ws10_method
+
+    # Leader POSTs vLLM workers to construct receive-side sharded PGs.
+    ws10_threads = []
+    _ws10_post_errors = []
+    if _is_xccl_leader:
+        def _post_sharded(r_idx, url):
+            try:
+                r = requests.post(
+                    f"{url}/collective_rpc",
+                    json={
+                        "method": "init_xccl_sharded_pgs",
+                        "args": [_xccl_host, xccl_port, world_size,
+                                 int(_ep_d), _ws10_method],
+                    },
+                    timeout=120,
+                )
+                if r.status_code != 200:
+                    _ws10_post_errors.append(
+                        f"init_xccl_sharded_pgs failed ({url}): "
+                        f"{r.status_code} {r.text}")
+                    return
+                result = r.json().get("results", [{}])
+                first = result[0] if result else {}
+                if isinstance(first, dict) and first.get("status") != "ok":
+                    _ws10_post_errors.append(
+                        f"init_xccl_sharded_pgs error ({url}): {first}")
+            except Exception as e:
+                _ws10_post_errors.append(str(e))
+
+        ws10_threads = [
+            threading.Thread(target=_post_sharded, args=(r_idx, url),
+                             daemon=True)
+            for r_idx, url in enumerate(self._vllm_urls)
+        ]
+        for t in ws10_threads:
+            t.start()
+
+    # Each EP shard rank R in [0..ep_d-1] joins one 2-rank PG PER vLLM replica
+    # (prefix wsync_sharded_R{R}_rep{rep_idx}). The trainer is rank 0; each
+    # replica's TP root joins as rank 1 of its own PG. The deferred broadcast
+    # loop iterates over all replica PGs so every replica receives the data
+    # and then fans out to its TP workers via the existing intra PG.
+    # Other trainer ranks (e.g. dp_replicate>1 with shard_rank >= ep_d) skip.
+    if 0 <= int(_shard_rank) < int(_ep_d):
+        _ws10_R = int(_shard_rank)
+        if _is_xccl_leader and getattr(self, "_xccl_store", None) is not None:
+            _ws10_store = self._xccl_store
+        else:
+            _ws10_store = dist.TCPStore(
+                host_name=_xccl_host,
+                port=xccl_port,
+                world_size=world_size,
+                is_master=False,
+                timeout=datetime.timedelta(seconds=120),
+            )
+
+        _ws10_pg_list = []
+        for _rep_idx in range(int(num_replicas)):
+            _ws10_prefix = f"wsync_sharded_R{_ws10_R}_rep{_rep_idx}"
+            _ws10_prefixed = c10d.PrefixStore(_ws10_prefix, _ws10_store)
+            if _ws10_method == "gloo":
+                _ws10_pg = c10d.ProcessGroupGloo(
+                    store=_ws10_prefixed, rank=0, size=2,
+                )
+            else:
+                _ws10_opts = c10d.ProcessGroupXCCL.Options()
+                _ws10_pg = c10d.ProcessGroupXCCL(
+                    store=_ws10_prefixed, rank=0, size=2, options=_ws10_opts,
+                )
+            _ws10_pg_list.append(_ws10_pg)
+            log.info(
+                "Rank %d: WS10 sharded PG created (R=%d rep=%d, prefix=%s, method=%s)",
+                self.rank, _ws10_R, _rep_idx, _ws10_prefix, _ws10_method,
+            )
+        self._xccl_wsync_sharded_pgs[_ws10_R] = _ws10_pg_list
+
+        # Commit B: every trainer EP rank in [0..ep_d-1] is its own WS10
+        # sender (broadcasts its local fused expert shard on its per-rank
+        # cross PG). The sync-done event/counter state is normally only
+        # created on rank 0 (vllm_backend._setup_vllm_server_mode) or on
+        # ranks in the legacy WSYNC_SENDER_POOL. WS10 needs it on every
+        # rank that will enter the sender path, otherwise non-rank-0 EP
+        # ranks AttributeError at `_sync_done_event.clear()`.
+        if not hasattr(self, "_sync_done_event"):
+            self._sync_done_event = threading.Event()
+            self._sync_done_event.set()
+            self._sync_error = None
+            self._sync_id_counter = 0
+            self._pending_sync_id = None
+
+    if _is_xccl_leader:
+        for t in ws10_threads:
+            t.join(timeout=120)
+        if _ws10_post_errors:
+            raise RuntimeError(
+                f"WS10 sharded PG init failed on vLLM side: "
+                f"{_ws10_post_errors}")
+    torch.distributed.barrier()
+    log.info(
+        "Rank %d: WS10 sharded PG construction complete "
+        "(ep_d=%d, num_replicas=%d, my_R_keys=%s)",
+        self.rank, int(_ep_d), int(num_replicas),
+        list(self._xccl_wsync_sharded_pgs.keys()),
+    )
 
 def _init_xccl_weight_sync(self) -> None:
     """Create a cross-process XCCL group between training rank 0 and vLLM worker(s).
@@ -1418,6 +1593,192 @@ def _init_xccl_weight_sync(self) -> None:
         raise RuntimeError(f"vLLM XCCL init failed: {vllm_errors}")
 
     log.info("Rank %d: XCCL weight sync communicator ready", self.rank)
+
+
+# ---------------------------------------------------------------------------
+# WS10 helpers — sharded vLLM MoE sync (Layer 3: sender staging)
+# ---------------------------------------------------------------------------
+#
+# Pure-CPU functions: no torch.distributed, no XPU. They take a per-rank
+# local sharded state-dict and return ``(cpu_batches, tensors_meta)`` ready
+# to be broadcast over a per-rank cross-PG. Manifest unification across
+# trainer EP ranks is also pure-CPU and can be exercised without a PG.
+#
+# Pin-down tests live in
+# ``tests/torchtune/dev/rl/test_sharded_vllm_moe_sync_equivalence.py``.
+
+# Module-level so tests and the deferred-broadcast loop share one definition
+# of the canonical manifest order. Keep in sync with
+# ``_canonical_manifest_sort_key`` in the pin-down test.
+_WS10_FUSED_RE = re.compile(
+    r"model\.layers\.(\d+)\.mlp\.experts\.(w13|w2)_weight"
+)
+
+
+def _ws10_sort_key(entry: dict) -> tuple:
+    """Canonical sort key for WS10 manifest entries.
+
+    Order: (layer_idx asc, w13 before w2, trainer_ep_rank asc).
+    Non-fused entries (norms, attention, embeddings) sort after all fused
+    entries with stable name-based tiebreak. The trainer + receiver both
+    sort with this key so the broadcast loop is lockstep across ranks.
+
+    Note: this is the legacy "AllGather-then-broadcast" ordering. For
+    Commit B's per-rank broadcast loop use ``_ws10_sort_key_by_rank``,
+    which groups entries by trainer_ep_rank so the receiver can iterate
+    one PG at a time without interleaving.
+    """
+    name = entry["name"]
+    m = _WS10_FUSED_RE.match(name)
+    if m:
+        layer_idx = int(m.group(1))
+        kind_rank = 0 if m.group(2) == "w13" else 1
+    else:
+        layer_idx, kind_rank = 10**9, 9
+    R = int(entry.get("trainer_ep_rank", -1))
+    return (layer_idx, kind_rank, R, name)
+
+
+def _ws10_sort_key_by_rank(entry: dict) -> tuple:
+    """Per-rank-grouped sort key for WS10 Commit B broadcast.
+
+    Order: (trainer_ep_rank asc, layer_idx asc, w13 before w2, name).
+    All entries owned by trainer rank R come together so the receiver
+    can drive ``_xccl_sharded_cross_pgs[R].broadcast(...)`` for the
+    contiguous run, then advance to ``R+1``'s PG. Non-expert entries
+    (norms, attention, embeddings, router) are sent only by trainer
+    rank 0 and sort with R=0 AFTER its fused entries (kind_rank=9).
+    """
+    name = entry["name"]
+    m = _WS10_FUSED_RE.match(name)
+    if m:
+        layer_idx = int(m.group(1))
+        kind_rank = 0 if m.group(2) == "w13" else 1
+    else:
+        # Non-expert: layer_idx large + kind_rank=9 puts them at the
+        # end of their rank's run. In Commit B these only ever carry
+        # trainer_ep_rank=0 (or default 0 when missing), so they trail
+        # rank 0's fused experts.
+        layer_idx, kind_rank = 10**9, 9
+    R = int(entry.get("trainer_ep_rank", 0))
+    return (R, layer_idx, kind_rank, name)
+
+
+def _ws10_build_local_payload(
+    local_experts: dict,
+    ep_rank: int,
+    ep_degree: int,
+    batch_max_numel: int,
+):
+    """Build per-rank cpu_batches + tensors_meta for the WS10 sharded path.
+
+    Args:
+        local_experts: ``{hf_name: local_shard_cpu_tensor}`` for THIS rank.
+            ``hf_name`` is post-rename
+            (e.g. ``model.layers.7.mlp.experts.w13_weight``). Each tensor is
+            the rank-local fused shard on CPU, bf16, contiguous.
+        ep_rank: Trainer EP rank of the producing process (0..ep_degree-1).
+        ep_degree: Total number of trainer EP ranks.
+        batch_max_numel: Max elements per concatenated CPU broadcast batch.
+
+    Returns:
+        (cpu_batches, tensors_meta) — tensor list of bf16 1-D CPU concats and
+        the matching list of dicts with ``trainer_ep_rank``/``ep_degree``/
+        ``n_local`` tags. Order is the canonical WS10 sort applied locally;
+        the batched concat respects that order.
+    """
+    if ep_degree <= 1:
+        raise ValueError(
+            f"_ws10_build_local_payload requires ep_degree > 1, got {ep_degree}")
+    if not (0 <= ep_rank < ep_degree):
+        raise ValueError(
+            f"ep_rank {ep_rank} out of range [0, {ep_degree})")
+
+    local_meta = []
+    for hf_name, t in local_experts.items():
+        m = _WS10_FUSED_RE.match(hf_name)
+        if m is None:
+            raise ValueError(
+                f"_ws10_build_local_payload: unexpected non-fused name "
+                f"{hf_name!r}; this helper only stages fused expert shards. "
+                "Non-expert params follow the existing path.")
+        if t.dim() < 1:
+            raise ValueError(
+                f"local shard {hf_name!r} must be at least 1-D, got shape {tuple(t.shape)}")
+        n_local = int(t.shape[0])
+        local_meta.append({
+            "name": hf_name,
+            "shape": list(t.shape),
+            "numel": int(t.numel()),
+            "trainer_ep_rank": int(ep_rank),
+            "ep_degree": int(ep_degree),
+            "n_local": n_local,
+            "_tensor": t,
+        })
+    local_meta.sort(key=_ws10_sort_key)
+
+    cpu_batches: list = []
+    cur_parts: list = []
+    cur_numel = 0
+    for entry in local_meta:
+        t = entry["_tensor"]
+        n = int(t.numel())
+        if cur_numel > 0 and cur_numel + n > batch_max_numel:
+            cpu_batches.append(torch.cat(cur_parts))
+            cur_parts = []
+            cur_numel = 0
+        cur_parts.append(t.flatten().contiguous())
+        cur_numel += n
+    if cur_parts:
+        cpu_batches.append(torch.cat(cur_parts))
+
+    tensors_meta = [
+        {k: v for k, v in e.items() if k != "_tensor"} for e in local_meta
+    ]
+    return cpu_batches, tensors_meta
+
+
+def _ws10_unify_manifests(per_rank_metas: list, sort_key=None) -> list:
+    """Collapse per-rank manifests into a single canonically-ordered list.
+
+    Args:
+        per_rank_metas: ``[meta_rank_0, meta_rank_1, ...]`` — output of
+            ``all_gather_object`` of the ``tensors_meta`` returned by
+            ``_ws10_build_local_payload``. Each entry must already carry
+            ``trainer_ep_rank``, ``ep_degree``, ``n_local``.
+        sort_key: Optional sort callable. Defaults to ``_ws10_sort_key``
+            (legacy by-layer order). Pass ``_ws10_sort_key_by_rank`` for
+            Commit B's per-rank broadcast loop ordering.
+
+    Returns:
+        Single sorted list. Receiver dispatcher drives broadcast order from
+        this list; the sender's deferred-broadcast loop drives the per-rank
+        ``cpu_batches`` send order from the same list (filtered by
+        ``trainer_ep_rank == self._ep_rank``).
+    """
+    if not per_rank_metas:
+        return []
+    ep_degrees = {
+        int(e["ep_degree"])
+        for meta in per_rank_metas
+        for e in meta
+        if "ep_degree" in e
+    }
+    if len(ep_degrees) > 1:
+        raise ValueError(
+            f"_ws10_unify_manifests: heterogeneous ep_degree across ranks: "
+            f"{sorted(ep_degrees)}")
+    if ep_degrees:
+        ep_d = next(iter(ep_degrees))
+        if len(per_rank_metas) != ep_d:
+            raise ValueError(
+                f"_ws10_unify_manifests: got {len(per_rank_metas)} per-rank "
+                f"manifests but ep_degree={ep_d}")
+
+    flat = [e for meta in per_rank_metas for e in meta]
+    flat.sort(key=sort_key if sort_key is not None else _ws10_sort_key)
+    return flat
+
 
 def _sync_weights_to_vllm_xccl(self) -> None:
     """Gather sharded params then broadcast to vLLM via XCCL (GPU→GPU).
@@ -1767,6 +2128,64 @@ def _sync_weights_to_vllm_xccl(self) -> None:
                 and not _layer_batch_active and not _gather_root_active
                 and hasattr(torch, 'float8_e4m3fn')
             )
+
+            # WS10 Commit B (opt-in): per-rank sharded broadcast.
+            # Each trainer EP rank R in [0..ep_d-1] broadcasts its OWN local
+            # expert shard direct to the vLLM root over a per-rank 2-rank
+            # cross-PG (`_xccl_wsync_sharded_pgs[R]`). The receiver assembles
+            # the global tensor via FusedMoE.expert_map. Skips the
+            # `_shard_pg` AllGather entirely on the expert path. Non-expert
+            # params (norms, attention, embedding, router) are sent only by
+            # rank 0 (no `trainer_ep_rank` tag → routed via R=0's PG on
+            # the receiver). Mutually exclusive with WS6/WS7/WS8.
+            # See docs/reports/MoE_EP_status_ws8_ws10_design.md §"WS10 Phase B+C".
+            _SHARDED_WIRE = os.environ.get(
+                "TORCHTUNE_EP_WSYNC_SHARDED", "0") == "1"
+            _ws10_pgs_dict = getattr(self, "_xccl_wsync_sharded_pgs", {}) or {}
+            _shard_rank_int = int(getattr(self, "_shard_rank", -1))
+            _sharded_active = (
+                _SHARDED_WIRE and _ep_deg > 1 and _is_moe
+                and getattr(self, '_shard_pg', None) is not None
+                and 0 <= _shard_rank_int < int(_ep_deg)
+                and _shard_rank_int in _ws10_pgs_dict
+                and not _layer_batch_active
+                and not _gather_root_active
+                and not _fp8_wire_active
+                # HSDP+EP would split trainer ranks into [0..ep_d-1]
+                # members and non-members; the non-members would fall
+                # through to the legacy AllGather path while the EP
+                # members early-return → deadlock. Single-replica EP only.
+                and getattr(self, '_dp_replicate', 1) <= 1
+            )
+            if (_SHARDED_WIRE and not _sharded_active and self.rank == 0
+                    and not getattr(self, "_ws10_skip_warned", False)):
+                if _layer_batch_active or _gather_root_active or _fp8_wire_active:
+                    log.warning(
+                        "Rank %d: TORCHTUNE_EP_WSYNC_SHARDED=1 requested but "
+                        "skipping (mutually exclusive with WS6=%s WS7=%s WS8=%s)",
+                        self.rank, _layer_batch_active,
+                        _gather_root_active, _fp8_wire_active,
+                    )
+                else:
+                    log.warning(
+                        "Rank %d: TORCHTUNE_EP_WSYNC_SHARDED=1 requested but "
+                        "skipping (ep_deg=%d, is_moe=%s, _shard_pg=%s, "
+                        "shard_rank=%d, ws10_pgs=%s)",
+                        self.rank, _ep_deg, _is_moe,
+                        getattr(self, '_shard_pg', None) is not None,
+                        _shard_rank_int, sorted(_ws10_pgs_dict.keys()),
+                    )
+                self._ws10_skip_warned = True
+            if _sharded_active and self.rank == 0 and not getattr(
+                    self, "_ws10_engaged_warned", False):
+                log.info(
+                    "Rank %d: WS10 sharded broadcast ENGAGED "
+                    "(ep_d=%d, sharded_method=%s, my_R=%d)",
+                    self.rank, _ep_deg,
+                    getattr(self, "_xccl_wsync_sharded_method", None),
+                    _shard_rank_int,
+                )
+                self._ws10_engaged_warned = True
             if _FP8_WIRE and not _fp8_wire_active:
                 log.info(
                     "Rank %d: TORCHTUNE_EP_WSYNC_FP8_WIRE=1 requested but "
@@ -1778,6 +2197,229 @@ def _sync_weights_to_vllm_xccl(self) -> None:
                     hasattr(torch, 'float8_e4m3fn'),
                 )
             _fp8_logged_engaged = False
+
+            if _sharded_active:
+                # WS10 Commit B sender path. ALL trainer ranks in [0..ep_d-1]
+                # participate (the non-expert .full_tensor() calls below are
+                # collectives on _shard_pg). Rank 0 uniquely stages the
+                # non-expert tail and POSTs the manifest.
+                _ws10_R = _shard_rank_int
+                _ws10_t0 = time.perf_counter()
+                _local_experts: dict = {}      # hf_name -> CPU bf16 tensor
+                _ws10_pending_proj: dict = {}  # layer_idx -> {gate/up/down: local_tensor (bf16, CPU)}
+                _ws10_non_expert_meta: list = []
+                _ws10_non_expert_cpu_parts: list = []
+                _ws10_non_expert_local_count = 0
+                _ws10_non_expert_full_count = 0
+
+                # First pass: walk sharded_sd. Expert params are kept local
+                # (no _shard_pg AllGather). Non-expert params still need
+                # global tensors (small) — call full_tensor() on ALL ranks
+                # (collective), but only rank 0 keeps the result.
+                for param_name, param in sharded_sd.items():
+                    if param.is_cpu:
+                        param = param.to(self._device)
+
+                    _cpn = param_name.replace(
+                        "_fsdp_wrapped_module.", "").replace(
+                        "_checkpoint_wrapped_module.", "")
+                    _is_expert = bool(_ep_expert_re.search(_cpn))
+
+                    if _is_expert:
+                        # Take the local shard ONLY — no AllGather over
+                        # _shard_pg. Each EP rank already owns its
+                        # interleaved n_local experts for this projection.
+                        if hasattr(param, "_local_tensor"):
+                            _loc = param._local_tensor
+                        else:
+                            _loc = param
+                        _loc_bf16 = _loc.to(torch.bfloat16).contiguous()
+                        # Stage to CPU now to keep GPU peak low.
+                        _loc_cpu = _loc_bf16.detach().cpu().contiguous()
+                        del _loc_bf16
+                        _m_lid = _ep_layer_re.search(_cpn)
+                        _m_proj = _ep_expert_re.search(_cpn)
+                        if _m_lid and _m_proj:
+                            _lid = int(_m_lid.group(1))
+                            _proj = _m_proj.group(1)
+                            _ws10_pending_proj.setdefault(_lid, {})[_proj] = _loc_cpu
+                            if len(_ws10_pending_proj[_lid]) == 3:
+                                _bundle = _ws10_pending_proj.pop(_lid)
+                                # Fuse gate+up -> w13 ALONG dim=1 (local
+                                # n_local rows preserved). Same convention
+                                # as fuse_experts_for_vllm. Then the local
+                                # shard for the layer's w13 has shape
+                                # [n_local, 2*intermediate_per_tp, hidden]
+                                # for gate/up (matches global shape with
+                                # n_local instead of total_experts).
+                                _w13_local = torch.cat(
+                                    [_bundle["gate_proj"], _bundle["up_proj"]],
+                                    dim=1).contiguous()
+                                _w2_local = _bundle["down_proj"].contiguous()
+                                _local_experts[
+                                    f"model.layers.{_lid}.mlp.experts.w13_weight"
+                                ] = _w13_local
+                                _local_experts[
+                                    f"model.layers.{_lid}.mlp.experts.w2_weight"
+                                ] = _w2_local
+                        del param, _loc, _loc_cpu
+                        continue
+
+                    # Non-expert: full_tensor() is a collective on _shard_pg —
+                    # ALL ranks must call. Rank 0 keeps it; others discard.
+                    if hasattr(param, "_local_tensor"):
+                        _ft0 = time.perf_counter()
+                        param = param.full_tensor()
+                        t_ft += time.perf_counter() - _ft0
+                    if _ws10_R == 0:
+                        _hf_name = _xccl_accept_and_rename(param_name)
+                        if _hf_name is None:
+                            del param
+                            continue
+                        _ne_bf = param.to(torch.bfloat16).contiguous()
+                        _ne_cpu = _ne_bf.detach().cpu()
+                        del _ne_bf
+                        _ws10_non_expert_meta.append({
+                            "name": _hf_name,
+                            "shape": list(_ne_cpu.shape),
+                            "numel": int(_ne_cpu.numel()),
+                        })
+                        _ws10_non_expert_cpu_parts.append(_ne_cpu.flatten())
+                        _ws10_non_expert_full_count += int(_ne_cpu.numel())
+                        del _ne_cpu
+                    del param
+
+                if _ws10_pending_proj:
+                    raise RuntimeError(
+                        f"WS10: rank {self.rank} has {len(_ws10_pending_proj)} "
+                        f"layer(s) with incomplete projections after staging: "
+                        f"{sorted(_ws10_pending_proj.keys())[:8]}"
+                    )
+
+                # Build per-rank payload via the shared helper.
+                _local_cpu_batches, _local_meta = _ws10_build_local_payload(
+                    _local_experts, _ws10_R, int(_ep_deg),
+                    batch_max_numel=_BATCH_MAX_NUMEL,
+                )
+                del _local_experts
+
+                # Rank 0 also appends its non-expert tail (no trainer_ep_rank
+                # tag in meta — receiver routes by absence). Keep them in
+                # rank 0's broadcast batches so they ride R=0's PG.
+                if _ws10_R == 0 and _ws10_non_expert_meta:
+                    # Reorder non-experts to match the receiver's unified
+                    # manifest order. The receiver sorts every entry with
+                    # _ws10_sort_key_by_rank, which places non-experts at
+                    # (R=0, layer_idx=10**9, kind_rank=9, name) — i.e.
+                    # lexicographic by name. The sender previously packed
+                    # in sharded_sd.items() walk order (module registration
+                    # order), so the greedy split landed at different byte
+                    # boundaries even though total bytes matched. That is
+                    # the run #7 wire size mismatch (1064400384 vs 622329856,
+                    # constant across runs because both orderings are
+                    # deterministic but different). Sort meta + the
+                    # parallel cpu_parts list by the same key, then pack.
+                    _ne_pairs = sorted(
+                        zip(_ws10_non_expert_meta, _ws10_non_expert_cpu_parts),
+                        key=lambda p: _ws10_sort_key_by_rank(p[0]),
+                    )
+                    _ws10_non_expert_meta = [p[0] for p in _ne_pairs]
+                    _ws10_non_expert_cpu_parts = [p[1] for p in _ne_pairs]
+                    _ne_flat = torch.cat(_ws10_non_expert_cpu_parts)
+                    # Greedy split same as expert batching.
+                    _cur_parts = []
+                    _cur_n = 0
+                    _ne_offset = 0
+                    for _ne_e in _ws10_non_expert_meta:
+                        _n = int(_ne_e["numel"])
+                        if _cur_n > 0 and _cur_n + _n > _BATCH_MAX_NUMEL:
+                            _local_cpu_batches.append(torch.cat(_cur_parts))
+                            _cur_parts = []
+                            _cur_n = 0
+                        _cur_parts.append(_ne_flat[_ne_offset:_ne_offset + _n])
+                        _cur_n += _n
+                        _ne_offset += _n
+                    if _cur_parts:
+                        _local_cpu_batches.append(torch.cat(_cur_parts))
+                    del _ne_flat
+                _ws10_non_expert_cpu_parts.clear()
+
+                # Mark this rank as the 'active' sender for sync-id bookkeeping.
+                # In WS10 every trainer EP rank in [0..ep_d-1] is its own sender;
+                # all of them set the done event/counters. Pool semantics differ.
+                self._sync_done_event.clear()
+                self._sync_error = None
+                self._sync_id_counter += 1
+                self._pending_sync_id = self._sync_id_counter
+
+                # Gather meta across all trainer EP ranks (object collective on
+                # the default PG — payload is small dict-of-dicts).
+                _per_rank_metas = [None] * int(_ep_deg)
+                # all_gather_object on _shard_pg (size = ep_d).
+                torch.distributed.all_gather_object(
+                    _per_rank_metas, _local_meta, group=self._shard_pg,
+                )
+                _meta_json = None
+                if _ws10_R == 0:
+                    # Merge non-expert tail INTO rank 0's per-rank slot
+                    # (the validator in _ws10_unify_manifests requires
+                    # len(per_rank_metas) == ep_degree). Mirrors the CPU
+                    # pin-down test in test_ws10_commitB_sender_manifest.
+                    _per_rank_metas_for_unify = list(_per_rank_metas)
+                    if _ws10_non_expert_meta and len(_per_rank_metas_for_unify) > 0:
+                        _r0_meta = list(_per_rank_metas_for_unify[0] or [])
+                        _r0_meta.extend(_ws10_non_expert_meta)
+                        _per_rank_metas_for_unify[0] = _r0_meta
+                    _unified = _ws10_unify_manifests(
+                        _per_rank_metas_for_unify,
+                        sort_key=_ws10_sort_key_by_rank,
+                    )
+                    pool_index = pool.index(self.rank) if pool else 0
+                    _meta_json = json.dumps({
+                        "tensors": _unified,
+                        "batch_max_numel": _BATCH_MAX_NUMEL,
+                        "sender_index": pool_index,
+                    })
+
+                if not self._production_mode:
+                    torch.distributed.barrier()
+                t_gather = time.perf_counter() - _ws10_t0
+
+                # Each rank stores its own (cpu_batches, per-rank PG list) for
+                # the deferred broadcast loop. The PG list has one entry per
+                # vLLM replica — every replica root gets the data and fans
+                # out to its TP workers via its existing intra PG.
+                # The 'sharded' flag distinguishes this from the legacy
+                # single-PG path.
+                _my_pgs = _ws10_pgs_dict[_ws10_R]
+                if not isinstance(_my_pgs, list):
+                    _my_pgs = [_my_pgs]
+                self._deferred_broadcast_args = (
+                    _local_cpu_batches,        # cpu_batches
+                    _meta_json,                # rank 0 only; other ranks None
+                    _local_meta,               # used for byte accounting
+                    _ws10_t0,                  # t0
+                    self._device,              # device
+                    _my_pgs,                   # pgs (one per replica)
+                    self._vllm_clients,        # only rank 0 will call them
+                    self._vllm_urls,           # only rank 0 will POST
+                    True,                      # _ws10_sharded marker
+                )
+
+                _total_gb = (sum(e["numel"] for e in _local_meta)
+                             + _ws10_non_expert_full_count) * 2 / 1024**3
+                log.info(
+                    "Rank %d: WS10 sharded gather done: %d expert entries "
+                    "(R=%d) + %d non-expert (rank0=%s) %.2f GiB local in "
+                    "%.1fs (no _shard_pg AllGather) — broadcast deferred",
+                    self.rank, len(_local_meta), _ws10_R,
+                    len(_ws10_non_expert_meta), _ws10_R == 0,
+                    _total_gb, t_gather,
+                )
+
+                self._wsync_round += 1
+                del sharded_sd
+                return
 
             for param_name, param in sharded_sd.items():
                 if param.is_cpu:
@@ -2622,10 +3264,19 @@ def _start_deferred_broadcast(self) -> None:
     import threading as _threading
     import requests
 
-    (cpu_batches, meta_json,
-     tensors_meta, t0, device, pgs, clients, urls) = args
+    # WS10 path packs an extra trailing marker. Detect by length so the
+    # off-path 8-tuple stays binary identical.
+    _ws10_sharded = False
+    if len(args) == 9:
+        (cpu_batches, meta_json,
+         tensors_meta, t0, device, pgs, clients, urls,
+         _ws10_sharded) = args
+    else:
+        (cpu_batches, meta_json,
+         tensors_meta, t0, device, pgs, clients, urls) = args
 
-    log.info("Rank %d: starting deferred XCCL broadcast (post-gen)", self.rank)
+    log.info("Rank %d: starting deferred XCCL broadcast (post-gen)%s",
+             self.rank, " [WS10 sharded]" if _ws10_sharded else "")
 
     post_errors = []
     # Timeout for receive_weights_xccl_streaming HTTP response. This call blocks
@@ -2652,23 +3303,53 @@ def _start_deferred_broadcast(self) -> None:
         except Exception as e:
             post_errors.append(str(e))
 
-    manifest_threads = [
-        _threading.Thread(target=_post_manifest, args=(url,), daemon=True)
-        for url in urls
-    ]
-    for mt in manifest_threads:
-        mt.start()
+    # WS10: only rank 0 POSTs (it's the only rank with meta_json). Other
+    # ranks skip the HTTP path entirely; their job is purely the broadcast
+    # of their own per-rank cpu_batches.
+    if _ws10_sharded and meta_json is None:
+        manifest_threads = []
+    else:
+        manifest_threads = [
+            _threading.Thread(target=_post_manifest, args=(url,), daemon=True)
+            for url in urls
+        ]
+        for mt in manifest_threads:
+            mt.start()
 
     time.sleep(0.3)
 
     def _bg_xccl_broadcast(
         bg_cpu_batches, bg_manifest_threads, bg_post_errors,
         bg_tensors_meta, bg_t0, bg_device, bg_pgs, bg_clients,
+        bg_ws10_sharded=False,
     ):
         try:
             tb_total = 0.0
-            cross_method = self._wsync_cross_method
-            if cross_method == "gloo":
+            # WS10 sharded path is gloo-only on per-rank cross PGs (see
+            # _bg_xccl_broadcast WS10 branch below). Don't deref
+            # self._wsync_cross_method here — it's only set on rank 0 /
+            # the legacy sender pool, but every EP rank in [0..ep_d-1]
+            # enters this bg thread under WS10. Default to "gloo" so the
+            # post-WS10 legacy code (unreachable in WS10 path) doesn't
+            # AttributeError on non-rank-0 ranks.
+            cross_method = getattr(self, "_wsync_cross_method", "gloo")
+            if bg_ws10_sharded:
+                # WS10: per-rank gloo broadcast on the per-rank sharded PG.
+                # XCCL+OFI on these PGs has known deadlock risk (WS-Varlen
+                # history); gloo TCP is the safe path. Trainer is rank 0
+                # within the 2-rank sharded PG.
+                for cpu_flat in bg_cpu_batches:
+                    tb0 = time.perf_counter()
+                    works = [pg.broadcast(cpu_flat, root=0) for pg in bg_pgs]
+                    for w in works:
+                        w.wait()
+                    tb_total += time.perf_counter() - tb0
+                log.info(
+                    "Rank %d: WS10 sharded gloo broadcast: %d batches × %d "
+                    "PG(s) sent (per-rank cross-PG)",
+                    self.rank, len(bg_cpu_batches), len(bg_pgs),
+                )
+            elif cross_method == "gloo":
                 for cpu_flat in bg_cpu_batches:
                     tb0 = time.perf_counter()
                     works = [pg.broadcast(cpu_flat, root=0) for pg in bg_pgs]
@@ -2719,8 +3400,14 @@ def _start_deferred_broadcast(self) -> None:
                           self.rank, bg_post_errors)
                 self._sync_error = RuntimeError(str(bg_post_errors))
 
-            for client in bg_clients:
-                client.reset_prefix_cache()
+            # WS10: only rank 0 owns the HTTP control path. Non-rank-0
+            # ranks do not even hold _vllm_clients-as-control objects in
+            # the canonical sense (we passed them through for symmetry),
+            # but skipping reset_prefix_cache prevents racey duplicate
+            # calls and simplifies the receiver-side bookkeeping.
+            if not bg_ws10_sharded or self.rank == 0:
+                for client in bg_clients:
+                    client.reset_prefix_cache()
 
             _total_gb = sum(e["numel"] for e in bg_tensors_meta) * 2 / 1024**3
             log.info(
@@ -2740,6 +3427,7 @@ def _start_deferred_broadcast(self) -> None:
     t = _threading.Thread(
         target=_bg_xccl_broadcast, daemon=True, name="xccl_wsync",
         args=(cpu_batches, manifest_threads, post_errors,
-              tensors_meta, t0, device, pgs, clients))
+              tensors_meta, t0, device, pgs, clients),
+        kwargs={"bg_ws10_sharded": _ws10_sharded})
     t.start()
 
