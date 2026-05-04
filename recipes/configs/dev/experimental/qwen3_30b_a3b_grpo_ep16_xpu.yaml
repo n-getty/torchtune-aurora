@@ -40,9 +40,16 @@ data_parallel_replicate_dim: 1   # dp_shard derived = world_size / dp_replicate 
 # URL list passed in by launcher via VLLM_URLS env override
 vllm_url: "http://${oc.env:VLLM_HOST_0}:8001,http://${oc.env:VLLM_HOST_1}:8001"
 vllm_group_port: 51216
-# WS5: sync XCCL wsync (validated EP=8 attempt 6, 2026-05-02). vLLM gets
-# fresh weights every step on the trainer's _xccl_wsync_pg, broadcast inline
-# end-of-step (dp_shard idle so no fabric contention).
+# WS10 sharded receiver currently REJECTS every layer with
+# "FusedMoE.expert_map; got None" because vLLM is launched TP=4 only (no
+# --enable-expert-parallel) and FusedMoE only populates expert_map when
+# EP>1. The trainer logs "NOT bumping weight version", so vLLM stays on
+# init weights for the entire run. Holds 8467299 (Commit B "validated")
+# and 8467388 (deferred A/B "validated") both hit this; the timing
+# numbers measured rejected broadcasts, not a working sync. Until the
+# receiver is taught the TP-only-vLLM path (or vLLM is launched with
+# --enable-expert-parallel), keep deferred=false (sync) — legacy
+# _load_fused_moe_experts handles TP-only and was validated on WS4 EP=8.
 vllm_weight_sync: true
 vllm_weight_sync_method: xccl
 vllm_weight_sync_interval: 1

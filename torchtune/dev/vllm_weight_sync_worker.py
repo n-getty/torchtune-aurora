@@ -438,17 +438,34 @@ class WeightSyncFromFileExtension:
                 moe_layer = None
 
             expert_map = getattr(moe_layer, "expert_map", None)
-            if expert_map is None:
-                raise RuntimeError(
-                    f"layer {layer_idx}: WS10 sharded receive requires "
-                    f"FusedMoE.expert_map; got None"
-                )
             moe_tp_rank = getattr(moe_layer, "tp_rank", 0) or 0
             moe_tp_size = getattr(moe_layer, "tp_size", 1) or 1
-            em_cpu = expert_map.to("cpu")
-            global_n = em_cpu.numel()
             local_n_vllm = w13_param.shape[0]
             device = w13_param.device
+
+            # Two valid vLLM layouts:
+            #   (a) EP>1: FusedMoE populates expert_map; local_n_vllm < global_n.
+            #   (b) TP-only (no --enable-expert-parallel): every worker holds
+            #       all experts; expert_map is None and local_n_vllm == global_n.
+            # Reject anything else — silent mis-shard would corrupt weights.
+            if expert_map is not None:
+                em_cpu = expert_map.to("cpu")
+                global_n = em_cpu.numel()
+            else:
+                # Derive global_n from one of the incoming shards instead of
+                # the param (which is local_n_vllm and equals global_n in this
+                # path). Cross-check below.
+                _sample = next(iter(w13_shards.values()))
+                global_n = int(_sample.shape[0]) * ep_degree
+                if local_n_vllm != global_n:
+                    raise RuntimeError(
+                        f"layer {layer_idx}: WS10 sharded receive without "
+                        f"expert_map requires TP-only vLLM (local_n="
+                        f"{local_n_vllm} == global_n={global_n}); got "
+                        f"local_n != global_n. vLLM appears EP-sharded but "
+                        f"FusedMoE.expert_map is None — refuse to mis-shard."
+                    )
+                em_cpu = None  # signal identity-perm path below
 
             # Stage as bf16 global tensors then reuse the existing TP/transpose
             # logic in _load_fused_moe_experts. Shape matches today's payload.
@@ -483,16 +500,21 @@ class WeightSyncFromFileExtension:
                 )
 
             # Slice EP via expert_map — same logic as _load_fused_moe_experts.
-            owned_global = (em_cpu >= 0).nonzero(as_tuple=True)[0]
-            if owned_global.numel() != local_n_vllm:
-                raise RuntimeError(
-                    f"layer {layer_idx}: expert_map owned={owned_global.numel()} "
-                    f"!= param local={local_n_vllm}"
-                )
-            perm = torch.empty(local_n_vllm, dtype=torch.long)
-            perm[em_cpu[owned_global].long()] = owned_global
-            w13_ep = w13_global.index_select(0, perm)
-            w2_ep = w2_global.index_select(0, perm)
+            # TP-only vLLM: identity perm (worker holds all global experts).
+            if em_cpu is None:
+                w13_ep = w13_global
+                w2_ep = w2_global
+            else:
+                owned_global = (em_cpu >= 0).nonzero(as_tuple=True)[0]
+                if owned_global.numel() != local_n_vllm:
+                    raise RuntimeError(
+                        f"layer {layer_idx}: expert_map owned={owned_global.numel()} "
+                        f"!= param local={local_n_vllm}"
+                    )
+                perm = torch.empty(local_n_vllm, dtype=torch.long)
+                perm[em_cpu[owned_global].long()] = owned_global
+                w13_ep = w13_global.index_select(0, perm)
+                w2_ep = w2_global.index_select(0, perm)
 
             # TP slice along intermediate dim.
             inter = w13_ep.shape[1] // 2
@@ -710,6 +732,93 @@ class WeightSyncFromFileExtension:
             logger.exception("init_xccl_communicator failed")
             return {"status": "error", "message": str(e)}
 
+    def init_xccl_sharded_pgs(
+        self, host: str, port: int, world_size: int,
+        ep_degree: int, method: str = "gloo",
+    ) -> dict:
+        """WS10 Commit B: construct ep_degree extra cross PGs on EVERY vLLM
+        replica root.
+
+        Each new PG is a 2-rank group ``[trainer_ep_rank_R, vllm_root_repK]``
+        with prefix ``wsync_sharded_R{R}_rep{K}``. Each replica's intra-PG
+        root (tp_rank=0 of that replica) joins as rank 1 of its own per-replica
+        PG. Other TP workers in each replica no-op — the existing intra PG
+        fanout (driven inside ``receive_weights_xccl_streaming``) carries the
+        data from that replica's root to its TP workers.
+
+        This makes WS10 multi-replica safe: every replica root receives the
+        per-EP-rank shard from the trainer over its own dedicated 2-rank PG.
+        """
+        import torch.distributed as dist
+        import torch.distributed.distributed_c10d as c10d
+
+        try:
+            t0 = time.perf_counter()
+            tp_rank = dist.get_rank() if dist.is_initialized() else 0
+            tp_size_local = dist.get_world_size() if dist.is_initialized() else 1
+            my_rank_in_xccl = getattr(self, "_xccl_rank", -1)
+            replica_idx = (
+                (my_rank_in_xccl - 1) // tp_size_local
+                if my_rank_in_xccl >= 1 else -1
+            )
+            # Each replica's intra-PG root joins as rank 1 of its own per-replica
+            # sharded PG. Other TP workers no-op (intra PG fans out from the root).
+            is_root = bool(getattr(self, "_is_intra_root", False)) or (
+                tp_rank == 0 and replica_idx >= 0
+            )
+            if not is_root:
+                logger.info(
+                    "init_xccl_sharded_pgs: noop on non-root vLLM worker "
+                    "(tp_rank=%d, replica_idx=%d)",
+                    tp_rank, replica_idx,
+                )
+                return {"status": "ok", "noop": True, "init_s": 0.0,
+                        "ep_degree": int(ep_degree),
+                        "replica_idx": int(replica_idx)}
+
+            # Reuse the existing TCPStore connection (built by
+            # init_xccl_communicator) when present; otherwise open one.
+            store = getattr(self, "_xccl_store", None)
+            if store is None:
+                import datetime as _dt
+                store = dist.TCPStore(
+                    host_name=host, port=port, world_size=world_size,
+                    is_master=False, timeout=_dt.timedelta(seconds=120),
+                )
+                self._xccl_store = store
+
+            sharded_pgs: dict = {}
+            for R in range(int(ep_degree)):
+                prefix = f"wsync_sharded_R{R}_rep{int(replica_idx)}"
+                prefixed = c10d.PrefixStore(prefix, store)
+                if method == "gloo":
+                    pg = c10d.ProcessGroupGloo(
+                        store=prefixed, rank=1, size=2,
+                    )
+                else:
+                    opts = c10d.ProcessGroupXCCL.Options()
+                    pg = c10d.ProcessGroupXCCL(
+                        store=prefixed, rank=1, size=2, options=opts,
+                    )
+                sharded_pgs[R] = pg
+                logger.info(
+                    "init_xccl_sharded_pgs: PG %d/%d created (prefix=%s, method=%s, replica=%d)",
+                    R, int(ep_degree), prefix, method, replica_idx,
+                )
+            self._xccl_sharded_cross_pgs = sharded_pgs
+            self._xccl_sharded_method = method
+            dt = time.perf_counter() - t0
+            logger.info(
+                "init_xccl_sharded_pgs: %d PGs ready in %.1fs (method=%s, replica=%d)",
+                len(sharded_pgs), dt, method, replica_idx,
+            )
+            return {"status": "ok", "init_s": round(dt, 2),
+                    "ep_degree": int(ep_degree), "method": method,
+                    "replica_idx": int(replica_idx)}
+        except Exception as e:
+            logger.exception("init_xccl_sharded_pgs failed")
+            return {"status": "error", "message": str(e)}
+
     def receive_weights_xccl(self, meta: str) -> dict:
         """Receive weights via XCCL broadcast from the training rank.
 
@@ -850,13 +959,24 @@ class WeightSyncFromFileExtension:
 
                 # Compute expected batch count (same greedy algorithm as sender)
                 # for diagnostic comparison with trainer's logged n_batches.
+                # WS10: must also break the batch at every trainer_ep_rank
+                # transition (and at the expert -> non-expert transition where
+                # the tag disappears) so the receiver's batches line up with
+                # the sender's per-rank greedy. Each trainer rank only emits
+                # its OWN local entries; the receiver was previously packing
+                # across rank boundaries and got a size mismatch (gloo:
+                # "preamble.length <= nbytes" terminate, run #6).
                 _diag_batches = 0
                 _diag_i = 0
                 _diag_bn = 0
                 while _diag_i < n_params:
                     _diag_inner_bn = 0
+                    _diag_R = tensors_meta[_diag_i].get("trainer_ep_rank")
                     while _diag_i < n_params:
                         _pn = tensors_meta[_diag_i]["numel"]
+                        _R_now = tensors_meta[_diag_i].get("trainer_ep_rank")
+                        if _diag_inner_bn > 0 and _R_now != _diag_R:
+                            break
                         if _diag_inner_bn > 0 and _diag_inner_bn + _pn > batch_max_numel:
                             break
                         _diag_inner_bn += _pn
@@ -874,54 +994,102 @@ class WeightSyncFromFileExtension:
 
                 _batch_idx = 0
                 i = 0
+                # WS10: when batch entries carry trainer_ep_rank tags, the
+                # cross PG to receive on switches per batch. The two-hop
+                # intra fanout stays the same (vLLM TP workers still need
+                # the data). Built-in receiver caches are unchanged on the
+                # off-path (no tag → use legacy self._xccl_cross_pg).
+                _ws10_sharded_cross_pgs = getattr(
+                    self, "_xccl_sharded_cross_pgs", None) or {}
                 while i < n_params:
                     batch_start = i
                     batch_numel = 0
+                    # WS10: each batch must come from a single trainer EP rank
+                    # so the receiver's batch boundaries match the sender's
+                    # per-rank greedy. The expert -> non-expert transition
+                    # (tag disappears, but rank 0 ships them on R=0's PG)
+                    # also forces a boundary because the sender concatenated
+                    # them into separate cpu_batches (see _ws10_build_local_payload
+                    # + the rank-0 non-expert tail packing).
+                    _ws10_R_run = tensors_meta[i].get("trainer_ep_rank")
                     while i < n_params:
                         pn = tensors_meta[i]["numel"]
+                        _R_now = tensors_meta[i].get("trainer_ep_rank")
+                        if batch_numel > 0 and _R_now != _ws10_R_run:
+                            break
                         if batch_numel > 0 and batch_numel + pn > batch_max_numel:
                             break
                         batch_numel += pn
                         i += 1
 
-                    recv_buf = self._xccl_recv_buf[:batch_numel]
-                    t_b0 = time.perf_counter()
-                    if two_hop:
-                        intra_method = getattr(self, '_wsync_intra_method', 'xccl')
-                        if self._is_intra_root:
-                            cross_method = getattr(self, '_wsync_cross_method', 'gloo')
-                            if cross_method == "gloo":
-                                if self._gloo_recv_buf is None or self._gloo_recv_buf.numel() < batch_numel:
-                                    self._gloo_recv_buf = torch.empty(batch_numel, dtype=torch.bfloat16)
-                                    logger.info("gloo recv buf allocated: %d elements", batch_numel)
-                                cpu_recv = self._gloo_recv_buf[:batch_numel]
-                                self._xccl_cross_pg.broadcast(cpu_recv, root=0).wait()
-                                if intra_method == "gloo":
-                                    self._xccl_intra_pg.broadcast(cpu_recv, root=0).wait()
-                                    recv_buf.copy_(cpu_recv)
-                                else:
-                                    recv_buf.copy_(cpu_recv)
+                    # WS10 per-batch PG selection: peek the FIRST entry of
+                    # this batch. If it carries trainer_ep_rank, use the
+                    # corresponding sharded PG. Otherwise fall back to the
+                    # legacy single cross PG. Non-expert tail (no tag) is
+                    # sent by trainer rank 0 → use sharded PG R=0 if
+                    # WS10 is active, else legacy.
+                    _ws10_first = tensors_meta[batch_start]
+                    _ws10_R_first = _ws10_first.get("trainer_ep_rank")
+                    _orig_cross_pg = getattr(self, "_xccl_cross_pg", None)
+                    _ws10_active_batch = False
+                    if _ws10_sharded_cross_pgs:
+                        if _ws10_R_first is not None:
+                            _R = int(_ws10_R_first)
+                            self._xccl_cross_pg = _ws10_sharded_cross_pgs[_R]
+                            _ws10_active_batch = True
+                        elif 0 in _ws10_sharded_cross_pgs:
+                            # Non-expert batch from trainer rank 0 in WS10
+                            # mode: route via R=0's sharded PG.
+                            self._xccl_cross_pg = _ws10_sharded_cross_pgs[0]
+                            _ws10_active_batch = True
+                    try:
+                        recv_buf = self._xccl_recv_buf[:batch_numel]
+                        t_b0 = time.perf_counter()
+                        if two_hop:
+                            intra_method = getattr(self, '_wsync_intra_method', 'xccl')
+                            if self._is_intra_root:
+                                # WS10 sharded PGs are gloo-only by default; force the
+                                # gloo cross-recv path when they're active for this batch.
+                                cross_method = (
+                                    "gloo" if _ws10_active_batch
+                                    else getattr(self, '_wsync_cross_method', 'gloo')
+                                )
+                                if cross_method == "gloo":
+                                    if self._gloo_recv_buf is None or self._gloo_recv_buf.numel() < batch_numel:
+                                        self._gloo_recv_buf = torch.empty(batch_numel, dtype=torch.bfloat16)
+                                        logger.info("gloo recv buf allocated: %d elements", batch_numel)
+                                    cpu_recv = self._gloo_recv_buf[:batch_numel]
+                                    self._xccl_cross_pg.broadcast(cpu_recv, root=0).wait()
+                                    if intra_method == "gloo":
+                                        self._xccl_intra_pg.broadcast(cpu_recv, root=0).wait()
+                                        recv_buf.copy_(cpu_recv)
+                                    else:
+                                        recv_buf.copy_(cpu_recv)
+                                        self._xccl_intra_pg.broadcast(recv_buf, root=0).wait()
+                                elif cross_method == "xccl_sendrecv":
+                                    self._xccl_cross_pg.recv([recv_buf], 0, 0).wait()
                                     self._xccl_intra_pg.broadcast(recv_buf, root=0).wait()
-                            elif cross_method == "xccl_sendrecv":
-                                self._xccl_cross_pg.recv([recv_buf], 0, 0).wait()
-                                self._xccl_intra_pg.broadcast(recv_buf, root=0).wait()
+                                else:
+                                    self._xccl_cross_pg.broadcast(recv_buf, root=0).wait()
+                                    self._xccl_intra_pg.broadcast(recv_buf, root=0).wait()
                             else:
-                                self._xccl_cross_pg.broadcast(recv_buf, root=0).wait()
-                                self._xccl_intra_pg.broadcast(recv_buf, root=0).wait()
+                                if intra_method == "gloo":
+                                    if self._gloo_intra_buf is None or self._gloo_intra_buf.numel() < batch_numel:
+                                        self._gloo_intra_buf = torch.empty(batch_numel, dtype=torch.bfloat16)
+                                        logger.info("gloo intra buf allocated: %d elements", batch_numel)
+                                    cpu_buf = self._gloo_intra_buf[:batch_numel]
+                                    self._xccl_intra_pg.broadcast(cpu_buf, root=0).wait()
+                                    recv_buf.copy_(cpu_buf)
+                                else:
+                                    self._xccl_intra_pg.broadcast(recv_buf, root=0).wait()
                         else:
-                            if intra_method == "gloo":
-                                if self._gloo_intra_buf is None or self._gloo_intra_buf.numel() < batch_numel:
-                                    self._gloo_intra_buf = torch.empty(batch_numel, dtype=torch.bfloat16)
-                                    logger.info("gloo intra buf allocated: %d elements", batch_numel)
-                                cpu_buf = self._gloo_intra_buf[:batch_numel]
-                                self._xccl_intra_pg.broadcast(cpu_buf, root=0).wait()
-                                recv_buf.copy_(cpu_buf)
-                            else:
-                                self._xccl_intra_pg.broadcast(recv_buf, root=0).wait()
-                    else:
-                        self._xccl_pg.broadcast(recv_buf, root=0).wait()
-                    t_bcast_i = time.perf_counter() - t_b0
-                    t_bcast_total += t_bcast_i
+                            self._xccl_pg.broadcast(recv_buf, root=0).wait()
+                        t_bcast_i = time.perf_counter() - t_b0
+                        t_bcast_total += t_bcast_i
+                    finally:
+                        # Restore the legacy cross PG selection for the
+                        # next batch (off-path code references it).
+                        self._xccl_cross_pg = _orig_cross_pg
 
                     # Split flat buffer back into per-param tensors, routing
                     # fused MoE experts to _load_fused_moe_experts (GPU-direct)
@@ -941,12 +1109,23 @@ class WeightSyncFromFileExtension:
                             ep_degree = entry.get("ep_degree")
                             if trainer_ep_rank is not None and ep_degree is not None:
                                 # WS10 sharded payload — accumulate per-rank shards.
+                                # Stage on CPU: with rank-grouped manifest order
+                                # ((R, layer, kind, name)) no layer becomes
+                                # complete until R=ep_d-1's batches arrive at
+                                # the very end. With ep_d=16, 48 layers, 2 kinds,
+                                # the pile-up is 48×2×16=1536 tensors (~57 GiB
+                                # for 30B-A3B) — does not fit on a 64 GiB tile
+                                # on top of the resident vLLM model (run #8 OOM
+                                # at batch 9/68). _load_fused_moe_experts_sharded
+                                # builds w13_global/w2_global on CPU anyway and
+                                # only the final TP slice goes to device, so
+                                # CPU staging is bit-equivalent.
                                 lyr = sharded_pending.setdefault(layer_idx, {
                                     "w13": {}, "w2": {},
                                     "ep_degree": int(ep_degree),
                                     "n_local_trainer": int(entry.get("n_local", entry["shape"][0])),
                                 })
-                                lyr[kind][int(trainer_ep_rank)] = tensor.clone()
+                                lyr[kind][int(trainer_ep_rank)] = tensor.detach().cpu()
                             else:
                                 # Clone: recv_buf is reused next iteration.
                                 fused_pending.setdefault(layer_idx, {})[kind] = tensor.clone()
