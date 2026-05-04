@@ -596,6 +596,14 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
         self._max_generated_tokens = cfg.max_generated_tokens
         self.batch_size = cfg.batch_size
         self._forward_batch_size = cfg.forward_batch_size
+        # Separate chunk size for no-grad forwards (ref_fwd inside disable_adapter,
+        # optional rollout policy logprobs). Defaults to forward_batch_size for
+        # backwards compatibility. Larger values (e.g. 16-24) reduce the number
+        # of FSDP all-gather rounds in ref_fwd; safe to raise because no-grad
+        # paths do not retain activations for backward.
+        self._ref_forward_batch_size = cfg.get(
+            "ref_forward_batch_size", cfg.forward_batch_size
+        )
         # Outer-loop chunk for trajectory generation. Defaults to batch_size so
         # all G*batch_size streams hit vLLM in one HTTP call (max throughput).
         # Lower it (e.g. to forward_batch_size) only if the resulting tensors
@@ -1010,7 +1018,10 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
         # grpo_step's per-chunk policy fwd produce both pi_logprobs and
         # old_logprobs (via .detach()) — ratios collapse to 1 either way.
         # Saves ~13% of step time at 4B.
-        fwd_bs = self._forward_batch_size
+        # Both no-grad paths (rollout policy logprobs, ref logprobs) chunk on
+        # _ref_forward_batch_size — independent of training _forward_batch_size
+        # because no activations are retained for backward here.
+        fwd_bs = self._ref_forward_batch_size
         _policy_fwd_t0 = time.perf_counter()
         if self._compute_rollout_logprobs_required:
             with torch.no_grad():

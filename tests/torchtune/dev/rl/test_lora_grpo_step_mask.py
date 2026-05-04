@@ -197,6 +197,30 @@ class TestLoRAGrpoStepBinding(unittest.TestCase):
                 f"chunk {i}: mask polarity wrong (recipe likely dropped the ~).",
             )
 
+    def test_grpo_step_uses_forward_batch_size_not_ref(self):
+        """P3 split-FBS guard: grpo_step (training) chunks by _forward_batch_size
+        and is independent of _ref_forward_batch_size. If a refactor accidentally
+        rewires grpo_step to read _ref_forward_batch_size, this test fires."""
+        model = _FakeModel()
+        loss = _FakeLoss()
+        # Training fwd_bs=2 (chunks training), ref_fwd_bs=8 (would be 1 chunk).
+        recipe = _build_recipe_stub(model, loss, fwd_bs=2, grad_accum=1)
+        recipe._ref_forward_batch_size = 8  # must not influence grpo_step
+        traj = _make_trajectory(B=4, prompt_len=4, resp_len=6, n_pad=2)
+        import os
+        os.environ["TORCHTUNE_USE_CHUNKED_LOSS"] = "1"
+        try:
+            self.grpo_step(recipe, traj)
+        finally:
+            os.environ.pop("TORCHTUNE_USE_CHUNKED_LOSS", None)
+        # 4 / 2 = 2 chunks (using _forward_batch_size=2).
+        # If grpo_step regressed to use _ref_forward_batch_size=8, we'd get 1 chunk.
+        self.assertEqual(
+            len(loss.calls), 2,
+            f"grpo_step must chunk by _forward_batch_size (2) → 2 chunks; got "
+            f"{len(loss.calls)} (likely reading _ref_forward_batch_size by mistake).",
+        )
+
     def test_grpo_step_returns_loss_and_kl(self):
         """grpo_step returns dict with 'loss' and 'kl' float keys."""
         model = _FakeModel()

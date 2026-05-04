@@ -79,7 +79,8 @@ epochs: 1
 num_steps: 200
 ppo_epochs: 1
 batch_size: 8                          # ppo_batch_size = batch_size * grpo_samples = 192 (paper)
-forward_batch_size: 8
+forward_batch_size: 8                  # training fwd+bwd chunk (memory-bound)
+ref_forward_batch_size: 16             # no-grad ref+rollout fwd chunk; halves FSDP all-gather rounds in ref_fwd
 gen_batch_size: 8                      # outer chunk for trajectory gen → 1 vLLM call/step (decoupled from fwd_bs)
 gradient_accumulation_steps: 1
 

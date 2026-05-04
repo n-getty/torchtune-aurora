@@ -1041,6 +1041,13 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         self._max_generated_tokens = cfg.max_generated_tokens
         self.batch_size = cfg.batch_size
         self._forward_batch_size = cfg.forward_batch_size
+        # Separate chunk size for no-grad forwards inside generate_trajectory
+        # (rollout policy logprobs + ref logprobs). Defaults to forward_batch_size.
+        # Larger values reduce FSDP all-gather rounds; safe to raise because
+        # no-grad paths do not retain activations for backward.
+        self._ref_forward_batch_size = cfg.get(
+            "ref_forward_batch_size", cfg.forward_batch_size
+        )
 
         # Reward mode: "math" (default) or "gene_recall"
         self._reward_mode = cfg.get("reward_mode", "math")
@@ -2520,7 +2527,9 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
 
         # step 2. estimate logprobs of the responses using the current policy
         num_seqs = query_responses.shape[0]
-        fwd_bs = self._forward_batch_size
+        # Ref/rollout no-grad forwards chunk on _ref_forward_batch_size
+        # (independent of training _forward_batch_size — see __init__).
+        fwd_bs = self._ref_forward_batch_size
 
         # Rollout-time logprobs.
         #   ppo_epochs > 1: must compute old_logprobs from the rollout-time policy
