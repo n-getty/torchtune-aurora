@@ -376,6 +376,33 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
             f"LoRA-GRPO: FSDP ignored_states={len(_lora_adapter_params)} adapter params "
             f"(replicated, not sharded; reduces IPC handle accumulation)",
         )
+
+        # NOTE: do NOT cast adapter params to fp32 in-place — LoRALinear
+        # forward computes `lora_a(bf16_input)` and the matmul rejects mixed
+        # dtypes (RuntimeError: expected mat1 and mat2 to have the same
+        # dtype). Master fp32 copy + post-step write-back is wired in
+        # _setup_optimizer instead, addressing the bf16 AdamW underflow that
+        # froze the adapter (delta=0). See
+        # docs/reports/lora_4b_mns8_frozen_adapter_20260503.md.
+
+        # Fix: broadcast adapter params from rank 0. LoRA inits use
+        # nn.init.kaiming_uniform_ on lora_a (consumes RNG), and per-rank RNG
+        # state diverges from the model build path (dataloader seeding etc.),
+        # so without an explicit broadcast each rank's lora_a starts with
+        # different values. FSDP1 with ignored_states= does NOT broadcast the
+        # ignored params even with sync_module_states=True. After this loop,
+        # all ranks hold rank-0's adapter values; subsequent grad all-reduces
+        # keep them in sync.
+        if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+            with torch.no_grad():
+                for _p in _lora_adapter_params:
+                    torch.distributed.broadcast(_p.data, src=0)
+            utils.log_rank_zero(
+                log,
+                f"LoRA-GRPO: broadcast {len(_lora_adapter_params)} adapter params "
+                f"from rank 0 (cross-rank init divergence fix)",
+            )
+
         model = FSDP(
             model,
             sharding_strategy=_sharding_strategy,
@@ -410,7 +437,28 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
         cfg_optimizer: DictConfig,
         opt_state_dict: Optional[dict[str, Any]] = None,
     ) -> Optional[Optimizer]:
-        """Create optimizer for adapter parameters only."""
+        """Create optimizer over fp32 MASTER copies of the bf16 adapter params.
+
+        The model holds bf16 adapter params (LoRALinear forward requires
+        matching bf16 input/weight dtypes). AdamW's per-element update during
+        warmup (`lr ≈ 3e-6`) underflows bf16's relative epsilon (`~7.8e-3` for
+        params of magnitude `~1e-1`) — observed as `delta=0.000000e+00` for
+        every step in the 2026-05-03 frozen-adapter run.
+
+        Fix: keep model params bf16, but build the optimizer over fp32 master
+        copies. Each step:
+          1. The recipe all-reduces and clips bf16 grads on the model's
+             ``adapter_optimizer_params`` (unchanged, line 1469-1500).
+          2. ``_sync_grads_to_master_fp32()`` copies bf16 grads → fp32 master
+             grads.
+          3. ``optimizer.step()`` updates the fp32 masters.
+          4. ``_sync_master_fp32_to_params()`` copies fp32 masters → bf16
+             params (rounding back, but the accumulated update is preserved
+             across steps in the fp32 masters).
+
+        VALMET still measures the bf16 model params (what vLLM consumes), so
+        a real, non-noise update will show as nonzero ``delta``.
+        """
         params = adapter_optimizer_params(self._model)
         if not params:
             raise ValueError(
@@ -418,13 +466,46 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
                 "and that build_qwen3_lora_model / set_trainable_params ran correctly."
             )
         utils.log_rank_zero(log, f"LoRA optimizer: {len(params)} adapter parameter tensors")
-        optimizer = config.instantiate(cfg_optimizer, params)
+
+        master_params = []
+        self._adapter_master_pairs = []
+        for _p in params:
+            _master = _p.detach().to(torch.float32).clone()
+            _master.requires_grad_(True)
+            master_params.append(_master)
+            self._adapter_master_pairs.append((_p, _master))
+        _master_mb = sum(m.numel() * m.element_size() for m in master_params) / 1e6
+        utils.log_rank_zero(
+            log,
+            f"LoRA optimizer: built {len(master_params)} fp32 master copies ({_master_mb:.1f} MB)",
+        )
+
+        optimizer = config.instantiate(cfg_optimizer, master_params)
         if opt_state_dict:
             training.load_from_full_optimizer_state_dict(
                 self._model, optimizer, opt_state_dict, self._device,
             )
-        utils.log_rank_zero(log, "Optimizer is initialized (adapter-only).")
+        utils.log_rank_zero(log, "Optimizer is initialized (adapter-only, fp32 masters).")
         return optimizer
+
+    def _sync_grads_to_master_fp32(self) -> None:
+        """Copy bf16 adapter grads → fp32 master grads (after all-reduce/clip)."""
+        with torch.no_grad():
+            for _bf16_p, _fp32_master in self._adapter_master_pairs:
+                if _bf16_p.grad is None:
+                    if _fp32_master.grad is not None:
+                        _fp32_master.grad.zero_()
+                    continue
+                if _fp32_master.grad is None:
+                    _fp32_master.grad = _bf16_p.grad.detach().to(torch.float32).clone()
+                else:
+                    _fp32_master.grad.copy_(_bf16_p.grad.to(torch.float32))
+
+    def _sync_master_fp32_to_params(self) -> None:
+        """Copy fp32 master params → bf16 model params (after optimizer.step)."""
+        with torch.no_grad():
+            for _bf16_p, _fp32_master in self._adapter_master_pairs:
+                _bf16_p.data.copy_(_fp32_master.data.to(_bf16_p.dtype))
 
     def _setup_lr_scheduler(
         self,
@@ -706,29 +787,40 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
     # -------------------------------------------------------------------------
 
     def _gather_lora_state_dict(self):
-        """FSDP collective gather — ALL ranks must call this.
+        """Rank-0-only adapter snapshot — no FSDP collective.
+
+        Adapter params live in FSDP ``ignored_states`` (recipe init line ~412),
+        are broadcast from rank 0 at init (line ~396), and grads are manually
+        all-reduced post-step (line ~1546). VALMET_RANK_EQUAL pins bit-identical
+        replication every step. Rank 0 can therefore read its own
+        ``named_parameters()`` directly — no FULL_STATE_DICT gather of the
+        frozen 4 B base. Saves ~7 s/step at the 4B/2-node envelope.
 
         Returns a tuple (peft_sd, adapter_config, adapter_name, slot, local_path, vllm_path)
         on rank 0, or None on non-rank-0 ranks.
         """
-        from torch.distributed.fsdp import (
-            FullyShardedDataParallel as FSDP,
-            StateDictType,
-            FullStateDictConfig,
-        )
-
-        with FSDP.state_dict_type(
-            self._model,
-            StateDictType.FULL_STATE_DICT,
-            FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
-        ):
-            full_sd = self._model.state_dict()
-
         if not self._is_rank_zero:
             return None
 
-        adapter_sd = get_adapter_state_dict(full_sd, device="cpu")
-        del full_sd
+        # Adapter-only snapshot from local replicated params. Keys still carry
+        # FSDP wrapping prefixes (use_orig_params=True), but
+        # _translate_lora_key() strips them via _strip_fsdp_prefixes().
+        adapter_sd = {
+            n: p.detach().cpu().to(torch.float32)
+            for n, p in self._model.named_parameters()
+            if "lora_a" in n or "lora_b" in n
+        }
+
+        # Fail closed: count must match adapter_optimizer_params (the same
+        # surface the optimizer trains and the manual all-reduce sweeps).
+        expected = len(list(adapter_optimizer_params(self._model)))
+        if len(adapter_sd) != expected or expected == 0:
+            raise RuntimeError(
+                f"_gather_lora_state_dict: adapter tensor count mismatch — "
+                f"snapshot={len(adapter_sd)} vs adapter_optimizer_params={expected}. "
+                f"Refusing to publish a partial adapter."
+            )
+
         peft_sd, adapter_config = torchtune_to_peft_state_dict(
             adapter_sd,
             model_name=str(getattr(self._checkpointer, "_checkpoint_dir", "base_model")),
@@ -737,6 +829,11 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
             target_modules=self._lora_target_modules,
         )
         del adapter_sd
+        if not peft_sd:
+            raise RuntimeError(
+                "_gather_lora_state_dict: torchtune_to_peft_state_dict produced "
+                "an empty PEFT state dict. Refusing to publish."
+            )
 
         step_id = self._steps_run
         slot = step_id % self._lora_max_loras
@@ -1524,10 +1621,20 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
                                     _sq += _p.detach().float().pow(2).sum()
                                 _adapter_norm_before = float(_sq.sqrt().item())
 
-                    # Optimizer step
+                    # Optimizer step (fp32 master copy path):
+                    #   bf16 grads (already all-reduced + clipped) → fp32 master grads,
+                    #   AdamW updates fp32 masters,
+                    #   fp32 masters → bf16 model params.
+                    # See _setup_optimizer for rationale.
                     _opt_t0 = time.perf_counter()
+                    self._sync_grads_to_master_fp32()
                     self._optimizer.step()
                     self._optimizer.zero_grad()
+                    self._sync_master_fp32_to_params()
+                    # Also clear bf16 grads (recipe's _adapter_grads will rebuild next step).
+                    for _bf16_p, _ in self._adapter_master_pairs:
+                        if _bf16_p.grad is not None:
+                            _bf16_p.grad = None
                     if self._device.type == "xpu":
                         torch.xpu.synchronize()
                     _opt_time = time.perf_counter() - _opt_t0
@@ -1542,12 +1649,30 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
                             for _p in _ap:
                                 _sq += _p.detach().float().pow(2).sum()
                             _adapter_norm_after = float(_sq.sqrt().item())
+                            # fp32 master L2 — proves AdamW actually moved the master copies
+                            # even when bf16 round-trip truncates sub-ULP updates.
+                            _msq = torch.zeros((), device=self._device, dtype=torch.float64)
+                            for _, _m in self._adapter_master_pairs:
+                                _msq += _m.detach().to(torch.float64).pow(2).sum()
+                            _master_norm = float(_msq.sqrt().item())
+                            # Also: fp32 grad L2 just before the step would be ideal but grads
+                            # are already zero'd; instead snapshot the optimizer state-step.
+                            _opt_step = 0
+                            for _g in self._optimizer.param_groups:
+                                for _p in _g["params"]:
+                                    _st = self._optimizer.state.get(_p, {})
+                                    _opt_step = int(_st.get("step", 0)) if "step" in _st else 0
+                                    break
+                                if _opt_step:
+                                    break
                         log.info(
-                            "VALMET step=%d adapter_l2_before=%.6e adapter_l2_after=%.6e delta=%.6e",
+                            "VALMET step=%d adapter_l2_before=%.6e adapter_l2_after=%.6e delta=%.6e master_l2=%.6e opt_step=%d",
                             self._steps_run,
                             _adapter_norm_before,
                             _adapter_norm_after,
                             _adapter_norm_after - _adapter_norm_before,
+                            _master_norm,
+                            _opt_step,
                         )
 
                     # Validation: rank-equality checksum on adapter params.
@@ -1589,15 +1714,15 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
                                             self._steps_run, float(_h_min.item()),
                                         )
 
-                    # LoRA publish: Phase A (sync FSDP gather, all ranks),
+                    # LoRA publish: Phase A (rank-0 adapter snapshot, no collective),
                     # Phase B (async IO + rsync + HTTP, rank 0 background thread)
                     if self._steps_run % self._lora_publish_every == 0:
                         _pub_t0 = time.perf_counter()
-                        publish_state = self._gather_lora_state_dict()  # all ranks participate
+                        publish_state = self._gather_lora_state_dict()  # rank-0 only; non-rank-0 returns None
                         if self._is_rank_zero and publish_state is not None:
                             _gather_time = time.perf_counter() - _pub_t0
                             log.info(
-                                "Rank 0: FSDP gather done in %.2fs — starting async publish",
+                                "Rank 0: adapter snapshot done in %.2fs — starting async publish",
                                 _gather_time,
                             )
                             self._publish_error = None
