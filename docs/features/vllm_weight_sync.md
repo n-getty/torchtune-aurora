@@ -469,12 +469,18 @@ To reduce fragmentation and avoid OOM, we built custom allocators loaded via
 | `usm_arena_alloc.cpp` v6 | Same as v5, BUCKET_CAP fixed | Segfault (arena sub-allocated pointers in 1–8 MiB range) |
 | `usm_arena_alloc.cpp` v7 | **No arena**: small buckets + exact-aligned direct only | Segfault (proves XPUPluggableAllocator itself is the issue) |
 
-**Root cause**: `XPUPluggableAllocator` creates allocations in a SYCL context
-that differs from what CCL uses for `zeMemGetIpcHandle`. Even pure
-`sycl::malloc_device` pointers (no sub-allocation) produce GPU segfaults at
-`0xffffff8000000000` during FSDP allgather/reduce_scatter. This is distinct
-from the `expandable_segments` bug (which involves non-USM virtual memory) —
-see `docs/bugs/intel_ccl_expandable_segments_bug.md` for full analysis.
+**Root cause**: the original "wrong SYCL context for `zeMemGetIpcHandle`"
+explanation has been retracted — LD_PRELOAD tracing confirms
+`zeMemGetIpcHandle` is never called on this path. The current evidence is
+that `XPUPluggableAllocator` recycles a freshly freed VA before FSDP's
+comm-stream collective has finished referencing it, and any allocator that
+adds an alloc-time or free-time `queue->wait()` (e.g. `usm_caching_alloc.so`,
+`usm_caching_alloc_v2.so`, `usm_pending_alloc.so`) avoids the fault. Whether
+the underlying mechanism is the `XPUPluggableAllocator` `recordStream` no-op
+or OFI MR stale registrations is still debated. See
+`docs/bugs/xpu_pluggable_allocator_record_stream.md` for full analysis. This
+is distinct from the `expandable_segments` bug (which involves non-USM
+virtual memory) — see `docs/bugs/intel_ccl_expandable_segments_bug.md`.
 
 **CCL algorithm overrides do not help**: `CCL_ALLGATHER=naive`,
 `CCL_REDUCE_SCATTER=naive`, `CCL_ALLREDUCE=direct` were tested — CCL still uses
@@ -691,7 +697,9 @@ See `docs/reports/bioreason_xccl_2hop_validated_20260430.md`.
 | `recipes/configs/dev/production/gemma4_31B_gene_recall_xpu.yaml` | `vllm_weight_sync_method: shm` |
 | `recipes/dev/usm_arena_alloc.cpp` | Custom XPU allocator (exact-aligned caching, no arena) |
 | `experiments/multinode_32b/run_32b_3node_24way.sh` | 3-node 24-way FSDP launcher (1 vLLM + 2 training) |
-| `docs/bugs/intel_ccl_expandable_segments_bug.md` | CCL IPC bug reports (expandable_segments + XPUPluggableAllocator) |
+| `docs/bugs/intel_ccl_expandable_segments_bug.md` | Bug A — CCL rejects `expandable_segments` virtual-memory pointers |
+| `docs/bugs/xpu_pluggable_allocator_record_stream.md` | Bug B — `XPUPluggableAllocator` step-1 GPU page fault under FSDP2 |
+| `docs/bugs/ccl_ipc_handle_cache.md` | Bug C — CCL IPC handle cache (eviction vs accumulation trade-off) |
 
 ---
 
