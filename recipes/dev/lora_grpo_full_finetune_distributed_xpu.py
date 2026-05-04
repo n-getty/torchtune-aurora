@@ -100,9 +100,12 @@ from torchtune.dev.rl.lora_helpers import (
     load_lora_adapter_http,
     unload_lora_adapter_http,
     load_peft_adapter_into_model,
+    iter_merged_lora_layers,
     _ATTN_TARGET_MODULES,
     _MLP_TARGET_MODULES,
+    _TUNE_MODULE_TO_HF,
 )
+from torchtune.dev.rl.weight_sync import _save_raw_bytes
 import torchtune.dev.rl.vllm_backend as _vllm_backend_module
 from tqdm import tqdm
 
@@ -207,6 +210,14 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
         # SSH ControlMaster socket for rsync multiplexing (avoids per-rsync conn overhead)
         self._ssh_control_socket: Optional[str] = None
         self._ssh_control_proc: Optional[subprocess.Popen] = None
+
+        # Adapter-delivery path:
+        #   use_runtime_lora=False (default) — merged-weight broadcast: gather adapter,
+        #     compute W_eff = W_base + (alpha/rank)*(B@A), POST raw_bytes to vLLM
+        #     /collective_rpc load_weights_from_raw. Sidesteps the vLLM --enable-lora
+        #     PDE crash on Aurora XPU (docs/reports/enable_lora_issue.md).
+        #   use_runtime_lora=True — legacy PEFT dir + /v1/load_lora_adapter path.
+        self._lora_use_runtime = bool(_get("use_runtime_lora", False))
 
         # Derive LoRA target_modules from model config
         _model_cfg = cfg.get("model", {}) or {}
@@ -620,6 +631,14 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
         # Build LoRA model (no separate ref model)
         self._model = self._setup_model_lora(cfg, checkpoint_dict[training.MODEL_KEY])
 
+        # Cache frozen base weights ONCE (collective). Eliminates the per-step
+        # FSDP1 FULL_STATE_DICT gather inside _gather_merged_lora_weights, which
+        # is the suspected trigger for trainer-side banned:1 PDE on Aurora XPU.
+        # Base weights are frozen so the cache is bit-exact for all future steps.
+        # Uses the merged-weight publish path; no-op for the legacy PEFT path.
+        if not self._lora_use_runtime:
+            self._cache_lora_base_weights()
+
         # Release checkpoint memory
         import gc as _gc
         try:
@@ -939,6 +958,200 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
         state = self._gather_lora_state_dict()
         if state is not None:
             self._publish_lora_background(state)
+
+    # -------------------------------------------------------------------------
+    # Merged-weight publish path (default — sidesteps vLLM --enable-lora PDE)
+    # -------------------------------------------------------------------------
+
+    def _cache_lora_base_weights(self) -> None:
+        """Cache frozen LoRA-target base weights on rank 0 (CPU) once at setup.
+
+        Avoids the per-step FSDP1 ``state_dict_type(FULL_STATE_DICT, rank0_only=True)``
+        gather inside ``_gather_merged_lora_weights``. The repeated per-step gather
+        is a suspected trigger for trainer-side ``banned:1 PDE`` faults on Aurora
+        XPU (observed on step 1 after step 0 publish; see
+        ``project_lora_grpo_merged_weight_path.md``). Base weights are frozen
+        (``requires_grad=False``) so a one-shot cache is bit-exact across all
+        future steps.
+
+        Sets ``self._cached_base_weights``: ``{tune_param_name: bf16_cpu_tensor}``
+        on rank 0, ``None`` on other ranks.
+        """
+        from torch.distributed.fsdp import (
+            FullyShardedDataParallel as FSDP,
+            StateDictType,
+            FullStateDictConfig,
+        )
+        from torchtune.modules.peft.lora import LoRALinear
+
+        # Collect names of LoRALinear base weights (these are what we need).
+        target_names: set[str] = set()
+        for mod_name, module in self._model.named_modules():
+            if isinstance(module, LoRALinear):
+                wn = f"{mod_name}.weight"
+                target_names.add(wn)
+                # Also store the wrapper-stripped form so iter_merged_lora_layers
+                # lookups succeed on either name.
+                target_names.add(
+                    wn.replace("_fsdp_wrapped_module.", "").replace(
+                        "_checkpoint_wrapped_module.", ""
+                    )
+                )
+
+        _t0 = time.perf_counter()
+        with FSDP.state_dict_type(
+            self._model,
+            StateDictType.FULL_STATE_DICT,
+            FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
+        ):
+            full_sd = self._model.state_dict()  # collective on every rank
+            if not self._is_rank_zero:
+                self._cached_base_weights = None
+                return
+            cached: dict[str, torch.Tensor] = {}
+            for k, v in full_sd.items():
+                # Filter to LoRA-target base weights; skip lora_a/lora_b (those
+                # are not in the FSDP state_dict anyway since they're ignored,
+                # but be defensive) and skip every other base linear that we
+                # do not need to broadcast.
+                if "lora_a" in k or "lora_b" in k:
+                    continue
+                if k in target_names:
+                    cached[k] = v.detach().to(torch.bfloat16).cpu().contiguous()
+            self._cached_base_weights = cached
+        if self._is_rank_zero:
+            _gb = sum(t.numel() * t.element_size() for t in self._cached_base_weights.values()) / 1024**3
+            log.info(
+                "LoRA-GRPO: cached %d frozen base weights on rank 0 (%.2f GiB CPU) in %.2fs — "
+                "per-step FSDP gather eliminated",
+                len(self._cached_base_weights), _gb, time.perf_counter() - _t0,
+            )
+
+    def _gather_merged_lora_weights(self) -> Optional[dict]:
+        """Build merged LoRA-target weight dict from cached base + live adapter.
+
+        Rank-0 only. Reads ``self._cached_base_weights`` (set by
+        ``_cache_lora_base_weights`` at setup) and the live ``lora_a`` /
+        ``lora_b`` adapter tensors (replicated across ranks via FSDP
+        ``ignored_states`` + manual all-reduce in the train loop, so rank 0's
+        copies are identical to all other ranks').
+
+        Returns ``{hf_name: bf16_cpu_tensor}`` on rank 0; ``None`` elsewhere.
+
+        No FSDP ``state_dict_type`` context is entered — there is no
+        cross-rank collective in this function. This sidesteps the per-step
+        ``FULL_STATE_DICT`` AllGather that was the suspected trigger for
+        trainer-side ``banned:1 PDE`` on Aurora XPU.
+        """
+        if not self._is_rank_zero:
+            return None
+        if getattr(self, "_cached_base_weights", None) is None:
+            raise RuntimeError(
+                "_gather_merged_lora_weights: _cached_base_weights not initialized — "
+                "_cache_lora_base_weights must be called once after FSDP wrap."
+            )
+
+        merged: dict[str, torch.Tensor] = {}
+        # iter_merged_lora_layers reads adapter tensors live from the model
+        # (lora_a/lora_b are replicated across ranks via ignored_states +
+        # manual all-reduce, so rank 0's copy is authoritative). Base weights
+        # come from the rank-0 cache; this is rank-0-only and never collective.
+        for tune_name, w in iter_merged_lora_layers(
+            self._model, base_weights=self._cached_base_weights
+        ):
+            clean = tune_name.replace("_fsdp_wrapped_module.", "").replace(
+                "_checkpoint_wrapped_module.", ""
+            )
+            import re as _re
+            m = _re.match(r"^(?:.*\.)?layers\.(\d+)\.(.+)\.weight$", clean)
+            if m is None:
+                log.warning(
+                    "Skipping unexpected merged-LoRA name (no match): %s", tune_name
+                )
+                continue
+            layer_idx, module_path = m.group(1), m.group(2)
+            hf_module = _TUNE_MODULE_TO_HF.get(module_path)
+            if hf_module is None:
+                log.warning(
+                    "Skipping unknown LoRA module path %r in %s", module_path, tune_name
+                )
+                continue
+            hf_name = f"model.layers.{layer_idx}.{hf_module}.weight"
+            merged[hf_name] = w.cpu().contiguous()
+        return merged
+
+    def _publish_merged_weights_background(self, hf_state_dict: dict) -> None:
+        """Rank-0 background: write raw_bytes file, fan out POST to all vLLM tiles.
+
+        Mirrors ``weight_sync._post_weights_to_vllm`` but is self-contained so
+        the LoRA recipe doesn't depend on the dense recipe's bound-method
+        plumbing (sender pool, _is_xccl_leader, _tune_to_hf_map, etc.).
+        """
+        import json
+        import requests
+
+        if not self._vllm_urls:
+            log.warning("Rank 0: no vLLM URLs configured — skipping merged publish")
+            return
+
+        # Slot rotation: keep the last few writes around so a still-running
+        # POST doesn't read a half-written file. _lora_max_loras already
+        # bounds slot count for the legacy path; reuse it here.
+        slot = self._steps_run % max(self._lora_max_loras, 1)
+        save_path = os.path.join(
+            self._lora_shm_root, f"merged_slot_{slot}", "weights.bin"
+        )
+
+        t_save0 = time.perf_counter()
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        n_params = _save_raw_bytes(hf_state_dict, save_path)
+        t_save = time.perf_counter() - t_save0
+        size_gb = os.path.getsize(save_path) / 1024**3
+        del hf_state_dict
+        log.info(
+            "Rank 0: merged adapter raw_bytes %d params %.2f GiB in %.2fs (%.2f GB/s) → %s",
+            n_params, size_gb, t_save,
+            (size_gb / t_save) if t_save > 0 else 0.0, save_path,
+        )
+
+        t_http0 = time.perf_counter()
+
+        def _post_one(url: str):
+            try:
+                r = requests.post(
+                    f"{url}/collective_rpc",
+                    json={"method": "load_weights_from_raw", "args": [save_path]},
+                    timeout=600,
+                )
+                if r.status_code != 200:
+                    log.warning(
+                        "Merged-weight reload failed (%s): %s %s",
+                        url, r.status_code, r.text[:200],
+                    )
+                    return
+                results = r.json().get("results", [{}])
+                first = results[0] if results else {}
+                if isinstance(first, dict) and first.get("status") not in (None, "ok"):
+                    log.warning("Merged-weight reload error (%s): %s", url, first)
+            except Exception as _e:
+                log.error("Merged-weight HTTP error (%s): %s", url, _e)
+
+        with ThreadPoolExecutor(max_workers=max(1, len(self._vllm_urls))) as pool:
+            for f in as_completed(
+                [pool.submit(_post_one, u) for u in self._vllm_urls]
+            ):
+                f.result()
+        t_http = time.perf_counter() - t_http0
+
+        # Reset prefix cache so the new weights are not aliased by stale KV.
+        if self._vllm_clients:
+            with ThreadPoolExecutor(max_workers=len(self._vllm_clients)) as pool:
+                list(pool.map(lambda c: c.reset_prefix_cache(), self._vllm_clients))
+
+        log.info(
+            "Rank 0: merged-weight publish: %d params, save=%.2fs http=%.2fs",
+            n_params, t_save, t_http,
+        )
 
     # -------------------------------------------------------------------------
     # Generation
@@ -1714,29 +1927,57 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
                                             self._steps_run, float(_h_min.item()),
                                         )
 
-                    # LoRA publish: Phase A (rank-0 adapter snapshot, no collective),
-                    # Phase B (async IO + rsync + HTTP, rank 0 background thread)
+                    # Adapter publish to vLLM. Two paths:
+                    #   merged (default) — collective FSDP gather, rank 0 builds
+                    #     merged W_eff state dict, raw_bytes file + POST. Sidesteps
+                    #     vLLM --enable-lora PDE crash on Aurora XPU.
+                    #   runtime (legacy) — rank-0 adapter snapshot, PEFT dir +
+                    #     /v1/load_lora_adapter HTTP. Requires --enable-lora.
                     if self._steps_run % self._lora_publish_every == 0:
                         _pub_t0 = time.perf_counter()
-                        publish_state = self._gather_lora_state_dict()  # rank-0 only; non-rank-0 returns None
-                        if self._is_rank_zero and publish_state is not None:
-                            _gather_time = time.perf_counter() - _pub_t0
-                            log.info(
-                                "Rank 0: adapter snapshot done in %.2fs — starting async publish",
-                                _gather_time,
-                            )
-                            self._publish_error = None
-                            _state = publish_state
+                        if self._lora_use_runtime:
+                            publish_state = self._gather_lora_state_dict()  # rank-0 only; non-rank-0 returns None
+                            if self._is_rank_zero and publish_state is not None:
+                                _gather_time = time.perf_counter() - _pub_t0
+                                log.info(
+                                    "Rank 0: adapter snapshot done in %.2fs — starting async publish",
+                                    _gather_time,
+                                )
+                                self._publish_error = None
+                                _state = publish_state
 
-                            def _bg(_s=_state):
-                                try:
-                                    self._publish_lora_background(_s)
-                                except Exception as _e:
-                                    self._publish_error = _e
-                                    log.error("Rank 0: async publish failed: %s", _e)
+                                def _bg(_s=_state):
+                                    try:
+                                        self._publish_lora_background(_s)
+                                    except Exception as _e:
+                                        self._publish_error = _e
+                                        log.error("Rank 0: async publish failed: %s", _e)
 
-                            self._publish_thread = threading.Thread(target=_bg, daemon=True)
-                            self._publish_thread.start()
+                                self._publish_thread = threading.Thread(target=_bg, daemon=True)
+                                self._publish_thread.start()
+                        else:
+                            # Merged path: COLLECTIVE — every rank must enter the
+                            # FSDP FULL_STATE_DICT context together. Non-rank-0 ranks
+                            # get None back and skip the background spawn.
+                            merged_sd = self._gather_merged_lora_weights()
+                            if self._is_rank_zero and merged_sd is not None:
+                                _gather_time = time.perf_counter() - _pub_t0
+                                log.info(
+                                    "Rank 0: merged-weight gather done in %.2fs (%d tensors) — starting async publish",
+                                    _gather_time, len(merged_sd),
+                                )
+                                self._publish_error = None
+                                _sd = merged_sd
+
+                                def _bg(_s=_sd):
+                                    try:
+                                        self._publish_merged_weights_background(_s)
+                                    except Exception as _e:
+                                        self._publish_error = _e
+                                        log.error("Rank 0: merged async publish failed: %s", _e)
+
+                                self._publish_thread = threading.Thread(target=_bg, daemon=True)
+                                self._publish_thread.start()
 
                     self.global_step += 1
                     if self._lr_scheduler is not None:

@@ -1,6 +1,6 @@
 # Project Status — Aurora RL (torchtune XPU)
 
-Last updated: 2026-05-02 (**EP=8 FULL CHAIN AUTOMATED** — WS11 banned:1 PDE root cause: CCL_ZE_CACHE=65536 caches stale IPC handles after free_unsharded_param() between chunks; fix: threshold=0. Unified sequencer (monitor blgah6auj) auto-submits: WS12 validation after LoRA v5 completes, WS13 capacity (40 steps, TRAIN_TIMEOUT=13200s) after WS12 passes, LoRA v6→v7 in parallel. hold_qwen3_ep8_v10f.sh timeout fix applied (TRAIN_TIMEOUT env var). **LoRA gene_recall v2 RUNNING** (job 8465533, step ~14-16, mean reward 0.25-0.45 — learning confirmed). Earlier: **WS10 CRASHED** — generation confirmed working (reward_mean=0.5065 success=0.75), crash in grpo_step scatter_add with MAX_GEN=1024 sequences (~1474 tok) exceeding L0 command queue capacity. **EP=8 WS9 12-step COMPLETE** — 3 root causes found. Earlier: **EP=8 WS9 12-step COMPLETE** — 3 root causes found; WS8.7 PASSED — `fsdp_cpu_offload=True` + CPUOffloadPolicy + ZeRO-3 fixes chunk[1:2] OOM (PRE-fwd[1:2] 34.38→20.15 GiB); step=0 TIMING=195.8s 2× faster than WS6/WS7 due to opt 202s→28.8s; F1=0.4310 at init; WS9 12-step run submitted (job 8465417). Also: **Dense Qwen3-8B varlen+maskfree validated — `TORCHTUNE_USE_IPEX_VARLEN=1 + TORCHTUNE_MASKFREE_CAUSAL=1` delivers 32–45% grpo_step speedup at G=4, 41–57% at G=8; −2 to −4 GiB/tile reserved; 5-step memory stable at 60.5 GiB (within 64 GiB limit). Previous "no benefit" verdict was wrong — it measured backward-only. The speedup is in the policy forward. See `docs/reports/varlen_maskfree_dense_qwen3_20260502.md`. Next: test on 32B. Earlier: BioReason 2-node 200-step stability proof — 200/200 steps clean, exit=0, ~53s/step, resv=58.17 GiB FLAT**)
+Last updated: 2026-05-04 (**EP=16 ZeRO-2 colocate fix VALIDATED** — Fix A1 `elif _ep_active` ZeRO-2 branch + Fix A2 `_GLOO_EP_PG` injection: 5/5 clean, step 1 (prev crash point) passed, reward 17→25, ~150s/step steady-state. **vLLM MoE serving bench COMPLETE** — A-J matrix on Aurora 1-node 12 tiles: Config A (TP=4, no EP) wins at 11.3s/G=4, 173 tok/s @G=8; Config E (native DP+EP AllToAll) catastrophic (+58%, `has_unfinished_dp()` all-reduce every 32 sched steps); EP dp=1 regresses ~3% uniformly (AgRs overhead, no routing benefit with dp=1 in vLLM 0.15.0); MoE 19% faster than Dense 32B at same hardware (bandwidth-bound; XPU backend reads all expert weights). See `docs/reports/vllm_moe_serving_bench_20260504.md`. Earlier: **EP=8 FULL CHAIN AUTOMATED** — WS11 banned:1 PDE root cause: CCL_ZE_CACHE=65536 caches stale IPC handles after free_unsharded_param() between chunks; fix: threshold=0. Unified sequencer (monitor blgah6auj) auto-submits: WS12 validation after LoRA v5 completes, WS13 capacity (40 steps, TRAIN_TIMEOUT=13200s) after WS12 passes, LoRA v6→v7 in parallel. hold_qwen3_ep8_v10f.sh timeout fix applied (TRAIN_TIMEOUT env var). **LoRA gene_recall v2 RUNNING** (job 8465533, step ~14-16, mean reward 0.25-0.45 — learning confirmed). Earlier: **WS10 CRASHED** — generation confirmed working (reward_mean=0.5065 success=0.75), crash in grpo_step scatter_add with MAX_GEN=1024 sequences (~1474 tok) exceeding L0 command queue capacity. **EP=8 WS9 12-step COMPLETE** — 3 root causes found. Earlier: **EP=8 WS9 12-step COMPLETE** — 3 root causes found; WS8.7 PASSED — `fsdp_cpu_offload=True` + CPUOffloadPolicy + ZeRO-3 fixes chunk[1:2] OOM (PRE-fwd[1:2] 34.38→20.15 GiB); step=0 TIMING=195.8s 2× faster than WS6/WS7 due to opt 202s→28.8s; F1=0.4310 at init; WS9 12-step run submitted (job 8465417). Also: **Dense Qwen3-8B varlen+maskfree validated — `TORCHTUNE_USE_IPEX_VARLEN=1 + TORCHTUNE_MASKFREE_CAUSAL=1` delivers 32–45% grpo_step speedup at G=4, 41–57% at G=8; −2 to −4 GiB/tile reserved; 5-step memory stable at 60.5 GiB (within 64 GiB limit). Previous "no benefit" verdict was wrong — it measured backward-only. The speedup is in the policy forward. See `docs/reports/varlen_maskfree_dense_qwen3_20260502.md`. Next: test on 32B. Earlier: BioReason 2-node 200-step stability proof — 200/200 steps clean, exit=0, ~53s/step, resv=58.17 GiB FLAT**)
 
 This document synthesizes the current state of the vLLM weight sync implementation,
 active training runs, open issues, and prioritized next steps. It is a living companion
@@ -1006,6 +1006,47 @@ wsync_gather=~70-75s is the bottleneck (bandwidth-bound AllGather on `_shard_pg`
 
 ### Config fix applied:
 `max_generated_tokens: 512` (from 256). GSM8K thinking traces require 300-500+ tokens; 256 truncated before `</answer>` on moderate-difficulty problems.
+
+### EP=16 ZeRO-2 colocate fix VALIDATED (2026-05-04)
+
+**Root cause**: EP=16 production YAML uses `vllm_mode: colocate`; the recipe defaulted `reshard_after_forward=False` (ZeRO-2) in colocate mode, keeping the full ~16 GiB of unsharded params on every tile throughout the entire step. Combined with vLLM's own ~16 GiB copy, this caused OOM-induced CCL stalls at step 1 (the first backward after vLLM is live).
+
+**Fixes**:
+- **Fix A1**: Added `elif _ep_active:` branch to set `reshard_after_forward=True` unconditionally for EP colocate mode (recipe `~line 830-831`)
+- **Fix A2**: Injected `_GLOO_EP_PG` to ensure the EP process group teardown is sequenced correctly without deadlocking on the vLLM-side gloo PG
+
+**Validation** (5/5 clean, step 1 passed — the previous crash point):
+- reward_mean 17→25 (GSM8K signal visible)
+- ~150s/step steady-state
+- Memory: alloc=29–31 GiB, resv=42.5 GiB (vs 55+ GiB pre-fix)
+- Phase 4 (Fix B static bufs) not needed — Fix A1+A2 sufficient
+
+---
+
+## vLLM MoE Serving Benchmark (2026-05-04)
+
+Full report: `docs/reports/vllm_moe_serving_bench_20260504.md`
+
+GRPO-mode burst latency (send G concurrent requests, wall time until all complete). Aurora 1-node 12 tiles, frameworks/2025.3.1 (vLLM 0.15.0). Qwen3-30B-A3B vs Qwen3-32B dense. G=4, max_tokens=256 operating point.
+
+| Config | best_s | vs A |
+|--------|--------|------|
+| **A: MoE TP=4, no EP** | **11.3s** | — |
+| B: MoE TP=4, EP dp=1 | 11.6s | +3% |
+| C: MoE TP=2, no EP | 11.7s | +4% |
+| D: MoE TP=2, EP dp=1 | 12.2s | +8% |
+| **E: MoE TP=4, EP dp=3 (AllToAll)** | **17.9s** | **+58%** |
+| H proxy: 3× TP=4 no EP | 12.2s | +8% |
+| **J: Dense 32B TP=4** | **13.5s** | **+19%** |
+
+**Key findings**:
+1. **Config A (TP=4, no EP) is optimal — production config is correct.** Batch scaling nearly free: G=2→G=8 adds only 1s while delivering 4× throughput.
+2. **Config E catastrophic (+58%)**: vLLM 0.15.0 `has_unfinished_dp()` fires blocking `all_reduce(ReduceOp.MAX)` every 32 scheduler steps — lands at wrong point in GRPO's burst-and-wait pattern. Never use `--data-parallel-size` with EP for GRPO.
+3. **EP dp=1 regresses ~3% uniformly**: `--enable-expert-parallel` with dp=1 uses AgRs dispatch (overhead, no routing benefit); `use_all2all = is_ep_communicator and (dp > 1)` in vLLM 0.15.0.
+4. **MoE 19% faster than Dense 32B** — real but far below theoretical 5–10×. Bandwidth-bound inference: XPU Unquantized MoE backend likely reads all 128 expert weights even when only 8 are active. A truly sparse XPU MoE kernel could recover the theoretical advantage.
+5. **73s GRPO gen time is NOT vLLM serving latency** — pure serving for G=4/256tok is 11.3s. Remaining ~62s is wsync_gather overlap + logprobs/trajectory computation.
+
+**Production implication**: Current EP=16 vLLM config (TP=4, no EP, 1 instance/node, G/2 requests/instance) is **optimal for single-node serving**. Do not change.
 
 ---
 

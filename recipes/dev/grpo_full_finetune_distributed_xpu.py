@@ -614,6 +614,32 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                         "EP single-replica: set_process_groups skipped (%s) — v9 "
                         "helper barrier may be a no-op.", _e,
                     )
+                # Fix A2: inject _GLOO_EP_PG so EP dispatch uses gloo CPU-bounce.
+                # Without it, _GLOO_EP_PG=None in _parallelism.py forces XCCL even when
+                # TORCHTUNE_EP_USE_XCCL=0, adding IPC handle accumulation from token dispatch.
+                # Separate communicator from _GLOO_DP_SHARD_PG (used for FSDP grad-sync
+                # CPU-bounce) to avoid sequence-number collisions on the same TCP socket.
+                import torch.distributed.distributed_c10d as _dc10d_ep
+                _default_pg_ep = _dc10d_ep._get_default_group()
+                _orig_bdev_ep = _default_pg_ep.bound_device_id
+                _default_pg_ep.bound_device_id = None
+                try:
+                    import datetime as _dt_ep
+                    _ep_gloo_pg_sr = torch.distributed.new_group(
+                        list(range(self.world_size)), backend="gloo",
+                        timeout=_dt_ep.timedelta(seconds=1800),
+                    )
+                finally:
+                    _default_pg_ep.bound_device_id = _orig_bdev_ep
+                try:
+                    from torchtune.modules.moe import _parallelism as _ep_par_sr
+                    _ep_par_sr._GLOO_EP_PG = _ep_gloo_pg_sr
+                    log.info(
+                        "EP single-replica: injected _GLOO_EP_PG into _parallelism "
+                        "(gloo CPU-bounce for EP dispatch, avoids XCCL IPC accumulation)."
+                    )
+                except Exception as _e_ep:
+                    log.warning("EP single-replica: could not inject _GLOO_EP_PG: %s", _e_ep)
                 log.info(
                     "EP single-replica: built 1D dp_shard mesh (world=%d), "
                     "_dp_mesh.ndim=%d, _shard_pg established.",
@@ -1576,6 +1602,38 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                         "to prevent XCCL conflict between dp_replicate all-gather and EP AllToAll.",
                         _dp_rep_size,
                     )
+        elif _ep_active:
+            # Single-replica EP (dp_replicate=1, ndim=1, e.g. EP=16 on 2 nodes).
+            # _GLOO_EP_PG injected above (Fix A2) so dispatch uses gloo CPU-bounce.
+            if eval_mode:
+                # Ref model: 1-rank solo FSDP2 (no cross-rank communication, no XCCL IPC).
+                # self._ref_root_solo_mesh set in the if _ep_active: block above (else branch
+                # of `if not eval_mode:`) when the ref model is being wrapped.
+                fsdp2_mesh = self._ref_root_solo_mesh
+                fsdp2_raf = True
+                model.requires_grad_(False)
+                log.info(
+                    "EP single-replica v126: ref model requires_grad_(False) before FSDP2 wrapping."
+                )
+                log.info(
+                    "EP single-replica: ref model using 1-rank solo FSDP2 mesh + cpu_offload=True + "
+                    "reshard_after_forward=True. Per-layer CPU→XPU copy, no XCCL."
+                )
+            else:
+                # Policy: full 16-rank dp_shard mesh, ZeRO-2 (reshard_after_forward=False).
+                # ZeRO-3 (default) generates ~384 cross-node XCCL AllGather/RS per step:
+                # 48 layers × 4 chunks × 2 (fwd+bwd). Each op allocates a fresh buffer VA.
+                # vLLM generation between steps prevents VA reuse → new CCL IPC handles each
+                # step → ~10 GiB accumulation by step 1 BWD → L0 OOM (banned:1 PDE).
+                # ZeRO-2: params unsharded once per layer at step start (~48 AllGather/step),
+                # VA stable throughout training step → IPC handles reused across steps.
+                fsdp2_mesh = self._dp_mesh   # 16-rank dp_shard (cross-node, unavoidable)
+                fsdp2_raf = False
+                log.info(
+                    "EP single-replica (dp_replicate=1): ZeRO-2 for non-expert policy FSDP2. "
+                    "Reduces cross-node XCCL AllGather from per-layer-per-chunk to "
+                    "per-layer-once (~48/step) with stable VA within step."
+                )
         else:
             fsdp2_mesh = self._dp_mesh
             fsdp2_raf = reshard_after_forward

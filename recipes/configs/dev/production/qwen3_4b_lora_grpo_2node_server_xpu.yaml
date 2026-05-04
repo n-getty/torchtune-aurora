@@ -115,13 +115,17 @@ reward_functions:
     negative_reward: 0.0
 
 # ── LoRA publish config ────────────────────────────────────────────────────────
+# Default publish path is merged-weight broadcast (use_runtime_lora=false):
+# rank 0 gathers W_eff = W_base + (alpha/rank)*(B@A) and POSTs raw bytes to
+# vLLM /collective_rpc load_weights_from_raw. Sidesteps the vLLM --enable-lora
+# PDE crash on Aurora XPU (docs/reports/enable_lora_issue.md).
+# Set use_runtime_lora=true to use the legacy PEFT dir + /v1/load_lora_adapter
+# path (requires --enable-lora on vLLM and the corresponding env var).
 lora:
+  use_runtime_lora: false             # merged-weight broadcast (default)
   publish_every_steps: 1              # sync adapter to vLLM after every optimizer step
-  max_loras: 2                        # one live + one in-flight for double-buffering
-  shm_root: /lus/flare/projects/ModCon/ngetty/torchtune/outputs/lora_grpo_qwen3_4b_2node_v1/adapters  # save_checkpoint only
-  tmpfs_transfer: true                # write to TRAIN_NODE /dev/shm, rsync to VLLM_NODE /dev/shm
-  train_shm: /dev/shm/lora_adapters
-  vllm_shm: /dev/shm/lora_adapters
+  max_loras: 2                        # slot rotation for raw_bytes file path
+  shm_root: /lus/flare/projects/ModCon/ngetty/torchtune/outputs/lora_grpo_qwen3_4b_2node_v1/adapters
   # Per-step adapter L2 norm before/after opt.step + vLLM model name log.
   # Used by the validation ladder to prove learning is happening.
   log_validation_metrics: true
@@ -129,15 +133,13 @@ lora:
 # ── vLLM rollout (server mode, DP=12) ─────────────────────────────────────────
 # vllm_url is filled at runtime by the launcher.
 vllm_mode: server
-vllm_weight_sync: false               # LoRA recipe uses _publish_lora_to_vllm instead
+vllm_weight_sync: false               # LoRA recipe drives publish via _publish_merged_weights_background
 vllm_max_model_len: 1536
 vllm_max_num_seqs: 64
 
 vllm:
   mode: server
-  enable_lora: true
-  max_lora_rank: 16
-  max_loras: 2
+  enable_lora: false                  # PDE on Aurora XPU under concurrent decode
 
 # ── Distributed / FSDP ────────────────────────────────────────────────────────
 # FSDP1 SHARD_GRAD_OP: adapter tensors are tiny (~80 MB total);

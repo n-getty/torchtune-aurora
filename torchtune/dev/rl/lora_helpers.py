@@ -322,6 +322,77 @@ def load_peft_adapter_into_model(model, adapter_dir: str) -> int:
     return len(tune_sd)
 
 
+def iter_merged_lora_layers(model: nn.Module, base_weights: dict | None = None):
+    """Yield ``(tune_param_name, merged_bf16_weight)`` for every LoRALinear under model.
+
+    For each ``LoRALinear`` module found, returns the merged effective weight::
+
+        W_eff = W_base + (alpha / rank) * (lora_b.weight @ lora_a.weight)
+
+    cast to bf16. The returned name is the torchtune param name of the base
+    weight (e.g. ``layers.0.attn.q_proj.weight``) suitable for routing through
+    the existing dense XCCL path.
+
+    Frozen-base linears that are not wrapped in ``LoRALinear`` are skipped.
+
+    Args:
+        model: A torchtune model containing ``LoRALinear`` modules. May be
+            already FSDP-wrapped.
+        base_weights: Optional dict mapping ``"{module_name}.weight"`` to the
+            full (un-sharded) base linear weight. **Required when the model is
+            FSDP1-wrapped.** FSDP1's ``state_dict_type`` only changes what
+            ``model.state_dict()`` returns — runtime ``module.weight`` stays
+            sharded. The caller must produce ``base_weights`` via
+            ``state_dict()`` inside ``FSDP.state_dict_type(FULL_STATE_DICT,
+            FullStateDictConfig(rank0_only=True))`` and call this function on
+            rank 0 only. When ``base_weights`` is None, falls back to
+            ``module.weight`` (correct for non-FSDP / single-device).
+        Caller is responsible for ``torch.no_grad()``.
+
+    Yields:
+        Tuples ``(tune_param_name, merged_weight)`` where ``merged_weight`` is
+        a bf16 ``torch.Tensor`` of the same shape as the base linear weight.
+    """
+    from torchtune.modules.peft.lora import LoRALinear
+
+    for module_name, module in model.named_modules():
+        if not isinstance(module, LoRALinear):
+            continue
+        # LoRALinear stores: self.weight (base), self.lora_a (Linear), self.lora_b (Linear)
+        # forward: out = F.linear(x, self.weight) + (alpha/rank) * lora_b(lora_a(x))
+        # → merged W_eff = self.weight + (alpha/rank) * (lora_b.weight @ lora_a.weight)
+        weight_name = f"{module_name}.weight"
+        if base_weights is not None:
+            base_w = base_weights.get(weight_name)
+            if base_w is None:
+                # Try common FSDP / activation-checkpointing wrapper strippings.
+                clean = weight_name.replace("_fsdp_wrapped_module.", "").replace(
+                    "_checkpoint_wrapped_module.", ""
+                )
+                base_w = base_weights.get(clean)
+            if base_w is None:
+                raise KeyError(
+                    f"iter_merged_lora_layers: base weight {weight_name!r} not "
+                    f"found in provided base_weights dict (have {len(base_weights)} keys)"
+                )
+        else:
+            base_w = module.weight
+        a_w = module.lora_a.weight
+        b_w = module.lora_b.weight
+        scale = float(module.alpha) / float(module.rank)
+        # Compute in fp32 to keep precision through the matmul, then cast to bf16
+        # to match the dense XCCL wire format.
+        # base_w may live on a different device than the LoRA params (e.g. CPU
+        # when materialized from FSDP1 state_dict with offload_to_cpu=True
+        # while lora_a/lora_b are still sharded on XPU). Move delta to base_w's
+        # device for the add — final tensor lands on whichever device base_w is on.
+        delta = (b_w.to(torch.float32) @ a_w.to(torch.float32)).mul_(scale)
+        if delta.device != base_w.device:
+            delta = delta.to(base_w.device)
+        merged = (base_w.to(torch.float32) + delta).to(torch.bfloat16)
+        yield (weight_name, merged)
+
+
 def make_lora_request(name: str, lora_int_id: int, path: str):
     """Create a vLLM ``LoRARequest`` for offline engine use.
 
