@@ -68,6 +68,7 @@ export PYTHONNOUSERSITE=1
 export PYTHONPATH=${PROJDIR}:${FW_SITE}:${LOCAL_SITE}
 export HF_DATASETS_OFFLINE=1
 export HF_HUB_OFFLINE=1
+export HF_DATASETS_CACHE=/lus/flare/projects/ModCon/ngetty/hf_datasets_cache
 export no_proxy="*"
 export NO_PROXY="*"
 

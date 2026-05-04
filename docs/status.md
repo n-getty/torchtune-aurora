@@ -971,6 +971,44 @@ After fix: tensors_meta=531=cpu_batches=n_params → 99 batches → no hang.
 
 ---
 
+## Qwen3-30B-A3B EP=16 Cross-Node GSM8K Status (2026-05-04)
+
+Config: `recipes/configs/dev/experimental/qwen3_30b_a3b_grpo_ep16_gsm8k_xpu.yaml`
+Launcher: `experiments/ep_parallelism/hold_qwen3_ep16_gsm8k.sh`
+
+**Motivation**: EP=16 gene_recall config had `max_generated_tokens=32`, causing `resp_len=31` and zero reward on every step — useless as an infrastructure smoke test. GSM8K with real math reward replaces it.
+
+### GSM8K as EP=16 exemplar — VALIDATED (job 8467968, 2026-05-04)
+
+3 steps completed (walltime limit), 0 crashes, real reward signal:
+
+| Step | reward_mean | reward_std | success | resp_len | TIMING total |
+|------|-------------|------------|---------|----------|-------------|
+| 0    | 0.0000      | 0.0000     | 0.0000  | 255.0    | 178.1s      |
+| 1    | 10.0000     | 0.0000     | 1.0000  | 255.0    | 151.0s      |
+| 2    | 5.0000      | 5.0000     | 0.5000  | 255.0    | ~150s (est) |
+
+**Step 0 zero reward root cause**: `max_generated_tokens=256` caused the model's thinking trace to be truncated before `</think><answer>` for harder problems (resp_len=255.0 = hitting cap). Fixed: bumped to 512 in config.
+
+**Steps 1 and 2** confirm working reward signal: step 1 trivial problem (100% success), step 2 medium problem (50% success, max variance — ideal GRPO signal).
+
+Between-step memory: alloc=29–31 GiB, resv=51–55 GiB (14–24 GiB gap). Stable.
+
+### EP=16 timing (gene_recall reference vs GSM8K):
+
+| Run      | total    | gen    | grpo   | opt   | wsync_gather | wsync_bcast_wait |
+|----------|----------|--------|--------|-------|--------------|------------------|
+| WS5 gene_recall | 140s | ~22s | ~18s | ~0s | 75s | ~23s |
+| GSM8K step 0    | 178s | 35.6s | 44.0s | 0.4s | 74.7s | 23.2s |
+| GSM8K step 1    | 151s | 18.7s | 38.8s | 0.0s | 70.4s | 23.0s |
+
+wsync_gather=~70-75s is the bottleneck (bandwidth-bound AllGather on `_shard_pg`; WS6-WS7 confirmed not latency-bound). gen time variation (35.6 vs 18.7s) reflects different problem lengths hitting the 256-token cap.
+
+### Config fix applied:
+`max_generated_tokens: 512` (from 256). GSM8K thinking traces require 300-500+ tokens; 256 truncated before `</answer>` on moderate-difficulty problems.
+
+---
+
 ## Prioritized Next Steps
 
 ### Tier 1: Immediate (production training)
