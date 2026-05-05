@@ -23,11 +23,17 @@ the default and the high-threshold settings have failure modes:
   builds up by the end of step 1's backward, and step 2 OOMs the L0 device.
   This is the failure mode that makes single-node 32B FSDP unviable; we use
   2-node HSDP instead.
-- **Zero (threshold = 0, WS12 candidate fix):** handles are closed immediately
-  after each AllGather. No stale handles can exist when VAs get recycled, and
-  no accumulation builds up. **Status: queued for validation, not yet
-  confirmed.** The recipe envelope is in `recipes/dev/run_qwen3_30b_ep8_vllm_2node.sh:44`
-  (`${CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD:-65536}`).
+- **Zero (threshold = 0):** ~~handles are closed immediately after each AllGather~~.
+  **INVALID — rejected by oneCCL at startup:**
+  `|CCL_ERROR| env.cpp:730 parse: condition ze_cache_open_ipc_handles_threshold > 0 failed`.
+  The minimum valid value is 1.
+- **One (threshold = 1, WS12 candidate fix):** semantically close to zero — one handle
+  is retained between consecutive collectives, then evicted. Accumulation is minimal
+  (1 handle at a time). Whether this prevents the stale-VA fault in the same way as
+  threshold=0 depends on L0 eviction semantics. **Status: queued for validation on
+  EP=16 with max_gen=256 long sequences.**
+  The EP=16 run script (`run_qwen3_30b_ep16_vllm_2node.sh`) now reads
+  `${CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD:-65536}` so this can be overridden.
 
 The issue surfaces in two distinct flavors that share the same root cause:
 
@@ -146,10 +152,11 @@ WS11 (MAX_GEN=768, threshold=65536): crashes between chunks because
 `_ep_release_fsdp_unsharded_grads()` frees backbone VAs, the next chunk's
 AllGather recycles them, and CCL accesses them via stale IPC handles.
 
-WS12 candidate (threshold=0): close handles immediately after each AllGather.
-**Status: queued for validation as of 2026-05-02. Not yet proven on the EP=8
-chain.** If WS12 passes, threshold=0 becomes the recommended setting for
-chunked-loss EP runs.
+WS12 candidate (threshold=1): threshold=0 is rejected by oneCCL (requires > 0).
+Minimum valid value is 1 — close handles after 1 subsequent collective.
+**Status: queued for validation on EP=16 long-seq run as of 2026-05-05.**
+If WS12 passes, threshold=1 becomes the recommended setting for EP runs
+with long completions (max_gen≥256).
 
 ## Suggested upstream fix
 
