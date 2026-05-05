@@ -479,19 +479,20 @@ class WeightSyncFromFileExtension:
             )
             n_filled_w13 = 0
             n_filled_w2 = 0
-            for trainer_rank, shard_w13 in w13_shards.items():
+            for trainer_rank in w13_shards:
                 R = int(trainer_rank)
-                for src_local_i in range(shard_w13.shape[0]):
-                    g = R + src_local_i * ep_degree
-                    if g < global_n:
-                        w13_global[g].copy_(shard_w13[src_local_i])
-                        n_filled_w13 += 1
+                shard_w13 = w13_shards[trainer_rank]
                 shard_w2 = w2_shards[trainer_rank]
-                for src_local_i in range(shard_w2.shape[0]):
-                    g = R + src_local_i * ep_degree
-                    if g < global_n:
-                        w2_global[g].copy_(shard_w2[src_local_i])
-                        n_filled_w2 += 1
+                n_loc = shard_w13.shape[0]
+                idx = torch.arange(R, R + n_loc * ep_degree, ep_degree)
+                if idx[-1] >= global_n:
+                    idx = idx[idx < global_n]
+                    shard_w13 = shard_w13[: idx.numel()]
+                    shard_w2 = shard_w2[: idx.numel()]
+                w13_global.index_copy_(0, idx, shard_w13)
+                w2_global.index_copy_(0, idx, shard_w2)
+                n_filled_w13 += idx.numel()
+                n_filled_w2 += idx.numel()
 
             if n_filled_w13 != global_n or n_filled_w2 != global_n:
                 raise RuntimeError(
@@ -543,6 +544,124 @@ class WeightSyncFromFileExtension:
             else:
                 w13_param.data.copy_(w13_tp.to(device))
                 w2_param.data.copy_(w2_tp.to(device))
+
+    def _ws10_parallel_recv(
+        self, tensors_meta: list, batch_max_numel: int, sharded_cross_pgs: dict
+    ) -> tuple:
+        """Receive WS10 expert shards from all EP ranks concurrently.
+
+        Each trainer EP rank broadcasts on its own gloo PG.  The serial
+        receive loop processes one rank at a time (36s total for EP=16).
+        Here we launch one thread per rank so all 16 receives overlap,
+        cutting network time from ~36s to max(per-rank_recv) ≈ ~5s.
+
+        Non-expert entries (trainer_ep_rank=None) are sent by trainer rank 0
+        on R=0's PG, after that rank's expert batches.  R=0's thread handles
+        both expert and non-expert entries in manifest order.
+
+        Args:
+            tensors_meta: full manifest entry list (same as serial path)
+            batch_max_numel: greedy batch size cap (elements, same on both sides)
+            sharded_cross_pgs: {R: gloo_pg} from self._xccl_sharded_cross_pgs
+
+        Returns:
+            (all_shards, nonexpert_weights, recv_times, t_parallel)
+            - all_shards: {layer_idx: {"w13": {R: cpu_tensor}, "w2": {R: cpu_tensor},
+                                        "ep_degree": int, "n_local_trainer": int}}
+            - nonexpert_weights: [(param_name, cpu_tensor), ...]
+            - recv_times: {R: elapsed_s}  (per-thread)
+            - t_parallel: wall time from first thread start to last thread join
+        """
+        import threading
+        import torch
+
+        _fused_re = re.compile(
+            r"model\.layers\.(\d+)\.mlp\.experts\.(w13|w2)_weight"
+        )
+
+        # Group manifest entries by effective EP rank.
+        # Non-expert entries (no trainer_ep_rank) are sent by trainer rank 0
+        # on PG[0] after expert batches — fold them into R=0's group.
+        rank_groups: dict = {}
+        for entry in tensors_meta:
+            R = entry.get("trainer_ep_rank")
+            eff_R = int(R) if R is not None else 0
+            rank_groups.setdefault(eff_R, []).append(entry)
+
+        all_shards: dict = {}       # {layer_idx: {"w13": {R: t}, "w2": {R: t}, ...}}
+        all_shards_lock = threading.Lock()
+        nonexpert_weights: list = []  # [(name, tensor)] — only R=0 thread writes
+        recv_times: dict = {}
+        errors: dict = {}
+
+        def recv_rank_thread(ep_rank: int, entries: list, pg) -> None:
+            t0 = time.perf_counter()
+            local_buf = None
+            try:
+                i = 0
+                while i < len(entries):
+                    # Greedy batch: same algorithm as sender (_ws10_build_local_payload)
+                    batch_numel = 0
+                    batch_start = i
+                    while i < len(entries):
+                        pn = entries[i]["numel"]
+                        if batch_numel > 0 and batch_numel + pn > batch_max_numel:
+                            break
+                        batch_numel += pn
+                        i += 1
+
+                    if local_buf is None or local_buf.numel() < batch_numel:
+                        local_buf = torch.empty(batch_numel, dtype=torch.bfloat16)
+                    cpu_recv = local_buf[:batch_numel]
+                    pg.broadcast(cpu_recv, root=0).wait()
+
+                    offset = 0
+                    for entry in entries[batch_start:i]:
+                        n = entry["numel"]
+                        tensor = cpu_recv[offset:offset + n].reshape(entry["shape"]).clone()
+                        offset += n
+                        m = _fused_re.match(entry["name"])
+                        if m:
+                            layer_idx = int(m.group(1))
+                            kind = m.group(2)
+                            ep_degree = int(entry.get("ep_degree", 1))
+                            n_local = int(entry.get("n_local", entry["shape"][0]))
+                            with all_shards_lock:
+                                lyr = all_shards.setdefault(layer_idx, {
+                                    "w13": {}, "w2": {},
+                                    "ep_degree": ep_degree,
+                                    "n_local_trainer": n_local,
+                                })
+                                lyr[kind][ep_rank] = tensor
+                        else:
+                            # Non-expert entry — only R=0 thread reaches here
+                            nonexpert_weights.append((entry["name"], tensor))
+            except Exception as e:
+                errors[ep_rank] = e
+            recv_times[ep_rank] = time.perf_counter() - t0
+
+        threads = []
+        t_launch = time.perf_counter()
+        for ep_rank, entries in sorted(rank_groups.items()):
+            pg = sharded_cross_pgs[ep_rank]
+            t = threading.Thread(
+                target=recv_rank_thread,
+                args=(ep_rank, entries, pg),
+                daemon=True,
+                name=f"ws10-recv-R{ep_rank}",
+            )
+            threads.append(t)
+
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        t_parallel = time.perf_counter() - t_launch
+
+        if errors:
+            raise RuntimeError(f"WS10 parallel recv errors: {errors}")
+
+        return all_shards, nonexpert_weights, recv_times, t_parallel
 
     # ------------------------------------------------------------------
     # XCCL broadcast weight sync
@@ -1001,6 +1120,60 @@ class WeightSyncFromFileExtension:
                 # off-path (no tag → use legacy self._xccl_cross_pg).
                 _ws10_sharded_cross_pgs = getattr(
                     self, "_xccl_sharded_cross_pgs", None) or {}
+
+                # WS10 parallel fast path: receive all EP-rank shards concurrently.
+                # The serial loop processes ranks one at a time (~2.3s × 16 = 36s).
+                # With parallel threads each rank's recv overlaps → ~5s total.
+                # Only activates when WS10 sharded PGs are present.
+                if _ws10_sharded_cross_pgs:
+                    _p_shards, _p_ne, _p_rtimes, _p_wall = self._ws10_parallel_recv(
+                        tensors_meta, batch_max_numel, _ws10_sharded_cross_pgs,
+                    )
+                    t_bcast_total = _p_wall
+                    _t_load0 = time.perf_counter()
+                    if _p_ne:
+                        self.model_runner.model.load_weights(weights=_p_ne)
+                    if _p_shards:
+                        _p_ready = {
+                            li: lyr for li, lyr in _p_shards.items()
+                            if (len(lyr["w13"]) == lyr["ep_degree"]
+                                and len(lyr["w2"]) == lyr["ep_degree"])
+                        }
+                        if len(_p_ready) != len(_p_shards):
+                            _incomplete = {
+                                li: {
+                                    "w13_ranks": sorted(_p_shards[li]["w13"].keys()),
+                                    "w2_ranks": sorted(_p_shards[li]["w2"].keys()),
+                                }
+                                for li in _p_shards if li not in _p_ready
+                            }
+                            raise RuntimeError(
+                                f"WS10 parallel recv: {len(_p_shards) - len(_p_ready)} "
+                                f"incomplete layers: {_incomplete}"
+                            )
+                        self._load_fused_moe_experts_sharded(_p_ready)
+                    t_load_total = time.perf_counter() - _t_load0
+                    logger.info(
+                        "WS10 parallel recv done: %d expert layers + %d non-expert "
+                        "recv_wall=%.1fs load=%.1fs per_rank=%s",
+                        len(_p_shards), len(_p_ne), _p_wall, t_load_total,
+                        {R: f"{t:.2f}s" for R, t in sorted(_p_rtimes.items())},
+                    )
+                    torch.xpu.synchronize(self._xccl_device)
+                    logger.info(
+                        "receive_weights_xccl_streaming: %d params %.2f GiB in %.1fs "
+                        "(bcast=%.1fs %.1f GB/s, load=%.1fs)",
+                        n_params, gb, time.perf_counter() - t0,
+                        t_bcast_total,
+                        gb / t_bcast_total if t_bcast_total > 0 else 0,
+                        t_load_total,
+                    )
+                    return {
+                        "status": "ok", "num_params": n_params,
+                        "bcast_s": round(t_bcast_total, 2),
+                        "load_s": round(t_load_total, 2),
+                    }
+
                 while i < n_params:
                     batch_start = i
                     batch_numel = 0
