@@ -102,7 +102,10 @@ reward_functions:
     reward_metric: f1
 
 # ── LoRA publish config ────────────────────────────────────────────────────────
+# Default = runtime hot-swap (memory project_lora_grpo_torch211_unblocks_bgmv.md);
+# requires the torch 2.11+xpu venv on the vLLM node and --enable-lora at startup.
 lora:
+  use_runtime_lora: true
   publish_every_steps: 1
   max_loras: 2
   shm_root: /lus/flare/projects/ModCon/ngetty/torchtune/outputs/lora_grpo_qwen3_8b_gene_recall_v1/adapters

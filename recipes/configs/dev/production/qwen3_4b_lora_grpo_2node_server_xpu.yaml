@@ -115,16 +115,17 @@ reward_functions:
     negative_reward: 0.0
 
 # ── LoRA publish config ────────────────────────────────────────────────────────
-# Default publish path is merged-weight broadcast (use_runtime_lora=false):
-# rank 0 gathers W_eff = W_base + (alpha/rank)*(B@A) and POSTs raw bytes to
-# vLLM /collective_rpc load_weights_from_raw. Sidesteps the vLLM --enable-lora
-# PDE crash on Aurora XPU (docs/reports/enable_lora_issue.md).
-# Set use_runtime_lora=true to use the legacy PEFT dir + /v1/load_lora_adapter
-# path (requires --enable-lora on vLLM and the corresponding env var).
+# Default publish path is runtime hot-swap (use_runtime_lora=true):
+# rank 0 writes a PEFT adapter dir to shm_root and POSTs /v1/load_lora_adapter
+# to all vLLM tiles. Requires vLLM launched with --enable-lora and the
+# torch 2.11+xpu venv (memory project_lora_grpo_torch211_unblocks_bgmv.md).
+# Set use_runtime_lora=false to use the merged-weight broadcast path:
+# rank 0 builds W_eff = W_base + (alpha/rank)*(B@A) and POSTs raw bytes to
+# vLLM /collective_rpc load_weights_from_raw (frameworks/2025.3.1, no --enable-lora).
 lora:
-  use_runtime_lora: false             # merged-weight broadcast (default)
+  use_runtime_lora: true              # runtime hot-swap (default)
   publish_every_steps: 1              # sync adapter to vLLM after every optimizer step
-  max_loras: 2                        # slot rotation for raw_bytes file path
+  max_loras: 2                        # slot rotation for adapter dirs / raw_bytes path
   shm_root: /lus/flare/projects/ModCon/ngetty/torchtune/outputs/lora_grpo_qwen3_4b_2node_v1/adapters
   # Per-step adapter L2 norm before/after opt.step + vLLM model name log.
   # Used by the validation ladder to prove learning is happening.
@@ -139,7 +140,7 @@ vllm_max_num_seqs: 64
 
 vllm:
   mode: server
-  enable_lora: false                  # PDE on Aurora XPU under concurrent decode
+  enable_lora: true                   # requires torch211_venv (BGMV PDE bypass)
 
 # ── Distributed / FSDP ────────────────────────────────────────────────────────
 # FSDP1 SHARD_GRAD_OP: adapter tensors are tiny (~80 MB total);
