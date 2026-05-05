@@ -1038,8 +1038,37 @@ despite its own data being received in ~2.3s.
 
 **banned:1 PDE crash at step 1 grpo_step**: All 4 gates passed in step 0 before the crash.
 Not a WS10 correctness bug. Same IPC-handle stale VA class as CCL_ZE_CACHE crashes.
-Root cause: step 1 grpo_step timing with WS10 changes memory pressure differently; needs
-investigation on next 2-node hold using hold-node approach.
+Root cause confirmed (2026-05-05): completion-length dependent; long seqs (ref_fwd>100s,
+grpo>300s) accumulate stale VA IPC handles. No software workaround (see
+`docs/bugs/ccl_ipc_handle_cache.md`).
+
+### EP=16 WS10 parallel recv test results (2026-05-05, job 8469882)
+
+**Test**: NSTEPS=1, gene_recall config (reward irrelevant — wsync timing only).
+
+**vLLM TP0 result** (correct but incomplete):
+- `recv_wall=7.2s + load=30.2s = 37.4s total` (vs serial 62.8s → 40% reduction) ✓
+
+**Trainer wsync_bcast_wait**: `r0:120.4/min:4.1/max:120.4/avg:12.0s` — GATE (e) FAILED
+
+**Root cause of 120s**: TP0 returned early from `receive_weights_xccl_streaming` (its
+`_xccl_sharded_cross_pgs` is set → WS10 path → early return). TP1/2/3 don't have that
+attribute → fell through to serial loop → waited on `_xccl_intra_pg.broadcast()` that
+TP0 never called → 120s DistStoreError timeout. Also a correctness bug: TP1/2/3 model
+weights stayed stale (never received weight updates).
+
+**Fix (commit 7140b1d2)**: TP0 builds `_ws10_pre_recv` batch-indexed CPU lookup from
+parallel recv results, falls through to serial loop. In serial loop, gloo cross-recv
+is replaced by CPU memcpy from `_ws10_pre_recv[batch_start]`. The existing
+`_xccl_intra_pg.broadcast()` then runs normally, distributing weights to TP1/2/3.
+All 4 TP workers now get correct TP-sliced weight updates.
+
+**Projected wsync_bcast_wait after fix**: ~37–40s (7s parallel recv + <3s intra-bcast
++ 30s load in parallel on all 4 TP workers). Still short of <30s target; bottleneck
+is the 30s GPU weight-loading phase. Parallel recv delivers recv_wall: 36s→7.2s (80%).
+
+**Next**: Submit new NSTEPS=1 hold with fixed code. Gate (e) target: wsync_bcast_wait < 30s.
+Load optimization needed to hit 30s total (currently 30.2s load alone).
 
 ### EP=16 ZeRO-2 colocate fix VALIDATED (2026-05-04)
 
