@@ -47,6 +47,7 @@ ssh -o StrictHostKeyChecking=no "${N0}" "
     export TORCHTUNE_EP_GRAD_RELEASE_XCCL=1
     export TORCHTUNE_USE_IPEX_VARLEN=1
     export TORCHTUNE_MASKFREE_CAUSAL=1
+    export CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD=65536
     export SMOKE_TAG=ep16_capacity
     nohup bash ${PROJDIR}/recipes/dev/run_qwen3_30b_ep16_vllm_2node.sh \${NSTEPS} \
         > ${OUTDIR}/ep16_capacity_run.log 2>&1 &

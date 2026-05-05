@@ -154,9 +154,34 @@ AllGather recycles them, and CCL accesses them via stale IPC handles.
 
 WS12 candidate (threshold=1): threshold=0 is rejected by oneCCL (requires > 0).
 Minimum valid value is 1 — close handles after 1 subsequent collective.
-**Status: queued for validation on EP=16 long-seq run as of 2026-05-05.**
-If WS12 passes, threshold=1 becomes the recommended setting for EP runs
-with long completions (max_gen≥256).
+**Status: FAILED — threshold=1 does NOT prevent the step-1 crash (EP=16
+job 8469882, 2026-05-05).** Both threshold=65536 AND threshold=1 crash at
+step 1 with identical banned:1 PDE signatures when completions are long
+(ref_fwd > ~100s). The two failure modes:
+- **threshold=65536 (accumulation)**: >65536 unique VAs accumulate in step 0's
+  long backward (grpo=320s) → eviction fires at step 1 → stale handle → crash.
+- **threshold=1 (eviction race)**: immediate eviction after every collective
+  creates a per-rank race: rank A closes H(VA) on the next collective while
+  rank B may still hold H(VA) from a different cache epoch → stale on rank B.
+
+The crash is **completion-length dependent**: short completions (ref_fwd < 20s,
+grpo < 50s) → step 1 passes consistently (EP=16 job 8468039, 5 steps clean);
+long completions (ref_fwd > 100s, grpo > 300s) → step 1 crashes regardless of
+threshold setting. Root cause: FSDP2 AllGather output VAs freed at end of step 0
+(many unique VAs with long backward) get reused at step 1 chunk[0:1] forward;
+CCL's per-rank independent caches hold stale handles from different step-0
+collectives → stale-VA read/write → banned:1.
+
+**No known software workaround** for the cross-step VA reuse + per-rank cache
+race. Upstream fix options: reference-count handles by collective (suppress
+eviction until all ranks retire), or hook the allocator's free/realloc to close
+handles immediately. Until then, EP=16 multi-step runs are limited to batches
+that produce short completions; checkpoint-restart every step is the operational
+workaround for mixed-length workloads.
+
+**Current setting**: `CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD=65536` retained
+(threshold=1 was tested and provides no benefit — the eviction race it creates
+matches the accumulation crash at longer completions).
 
 ## Suggested upstream fix
 
