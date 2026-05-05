@@ -1121,58 +1121,76 @@ class WeightSyncFromFileExtension:
                 _ws10_sharded_cross_pgs = getattr(
                     self, "_xccl_sharded_cross_pgs", None) or {}
 
-                # WS10 parallel fast path: receive all EP-rank shards concurrently.
-                # The serial loop processes ranks one at a time (~2.3s × 16 = 36s).
-                # With parallel threads each rank's recv overlaps → ~5s total.
-                # Only activates when WS10 sharded PGs are present.
+                # WS10 parallel fast path: receive all EP-rank shards concurrently
+                # (16 gloo threads, one per trainer EP rank), then fall through to
+                # the serial loop for intra-TP fanout so TP1/2/3 also get updates.
+                # Without the fanout TP1/2/3 waited on _xccl_intra_pg.broadcast()
+                # that TP0 never called (120 s DistStoreError timeout, 2026-05-05).
+                # _ws10_serial_fanout replaces gloo cross-recv with a CPU buf copy
+                # from pre-received data; intra-bcast + load run on all TP workers.
+                _ws10_serial_fanout = False
+                _ws10_pre_recv: dict = {}   # {batch_start → flat_cpu_tensor}
                 if _ws10_sharded_cross_pgs:
                     _p_shards, _p_ne, _p_rtimes, _p_wall = self._ws10_parallel_recv(
                         tensors_meta, batch_max_numel, _ws10_sharded_cross_pgs,
                     )
                     t_bcast_total = _p_wall
-                    _t_load0 = time.perf_counter()
-                    if _p_ne:
-                        self.model_runner.model.load_weights(weights=_p_ne)
-                    if _p_shards:
-                        _p_ready = {
-                            li: lyr for li, lyr in _p_shards.items()
-                            if (len(lyr["w13"]) == lyr["ep_degree"]
-                                and len(lyr["w2"]) == lyr["ep_degree"])
-                        }
-                        if len(_p_ready) != len(_p_shards):
-                            _incomplete = {
-                                li: {
-                                    "w13_ranks": sorted(_p_shards[li]["w13"].keys()),
-                                    "w2_ranks": sorted(_p_shards[li]["w2"].keys()),
-                                }
-                                for li in _p_shards if li not in _p_ready
-                            }
-                            raise RuntimeError(
-                                f"WS10 parallel recv: {len(_p_shards) - len(_p_ready)} "
-                                f"incomplete layers: {_incomplete}"
-                            )
-                        self._load_fused_moe_experts_sharded(_p_ready)
-                    t_load_total = time.perf_counter() - _t_load0
                     logger.info(
                         "WS10 parallel recv done: %d expert layers + %d non-expert "
-                        "recv_wall=%.1fs load=%.1fs per_rank=%s",
-                        len(_p_shards), len(_p_ne), _p_wall, t_load_total,
+                        "recv_wall=%.1fs per_rank=%s (intra fanout pending)",
+                        len(_p_shards), len(_p_ne), _p_wall,
                         {R: f"{t:.2f}s" for R, t in sorted(_p_rtimes.items())},
                     )
-                    torch.xpu.synchronize(self._xccl_device)
-                    logger.info(
-                        "receive_weights_xccl_streaming: %d params %.2f GiB in %.1fs "
-                        "(bcast=%.1fs %.1f GB/s, load=%.1fs)",
-                        n_params, gb, time.perf_counter() - t0,
-                        t_bcast_total,
-                        gb / t_bcast_total if t_bcast_total > 0 else 0,
-                        t_load_total,
+                    # Build batch-indexed lookup so the serial loop can skip the
+                    # gloo cross-recv (data already received) and go straight to
+                    # the intra-TP broadcast that feeds TP1/2/3.
+                    _ws10_ntf: dict = {}    # name/key → flat cpu tensor
+                    for _ws10_n, _ws10_t in _p_ne:
+                        _ws10_ntf[_ws10_n] = _ws10_t.view(-1)
+                    _ws10_ere = re.compile(
+                        r"model\.layers\.(\d+)\.mlp\.experts\.(w13|w2)_weight"
                     )
-                    return {
-                        "status": "ok", "num_params": n_params,
-                        "bcast_s": round(t_bcast_total, 2),
-                        "load_s": round(t_load_total, 2),
-                    }
+                    for _ws10_li, _ws10_lyr in _p_shards.items():
+                        for _ws10_R, _ws10_s in _ws10_lyr.get("w13", {}).items():
+                            _ws10_ntf[(_ws10_li, "w13", _ws10_R)] = _ws10_s.view(-1)
+                        for _ws10_R, _ws10_s in _ws10_lyr.get("w2", {}).items():
+                            _ws10_ntf[(_ws10_li, "w2", _ws10_R)] = _ws10_s.view(-1)
+                    _ws10_j = 0
+                    while _ws10_j < n_params:
+                        _ws10_bs = _ws10_j
+                        _ws10_bn = 0
+                        _ws10_Rr = tensors_meta[_ws10_j].get("trainer_ep_rank")
+                        while _ws10_j < n_params:
+                            _ws10_pn = tensors_meta[_ws10_j]["numel"]
+                            _ws10_Rn = tensors_meta[_ws10_j].get("trainer_ep_rank")
+                            if _ws10_bn > 0 and _ws10_Rn != _ws10_Rr:
+                                break
+                            if _ws10_bn > 0 and _ws10_bn + _ws10_pn > batch_max_numel:
+                                break
+                            _ws10_bn += _ws10_pn
+                            _ws10_j += 1
+                        _ws10_pack = torch.empty(_ws10_bn, dtype=torch.bfloat16)
+                        _ws10_off = 0
+                        for _ws10_e in tensors_meta[_ws10_bs:_ws10_j]:
+                            _ws10_en = _ws10_e["numel"]
+                            _ws10_em = _ws10_ere.match(_ws10_e["name"])
+                            if _ws10_em:
+                                _ws10_k = (
+                                    int(_ws10_em.group(1)),
+                                    _ws10_em.group(2),
+                                    int(_ws10_e.get("trainer_ep_rank", 0)),
+                                )
+                            else:
+                                _ws10_k = _ws10_e["name"]
+                            _ws10_src = _ws10_ntf.get(_ws10_k)
+                            if _ws10_src is not None:
+                                _ws10_pack[_ws10_off:_ws10_off + _ws10_en].copy_(
+                                    _ws10_src[:_ws10_en]
+                                )
+                            _ws10_off += _ws10_en
+                        _ws10_pre_recv[_ws10_bs] = _ws10_pack
+                    _ws10_serial_fanout = True
+                    # Fall through: serial loop does intra-bcast + load on all workers.
 
                 while i < n_params:
                     batch_start = i
@@ -1232,7 +1250,11 @@ class WeightSyncFromFileExtension:
                                         self._gloo_recv_buf = torch.empty(batch_numel, dtype=torch.bfloat16)
                                         logger.info("gloo recv buf allocated: %d elements", batch_numel)
                                     cpu_recv = self._gloo_recv_buf[:batch_numel]
-                                    self._xccl_cross_pg.broadcast(cpu_recv, root=0).wait()
+                                    if _ws10_serial_fanout:
+                                        # WS10: data already recv'd; skip cross-recv.
+                                        cpu_recv.copy_(_ws10_pre_recv[batch_start])
+                                    else:
+                                        self._xccl_cross_pg.broadcast(cpu_recv, root=0).wait()
                                     if intra_method == "gloo":
                                         self._xccl_intra_pg.broadcast(cpu_recv, root=0).wait()
                                         recv_buf.copy_(cpu_recv)
