@@ -1320,6 +1320,46 @@ pkill alone is insufficient.
   `recipes/dev/grpo_full_finetune_distributed_xpu.py:1440-1464` (v59);
   deferred dp_replicate all_reduce: `:2945-2954`;
   optimizer.zero_grad call sites that don't reach FSDP2 grads: `:3047, 3322`
-- Synthesis report: `docs/reports/qwen3_ep_v8_3node_20260430.md`
-- Memory entries: `project_qwen3_ep_v1_v2.md`, `project_qwen3_ep_v3_v7.md`,
-  `project_qwen3_ep_v8_3node.md`
+- Synthesis report: `docs/reports/qwen3_ep_v8_3node_20260430.md` (archived)
+- Memory entries: `project_qwen3_ep_v1_v2.md` (archived), `project_qwen3_ep_v3_v7.md` (archived),
+  `project_qwen3_ep_v8_3node.md` (archived)
+
+---
+
+## MoE Optimization Roadmap
+
+*Baseline (2026-04-27): Qwen3-30B-A3B, 10+2 tiles, SHM sync, 35.3s/step at G=4/max_gen=64.
+Production (2026-04-27): G=8/max_gen=512, 54.8s/step, 9.2 tok/s.*
+
+**Core constraint**: MoE has 11.5× less compute than 32B dense but identical FSDP communication
+volume (~122 GB AllGather+ReduceScatter per fwd+bwd). On 10 tiles, communication dominates
+(~15s of 23s GRPO fwd+bwd). The only real fix is EP — all other levers amortize cost at the
+margin.
+
+| Priority | Task | Expected impact | Effort |
+|----------|------|-----------------|--------|
+| **P0** | Increase `batch_size=2`, `grpo_samples=8` | 2-4× throughput/step | Config change |
+| **P0** | Set `fbs=4` (match grpo_samples) | Minor latency reduction | Config change |
+| **P1** | `torch.compile` on expert forward (single-node only) | 2-5× expert compute | Low |
+| **P1** | IPEX FusedMoE for no-grad forwards (policy+ref logprob) | 2-3× policy/ref speedup | Medium |
+| **P2** | 2-node HSDP colocated vLLM (avoids cross-node wsync) | Enables batch=4+, more tiles | Medium |
+| **P2** | `weight_sync_interval=2-4` | 13-25% throughput improvement | Config change |
+| **P3** | EP fix: cache router outputs through AC (`_parallelism.py`) | Unblocks EP, realizes 11.5× advantage | Medium |
+| **P3** | Intel Triton fused MoE kernel | Best possible expert compute | High |
+
+**EP fix detail**: The v154 `ScatterAddBackward0` shape error is caused by AC recompute
+regenerating router outputs (non-deterministic at tie boundaries). Fix: save
+`_ag_gather_idx` and `_ag_s_local` during original forward, restore during AC recompute
+(~30 lines in `_parallelism.py`). If that holds, switch `use_reentrant=False` to also fix
+the v153 scheduling desync.
+
+**2-node XCCL warning**: Cross-node XCCL weight sync leaks ~9 MiB/step CXI MR cache
+entries and crashes ~step 28 (same as 32B). For runs >28 steps, use gloo cross-PG
+(~44s sync for 57 GiB MoE) — can partially overlap with vLLM generation (30-60s).
+
+| Metric | Current | Target (Tier 1+2) | Target (with EP) |
+|--------|---------|-------------------|------------------|
+| Step time (G=4) | 35.3s | ~30s | — |
+| GRPO fwd+bwd | 23s | 15-18s | 5-8s |
+| Tokens/second | ~13 | ~50-100 (batch=2-4) | ~200+ |
+| Comm fraction | ~65% of fwd+bwd | ~50% (larger batch) | ~15% (EP) |

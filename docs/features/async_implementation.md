@@ -338,3 +338,26 @@ bash recipes/dev/run_grpo_vllm_xpu.sh 1 10 \
     vllm_weight_sync_interval=2 \
     loss.epsilon_high=0.28
 ```
+
+---
+
+## Phase 1 design constraints
+
+Only `_generate_with_vllm` (HTTP POST + broadcast result to all ranks) can
+overlap with training. Steps 2-4 of `generate_trajectory` — ref forward, policy
+forward, reward + advantages — require all ranks to participate in XPU collectives
+and must run synchronously. The Phase 1 speedup ceiling is `vllm_gen_time` only.
+
+**Producer/consumer architecture**: Producer (rank 0) owns a separate
+`DistributedSampler(num_replicas=1)` dataloader so it can pull batches
+independently without racing the training-rank-0 sampler. Consumer (all ranks)
+pops the pre-fetched `(batch, query_responses_cpu)` from a `queue.Queue(maxsize=1)`
+at step start, broadcasts to all ranks, then continues with ref/policy fwd.
+
+**Non-obvious constraints**:
+- Producer must NOT issue the next `generate()` until `_sync_done_event` is set
+  after weight sync completes — otherwise rollout uses stale-by-2 weights.
+- Producer thread crashes must broadcast a `producer_dead` flag to all ranks or
+  training deadlocks waiting for a broadcast that never arrives.
+- GRPOSimpleLoss (k=1, ratios→1) is fine for Phase 1; GRPOLoss required for
+  Phase 2 (k>1, off-policy IS correction).

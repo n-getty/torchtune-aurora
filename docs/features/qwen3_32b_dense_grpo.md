@@ -166,8 +166,26 @@ one-shot `varlen=` line emitted from `torchtune/modules/attention_utils.py`:
   Qwen3 normal path. **This is expected for 32B GRPO today.**
 - `varlen=disabled (TORCHTUNE_USE_IPEX_VARLEN unset)` — env var not set.
 
-Removing the explicit mask for dense 32B (to enable varlen) is a worthwhile
-experiment but must preserve response padding semantics; not done here.
+Removing the explicit mask for dense 32B (to enable varlen) requires `TORCHTUNE_MASKFREE_CAUSAL=1`. A/B tested on Qwen3-8B 10-tile colocate (2026-05-01):
+
+| Config | resp_len | speedup | memory delta |
+|--------|----------|---------|-------------|
+| varlen only (mask=None blocked by gate) | 199 | 0% | 0 |
+| varlen + MASKFREE_CAUSAL | 199 | **0% timing** | **−1.6 GiB allocated** |
+
+At resp_len=199, varlen engages but provides no timing win — mask tensor allocation at this length is not the bottleneck. Memory savings (−1.6 GiB) come from eliminating the explicit causal mask. Speedup requires resp_len≥400 where mask allocation overhead becomes significant. For 32B GRPO where `grpo_step` is XCCL AllGather-dominated (~85% of grpo time), varlen cannot move the needle regardless of response length.
+
+### vLLM safe envelope (colocate, post-prompt-truncation-fix)
+
+The prompt-truncation fix (`max_prompt_len = vllm_max_model_len - max_generated_tokens`) in `_generate_with_vllm` prevents block-table overflow. After the fix, safe envelopes are:
+
+| max_model_len | Behavior | Status |
+|--------------|----------|--------|
+| 1024 | 64 blocks/seq; prompts auto-truncated | **PASS** (confirmed) |
+| 1536 | 96 blocks/seq; node-dependent | Node-specific: some pass, some crash at ≤1280 |
+| 2048 | 128 blocks/seq | **CRASH** — insufficient HBM for block table |
+
+Node variation at max_model_len=1536 is a hardware/driver L0 mapping limit, not a software issue. Test your specific node before assuming 1536 works.
 
 ## Related
 

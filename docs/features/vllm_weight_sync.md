@@ -847,3 +847,26 @@ has more production mileage.
 (root cause identified 2026-04-28). Step-28 crash is from FSDP AllGather/ReduceScatter,
 not weight sync. Must prevent caching allocator contraction or wait for Intel
 SHS 13.1.0. Current mitigation: checkpoint-restart at ~step 60-70.
+
+### Static XCCL buffer (unimplemented — eliminates ~30 MiB/step external growth)
+
+**Root cause of growth**: XCCL weight sync dynamically allocates ~1 GiB temp buffers per
+chunk each step. Allocator fragmentation (from vLLM variable-length generation) means new
+VAs are returned frequently → oneCCL registers a new IPC MR handle per VA → with
+`CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD=65536` those handles accumulate, growing external
+memory ~30 MiB/step → crash at step ~80.
+
+**Fix**: Pre-allocate one static `_xccl_bcast_buf` on the training side and one
+`_xccl_recv_buf` on the vLLM worker side, sized to `batch_max_numel`. Reuse the exact same
+buffer every step so the VA never changes, oneCCL registers the IPC handle once, and
+external growth drops to zero.
+
+**Training side** (`_bg_xccl_broadcast`): replace `gpu_temp = torch.empty(max_numel)` with
+a lazy-initialized `self._xccl_bcast_buf`; use `view = self._xccl_bcast_buf[:n]` per chunk.
+
+**vLLM worker side** (`receive_weights_xccl_streaming`): replace `recv_buf = torch.empty(batch_numel)`
+inside the while-loop with a view of `self._xccl_recv_buf` initialized from the manifest's
+`batch_max_numel`.
+
+**Cleanup**: delete both static buffers in `close_xccl_communicator` to allow re-init.
+See `docs/plans/static_xccl_buffer_weight_sync.md` (archived) for original design doc.

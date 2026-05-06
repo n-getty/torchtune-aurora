@@ -106,6 +106,14 @@ This documents all monkeypatches applied at runtime to make GRPO training work o
 
 **Used by**: Only when `VLLM_TILES=1` in the launch script. Default production uses `VLLM_TILES=2` (TP=2), which uses the standard `vllm.entrypoints.openai.api_server` instead. Currently **not active** in optimized configs.
 
+## Known No-Ops on XPU (not patches, but common misconceptions)
+
+### `force_math_sdpa` config flag
+
+`force_math_sdpa: true` in a recipe config calls `torch.backends.cuda.enable_flash_sdp(False)`. This is a **no-op on XPU** — those toggles control the CUDA SDPA dispatcher and never reach the XPU SDPA path. Validated 2026-04-30: identical timing and peak memory with and without the flag on Aurora.
+
+**Implication**: if your YAML has `force_math_sdpa: true`, it has zero effect on XPU. Prior recipe configurations that varied this flag between 1-node and 2-node setups were based on a phantom variable — both used the same XPU SDPA path.
+
 ## Checking If Patches Are Still Needed
 
 When `module load frameworks` is updated to a new version:
