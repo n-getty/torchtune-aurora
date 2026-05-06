@@ -53,8 +53,8 @@ class TestLoraRolloutLogprobsGate(unittest.TestCase):
         marker = "Step 2: policy logprobs"
         idx = self.src.find(marker)
         self.assertNotEqual(idx, -1, f"could not find '{marker}' in recipe")
-        # Inspect the next ~2000 chars for the gate.
-        window = self.src[idx:idx + 2000]
+        # Inspect the next ~2500 chars for the gate (logprobs=None is ~2071 chars past marker).
+        window = self.src[idx:idx + 2500]
         self.assertIn(
             "if self._compute_rollout_logprobs_required",
             window,
