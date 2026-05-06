@@ -3544,6 +3544,28 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                     log.info("Rank 0: PRE-STEP %d memory: allocated=%.2f GiB, reserved=%.2f GiB",
                              self._steps_run, _alloc, _resv)
 
+                # Asym-optim per-rank free-HBM probe (acceptance gate). Off
+                # unless TORCHTUNE_ASYM_MEMPROBE=1. Every rank logs its own
+                # free / reserved HBM so spare-rank vs trainer-rank deltas are
+                # visible in the launcher grep.
+                if (
+                    self._device.type == "xpu"
+                    and os.environ.get("TORCHTUNE_ASYM_MEMPROBE", "0") == "1"
+                    and self._steps_run == 0
+                ):
+                    try:
+                        _free, _total = torch.xpu.mem_get_info(self._device)
+                        _alloc_r = torch.xpu.memory_allocated() / 1024**3
+                        _resv_r = torch.xpu.memory_reserved() / 1024**3
+                        log.info(
+                            "ASYM-MEMPROBE rank=%d free=%.2f GiB total=%.2f GiB "
+                            "alloc=%.2f GiB resv=%.2f GiB step=%d",
+                            self.rank, _free / 1024**3, _total / 1024**3,
+                            _alloc_r, _resv_r, self._steps_run,
+                        )
+                    except Exception as _e:
+                        log.info("ASYM-MEMPROBE rank=%d failed: %s", self.rank, _e)
+
                 # NOTE: XCCL broadcast is DEFERRED — it starts after gen completes
                 # (in _start_deferred_broadcast below), runs during GRPO/backward.
                 # vLLM generates with the latest available weights (no contention).
