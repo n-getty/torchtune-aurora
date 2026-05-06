@@ -55,9 +55,19 @@ def _init_vllm_early(self, cfg):
     **TP>1**: Ranks are grouped into DP groups of size tp_size. Each group
     creates one shared vLLM engine via ``external_launcher`` with an XCCL
     PG of size tp_size. All ranks in a group call generate() together.
+
+    When ``self._vllm_ranks`` is set (Phase A asym-optim path), spare ranks
+    not in that list early-return and never touch vLLM init at all.
     """
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
+
+    # Asym-optim Phase A: skip vLLM init on spare ranks. Recipe also gates the
+    # call site, but this is belt-and-suspenders so any direct call no-ops.
+    _vllm_ranks = getattr(self, "_vllm_ranks", None)
+    if _vllm_ranks is not None and rank not in _vllm_ranks:
+        log.info("Rank %d: spare rank (not in vllm_ranks=%s); skipping vLLM init", rank, list(_vllm_ranks))
+        return
     # Match the recipe's _xpu_device_index logic: with single-tile affinity
     # the rank sees its tile as xpu:0; otherwise select by LOCAL_RANK.
     _affinity = os.environ.get("ZE_AFFINITY_MASK", "")
@@ -425,12 +435,27 @@ def _init_vllm_tp(self, cfg, rank, world_size, local_rank, tp_size,
     4. Create vLLM LLM with external_launcher
     5. Destroy TP PG, restore env (training PG created later via elastic agent store)
     """
-    assert world_size % tp_size == 0, (
-        f"world_size={world_size} must be divisible by vllm_tensor_parallel_size={tp_size}"
+    # Phase A asym-optim: vLLM may live on a subset of world ranks. Default
+    # to the full world (preserves prior behavior).
+    _vllm_ranks = getattr(self, "_vllm_ranks", None)
+    if _vllm_ranks is None:
+        _vllm_ranks = list(range(world_size))
+    else:
+        _vllm_ranks = list(_vllm_ranks)
+    n_vllm = len(_vllm_ranks)
+    assert n_vllm % tp_size == 0, (
+        f"len(vllm_ranks)={n_vllm} must be divisible by "
+        f"vllm_tensor_parallel_size={tp_size}"
     )
-    dp_size = world_size // tp_size
-    dp_rank = rank // tp_size
-    tp_rank = rank % tp_size
+    # Spare ranks should have early-returned in _init_vllm_early; this is a
+    # safety check in case _init_vllm_tp is invoked directly.
+    assert rank in _vllm_ranks, (
+        f"_init_vllm_tp called on spare rank {rank} (not in vllm_ranks={_vllm_ranks})"
+    )
+    pos = _vllm_ranks.index(rank)
+    dp_size = n_vllm // tp_size
+    dp_rank = pos // tp_size
+    tp_rank = pos % tp_size
 
     # Store TP/DP info for later use
     self._vllm_dp_rank = dp_rank
@@ -438,8 +463,8 @@ def _init_vllm_tp(self, cfg, rank, world_size, local_rank, tp_size,
     self._vllm_dp_size = dp_size
 
     log.info(
-        "Rank %d: TP init — dp_rank=%d, tp_rank=%d, dp_size=%d, tp_size=%d",
-        rank, dp_rank, tp_rank, dp_size, tp_size,
+        "Rank %d: TP init — dp_rank=%d, tp_rank=%d, dp_size=%d, tp_size=%d (vllm_ranks=%s)",
+        rank, dp_rank, tp_rank, dp_size, tp_size, _vllm_ranks,
     )
 
     # Step 1: File-based barrier — all ranks signal ready before any creates PG.
@@ -451,8 +476,8 @@ def _init_vllm_tp(self, cfg, rank, world_size, local_rank, tp_size,
     # Signal this rank is ready
     with open(os.path.join(_barrier_dir, f"rank_{rank}"), "w") as f:
         f.write("ready")
-    # Wait for all ranks in our DP group to be ready
-    dp_group_ranks = list(range(dp_rank * tp_size, (dp_rank + 1) * tp_size))
+    # Wait for all ranks in our DP group to be ready (global rank ids).
+    dp_group_ranks = _vllm_ranks[dp_rank * tp_size : (dp_rank + 1) * tp_size]
     for r in dp_group_ranks:
         while not os.path.exists(os.path.join(_barrier_dir, f"rank_{r}")):
             time.sleep(0.1)
@@ -483,6 +508,12 @@ def _init_vllm_tp(self, cfg, rank, world_size, local_rank, tp_size,
              rank, dp_rank, torch.distributed.get_world_size())
 
     # Step 5: Create vLLM LLM engine
+    # enforce_eager=False + VLLM_XPU_ENABLE_XPU_GRAPH=1 enables PIECEWISE XPU graph mode
+    # on the torch211 venv (vLLM 0.1.dev1). PIECEWISE captures non-collective ops in XPU
+    # graphs and runs TP AllReduce eagerly — safe after destroy_process_group() because the
+    # Python PG object ref survives the registry clear. Legacy vLLM 0.15.0 required
+    # enforce_eager=True because VLLM_COMPILE baked PG "name 3" into the compiled kernel.
+    enforce_eager = cfg.get("vllm_enforce_eager", True)
     llm_kwargs = dict(
         model=model_path,
         tensor_parallel_size=tp_size,
@@ -490,14 +521,53 @@ def _init_vllm_tp(self, cfg, rank, world_size, local_rank, tp_size,
         gpu_memory_utilization=gpu_mem,
         max_model_len=max_model_len,
         max_num_seqs=max_num_seqs,
-        enforce_eager=True,
+        enforce_eager=enforce_eager,
         dtype="bfloat16",
     )
+    # With torch211 vLLM and VLLM_XPU_ENABLE_XPU_GRAPH=1, PIECEWISE mode captures
+    # non-collective ops in XPU graphs while TP AllReduce runs eagerly via the Python PG
+    # object (safe after destroy_process_group — object ref survives registry clear).
+    # PIECEWISE requires CompilationMode.VLLM_COMPILE (3); xpu.py only enables PIECEWISE
+    # when data_parallel_size=1, so TP AllReduce is never captured.
+    if int(os.environ.get("VLLM_XPU_ENABLE_XPU_GRAPH", "0")) and not enforce_eager:
+        llm_kwargs["compilation_config"] = 3  # CompilationMode.VLLM_COMPILE
     if vllm_mode == "colocate_sleep":
         llm_kwargs["enable_sleep_mode"] = True
     llm_kwargs.update(_lora_engine_kwargs(cfg))
 
+    # _init_vllm_early() sets TORCH_COMPILE_DISABLE=1 to protect early init from
+    # torch.compile overhead. For PIECEWISE XPU graph mode we need inductor active,
+    # so pop it before LLM() (vllm.py:907 checks it and overrides mode→NONE if set).
+    # Restore immediately after LLM() so training ranks still see TORCH_COMPILE_DISABLE.
+    _tcd_saved = None
+    if "compilation_config" in llm_kwargs:
+        _tcd_saved = os.environ.pop("TORCH_COMPILE_DISABLE", None)
     self._vllm_llm = LLM(**llm_kwargs)
+    if _tcd_saved is not None:
+        os.environ["TORCH_COMPILE_DISABLE"] = _tcd_saved
+
+    # Step 5b: Pre-warm _compute_slot_mapping_kernel (PagedAttention Triton kernel).
+    # Without this, the first call happens at step 0 generation and triggers
+    # zeModuleCreate (SPIR-V → XPU binary) which takes 50+ min on cold cache.
+    # With TRITON_XPU_GEN_NATIVE_CODE=1, ocloc caches the zebin to ~/.triton/cache/
+    # so subsequent runs are instant. Only active with VLLM_XPU_ENABLE_XPU_GRAPH=1
+    # (torch211 PIECEWISE mode); legacy enforce_eager path has no Triton kernels.
+    if int(os.environ.get("VLLM_XPU_ENABLE_XPU_GRAPH", "0")):
+        from vllm import SamplingParams as _SP
+        _t0 = time.monotonic()
+        log.info(
+            "Rank %d: pre-warming _compute_slot_mapping_kernel "
+            "(first run: ocloc compile may take 50+ min; cached runs: ~instant)",
+            rank,
+        )
+        self._vllm_llm.generate(
+            prompts=[{"prompt_token_ids": [1, 2]}],
+            sampling_params=_SP(max_tokens=1, temperature=0.0, detokenize=False),
+            use_tqdm=False,
+        )
+        log.info(
+            "Rank %d: slot_mapping pre-warm done in %.1fs", rank, time.monotonic() - _t0
+        )
 
     # Step 6: Destroy TP PG — training will create its own global XCCL PG
     if torch.distributed.is_initialized():
@@ -512,8 +582,9 @@ def _init_vllm_tp(self, cfg, rank, world_size, local_rank, tp_size,
         elif key in os.environ:
             del os.environ[key]
 
-    # Clean up barrier files (best-effort)
-    if rank == 0:
+    # Clean up barrier files (best-effort). Use the first vLLM rank rather
+    # than global rank 0, since rank 0 might not be a vLLM participant.
+    if rank == _vllm_ranks[0]:
         import shutil
         try:
             shutil.rmtree(_barrier_dir, ignore_errors=True)
@@ -629,15 +700,29 @@ def _setup_vllm_colocate_mode(self, cfg):
     communication during generation). Weight sync loads gathered FSDP2
     params into each rank's local engine.
 
-    Called from setup() AFTER model init.
+    Called from setup() AFTER model init. When ``self._vllm_ranks`` is set
+    (asym-optim Phase A), spare ranks still hit the world barrier (collective
+    ordering invariant) but skip the vLLM-specific bookkeeping.
     """
-    # Build param name mapping for weight sync
-    self._build_tune_to_hf_map()
+    _vllm_ranks = getattr(self, "_vllm_ranks", None)
+    _is_vllm_rank = (_vllm_ranks is None) or (self.rank in _vllm_ranks)
 
-    log.info(
-        "Rank %d: colocated vLLM engine ready (%d params mapped, local generation)",
-        self.rank, len(self._tune_to_hf_map),
-    )
+    if _is_vllm_rank:
+        # Build param name mapping for weight sync
+        self._build_tune_to_hf_map()
+        log.info(
+            "Rank %d: colocated vLLM engine ready (%d params mapped, local generation)",
+            self.rank, len(self._tune_to_hf_map),
+        )
+    else:
+        # Spare ranks still need _tune_to_hf_map for the full_tensor() call site
+        # in _sync_colocated_weights (the FSDP collective is on all ranks; the
+        # name lookup is per-param).
+        self._build_tune_to_hf_map()
+        log.info(
+            "Rank %d: spare rank — no vLLM engine; participates only in FSDP "
+            "collectives during weight sync", self.rank,
+        )
     torch.distributed.barrier()
 
 

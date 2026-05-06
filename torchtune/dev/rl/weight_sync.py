@@ -69,7 +69,15 @@ def _sync_colocated_weights(self) -> None:
     import gc
 
     t0 = time.perf_counter()
-    llm_model = self._vllm_llm.llm_engine.model_executor.driver_worker.model_runner.model
+    # Phase A asym-optim: spare ranks still join the FSDP full_tensor() collective
+    # (12-rank dp_mesh) but have no vLLM engine to load into.
+    _vllm_ranks = getattr(self, "_vllm_ranks", None)
+    _is_vllm_rank = (_vllm_ranks is None) or (self.rank in _vllm_ranks)
+    llm_model = (
+        self._vllm_llm.llm_engine.model_executor.driver_worker.model_runner.model
+        if _is_vllm_rank
+        else None
+    )
 
     n_synced = 0
     # BioReasonModel (and other multimodal wrappers) expose vllm_param_iter()
@@ -93,7 +101,8 @@ def _sync_colocated_weights(self) -> None:
         else:
             weight_data = param.data
 
-        llm_model.load_weights([(hf_name, weight_data)])
+        if _is_vllm_rank:
+            llm_model.load_weights([(hf_name, weight_data)])
         n_synced += 1
         del weight_data
 
@@ -104,7 +113,8 @@ def _sync_colocated_weights(self) -> None:
             gc.collect()
             torch.xpu.synchronize(self._device)
 
-    self._vllm_llm.llm_engine.reset_prefix_cache()
+    if _is_vllm_rank:
+        self._vllm_llm.llm_engine.reset_prefix_cache()
 
     gc.collect()
     if torch.xpu.is_available():

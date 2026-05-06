@@ -282,8 +282,18 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         vllm_mode = cfg.get("vllm_mode", None)
         if cfg.get("vllm_url", None) is not None and vllm_mode is None:
             vllm_mode = "server"
+        # Asym-optim Phase A: optional rank subset for colocated vLLM. Spare ranks
+        # outside this list participate in FSDP collectives but never touch vLLM.
+        # Stash on self before _init_vllm_early so vllm_backend.py can read it.
+        _vllm_ranks_cfg = cfg.get("vllm_ranks", None)
+        if _vllm_ranks_cfg is not None:
+            self._vllm_ranks = list(_vllm_ranks_cfg)
+        else:
+            self._vllm_ranks = None
+        _cur_rank_for_vllm = int(os.environ.get("RANK", "0"))
         if vllm_mode in ("colocate", "colocate_sleep"):
-            self._init_vllm_early(cfg)
+            if self._vllm_ranks is None or _cur_rank_for_vllm in self._vllm_ranks:
+                self._init_vllm_early(cfg)
         elif vllm_mode == "dedicated_rank":
             _ded_rank = cfg.get("vllm_dedicated_rank", None)
             _cur_rank = int(os.environ.get("RANK", "0"))
@@ -303,6 +313,25 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             init_xpu_process_group(self.distributed_backend, device_index=_xpu_device_index)
         self.world_size, self.rank = utils.get_world_size_and_rank()
         self._is_rank_zero = self.rank == 0
+
+        # Asym-optim Phase B: a dedicated XCCL PG covering every rank in
+        # train_ranks ∪ spare_ranks (== world for the colocate path). Built
+        # here so it lives independently of the FSDP2 dp_mesh; the optimizer
+        # uses it for all_to_all_single without touching FSDP collectives.
+        # NULL when no optimizer_offload is requested (preserves baseline).
+        self._optim_pg = None
+        _opt_off_cfg = cfg.get("optimizer_offload", None)
+        if _opt_off_cfg is not None and _opt_off_cfg.get("spare_ranks", None):
+            _all_optim_ranks = list(range(self.world_size))
+            self._optim_pg = torch.distributed.new_group(
+                _all_optim_ranks, backend=self.distributed_backend,
+            )
+            if self._is_rank_zero:
+                log.info(
+                    "Asym-optim _optim_pg created: ranks=%s backend=%s spare_ranks=%s",
+                    _all_optim_ranks, self.distributed_backend,
+                    list(_opt_off_cfg["spare_ranks"]),
+                )
 
         # SDPA backend selection.
         # NOTE: torch.backends.cuda.enable_flash_sdp() is a NO-OP on XPU — those
@@ -827,6 +856,9 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         Setup the recipe. This includes training state (if resume_from_checkpoint is True),
         model, tokenizer, loss, optimizer, lr scheduler, sampler, and dataloader.
         """
+        # Stash cfg so _setup_optimizer / etc. can read optional knobs
+        # (e.g. asym-optim Phase B optimizer_offload).
+        self._cfg = cfg
         if self.fsdp_cpu_offload:
             training.set_torch_num_threads()
 
@@ -1074,6 +1106,10 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         self._ref_forward_batch_size = cfg.get(
             "ref_forward_batch_size", cfg.forward_batch_size
         )
+        # Number of prompts passed to vLLM in a single generate() call.
+        # Defaults to batch_size (one vLLM call per step). Lower to
+        # forward_batch_size only if vLLM OOMs on the full prompt batch.
+        self._gen_batch_size = cfg.get("gen_batch_size", cfg.batch_size)
 
         # Reward mode: "math" (default) or "gene_recall"
         self._reward_mode = cfg.get("reward_mode", "math")
@@ -1903,6 +1939,37 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             params = [p for _, p in self._model.trainable_parameters()]
         else:
             params = [p for p in self._model.parameters() if p.requires_grad]
+
+        # Asym-optim Phase B: optionally route through AsymAdamWXPU, which
+        # keeps FP32 master + moments only on a designated set of spare ranks.
+        # See ~/.claude/plans/virtual-orbiting-kite.md.
+        offload = self._cfg.get("optimizer_offload", None) if hasattr(self, "_cfg") else None
+        # Fall back to looking it up on the live config if not stashed on self.
+        if offload is None:
+            try:
+                offload = cfg_optimizer.get("offload", None)
+            except Exception:
+                offload = None
+        if offload and offload.get("spare_ranks"):
+            from torchtune.dev.asym_optim import AsymAdamWXPU
+            opt_kwargs = dict(
+                lr=cfg_optimizer.get("lr", 1e-5),
+            )
+            for k in ("betas", "eps", "weight_decay"):
+                if k in cfg_optimizer:
+                    opt_kwargs[k] = cfg_optimizer[k]
+            optimizer = AsymAdamWXPU(
+                params,
+                spare_ranks=list(offload["spare_ranks"]),
+                optim_pg=getattr(self, "_optim_pg", None),
+                **opt_kwargs,
+            )
+            utils.log_rank_zero(
+                log,
+                f"AsymAdamWXPU initialized: spare_ranks={list(offload['spare_ranks'])}",
+            )
+            return optimizer
+
         optimizer = config.instantiate(cfg_optimizer, params)
         if opt_state_dict:
             training.load_from_full_optimizer_state_dict(
@@ -2843,16 +2910,22 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         answers: list[str],
     ) -> GRPOTrajectory:
         """
-        Generates trajectories using forward_batch_size micro-batches.
+        Generates trajectories in gen_batch_size vLLM calls, then ref/rollout
+        logprob forwards in forward_batch_size micro-batches.
+
+        gen_batch_size (default=batch_size) controls how many prompts go into
+        each vLLM generate() call. Set gen_batch_size=batch_size for one call
+        per step (fastest when vLLM memory allows), or lower to forward_batch_size
+        if vLLM OOMs on the full prompt batch.
         """
         trajectories: list[GRPOTrajectory] = []
         with torch.no_grad():
-            for batch_start in range(0, self.batch_size, self._forward_batch_size):
+            for batch_start in range(0, self.batch_size, self._gen_batch_size):
                 batch_input_ids = input_ids[
-                    batch_start : batch_start + self._forward_batch_size
+                    batch_start : batch_start + self._gen_batch_size
                 ]
                 batch_answers = answers[
-                    batch_start : batch_start + self._forward_batch_size
+                    batch_start : batch_start + self._gen_batch_size
                 ]
                 device_empty_cache(self._device)
                 trajectories.append(
