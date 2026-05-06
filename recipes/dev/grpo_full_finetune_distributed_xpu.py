@@ -2019,8 +2019,16 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             sampler_replicas = self._dp_replicate
             sampler_rank = self.rank // self._dp_shard
         elif self._vllm_tp_size > 1:
-            sampler_replicas = self.world_size // self._vllm_tp_size
-            sampler_rank = self.rank // self._vllm_tp_size
+            # Asym-optim Phase A: when vllm runs on a rank subset (e.g. 8 of 12),
+            # spare ranks (8..11) participate in FSDP fwd/bwd but don't generate.
+            # They must see the SAME batch as the tp group, so collapse to 1 replica.
+            _vllm_ranks = getattr(self, "_vllm_ranks", None)
+            if _vllm_ranks is not None and len(_vllm_ranks) != self.world_size:
+                sampler_replicas = 1
+                sampler_rank = 0
+            else:
+                sampler_replicas = self.world_size // self._vllm_tp_size
+                sampler_rank = self.rank // self._vllm_tp_size
         else:
             sampler_replicas = self.world_size
             sampler_rank = self.rank
@@ -2483,9 +2491,26 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         # step 1: generate responses using the current policy (or vLLM)
         _vllm_t0 = time.perf_counter()
         if self._vllm_mode in ("colocate", "colocate_sleep"):
-            query_responses = self._generate_with_colocated_vllm(
-                batch_input_ids, context_length
-            )
+            # Asym-optim Phase A: vllm runs on a rank subset (e.g. ranks 0-7 of 12).
+            # Spare ranks (8-11) do not own a vLLM engine. They have the SAME batch
+            # (sampler_replicas=1) as the vllm group, so we let any vllm rank generate
+            # and broadcast the qr tensor to spare ranks for the FSDP forward.
+            _vllm_ranks = getattr(self, "_vllm_ranks", None)
+            _is_vllm_rank = (_vllm_ranks is None) or (self.rank in _vllm_ranks)
+            if _is_vllm_rank:
+                query_responses = self._generate_with_colocated_vllm(
+                    batch_input_ids, context_length
+                )
+            else:
+                total_len = context_length + self._max_generated_tokens
+                query_responses = batch_input_ids.new_full(
+                    (batch_input_ids.shape[0], total_len), self._tokenizer.pad_id,
+                )
+            if _vllm_ranks is not None and len(_vllm_ranks) != self.world_size:
+                # Broadcast from a vllm rank to every spare rank (world PG).
+                torch.distributed.broadcast(
+                    query_responses, src=int(_vllm_ranks[0]),
+                )
         elif self._vllm_mode == "dedicated_rank":
             # Fan out qr to training ranks [0..N-2] over gloo. Each rank's
             # own batch has its own padded context_length, so broadcast rank
