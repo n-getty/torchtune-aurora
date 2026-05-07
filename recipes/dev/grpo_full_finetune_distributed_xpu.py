@@ -294,6 +294,10 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         if vllm_mode in ("colocate", "colocate_sleep"):
             if self._vllm_ranks is None or _cur_rank_for_vllm in self._vllm_ranks:
                 self._init_vllm_early(cfg)
+        elif vllm_mode == "colocate_ray":
+            # Ray-colocate: only rank 0 holds the LLM driver handle; other
+            # ranks stub self._vllm_llm = None inside _init_vllm_ray_colocate.
+            self._init_vllm_ray_colocate(cfg)
         elif vllm_mode == "dedicated_rank":
             _ded_rank = cfg.get("vllm_dedicated_rank", None)
             _cur_rank = int(os.environ.get("RANK", "0"))
@@ -804,6 +808,7 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
 
     _init_vllm_early = _vllm_backend_module._init_vllm_early
     _init_vllm_early_dedicated = _vllm_backend_module._init_vllm_early_dedicated
+    _init_vllm_ray_colocate = _vllm_backend_module._init_vllm_ray_colocate
     _init_vllm_tp1 = _vllm_backend_module._init_vllm_tp1
     _init_vllm_tp = _vllm_backend_module._init_vllm_tp
     def load_checkpoint(self, cfg_checkpointer: DictConfig) -> dict[str, Any]:
@@ -1166,11 +1171,18 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             # present alongside FSDP collectives on the same XPU tile.
             global _colocate_vllm_mode
             _colocate_vllm_mode = True
+        elif self._vllm_mode == "colocate_ray":
+            self._setup_vllm_ray_colocate_mode(cfg)
+            # Ray-colocate intentionally does NOT set _colocate_vllm_mode:
+            # the global flag drives the in-process empty_cache + KV-cache
+            # restore path used by external_launcher colocate. Ray actors
+            # own their own KV cache lifecycle in a separate process tree.
         # dedicated_rank PG setup happens at the top of setup() (in lockstep with
         # the vLLM rank), not here.
 
     _setup_vllm_server_mode = _vllm_backend_module._setup_vllm_server_mode
     _setup_vllm_colocate_mode = _vllm_backend_module._setup_vllm_colocate_mode
+    _setup_vllm_ray_colocate_mode = _vllm_backend_module._setup_vllm_ray_colocate_mode
     _setup_dedicated_vllm_rank = _vllm_backend_module._setup_dedicated_vllm_rank
     _setup_dedicated_training_pgs = _vllm_backend_module._setup_dedicated_training_pgs
     def _build_tune_to_hf_map(self):
@@ -2300,6 +2312,192 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         )
         return query_responses
 
+    def _generate_with_ray_colocate_vllm(
+        self,
+        batch_input_ids: torch.Tensor,
+        context_length: int,
+    ) -> torch.Tensor:
+        """Generate using rank-0's Ray-colocate vLLM driver, then gloo-broadcast
+        the query_responses to every trainer rank.
+
+        Each trainer rank has its OWN sub-batch of prompts (DistributedSampler).
+        We gather all sub-batches to rank 0, run a single vLLM generate, then
+        broadcast the full query_responses tensor back. The Ray actors fan-out
+        TP=8 generation across the same 8 tiles the trainer occupies, so this
+        eliminates the per-rank vLLM call (and its underlying CCL allgather
+        wedge) that the external_launcher colocate path tripped on.
+        """
+        from vllm import SamplingParams
+
+        bsz_local = batch_input_ids.shape[0]
+        total_len = context_length + self._max_generated_tokens
+        gen_pg = getattr(self, "_ray_colocate_gen_pg", None)
+
+        # Step 1: gather every rank's prompt block to rank 0.
+        # gather_object handles variable per-rank sizes internally; no shape
+        # broadcast needed.
+        if self.world_size > 1:
+            local_cpu = batch_input_ids.detach().to("cpu")
+            gathered = [None] * self.world_size if self._is_rank_zero else None
+            torch.distributed.gather_object(
+                local_cpu, gathered if self._is_rank_zero else None,
+                dst=0, group=gen_pg,
+            )
+        else:
+            gathered = [batch_input_ids.detach().to("cpu")]
+
+        if self._is_rank_zero:
+            # Concatenate all rank batches into a single contiguous block.
+            # Each rank's bsz can differ (last DistributedSampler shard); each
+            # rank also pads input_ids to its OWN per-rank max prompt length, so
+            # the second dim (context_length) varies across ranks. Pad every
+            # gathered tensor to the global max context_length with pad_id
+            # before cat so torch.cat does not raise on dim mismatch. The pad
+            # tokens are filtered out below when building vllm prompts.
+            assert all(t is not None for t in gathered), "rank 0 missing gather"
+            global_ctx = max(int(t.shape[1]) for t in gathered)
+            pad_id = self._tokenizer.pad_id
+            padded_gathered = []
+            for t in gathered:
+                if int(t.shape[1]) < global_ctx:
+                    pad_n = global_ctx - int(t.shape[1])
+                    pad_block = t.new_full((t.shape[0], pad_n), pad_id)
+                    padded_gathered.append(torch.cat([t, pad_block], dim=1))
+                else:
+                    padded_gathered.append(t)
+            full_ids = torch.cat(padded_gathered, dim=0)
+            bsz_total = full_ids.shape[0]
+
+            sampling_params = SamplingParams(
+                max_tokens=self._max_generated_tokens,
+                temperature=self._temperature,
+                top_k=self._top_k if self._top_k else -1,
+                detokenize=False,
+            )
+
+            max_prompt_len = self._vllm_max_model_len - self._max_generated_tokens
+            raw_prompts = []
+            for i in range(bsz_total):
+                ids = full_ids[i].tolist()
+                ids = [t for t in ids if t != self._tokenizer.pad_id]
+                raw_prompts.append(ids[-max_prompt_len:] if len(ids) > max_prompt_len else ids)
+            vllm_prompts = [{"prompt_token_ids": p} for p in raw_prompts]
+
+            t0 = time.perf_counter()
+            # Probe gate: TORCHTUNE_RAY_COLOCATE_SKIP_GENERATE=1 returns
+            # zero-filled completions without calling vLLM .generate(). Used to
+            # isolate whether the BWD wedge comes from generate-time event
+            # accumulation (skip → BWD passes) vs Ray actor existence alone
+            # (skip → BWD still UR40). Diagnostic ONLY — completions are bogus.
+            if os.environ.get("TORCHTUNE_RAY_COLOCATE_SKIP_GENERATE", "0") == "1":
+                log.info(
+                    "Rank 0: ray-colocate SKIP_GENERATE=1 — bypassing vLLM .generate() "
+                    "(diagnostic probe; completions will be zero-filled)"
+                )
+                # Build outputs shaped like vLLM's response so the rest of the path
+                # behaves identically. Each item: outputs[0].token_ids is a list[int].
+                class _StubOutput:
+                    __slots__ = ("token_ids",)
+                    def __init__(self, n): self.token_ids = [0] * n
+
+                class _StubResp:
+                    __slots__ = ("outputs",)
+                    def __init__(self, n): self.outputs = [_StubOutput(n)]
+
+                outputs = [_StubResp(self._max_generated_tokens) for _ in range(bsz_total)]
+            else:
+                outputs = self._vllm_llm.generate(
+                    prompts=vllm_prompts,
+                    sampling_params=sampling_params,
+                    use_tqdm=False,
+                )
+            gen_time = time.perf_counter() - t0
+
+            # Use global_ctx (per-rank max prompt len after padding) for qr_full
+            # allocation — full_ids is shaped (bsz_total, global_ctx). The
+            # rank-local context_length passed in by callers reflects the
+            # caller's own per-rank prompt width, not the global one.
+            qr_total_len = global_ctx + self._max_generated_tokens
+            qr_full = full_ids.new_full((bsz_total, qr_total_len), self._tokenizer.pad_id)
+            qr_full[:, :global_ctx] = full_ids
+            total_tokens = 0
+            for i, output in enumerate(outputs):
+                comp = output.outputs[0].token_ids
+                total_tokens += len(comp)
+                length = min(len(comp), self._max_generated_tokens)
+                qr_full[i, global_ctx : global_ctx + length] = torch.tensor(
+                    comp[:length], dtype=full_ids.dtype,
+                )
+            log.info(
+                "Rank 0: ray-colocate vLLM generated %d sequences (gathered from %d ranks), "
+                "%d tokens in %.1fs (%.1f tok/s)",
+                bsz_total, self.world_size, total_tokens, gen_time,
+                total_tokens / max(gen_time, 0.01),
+            )
+        else:
+            qr_full = None
+
+        # Step 2: scatter the per-rank slice back. Every rank knows its slice
+        # bounds because it knows its own bsz_local and rank order is fixed.
+        if self.world_size > 1:
+            # Broadcast the full qr CPU tensor (cheap: ~few MB at recipe sizes).
+            # Reusing the gen_pg gloo group keeps this off the XCCL fabric.
+            shape_obj = [list(qr_full.shape)] if self._is_rank_zero else [None]
+            torch.distributed.broadcast_object_list(
+                shape_obj, src=0, group=gen_pg, device="cpu",
+            )
+            qr_shape = tuple(shape_obj[0])
+            if not self._is_rank_zero:
+                qr_full = torch.empty(qr_shape, dtype=batch_input_ids.dtype, device="cpu")
+            torch.distributed.broadcast(qr_full, src=0, group=gen_pg)
+            # Each rank knows the per-rank gather order (DistributedSampler is
+            # rank-aligned). Allgather per-rank bsz_local to compute slice bounds.
+            sizes_all = [None] * self.world_size
+            torch.distributed.all_gather_object(sizes_all, int(bsz_local), group=gen_pg)
+            offsets = [0]
+            for s in sizes_all:
+                offsets.append(offsets[-1] + int(s))
+            start = offsets[self.rank]
+            end = offsets[self.rank + 1]
+            qr_local_full = qr_full[start:end]
+            # qr_local_full is shaped (bsz_local, global_ctx + max_gen). Each
+            # rank's downstream code uses its OWN context_length (= local_ctx,
+            # i.e. batch_input_ids.shape[1]); the [global_ctx - local_ctx] pad
+            # columns inserted by rank 0 to align cat must be dropped here so
+            # query_responses[:, :context_length] == batch_input_ids and
+            # query_responses[:, context_length:] == completion tokens.
+            local_ctx = int(batch_input_ids.shape[1])
+            global_ctx = int(qr_local_full.shape[1]) - int(self._max_generated_tokens)
+            if local_ctx < global_ctx:
+                query_responses = torch.cat(
+                    [qr_local_full[:, :local_ctx], qr_local_full[:, global_ctx:]],
+                    dim=1,
+                ).to(self._device)
+            else:
+                query_responses = qr_local_full.to(self._device)
+        else:
+            query_responses = qr_full.to(self._device)
+
+        torch.xpu.set_device(_xpu_device_index)
+        torch.xpu.synchronize()
+
+        # W4 (diagnostic): drain L0 event pool between gen and bwd. Co-tenancy
+        # of Ray actor + trainer on the same per-tile L0 driver context is
+        # exhausting the event pool by the first BWD chunk (UR error 40 even
+        # with ~30 GiB HBM headroom). empty_cache() is normally banned in FSDP
+        # loops (UR-handle leak, see docs/bugs/intel_xpu_resource_leak_bug_report.md),
+        # but here it is a probe: if BWD survives step 0 with this on, the
+        # diagnosis is confirmed and W1 (sleep/wake adapter) is the production
+        # fix. NOT a production setting — accelerates the FSDP UR leak.
+        if os.environ.get("TORCHTUNE_RAY_COLOCATE_DRAIN_L0", "0") == "1":
+            torch.xpu.empty_cache()
+            if self._is_rank_zero:
+                log.info(
+                    "Rank 0: ray-colocate post-gen empty_cache() (W4 diagnostic)"
+                )
+
+        return query_responses
+
     def _generate_with_colocated_vllm(
         self,
         batch_input_ids: torch.Tensor,
@@ -2421,6 +2619,7 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
     # Weight sync methods (see torchtune/dev/rl/weight_sync.py)
     # ---------------------------------------------------------------------------
     _sync_colocated_weights = _weight_sync_module._sync_colocated_weights
+    _sync_ray_colocate_weights = _weight_sync_module._sync_ray_colocate_weights
     _compute_wsync_layout = _weight_sync_module._compute_wsync_layout
     _sync_dedicated_vllm_weights = _weight_sync_module._sync_dedicated_vllm_weights
     _recv_weight_update = _weight_sync_module._recv_weight_update
@@ -2511,6 +2710,13 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                 torch.distributed.broadcast(
                     query_responses, src=int(_vllm_ranks[0]),
                 )
+        elif self._vllm_mode == "colocate_ray":
+            # Rank 0 holds the vLLM driver; gather prompts → generate → scatter
+            # query_responses back via the gen_pg gloo group. Every rank ends
+            # up with its own slice (matching DistributedSampler ordering).
+            query_responses = self._generate_with_ray_colocate_vllm(
+                batch_input_ids, context_length
+            )
         elif self._vllm_mode == "dedicated_rank":
             # Fan out qr to training ranks [0..N-2] over gloo. Each rank's
             # own batch has its own padded context_length, so broadcast rank
@@ -3896,6 +4102,10 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                 if self._vllm_mode == "colocate":
                     _wsync_gather_t0 = time.perf_counter()
                     self._sync_colocated_weights()
+                    _wsync_gather_time = time.perf_counter() - _wsync_gather_t0
+                elif self._vllm_mode == "colocate_ray":
+                    _wsync_gather_t0 = time.perf_counter()
+                    self._sync_ray_colocate_weights()
                     _wsync_gather_time = time.perf_counter() - _wsync_gather_t0
                 elif self._vllm_mode == "dedicated_rank" and not self._is_vllm_rank:
                     # summon_full_params in _sync_dedicated_vllm_weights is a collective

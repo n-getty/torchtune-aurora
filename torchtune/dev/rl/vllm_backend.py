@@ -569,6 +569,56 @@ def _init_vllm_tp(self, cfg, rank, world_size, local_rank, tp_size,
             "Rank %d: slot_mapping pre-warm done in %.1fs", rank, time.monotonic() - _t0
         )
 
+    # Step 5c (E34): explicit large-allgather pre-warm via raw PG.
+    #
+    # py-spy E25/E32/E33 all show the same wedge at the very first vLLM
+    # `tensor_model_parallel_all_gather` of `_gather_logits` (logits shape
+    # ~117 MiB / rank for Qwen3-8B at recipe size). With default
+    # `CCL_ZE_IPC_EXCHANGE=common_fd_mode_exchange` the wedge sits in the
+    # IPC FD socket exchange itself; with `=sockets` it shifts to
+    # `urEventWait` on the kernel completion event — same root: CCL's
+    # large-allgather code path's first invocation hangs against the live
+    # vLLM-allocated XPU buffers.
+    #
+    # Hypothesis: prime the path here, BEFORE FSDP load mutates the
+    # caching-allocator state. Use a raw `dist.all_gather_into_tensor` on
+    # the live PG_A at a buffer size that routes through `allgatherv_large`
+    # (we used the same size class as the recipe's first generate would,
+    # ~128 MiB / rank in bf16).
+    #
+    # Activated by `TORCHTUNE_VLLM_LARGE_AG_PREWARM=1`.
+    if int(os.environ.get("TORCHTUNE_VLLM_LARGE_AG_PREWARM", "0")):
+        _prewarm_t0 = time.monotonic()
+        try:
+            # Size: ~128 MiB per rank in bf16 → forces allgatherv_large.
+            # Output: tp_size * 128 MiB ≈ 1 GiB. KV cache reserves the rest;
+            # this should fit inside the gpu_memory_utilization headroom.
+            _ag_per_rank = int(os.environ.get(
+                "TORCHTUNE_VLLM_LARGE_AG_BYTES", str(128 * 1024 * 1024)
+            ))
+            _n_elem = _ag_per_rank // 2  # bf16 = 2 bytes/elem
+            _device = torch.device(f"xpu:{local_rank}")
+            _ag_in = torch.zeros(_n_elem, dtype=torch.bfloat16, device=_device)
+            _ag_out = torch.zeros(tp_size * _n_elem, dtype=torch.bfloat16, device=_device)
+            log.info(
+                "Rank %d: large-AG pre-warm: %d MiB/rank x tp=%d on PG_A — "
+                "primes allgatherv_large IPC handles before FSDP load",
+                rank, _ag_per_rank // (1024 * 1024), tp_size,
+            )
+            torch.distributed.all_gather_into_tensor(_ag_out, _ag_in)
+            torch.xpu.synchronize(_device)
+            del _ag_in, _ag_out
+            torch.xpu.empty_cache()
+            log.info(
+                "Rank %d: large-AG pre-warm complete in %.2fs",
+                rank, time.monotonic() - _prewarm_t0,
+            )
+        except Exception as _e:
+            log.warning(
+                "Rank %d: large-AG pre-warm FAILED in %.2fs: %s — continuing",
+                rank, time.monotonic() - _prewarm_t0, _e,
+            )
+
     # Step 6: Destroy TP PG — training will create its own global XCCL PG
     if torch.distributed.is_initialized():
         torch.distributed.destroy_process_group()
@@ -824,3 +874,151 @@ def _setup_dedicated_training_pgs(self, cfg) -> None:
         os.environ.get("TORCHTUNE_WSYNC_BACKEND", "gloo"),
     )
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ray-colocate (vllm_mode == "colocate_ray")
+#
+# Architecture:
+#   - 8 trainer ranks via torchrun --standalone --nproc_per_node=8 (FSDP2 ZeRO-3
+#     on the same 8 tiles as before).
+#   - vLLM TP=8 lives in 8 separate Ray actors (process-isolated; vLLM bootstraps
+#     them via distributed_executor_backend="ray"). The Ray actors share the
+#     same physical tiles as the trainer ranks but live in their own process
+#     trees, so the external_launcher CCL/L0 wedge does not apply.
+#   - Only trainer rank 0 holds the vLLM driver handle (`self._vllm_llm`). All
+#     other trainer ranks set `self._vllm_llm = None` and consume `query_responses`
+#     via a gloo broadcast (rank 0 → world).
+#   - Weight sync: every trainer rank participates in FSDP `full_tensor()`
+#     (collective). Only rank 0 ships the gathered tensor to the Ray actors via
+#     `llm_engine.collective_rpc("load_weights", ...)`.
+#
+# Memory budget notes (per tile, 64 GiB):
+#   FSDP2 sharded model (16 GiB / 8 = 2 GiB) +
+#   AdamWBf16 state (4 GiB / 8 = 0.5 GiB) +
+#   FSDP unsharded layer buffer (~0.5 GiB) +
+#   Activations + grads (G=4, fbs=2) (~4-8 GiB)
+#   ≈ 7-11 GiB trainer footprint per tile.
+#   ⇒ vLLM Ray actor's gpu_memory_utilization must leave that much headroom.
+#   At gpu_mem_util=0.55 (35 GiB for vLLM weights+KV) we have ~17 GiB cushion,
+#   which the A3b coexistence probe confirmed is sufficient (10 GiB pre-alloc
+#   under 0.55 util passed).
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _init_vllm_ray_colocate(self, cfg) -> None:
+    """Initialize vLLM via Ray actors on rank 0 only.
+
+    Trainer ranks 1..N-1 set ``self._vllm_llm = None`` and skip Ray entirely.
+    They participate only in the post-generation gloo broadcast and the FSDP
+    ``full_tensor()`` collective during weight sync.
+
+    Must be called BEFORE the training XCCL PG is initialized (matches the
+    contract of ``_init_vllm_early`` / ``_init_vllm_early_dedicated``).
+
+    Required env: an external Ray head must already be running. The launcher
+    (``run_qwen3_8b_colocate_ray.sh``) starts it via ``ray start --head`` and
+    sets ``RAY_ADDRESS`` before invoking torchrun.
+    """
+    rank = int(os.environ.get("RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+
+    # Belt-and-suspenders: every rank stubs the handle so any accidental access
+    # on a non-driver rank fails fast instead of silently hanging.
+    self._vllm_llm = None
+
+    if rank != 0:
+        log.info(
+            "Rank %d: vllm_mode=colocate_ray — non-driver rank; skipping Ray init",
+            rank,
+        )
+        return
+
+    tp_size = int(cfg.get("vllm_tensor_parallel_size", world_size))
+    model_path = cfg.base_model_path
+    gpu_mem = float(cfg.get("vllm_gpu_memory_utilization", 0.55))
+    max_model_len = int(cfg.get("vllm_max_model_len", 1024))
+    max_num_seqs = max(int(cfg.batch_size) * int(cfg.grpo_samples), 1)
+
+    ray_address = os.environ.get("RAY_ADDRESS", "auto")
+    log.info(
+        "Rank 0: vllm_mode=colocate_ray — connecting to Ray (%s), then "
+        "spawning TP=%d vLLM actors (model=%s, gpu_mem=%.2f, max_model_len=%d, max_num_seqs=%d)",
+        ray_address, tp_size, model_path, gpu_mem, max_model_len, max_num_seqs,
+    )
+
+    # Disable torch.compile during vLLM init (driver-only side effect).
+    _prev_compile_disable = os.environ.get("TORCH_COMPILE_DISABLE")
+    os.environ["TORCH_COMPILE_DISABLE"] = "1"
+
+    import ray
+    if not ray.is_initialized():
+        ray.init(address=ray_address)
+        log.info("Rank 0: ray.init(address=%s) done; resources=%s",
+                 ray_address, ray.cluster_resources())
+
+    from vllm import LLM
+    llm_kwargs = dict(
+        model=model_path,
+        tensor_parallel_size=tp_size,
+        distributed_executor_backend="ray",
+        gpu_memory_utilization=gpu_mem,
+        max_model_len=max_model_len,
+        max_num_seqs=max_num_seqs,
+        enforce_eager=True,  # XPU + Ray: PIECEWISE not validated; eager is the safe baseline
+        dtype="bfloat16",
+        trust_remote_code=True,
+        disable_log_stats=True,
+    )
+    llm_kwargs.update(_lora_engine_kwargs(cfg))
+    _t0 = time.monotonic()
+    self._vllm_llm = LLM(**llm_kwargs)
+    log.info("Rank 0: Ray-colocate LLM loaded in %.1fs", time.monotonic() - _t0)
+
+    # Restore torch.compile env so the trainer model can use it if requested.
+    if _prev_compile_disable is not None:
+        os.environ["TORCH_COMPILE_DISABLE"] = _prev_compile_disable
+    elif "TORCH_COMPILE_DISABLE" in os.environ:
+        del os.environ["TORCH_COMPILE_DISABLE"]
+
+
+def _setup_vllm_ray_colocate_mode(self, cfg) -> None:
+    """Recipe-side wiring for Ray-colocate mode.
+
+    Builds the tune→HF param map on every rank (FSDP full_tensor collectives
+    fire on all ranks during weight sync, and the name lookup is per-param so
+    even non-driver ranks need the map populated).
+
+    Creates ``self._gen_pg`` only when world_size > 1: a gloo group used to
+    broadcast vLLM-generated query_responses from rank 0 to all other trainer
+    ranks. Gloo is the safe choice — it is fully decoupled from the XCCL
+    training PG, so we don't need the dedicated_rank-style _training_fanout_pg
+    dance.
+    """
+    self._build_tune_to_hf_map()
+
+    if self.world_size > 1:
+        # Gloo broadcast PG for query_responses (rank 0 → all ranks).
+        # CPU-side; never touches the XCCL training PG.
+        import torch.distributed.distributed_c10d as _dc10d
+        _default_pg = _dc10d._get_default_group()
+        _orig_bound = _default_pg.bound_device_id
+        _default_pg.bound_device_id = None
+        try:
+            self._ray_colocate_gen_pg = torch.distributed.new_group(
+                list(range(self.world_size)), backend="gloo",
+            )
+        finally:
+            _default_pg.bound_device_id = _orig_bound
+        log.info(
+            "Rank %d: colocate_ray gen_pg (gloo, world=%d) ready",
+            self.rank, self.world_size,
+        )
+    else:
+        self._ray_colocate_gen_pg = None
+
+    if self.rank == 0:
+        log.info(
+            "Rank 0: colocate_ray driver ready (%d params mapped, vLLM TP=%d via Ray actors)",
+            len(self._tune_to_hf_map), int(cfg.get("vllm_tensor_parallel_size", self.world_size)),
+        )
+    if not self._production_mode:
+        torch.distributed.barrier()

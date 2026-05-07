@@ -138,3 +138,14 @@ def _apply_xpu_memory_patch(XPUWorker):
 
 
 builtins.__import__ = _patching_import
+
+# --- Patch 4: optional XPU TP gloo all_reduce fallback ---
+# Activated only when TORCHTUNE_VLLM_XPU_GLOO_TP=1. Used to bypass the vLLM
+# TP>1 prefill XCCL all_reduce hang at plen>32 on torch211 stack. Module
+# self-installs via builtins.__import__ hook on first vllm xpu_communicator
+# import. No-op when env unset.
+try:
+    import _xpu_gloo_allreduce_patch  # noqa: F401  -- top-level on PYTHONPATH
+except Exception as _e:
+    print(f"[usercustomize] xpu gloo patch import failed: {_e}", flush=True)
+
