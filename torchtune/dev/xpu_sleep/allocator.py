@@ -98,7 +98,11 @@ class XPUMemAllocator:
             len(kv_caches), total_bytes / 2**30,
         )
 
-    def sleep(self, offload_tags: tuple[str, ...] | None = None) -> None:
+    def sleep(
+        self,
+        offload_tags: tuple[str, ...] | None = None,
+        only_tags: tuple[str, ...] | None = None,
+    ) -> None:
         """Release GPU memory by backing up tensors to CPU.
 
         Args:
@@ -106,15 +110,20 @@ class XPUMemAllocator:
                 releasing GPU storage. If None or empty, GPU storage is released
                 without CPU backup (level 2 behavior — weights are discarded
                 and must be reloaded from disk on wake_up).
+            only_tags: If set, only sleep these tags (others stay on GPU).
+                If None, all tags are slept.
         """
         if self._is_sleeping:
             logger.warning("XPUMemAllocator is already sleeping.")
             return
 
         offload_tags = offload_tags or ()
+        tags_to_sleep = set(only_tags) if only_tags else set(self._pools.keys())
         freed_bytes = 0
 
         for tag, records in self._pools.items():
+            if tag not in tags_to_sleep:
+                continue
             for rec in records:
                 if rec.tensor.untyped_storage().size() == 0:
                     continue  # Already released
@@ -137,7 +146,8 @@ class XPUMemAllocator:
         gc.collect()
         # NOTE: Do NOT call torch.xpu.empty_cache() — leaks UR handles with FSDP
         self._is_sleeping = True
-        logger.info("XPU sleep freed %.2f GiB GPU memory", freed_bytes / 2**30)
+        logger.info("XPU sleep freed %.2f GiB GPU memory (tags=%s)",
+                     freed_bytes / 2**30, tags_to_sleep)
 
     def wake_up(self, tags: list[str] | None = None) -> None:
         """Restore GPU tensors from CPU backups.

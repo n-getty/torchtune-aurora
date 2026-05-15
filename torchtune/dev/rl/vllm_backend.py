@@ -338,28 +338,49 @@ def _init_vllm_tp1(self, cfg, rank, world_size, local_rank,
     )
     if vllm_mode == "colocate_sleep":
         llm_kwargs["enable_sleep_mode"] = True
+        # Force uniform KV cache sizing across all ranks. Without this,
+        # the L0 mem_get_info bug (returns tile 0 stats for all tiles) creates
+        # bimodal KV cache sizes (e.g. 19 vs 25 GiB at util=0.40). Ranks with
+        # oversized KV get their caching allocator trimmed during FSDP training,
+        # leaking UR handles and corrupting L0 state → banned:1 PDE at step 1.
+        # Fixed block count = uniform reserved memory = no trimming = no crash.
+        _block_override = cfg.get("vllm_num_gpu_blocks_override", None)
+        if _block_override is None:
+            _batch = cfg.get("batch_size", 4)
+            _grpo_g = cfg.get("grpo_samples", 4)
+            _block_size = 16  # vLLM default
+            _blocks_per_seq = (max_model_len + _block_size - 1) // _block_size
+            _kv_mult = cfg.get("vllm_kv_cache_multiplier", 1.1)
+            _block_override = int(_batch * _grpo_g * _blocks_per_seq * _kv_mult)
+        llm_kwargs["num_gpu_blocks_override"] = _block_override
+        log.info("colocate_sleep: num_gpu_blocks_override=%d", _block_override)
     if cfg.get("vllm_enable_prompt_embeds", False):
         llm_kwargs["enable_prompt_embeds"] = True
     llm_kwargs.update(_lora_engine_kwargs(cfg))
 
     self._vllm_llm = LLM(**llm_kwargs)
 
-    # colocate_sleep: sleep immediately after init if not the last rank.
-    # torch.xpu.mem_get_info always returns tile 0's memory stats regardless
-    # of which device is queried (L0 bug). Sequential init means rank 0's vLLM
-    # weights + KV appear in tile 0's mem_get_info when rank 1 profiles, making
-    # rank 1's memory budget check report 0 KV blocks. Sleeping rank 0's vLLM
-    # moves tensors to CPU; empty_cache() then releases PyTorch's reserved GPU
-    # pool back to the L0 driver so mem_get_info shows ~64 GiB free on tile 0.
+    # colocate_sleep: sleep ALL ranks immediately after init.
+    # Reason 1 (ranks 0..N-2): torch.xpu.mem_get_info always returns tile 0's
+    # memory stats regardless of which device is queried (L0 bug). Sleeping
+    # each rank's vLLM before the next rank inits ensures mem_get_info reports
+    # ~64 GiB free so the KV cache profiler allocates the correct block count.
+    # Reason 2 (ALL ranks including last): generate_trajectory() enters a
+    # torch.distributed.barrier() when _vllm_is_sleeping is True. If the last
+    # rank skips the sleep, it bypasses the barrier → collective mismatch
+    # deadlock (ranks 0..N-2 block at barrier, last rank blocks at FSDP
+    # all-gather in ref forward).
     # Safe to call here: FSDP is not yet initialized (no IPC handles open), so
     # the XPU empty_cache UR-handle-leak bug (FSDP+empty_cache) does not apply.
-    if vllm_mode == "colocate_sleep" and rank < world_size - 1:
+    if vllm_mode == "colocate_sleep":
         log.info(
-            "Rank %d: sleeping vLLM immediately after init (next rank needs clean mem_get_info)",
-            rank,
+            "Rank %d: sleeping vLLM immediately after init", rank,
         )
         self._vllm_llm.sleep(level=1)
         self._vllm_is_sleeping = True
+        self._vllm_kv_only_sleep = cfg.get("vllm_kv_only_sleep", False)
+        if self._vllm_kv_only_sleep:
+            log.info("Rank %d: KV-only sleep enabled — weights stay on GPU during training", rank)
         if self._device.type == "xpu":
             torch.xpu.synchronize()
             torch.xpu.empty_cache()

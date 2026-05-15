@@ -2652,18 +2652,19 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         if not _colocate_vllm_mode:
             device_empty_cache(self._device)
         elif self._vllm_mode == "colocate_sleep" and self._vllm_llm is not None and hasattr(self, '_vllm_is_sleeping') and self._vllm_is_sleeping:
-            # Sleep mode: wake weights → sync updated FSDP weights → wake KV cache
             import gc
             gc.collect()
-            torch.xpu.synchronize()
+            if self._device.type == "xpu":
+                torch.xpu.synchronize()
+                _a = torch.xpu.memory_allocated(self._device) / 2**30
+                _r = torch.xpu.memory_reserved(self._device) / 2**30
+                log.info("Rank %d: pre-wake alloc=%.2f GiB resv=%.2f GiB free_cached=%.2f GiB",
+                         self.rank, _a, _r, _r - _a)
             torch.distributed.barrier()
             log.info("Rank %d: waking up vLLM for generation", self.rank)
             t_wake = time.perf_counter()
-            # 1. Restore vLLM weight storage (from CPU backup — old weights)
             self._vllm_llm.wake_up(tags=["weights"])
-            # 2. Overwrite with updated FSDP weights
             self._sync_colocated_weights()
-            # 3. Reallocate KV cache
             self._vllm_llm.wake_up(tags=["kv_cache"])
             self._vllm_is_sleeping = False
             log.info("Rank %d: vLLM wake_up + weight sync completed in %.2fs", self.rank, time.perf_counter() - t_wake)
@@ -2803,14 +2804,46 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         if self._vllm_mode not in ("server", "dedicated_rank") and not self._production_mode:
             torch.distributed.barrier()
 
+        # ── W17 PROBE: sequential co-tenancy ────────────────────────────────
+        # If TORCHTUNE_RAY_COLOCATE_KILL_AFTER_GEN=1, rank 0 tears down the
+        # vLLM driver and shuts down Ray BEFORE any rank starts BWD. All ranks
+        # then sleep briefly to let L0 driver clients fully release their
+        # per-tile state. If BWD proceeds cleanly afterward → wedge is from
+        # LIVE co-tenancy and a "destroy-before-bwd" workaround is viable.
+        # If BWD still wedges → L0 state corruption is sticky; teardown does
+        # not undo it.
+        if (
+            self._vllm_mode == "colocate_ray"
+            and os.environ.get("TORCHTUNE_RAY_COLOCATE_KILL_AFTER_GEN", "0") == "1"
+        ):
+            if self._is_rank_zero and self._vllm_llm is not None:
+                _t_kill = time.perf_counter()
+                log.info("Rank 0: [W17] killing vLLM driver + Ray actors before BWD")
+                try:
+                    del self._vllm_llm
+                except Exception as _e:
+                    log.warning("Rank 0: [W17] del _vllm_llm raised %s", _e)
+                self._vllm_llm = None
+                try:
+                    import ray as _ray
+                    if _ray.is_initialized():
+                        _ray.shutdown()
+                        log.info("Rank 0: [W17] ray.shutdown() done")
+                except Exception as _e:
+                    log.warning("Rank 0: [W17] ray.shutdown() raised %s", _e)
+                log.info("Rank 0: [W17] teardown took %.2fs", time.perf_counter() - _t_kill)
+            # Drain interval — let i915 + L0 reclaim per-client state on every tile.
+            time.sleep(float(os.environ.get("TORCHTUNE_RAY_COLOCATE_DRAIN_S", "5")))
+            if not self._production_mode:
+                torch.distributed.barrier()
+            log.info("Rank %d: [W17] post-teardown barrier passed; entering BWD", self.rank)
+
         # Free vLLM GPU memory to reclaim space for training forward/backward passes.
         if _colocate_vllm_mode and self._vllm_llm is not None:
             if torch.xpu.is_available():
                 mem_before = torch.xpu.memory_allocated(self._device) / 1024**3
 
             if self._vllm_mode == "colocate_sleep":
-                # Sleep mode: offload weights to CPU and release all GPU storage
-                # (weights + KV cache). This frees maximum memory for training.
                 log.info("Rank %d: sleeping vLLM (weights + KV cache) for training", self.rank)
                 t_free = time.perf_counter()
                 self._vllm_llm.sleep(level=1)
@@ -4105,6 +4138,48 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                     _wsync_gather_time = time.perf_counter() - _wsync_gather_t0
                 elif self._vllm_mode == "colocate_ray":
                     _wsync_gather_t0 = time.perf_counter()
+                    # ── W18: respawn vLLM if W17 killed it after gen ────
+                    # When TORCHTUNE_RAY_COLOCATE_KILL_AFTER_GEN=1, the gen
+                    # block tore down the LLM driver + ray.shutdown() to
+                    # avoid the live-co-tenancy BWD wedge. Before we can
+                    # ship fresh trainer weights to vLLM, re-attach: rank 0
+                    # restarts ray.init() + LLM(...). Other ranks barrier.
+                    # The respawn cost (~30-60s on warm cache) is the price
+                    # of fully-colocated TP=8 under this driver.
+                    if (
+                        os.environ.get(
+                            "TORCHTUNE_RAY_COLOCATE_KILL_AFTER_GEN", "0"
+                        ) == "1"
+                        and self._vllm_llm is None
+                    ):
+                        _t_respawn = time.perf_counter()
+                        # ── W19 fix ─────────────────────────────────────────
+                        # W18 deadlocked here: the trainer xccl barrier on
+                        # ranks 1-7 was a LIVE L0 collective on the same 8
+                        # tiles where vLLM's TP=8 init was posting its own
+                        # all_reduce. Symmetric live co-tenancy = same wedge
+                        # we proved in W17, just rotated. Fix: ranks 1-7 must
+                        # hold NO live XPU work while vLLM initializes. Use
+                        # the gloo gen_pg (CPU-only, fully decoupled from
+                        # XCCL) for the wait. Rank 0 finishes LLM(...) →
+                        # gloo barrier → all 8 ranks meet on CPU and only
+                        # then proceed to the wsync collective.
+                        if self._is_rank_zero:
+                            log.info(
+                                "Rank 0: [W19] respawning vLLM Ray actors "
+                                "(post-BWD, pre-wsync); peers wait on gloo"
+                            )
+                            self._init_vllm_ray_colocate(self._cfg)
+                            log.info(
+                                "Rank 0: [W19] respawn took %.1fs",
+                                time.perf_counter() - _t_respawn,
+                            )
+                        if getattr(self, "_ray_colocate_gen_pg", None) is not None:
+                            torch.distributed.barrier(
+                                group=self._ray_colocate_gen_pg
+                            )
+                        elif not self._production_mode:
+                            torch.distributed.barrier()
                     self._sync_ray_colocate_weights()
                     _wsync_gather_time = time.perf_counter() - _wsync_gather_t0
                 elif self._vllm_mode == "dedicated_rank" and not self._is_vllm_rank:

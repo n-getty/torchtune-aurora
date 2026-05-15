@@ -55,6 +55,8 @@ worker node (greedy placement). The 16-rank AllReduce crosses Slingshot HSN.
 | `pbs_bench_1node_32b.sh` | PBS job: Qwen3-32B TP=8 1-node throughput |
 | `pbs_bench_2node_32b.sh` | PBS job: Qwen3-32B TP=16 2-node throughput |
 | `pbs_bench_2node_480b.sh` | PBS job: Qwen3-Coder-480B TP=16 PP=1 2-node throughput (see 480B section) |
+| `pbs_serve_bench_2node_480b_tp8pp3.sh` | PBS job: 480B TP=8 PP=3 serve bench — FAILS (sharded_state PP>1 incompatible) |
+| `pbs_serve_bench_3node_480b_tp32.sh` | PBS job: 480B TP=32 PP=1 3-node serve bench — validated 106.19 tok/s |
 
 `BENCH_*` variables: `BENCH_MODEL`, `BENCH_TP`, `BENCH_PP`, `BENCH_NUM_PROMPTS`,
 `BENCH_INPUT_LEN`, `BENCH_OUTPUT_LEN`, `BENCH_GPU_MEM_UTIL`, `BENCH_MAX_MODEL_LEN`,
@@ -96,7 +98,7 @@ inside the job without manual discovery.
 
 ### Throughput benchmarks (`experiments/ray_bench/`)
 
-Qwen3-32B (`enforce_eager=True`, `gpu_memory_utilization=0.85`, 64 prompts, 256 in / 128 out tokens):
+**Qwen3-32B** (`enforce_eager=True`, `gpu_memory_utilization=0.85`, 64 prompts, 256 in / 128 out tokens):
 
 | Config | TP | PP | Nodes | Tiles | Input tok/s | Output tok/s | Total tok/s |
 |--------|----|----|-------|-------|------------|-------------|------------|
@@ -106,6 +108,20 @@ Qwen3-32B (`enforce_eager=True`, `gpu_memory_utilization=0.85`, 64 prompts, 256 
 **TP=16 is 3.5× slower than TP=8** for Qwen3-32B. Cross-node AllReduce on Slingshot
 dominates when the model fits on a single node. Use TP=8 (1-node) for Qwen3-32B throughput.
 Use TP=16 only when TP=8 is unavailable or for latency-critical deployments with memory pressure.
+
+**Qwen3-Coder-480B-A35B** (`enforce_eager=True`, `load_format=sharded_state`, `vllm bench serve`,
+input=1024, output=512, rate=inf, 2026-05-15):
+
+| Config | Nodes | Tiles | max_num_seqs | Output tok/s | Peak tok/s | Server load | TTFT mean | TPOT |
+|--------|-------|-------|-------------|-------------|-----------|-------------|-----------|------|
+| TP=16 PP=1 (baseline) | 2 | 16 | 24 | 78.55 | 120.00 | 870s | — | — |
+| **TP=32 PP=1** | **3** | **32** | **64** | **106.19 (+35%)** | **192.00** | **320s** | 226s | 515ms/tok |
+| TP=8 PP=3 | 2 | 24 | — | FAIL | — | — | — | — |
+
+TP=32 advantages: 2× decode tiles → higher parallel decode throughput; ~34 GiB free HBM/rank
+(vs ~4 GiB at TP=16) → 2.7× more concurrent sequences; 2.7× faster model load.
+TTFT=226s at rate=inf is prefill-bound (128 concurrent 1024-token prompts). TPOT=515ms/token
+is the relevant number for interactive workloads. **TP=32 PP=1 is the production config.**
 
 ### Large model loading — Qwen3-Coder-480B-A35B (2-node, 2026-05-07)
 
@@ -132,10 +148,24 @@ node. Populates Linux page cache (1.1 TiB DRAM/node). Total I/O per node: ~448 G
   **compute-bound** (tensor deserialization + XPU DMA transfer), so prewarm helps I/O
   latency, not total loading time.
 
-#### Attempt 1 — TP=8 PP=3 (FAIL: XPU PP KV-cache init bug)
+#### Attempt 1 — TP=8 PP=3 (FAIL: two independent blockers)
 
-24 workers, weights load successfully (647s worker, 1001s head, warm cache). KV cache
-initialization crashes on all 24 workers after weight loading:
+This config hits two distinct bugs, each independently fatal. See
+`docs/bugs/vllm_xpu_pp_kvcache_init.md` for full root cause and fix details.
+
+**Failure B — sharded_state loader (2026-05-15):** When using `load_format=sharded_state`
+with PP>1, all PP stage k≠0 workers crash during weight loading:
+```
+KeyError: 'model.layers.0.input_layernorm.weight'
+  File "vllm/model_executor/model_loader/sharded_state_loader.py", line 141
+```
+Root cause: the sharded_state converter stores all N layers with absolute indices in each
+rank file (PP=1 design). Stage 1/2 workers' `model.state_dict()` only contains their
+local-stage layers — the first key read from the file (`model.layers.0.*`) is absent.
+Not fixable without converter changes to produce per-stage rank files.
+
+**Failure A — KV cache init (2026-05-07, HF format):** Even with HF format (avoiding the
+loader issue), 24 workers crash post-load during KV cache initialization:
 ```
 KeyError: 'model.layers.0.self_attn.attn'
 KeyError: 'model.layers.21.self_attn.attn'
@@ -143,9 +173,7 @@ KeyError: 'model.layers.42.self_attn.attn'
 ```
 XPU `gpu_model_runner.py` has diverged from the CUDA path; workers receive
 `kv_cache_group_spec.layer_names` containing layers from other PP stages, then
-`get_layers_from_vllm_config` does an unsafe `forward_context[layer_name]` lookup
-→ `KeyError`. See `docs/bugs/vllm_xpu_pp_kvcache_init.md` for full root cause and
-monkey-patch fix.
+`get_layers_from_vllm_config` does an unsafe `forward_context[layer_name]` lookup → `KeyError`.
 
 #### Attempt 2 — TP=24 PP=1 (FAIL: vocab size constraint)
 
@@ -166,37 +194,232 @@ weights; ~6.8 GB/tile KV headroom.
 Weight loading started but PBS walltime (1 hour) was exceeded. Loaded 96/241 shards (40%)
 in ~54 min of loading time. **Extrapolated total: ~135 min (2h15m)** for full 241 shards.
 
-Loading rate is not constant — it degrades as HBM fills:
+Per-shard wall time, computed from rank-0's tqdm timestamps (not its EWMA `s/it` rate):
 
-| Shards loaded | Approx. seconds/shard |
-|---------------|----------------------|
-| 1–30          | 10–30s (avg ~20s) |
-| 30–60         | 25–35s (avg ~30s) |
-| 60–96         | 38–52s (avg ~45s) |
+| Shards    | Wall time            | Pattern |
+|-----------|---------------------|---------|
+| 1–12      | 39 s total           | warm-up burst |
+| 13+       | bimodal: ~5 s OR 30–50 s | most shards stall |
 
-Root cause: 16 tiles on 2 nodes all compete for the same host-PCIe bandwidth simultaneously
-as HBM fills. Per-shard time grows approximately linearly with the fraction of HBM filled.
-A full load would take ~2.5 hours regardless of Lustre prewarm.
+Average of ~40 s/shard from shard 13 onward, **constant** — not growing with HBM fill.
+The earlier "20 s → 45 s" reading was the tqdm exponential-moving-average rate
+catching up to the stall regime after the initial warm-up burst, not per-shard
+wall time growing linearly with HBM occupancy.
+
+#### Root cause: reading from Lustre (not staging to /tmp tmpfs)
+
+A diagnostic experiment (`experiments/load_diag/`) verified each candidate.
+The 480B benchmark reads directly from `/flare/datasets/...` (Lustre);
+production training launchers (`recipes/dev/run_qwen3_30b_vllm_server.sh:65`)
+copy the model to `/tmp/torchtune/...` (Aurora compute `/tmp` is **tmpfs**,
+504 GiB RAM-backed, NUMA-interleaved) before starting vLLM. The difference
+is dramatic.
+
+**Direct-Lustre vs `/tmp` tmpfs vs Copper (multiple models, vLLM TP=8 single-node):**
+
+| Model | Source | `Loading weights took` | Speedup | Notes |
+|-------|--------|-----------------------:|--------:|-------|
+| Qwen3-30B-A3B (60 GB) | Lustre, cold | **785.83 s** (Exp 4) | 1× | |
+| Qwen3-30B-A3B | `/tmp` tmpfs | **13.13 s** (Exp 5) | 60× | page cache warm from Exp 4 |
+| Qwen3-30B-A3B | production baseline (fresh node, TP=2) | **9.13 s** | — | |
+| Llama-3.3-70B (132 GB) | Lustre, cold | **221.66 s** (Exp 6) | 1× | |
+| Llama-3.3-70B | `/tmp` tmpfs (after `cp -rL`, 85 s stage) | **32.68 s** (Exp 6) | **6.8×** | |
+| Llama-3.3-70B | Copper FUSE, page cache warm | **17.33 s** (Exp 6) | **12.8×** | **artifact** — see below |
+| Llama-3.3-70B | Copper FUSE, cold node | **212.73 s** (Exp 9b) | **1.0×** | fresh node; matches Lustre |
+| Llama-3.3-70B | Copper FUSE, same-node 2nd load | **13.14 s** (Exp 10) | **16.9×** | page cache warm from 1st load |
+| Llama-3.3-70B | Copper FUSE, cross-node 2nd load | **385.22 s** (Exp 11) | **0.6×** | **1.74× slower** than Lustre direct |
+| Llama-3.3-70B | sharded_state from /tmp tmpfs (Exp 13) | **13.23 s** | **16.7×** | each rank reads only its 16 GB slice |
+| Qwen3-30B-A3B (MoE, 60 GB) | sharded_state from /tmp tmpfs (Exp 17) | **5.52 s** | **142×** | CPU converter; gate key + XPU scale buffer fixes required |
+
+#### Copper FUSE — evaluated and rejected for cross-node loading
+
+Exp 6's 17.33 s Copper result was a **warm-cache artifact**: the script ran
+Lustre-direct first (221 s, warming the Linux page cache), then tmpfs (32 s),
+then Copper (17 s) on the same node. Copper read from already-warm page cache.
+
+Exp 9b confirmed this: on a fresh node with cold page cache, Copper loaded
+70B in **212.73 s** — identical to Lustre direct.
+
+Exp 10 (same-node cold→hot): cold load = **69.46 s** (partially warm cache),
+hot load = **13.14 s** (both Copper cache and Linux page cache warm). The
+hot-load speedup is indistinguishable from Linux page cache warming.
+
+Exp 11 (cross-node cache test — the critical measurement for 405B): after
+loading on HEAD node (populating Copper cache), loading on WORKER node
+(cold page cache) took **385.22 s** total — **1.74× slower than Lustre
+direct** (221 s). Per-shard timing showed 8–10 s for early shards
+then a **148 s stall on a single shard** at 73%, consistent with the
+bimodal Lustre I/O stall pattern amplified by FUSE + Thallium RPC overhead.
+
+**Copper is NOT viable for cross-node model loading on Aurora.** The
+cooperative cache does not serve cross-node reads at useful bandwidth.
+The only scenario where Copper helps is same-node re-loads, which Linux
+page cache already provides for free.
+
+**One viable approach: `/tmp` tmpfs staging.**
+
+- **`/tmp` tmpfs staging** — what production already does. Reliable. 6–60× speedup.
+  Limited to models that fit in 504 GiB tmpfs per node. Use `cp -rL` (not `cp -r`)
+  to dereference HF blob symlinks; otherwise the copy creates broken symlinks
+  and vLLM falls back to Lustre or fails.
+
+**What's NOT the cause** (each pre-tested before Exp 5 found the real issue):
+
+| Hypothesis                              | Verdict      | Evidence |
+|-----------------------------------------|--------------|----------|
+| Shard non-uniformity                    | ❌ ruled out | All 241 shards = 3.99 GB ± noise |
+| Lustre I/O bandwidth                    | ❌ ruled out | Exp 1: 16 procs × 60 shards, per-shard time stable ~1.5 s |
+| L0/USM allocator fragmentation          | ❌ ruled out | Exp 2: 256 MiB alloc probe constant 0.2 ms across HBM 4.5 → 48 GB |
+| H2D / PCIe degradation as HBM fills     | ❌ ruled out | Exp 2: per-shard H2D **decreased** 8.15 → 2.08 s as HBM filled |
+
+The original "PCIe contention as HBM fills" reading was wrong: hardware H2D
+sustains ~2 GB/s/tile, allocator latency stays at 0.2 ms, and Lustre I/O
+itself measures fine when read independently. The misdiagnosis came from
+trusting tqdm's EWMA `s/it` rate as if it were per-shard wall time.
+
+#### Why tmpfs is faster than Lustre page cache
+
+This is the part that's not yet fully explained. Both end up in DRAM
+(Lustre's reads land in the Linux page cache; tmpfs IS DRAM), so naively
+they should perform equivalently. They don't. The 60× gap remains even
+after `BENCH_PREWARM=1` populates the page cache. Working hypotheses
+(verifiable with `numastat`, `perf stat -e dTLB-load-misses`):
+
+- **NUMA placement**: tmpfs is mounted with `mpol=interleave:0-1`, so pages
+  spread evenly across the two sockets. Lustre page cache lands on whichever
+  socket the reading thread ran on, then DMAs cross-socket.
+- **mmap fault overhead**: Lustre-backed mmap pages may take more expensive
+  faults (extent-list lookups, OST coordination) than anonymous tmpfs pages,
+  even after the cache hit.
+- **Hugepages**: tmpfs supports transparent hugepages straightforwardly;
+  Lustre-backed mmap may not. Per-page TLB pressure on 940 GB matters.
 
 #### Summary table
 
-| Config | Failure | Stage |
-|--------|---------|-------|
-| TP=8 PP=3 | XPU PP KV-cache `KeyError` | KV cache init (post-load) |
-| TP=24 PP=1 | `151936 % 24 ≠ 0` | Model init (pre-load) |
-| TP=16 PP=1 | Walltime at 40% loaded | Weight loading (~2h15m) |
+| Config | Nodes | Outcome | Stage | Output tok/s |
+|--------|-------|---------|-------|-------------|
+| TP=8 PP=3 | 2 | FAIL (Failure A + B) | Weight load / KV cache init | — |
+| TP=24 PP=1 | 2 | FAIL (`151936 % 24 ≠ 0`) | Model init (pre-load) | — |
+| TP=16 PP=1 | 2 | PASS (baseline) | — | 78.55 |
+| **TP=32 PP=1** | **3** | **PASS (recommended)** | — | **106.19 (+35%)** |
 
-#### Path forward
+#### Path forward — for 480B specifically
 
-**480B cannot be benchmarked in the 1-hour debug queue.** Options:
-1. **Production queue** — allocate 3+ hours; TP=16 PP=1 with `gpu_memory_utilization=0.98`
-   and `max_model_len=1024` is the configuration to use. `pbs_bench_2node_480b.sh` is
-   already configured for this.
-2. **Wait for XPU PP fix** — if vLLM upstream fixes `gpu_model_runner.py`'s PP handling,
-   TP=8 PP=3 becomes viable (24 tiles, faster per-tile load since each tile loads only 1/3
-   of layers). See `docs/bugs/vllm_xpu_pp_kvcache_init.md` for the fix location.
-3. **Quantized checkpoint** — INT8/AWQ halves to ~448 GB; TP=8 PP=1 would need 56 GB/tile,
-   fitting on one node with no cross-node overhead.
+**RESOLVED (2026-05-15)**: TP=32 PP=1 with sharded_state format is the validated
+production config (106.19 output tok/s, +35% vs TP=16 baseline). See throughput
+benchmark results below.
+
+Production training launchers stage to `/tmp` (tmpfs) and load in seconds.
+The 480B benchmark cannot do the same trivially because **480B = 940 GB > 504 GiB
+tmpfs per node**. Options (historical context for how we got here):
+
+The two approaches combine naturally: use `save_sharded_state` once (options 1/4),
+then distributed tmpfs staging on every subsequent run (option 2).
+
+**1. One-time save: CPU-side offline converter (exp16) — preferred**
+
+`experiments/load_diag/convert_hf_to_sharded.py` reads the HF safetensors
+directly, applies FusedMoE packing + TP sharding in CPU RAM, and writes
+per-rank `model-rank-{rank}-part-0.safetensors` files. No GPU, no vLLM
+engine start, no FusedMoE Python overhead.
+
+```bash
+# Hold a compute node (needs 1134 GiB DRAM for page cache)
+qsub experiments/load_diag/hold_1node.sh
+
+# Convert: 4 parallel processes, each handling 4 ranks sequentially
+bash experiments/load_diag/exp16_convert_480b.sh <JOBID>
+# Runtime: ~12-15 min (10 min cold Lustre read, then page-cached passes)
+# Output: 16 × ~59 GB rank files on Lustre
+```
+
+Why this beats the vLLM-based save (exp15):
+
+| Method | One-time cost | Root cause |
+|--------|--------------|------------|
+| exp15 vLLM engine | ~3-4h | FusedMoE.weight_loader: 42s/shard Python overhead (21× vs 2s hardware ceiling) |
+| exp16 CPU converter | ~12-15 min | Direct slice + pack in numpy, no vLLM overhead |
+
+Shape transformations applied by the converter:
+- `experts.{j}.gate/up_proj.weight [I, H]` → `w13_weight [E, 2*I_p, H]` (column-parallel)
+- `experts.{j}.down_proj.weight [H, I]` → `w2_weight [E, H, I_p]` (row-parallel)
+- `q/k/v_proj.weight` → `qkv_proj.weight [Q_p+KV_p+KV_p, H]` (stacked, column-parallel)
+- `o_proj.weight [H, Q]` → `o_proj.weight [H, Q_p]` (row-parallel)
+- norms, routers, q/k_norm → replicated (copied to each rank)
+- `embed_tokens / lm_head` → vocab-parallel (`[vocab//tp, H]` per rank)
+
+**2. Distributed tmpfs staging + fast reload (every subsequent run)**
+
+With per-rank files on Lustre, each 2-node run stages only what it needs:
+
+```bash
+# Node 0 stages ranks 0-7  (~470 GB → local /tmp)
+# Node 1 stages ranks 8-15 (~470 GB → local /tmp)
+# Both nodes stage metadata (config.json, tokenizer, etc.)
+```
+
+Then load with `load_format=sharded_state`, TP=16, Ray executor:
+```python
+LLM(model="/tmp/.../sharded_480b_tp16/",
+    load_format="sharded_state",
+    tensor_parallel_size=16,
+    distributed_executor_backend="ray")
+```
+
+Each rank's `glob.glob` runs on **local tmpfs** (fast, no Lustre hang risk).
+All 16 ranks load their ~59 GB slices in parallel from local HBM-adjacent DRAM.
+Expected load time: **~15–20 s** (vs ~2.5 h Lustre cold, ~32 s tmpfs staged TP=8
+at 70B scale). Staging cost: ~200 s parallel cp on both nodes (each copies 470 GB
+at ~2 GB/s Lustre read bandwidth).
+
+**Validation status:**
+- **70B TP=8 single-node**: **VALIDATED** (Exp 12+13, 2026-05-13)
+  - Save: 73s load (tmpfs) + **31.7s write** (8 × 16 GB to Lustre)
+  - Reload: **13.23s** `Loading weights took` (vs 221s Lustre cold — **16.7× speedup**)
+  - Staging cost (Lustre → /tmp): 97s (one-time per hold, not per vLLM restart)
+- **30B-A3B MoE TP=8 single-node (CPU converter)**: **VALIDATED** (Exp 17, 2026-05-13)
+  - Convert: ~12 min CPU-only on compute node (`exp16_convert_480b.sh` pattern)
+  - Reload: **5.52s** `Loading weights took` (vs 785s Lustre cold — **142× speedup**)
+  - Staging cost (Lustre → /tmp): 41s
+  - MoE-specific fixes in converter: (1) gate key `mlp.gate.weight` →
+    `mlp.experts._gate.weight` (`_filter_subtensors` lexicographic tie-breaking);
+    (2) 4 XPU attention scale buffers `self_attn.attn._k/_v/_q/_prob_scale`
+    (float32 1.0, registered by vLLM `Attention` module, absent from HF checkpoints)
+- **480B TP=16 2-node (sharded_state, Lustre)**: **VALIDATED** (2026-05-15)
+  - Load via Ray, `load_format=sharded_state`, TP=16, `max_num_seqs=24`
+  - Output tok/s: **78.55** (baseline), server load: 870s
+- **480B TP=32 3-node (sharded_state, Lustre)**: **VALIDATED** (2026-05-15)
+  - Load via Ray, `load_format=sharded_state`, TP=32, `max_num_seqs=64`
+  - Output tok/s: **106.19 (+35%)**, server load: 320s; peak output tok/s: 192
+  - TTFT=226s mean at rate=inf (prefill-bound, 128 concurrent 1024-token prompts)
+  - TPOT=515ms/token; bench logs: `ray_bench/logs/20260515_133332_2node_serve/`
+
+**Scripts:**
+
+| Script | Purpose |
+|--------|---------|
+| `experiments/load_diag/convert_hf_to_sharded.py` | CPU converter: HF → vLLM sharded_state |
+| `experiments/load_diag/exp16_convert_480b.sh` | Driver: parallel converter on held node |
+| `experiments/load_diag/exp12_save_sharded.py` | Alt: load model via vLLM, save sharded state |
+| `experiments/load_diag/exp13_load_sharded.py` | Load from sharded state |
+| `experiments/load_diag/exp12_13_run.sh` | 70B save+load validation (1 node, 1h) |
+| `experiments/load_diag/exp14_distributed_stage_load.sh` | 2-node distributed staging + load |
+
+3. **Quantized checkpoint** — INT8/AWQ halves to ~448 GB; fits in one node's
+   tmpfs after staging, TP=8 PP=1 single-node eliminates cross-node entirely.
+
+4. **Wait for XPU PP fix** — TP=8 PP=3 (24 tiles) is blocked by two independent
+   bugs (sharded_state loader format incompatibility + XPU `gpu_model_runner.py`
+   KV cache init divergence). Even if both are fixed, PP>1 with sharded_state requires
+   the converter to produce per-stage rank files. See `docs/bugs/vllm_xpu_pp_kvcache_init.md`.
+   **TP=32 PP=1 (+35% throughput) is the preferred path.**
+
+**Note:** `BENCH_PREWARM=1` warms the Lustre page cache but did NOT bring
+load time anywhere close to staging — production with `/tmp` staging hits
+~9 s on Qwen3-30B; cold Lustre with the same vLLM stack took 786 s on the
+same model. The page cache and tmpfs are both DRAM-resident; the gap
+between them (mmap fault cost, NUMA placement, TLB, hugepage support) is
+the next thing to investigate, but the practical fix is "stage to `/tmp`".
 
 ---
 

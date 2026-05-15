@@ -37,22 +37,32 @@ def patch_vllm_for_xpu_sleep() -> None:
     from vllm.v1.worker.xpu_worker import XPUWorker
 
     def xpu_sleep(self, level: int = 1) -> None:
-        """XPU sleep: back up tensors to CPU and release GPU storage."""
+        """XPU sleep: back up tensors to CPU and release GPU storage.
+
+        Levels:
+            1 — offload weights to CPU, discard KV cache (standard)
+            2 — discard both weights and KV cache
+            10 — KV-only sleep: discard KV cache, weights stay on GPU
+        """
         allocator = XPUMemAllocator.get_instance()
 
         free_before = torch.xpu.mem_get_info()[0]
 
-        # For level 2, save named_buffers separately (same as CUDA worker)
-        if level == 2:
-            model = self.model_runner.model
-            self._sleep_saved_buffers = {
-                name: buf.cpu().clone()
-                for name, buf in model.named_buffers()
-            }
+        if level == 10:
+            # KV-only: weights stay on GPU, only release KV cache
+            allocator.sleep(offload_tags=(), only_tags=("kv_cache",))
+        else:
+            # For level 2, save named_buffers separately (same as CUDA worker)
+            if level == 2:
+                model = self.model_runner.model
+                self._sleep_saved_buffers = {
+                    name: buf.cpu().clone()
+                    for name, buf in model.named_buffers()
+                }
 
-        # Offload weights at level 1, nothing at level 2 (discard and reload)
-        offload = ("weights",) if level == 1 else ()
-        allocator.sleep(offload_tags=offload)
+            # Offload weights at level 1, nothing at level 2 (discard and reload)
+            offload = ("weights",) if level == 1 else ()
+            allocator.sleep(offload_tags=offload)
 
         free_after = torch.xpu.mem_get_info()[0]
         freed = free_after - free_before
