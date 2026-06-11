@@ -772,6 +772,16 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             self._always_compute_rollout_logprobs
             or self._async_generation_enabled
         )
+
+        # Advantage normalization: batch-level pools mean/std over the full B*G
+        # batch instead of per-prompt-group. Per-group normalization silently
+        # zeros the policy gradient whenever a prompt's G rollouts all earn the
+        # same reward (the common early-training case), leaving only the KL term
+        # — the same failure mode documented for BioReason in
+        # docs/reports/bioreason_4b_200step_stability_20260501.md. Default on;
+        # opt out with `batch_level_advantages: false` to reproduce legacy runs.
+        self._batch_level_advantages = cfg.get("batch_level_advantages", True)
+
         self._vllm_clients = []  # initialized in setup() if vllm_mode == "server"
         self._vllm_client = None  # backward compat: first client
         # _vllm_llm may already be set by _init_vllm_early() for colocate mode
@@ -1195,6 +1205,36 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         from torchtune.models.convert_weights import get_mapped_key
         from torchtune.training.checkpointing._utils import ModelType
 
+        # Cache model attention dims for the Q/K un-permute path in
+        # torchtune/dev/rl/weight_sync.py (`_maybe_unpermute_qk`). Llama-family
+        # checkpointers permute Q/K at load time so torchtune's attention can
+        # consume them in its native layout, but vLLM expects HF-format
+        # unpermuted Q/K — the wsync path needs to invert the permutation. We
+        # read dims from cfg.model (already validated by the model builder) so
+        # this works for any architecture parameterization.
+        try:
+            _cfg_model = getattr(self, "_cfg", None)
+            if _cfg_model is not None:
+                _cfg_model = _cfg_model.get("model", {})
+            else:
+                _cfg_model = {}
+            _nh = _cfg_model.get("num_heads")
+            _nkv = _cfg_model.get("num_kv_heads")
+            _ed = _cfg_model.get("embed_dim")
+            _hd = _cfg_model.get("head_dim")
+            if _nh is not None:
+                self._model_num_heads = int(_nh)
+            if _nkv is not None:
+                self._model_num_kv_heads = int(_nkv)
+            elif _nh is not None:
+                self._model_num_kv_heads = int(_nh)
+            if _hd is not None:
+                self._model_head_dim = int(_hd)
+            elif _ed is not None and _nh is not None:
+                self._model_head_dim = int(_ed) // int(_nh)
+        except Exception as _dim_exc:
+            log.warning("Failed to cache model attention dims for wsync Q/K un-permute: %r", _dim_exc)
+
         # Select the model-specific _FROM_HF map based on checkpointer model_type.
         # This avoids hardcoding Qwen2's map and works for Gemma4, etc.
         _model_type = getattr(self._checkpointer, "_model_type", None) if self._checkpointer is not None else None
@@ -1214,6 +1254,15 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             from torchtune.models.qwen2._convert_weights import _FROM_HF
         elif _model_type == ModelType.QWEN3:
             from torchtune.models.qwen3._convert_weights import _FROM_HF
+        elif _model_type in (
+            getattr(ModelType, "LLAMA2", None),
+            getattr(ModelType, "LLAMA3", None),
+            getattr(ModelType, "LLAMA3_2", None),
+        ):
+            # Llama-family naming matches `convert_weights._FROM_HF` (the std
+            # Llama HF layout); use it directly so the warning is silenced.
+            # The Q/K permutation is handled at sync time, not via the map.
+            from torchtune.models.convert_weights import _FROM_HF
         else:
             from torchtune.models.qwen2._convert_weights import _FROM_HF
             log.warning(
@@ -2921,6 +2970,24 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         # (independent of training _forward_batch_size — see __init__).
         fwd_bs = self._ref_forward_batch_size
 
+        # TORCHTUNE_VARLEN_NOGRAD_BYPASS=1: drop the explicit causal+padding mask
+        # on no-grad ref+rollout forwards so IPEX varlen (TORCHTUNE_USE_IPEX_VARLEN=1)
+        # can actually engage even when prompts have variable lengths. Trade-off:
+        # the pad positions in the prompt prefix will participate in attention
+        # (instead of being masked out), so ref_logprobs drift slightly. Since
+        # rollout policy_fwd is typically SKIPPED (single-epoch sync), ratios stay
+        # 1.0000 — only the KL term sees the drift. Monitor kl_loss for bounded
+        # behavior. Safe to compose with mask=None only when TORCHTUNE_USE_IPEX_VARLEN=1
+        # is also set; otherwise standard SDPA with is_causal=True is used.
+        _varlen_nograd_bypass = (
+            os.environ.get("TORCHTUNE_VARLEN_NOGRAD_BYPASS", "0") == "1"
+            and self._device.type == "xpu"
+            and masks is not None
+        )
+        _nograd_masks = None if _varlen_nograd_bypass else masks
+        if _varlen_nograd_bypass:
+            log.info("Rank %d: varlen no-grad bypass ENGAGED (ref+rollout fwd mask=None)", self.rank)
+
         # Rollout-time logprobs.
         #   ppo_epochs > 1: must compute old_logprobs from the rollout-time policy
         #     because the multi-epoch update mutates the weights between epochs.
@@ -2940,7 +3007,7 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             with torch.no_grad():
                 if fwd_bs >= num_seqs:
                     log.info("Rank %d: policy forward start (shape=%s)", self.rank, list(query_responses.shape))
-                    logits = self._model(query_responses, input_pos=position_ids, mask=masks)
+                    logits = self._model(query_responses, input_pos=position_ids, mask=_nograd_masks)
                     log.info("Rank %d: policy forward done", self.rank)
                     logits = logits[:, context_length - 1 :]
                     logprobs = rlhf.batched_logits_to_logprobs(logits, responses, self._temperature)
@@ -2956,7 +3023,7 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                         chunk_logits = self._model(
                             query_responses[cs:ce],
                             input_pos=position_ids[cs:ce],
-                            mask=None if masks is None else masks[cs:ce],
+                            mask=None if _nograd_masks is None else _nograd_masks[cs:ce],
                         )
                         if self.rank == 0 and self._device.type == "xpu":
                             log.info("Rank 0: POST-chunk[%d:%d] memory: alloc=%.2f GiB, resv=%.2f GiB",
@@ -3021,7 +3088,7 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         if fwd_bs >= num_seqs:
             log.info("Rank %d: ref forward start", self.rank)
             ref_logits = self._ref_model(
-                query_responses, input_pos=position_ids, mask=masks
+                query_responses, input_pos=position_ids, mask=_nograd_masks
             )
             ref_logits = rlhf.truncate_sequence_for_logprobs(ref_logits, context_length)
             ref_logprobs = rlhf.batched_logits_to_logprobs(
@@ -3036,7 +3103,7 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                 chunk_ref_logits = self._ref_model(
                     query_responses[cs:ce],
                     input_pos=position_ids[cs:ce],
-                    mask=None if masks is None else masks[cs:ce],
+                    mask=None if _nograd_masks is None else _nograd_masks[cs:ce],
                 )
                 chunk_ref_logits = rlhf.truncate_sequence_for_logprobs(chunk_ref_logits, context_length)
                 ref_logprobs_chunks.append(
@@ -3141,10 +3208,36 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
 
         self._log_batch_reward(rewards, successes)
 
-        advantages = (rewards - rewards.mean(1, keepdim=True)) / (
-            rewards.std(1, keepdim=True) + 1e-4
-        )
-        advantages = advantages.reshape(batch_size * grpo_size)
+        if self._batch_level_advantages:
+            from torchtune.dev.rl.rewards import batch_level_advantages
+            advantages = batch_level_advantages(
+                rewards.reshape(batch_size * grpo_size), group_size=grpo_size,
+            )
+        else:
+            advantages = (rewards - rewards.mean(1, keepdim=True)) / (
+                rewards.std(1, keepdim=True) + 1e-4
+            )
+            advantages = advantages.reshape(batch_size * grpo_size)
+        # Rank-0 diagnostic: per-group std min/max + final advantage stats.
+        # Lets log parsers detect future collapses without re-instrumenting —
+        # cross-reference with METRICS kl_loss to attribute flat learning to
+        # advantage zeroing vs other causes.
+        if self._is_rank_zero:
+            try:
+                _group_std = rewards.std(dim=1)
+                log.info(
+                    "ADV_DEBUG step=%d group_std_min=%.4f group_std_max=%.4f "
+                    "adv_min=%.4f adv_mean=%.4f adv_std=%.4f adv_abs_max=%.4f",
+                    self._steps_run,
+                    _group_std.min().item(),
+                    _group_std.max().item(),
+                    advantages.min().item(),
+                    advantages.mean().item(),
+                    advantages.std().item(),
+                    advantages.abs().max().item(),
+                )
+            except Exception as e:
+                log.warning("ADV_DEBUG log failed: %s", e)
         del responses
         device_empty_cache(self._device)
 

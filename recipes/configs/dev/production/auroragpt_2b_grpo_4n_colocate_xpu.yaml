@@ -1,0 +1,146 @@
+# AuroraGPT-2B GRPO — 4N colocate (bake-off vs ezpz/rl)
+#
+# AuroraGPT-2B is a plain Llama (12L, hidden=2048, GQA 16/4, vocab=256000,
+# rope_base=50000, intermediate=11008). The generic torchtune.models.llama3.llama3
+# builder accepts every hparam directly. Checkpointer uses model_type: LLAMA3
+# which routes through convert_weights.hf_to_tune with the correct Q/K permute.
+#
+# Mode: colocate_sleep (one in-process vLLM engine per training rank). 4N x 12
+# tiles = 48 ranks. Validated upper bound for colocate_sleep is Qwen3-8B at G=4
+# max_len=256; the 2B model has comfortable headroom.
+#
+# Hyperparameters match ezpz/rl defaults for an apples-to-apples comparison:
+#   num_generations=4, max_completion_length=64, temperature=0.7, beta=kl_coeff
+#   per_device_batch=1, grad_accum=1, max_steps=50.
+#
+# Override task with: dataset.task=<sum_digits|multiply|word_sort|countdown|arithmetic>
+# Override reward_functions[0]._component_ to the matching Reward subclass.
+
+name: grpo_auroragpt_2b_4n_colocate
+output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/outputs/grpo_auroragpt_2b_bakeoff
+base_model_path: /flare/AuroraGPT/AuroraGPT-v1/Experiments/AuroraGPT-2B/public/sophiag/hf/global_step138650
+
+# ── vLLM (colocate — resident weights, TP=1 per rank) ────────────────────────
+# colocate (no sleep) is 1.36× faster than colocate_sleep at +9 GiB peak HBM
+# tradeoff (29.8 vs 21.0 GiB) — comfortable margin on 64 GiB tiles for AGPT-2B.
+# See experiments/auroragpt_2b_bakeoff/logs/4N_20260610_190537/RESULTS.md.
+vllm_mode: colocate
+vllm_enforce_eager: true
+vllm_gpu_memory_utilization: 0.12
+vllm_max_model_len: 256
+vllm_max_num_seqs: 16
+reshard_after_forward: true
+
+# ── Model ────────────────────────────────────────────────────────────────────
+model:
+  _component_: torchtune.models.llama3.llama3
+  vocab_size: 256000
+  num_layers: 12
+  num_heads: 16
+  num_kv_heads: 4
+  embed_dim: 2048
+  max_seq_len: 1024
+  intermediate_dim: 11008
+  rope_base: 50000
+
+# ── Tokenizer ────────────────────────────────────────────────────────────────
+tokenizer:
+  _component_: torchtune.dev.rl.ezpz_tasks.auroragpt_tokenizer
+  path: ${base_model_path}/tokenizer.model
+  max_seq_len: 1024
+
+# ── Checkpointers (policy + ref share the base model) ────────────────────────
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [pytorch_model.bin]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: LLAMA3
+
+ref_checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [pytorch_model.bin]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}/ref
+  model_type: LLAMA3
+
+resume_from_checkpoint: false
+save_every_n_epochs: 1
+
+# ── Dataset (ezpz task — override `task` per run) ─────────────────────────────
+dataset:
+  _component_: torchtune.dev.rl.ezpz_tasks.build_ezpz_dataset
+  task: sum_digits
+  num_samples: 0           # 0 → 100k pool, ezpz default
+  seed: 42
+  max_seq_len: 512
+seed: 42
+shuffle: true
+
+# ── GRPO hparams (match ezpz defaults) ───────────────────────────────────────
+batch_size: 1
+grpo_samples: 4              # ezpz num_generations
+forward_batch_size: 1
+max_generated_tokens: 64     # ezpz max_completion_length
+top_k: null
+temperature: 0.7             # ezpz temperature
+gen_batch_size: 1            # one vLLM call per training step
+
+epochs: 1
+num_steps: 50
+ppo_epochs: 1
+gradient_accumulation_steps: 1
+clip_grad_norm: 1.0
+
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 1.0e-5
+  weight_decay: 0.01
+  fused: false
+
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  num_warmup_steps: 2
+
+# beta=0.0 in ezpz → KL coefficient zero. Use GRPOSimpleLoss (no IS correction).
+loss:
+  _component_: torchtune.dev.rl.loss.GRPOSimpleLoss
+  kl_coeff: 0.0
+  epsilon: 0.2
+
+# ── Reward (override per task at launch time) ────────────────────────────────
+reward_functions:
+  - _component_: torchtune.dev.rl.ezpz_tasks.SumDigitsReward
+
+# ── Distributed / XPU ────────────────────────────────────────────────────────
+data_parallel_replicate_dim: 1
+device: xpu
+dtype: bf16
+compile: false
+enable_activation_checkpointing: true
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+log_every_n_steps: 1
+log_peak_memory_stats: true
+
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+
+# ── Profiler (off) ───────────────────────────────────────────────────────────
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: false
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: true
+  cuda: false
+  profile_memory: false
+  with_stack: false
+  record_shapes: false
+  with_flops: false
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1

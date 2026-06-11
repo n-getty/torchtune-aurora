@@ -56,6 +56,108 @@ def _backbone_param_iter(self, policy=None):
         yield hf_name, param
 
 
+# Llama-family checkpointers (LLAMA2/LLAMA3 / default fallback) route through
+# `torchtune.models.convert_weights.hf_to_tune`, which **permutes** Q/K weights
+# (interleaves the rotary frequency halves) so torchtune's attention forward
+# can consume them in its native layout. Qwen2/3, Gemma2/4, Phi3, etc. all
+# load without this permutation — their attention forwards consume HF layout
+# directly. See `torchtune/training/checkpointing/_checkpointer.py:736-743`.
+#
+# At weight-sync time, vLLM expects **HF-format unpermuted** Q/K. If we send
+# torchtune-permuted Q/K (via `param.full_tensor()`) without inverting the
+# permutation, vLLM's Q/K projections become scrambled and generation
+# degenerates after the first sync (the model emits pretraining-corpus
+# continuations instead of conditioning on the prompt). This was the silent
+# cause of the AuroraGPT-2B GRPO bake-off accuracy gap (RESULTS.md
+# 2026-06-11): torchtune-XPU rewards stayed flat ~0.20 over 50 steps while
+# ezpz climbed 0.08→0.65 on identical prompts. Empirically reproduces
+# whenever a LLAMA3 model_type is used with vLLM colocate / dedicated_rank /
+# server modes — Qwen/Gemma paths were unaffected and that's why this hid.
+_LLAMA_PERMUTING_MODEL_TYPES = frozenset()  # populated lazily from ModelType
+
+
+def _needs_qk_unpermute(self) -> bool:
+    """True iff this run's checkpointer applies the Llama-family Q/K permutation.
+
+    Triggered by LLAMA2 / LLAMA3 / LLAMA3_VISION model_types plus the default
+    `hf_to_tune` fall-through (used for unknown HF llama-architecture models).
+    Falls back to False for any model_type whose hf_to_tune does NOT permute
+    (Qwen2/3, Gemma2/4, Phi3, etc.).
+    """
+    global _LLAMA_PERMUTING_MODEL_TYPES
+    if not _LLAMA_PERMUTING_MODEL_TYPES:
+        from torchtune.training.checkpointing._utils import ModelType
+        # The set of model_types whose hf_to_tune is `convert_weights.hf_to_tune`
+        # (or a delegating wrapper) — these all permute Q/K. Determined by
+        # reading `_checkpointer.py:609-743`: everything that does NOT have an
+        # explicit elif branch falls through to the default `hf_to_tune`. Of
+        # the branches that DO exist, llama3_vision_hf_to_tune also permutes
+        # (see llama3_2_vision/_convert_weights.py:269).
+        _LLAMA_PERMUTING_MODEL_TYPES = frozenset({
+            ModelType.LLAMA2,
+            ModelType.LLAMA3,
+            ModelType.LLAMA3_2,
+            ModelType.LLAMA3_VISION,
+        })
+    ckpt = getattr(self, '_checkpointer', None)
+    if ckpt is None:
+        return False
+    mt = getattr(ckpt, '_model_type', None)
+    if mt is None:
+        return False
+    return mt in _LLAMA_PERMUTING_MODEL_TYPES
+
+
+def _qk_unpermute_for_vllm(weight: torch.Tensor, n_heads: int, head_dim: int) -> torch.Tensor:
+    """Invert `convert_weights.hf_to_tune`'s Q/K interleave.
+
+    hf_to_tune does: `view(n_heads, 2, head_dim // 2, dim).transpose(1, 2).reshape(...)`
+    The inverse (matches `convert_weights.tune_to_hf`): `view(n_heads,
+    head_dim // 2, 2, dim).transpose(1, 2).reshape(...)`. We return a
+    contiguous copy so vLLM's `load_weights` can index it without surprises.
+    """
+    dim = weight.shape[1]
+    return (
+        weight.view(n_heads, head_dim // 2, 2, dim)
+        .transpose(1, 2)
+        .reshape(n_heads * head_dim, dim)
+        .contiguous()
+    )
+
+
+def _maybe_unpermute_qk(self, hf_name: str, weight: torch.Tensor) -> torch.Tensor:
+    """Apply the Q/K un-permute if this run uses a Llama-family checkpointer.
+
+    Detection is by HF name suffix (`q_proj.weight` / `k_proj.weight`) so it
+    works regardless of whether the param iterator yields tune-format or
+    HF-format names. Returns the input unchanged when no un-permute is needed.
+    """
+    if not _needs_qk_unpermute(self):
+        return weight
+    is_q = hf_name.endswith("q_proj.weight")
+    is_k = hf_name.endswith("k_proj.weight")
+    if not (is_q or is_k):
+        return weight
+    # Pull head counts from the recipe's cached model dims. These are populated
+    # in setup() from cfg.model.{num_heads,num_kv_heads,embed_dim}.
+    n_heads = getattr(self, '_model_num_heads', None)
+    n_kv_heads = getattr(self, '_model_num_kv_heads', None)
+    head_dim = getattr(self, '_model_head_dim', None)
+    if n_heads is None or n_kv_heads is None or head_dim is None:
+        # Fall back to introspecting the model config the FIRST time. Don't
+        # crash the sync — better to send slightly wrong weights once and
+        # warn loudly than to kill the run.
+        log.warning(
+            "QK un-permute requested but recipe missing _model_num_heads / "
+            "_model_num_kv_heads / _model_head_dim. Sending raw weights for "
+            "%s — generation will degrade.", hf_name,
+        )
+        return weight
+    return _qk_unpermute_for_vllm(
+        weight, n_heads if is_q else n_kv_heads, head_dim,
+    )
+
+
 def _sync_colocated_weights(self) -> None:
     """Sync FSDP2 weights to colocated vLLM via load_weights().
 
@@ -95,6 +197,7 @@ def _sync_colocated_weights(self) -> None:
                 yield hf_name, param
         param_iter = _default_iter()
 
+    _unperm_needed = _needs_qk_unpermute(self)
     for hf_name, param in param_iter:
         if hasattr(param, 'full_tensor'):
             weight_data = param.full_tensor()
@@ -102,6 +205,10 @@ def _sync_colocated_weights(self) -> None:
             weight_data = param.data
 
         if _is_vllm_rank:
+            if _unperm_needed:
+                # Llama-family Q/K were permuted at checkpoint load; un-permute
+                # back to HF layout so vLLM consumes them correctly.
+                weight_data = _maybe_unpermute_qk(self, hf_name, weight_data)
             llm_model.load_weights([(hf_name, weight_data)])
         n_synced += 1
         del weight_data
@@ -167,6 +274,7 @@ def _sync_ray_colocate_weights(self) -> None:
     n_chunks = 0
     chunk_pairs = []  # list of (hf_name, cpu_tensor) for rank 0
     chunk_numel = 0
+    _unperm_needed = _needs_qk_unpermute(self)
 
     for hf_name, param in param_iter:
         # full_tensor() is collective — every FSDP rank must call.
@@ -174,6 +282,12 @@ def _sync_ray_colocate_weights(self) -> None:
             weight_data = param.full_tensor()
         else:
             weight_data = param.data
+
+        if _unperm_needed and is_driver:
+            # Llama-family Q/K un-permute happens only on the driver — the
+            # workers throw their `weight_data` away unread, so we don't waste
+            # cycles permuting on them.
+            weight_data = _maybe_unpermute_qk(self, hf_name, weight_data)
 
         param_numel = weight_data.numel()
 
@@ -432,12 +546,13 @@ def _sync_dedicated_vllm_weights(self) -> None:
         t_d2h_total = 0.0
         t_bcast_total = 0.0
         bcast_bytes_total = 0
+        _unperm_needed = _needs_qk_unpermute(self)
         for ci, (pidx_start, pidx_end, chunk_numel) in enumerate(self._wsync_chunk_ranges):
             tp0 = time.perf_counter()
             if self.rank == 0:
                 chunk_view = self._wsync_chunk_buf[:chunk_numel]
                 offset = 0
-            for _, param in params_list[pidx_start:pidx_end]:
+            for _hf_name, param in params_list[pidx_start:pidx_end]:
                 # full_tensor() is COLLECTIVE — every training rank must call.
                 # On FSDP1 with summon_full_params(rank0_only=True) the params
                 # already are full tensors on rank 0, so just .data works.
@@ -446,6 +561,8 @@ def _sync_dedicated_vllm_weights(self) -> None:
                 else:
                     full = param.data
                 if self.rank == 0:
+                    if _unperm_needed:
+                        full = _maybe_unpermute_qk(self, _hf_name, full)
                     n = full.numel()
                     chunk_view[offset:offset + n].copy_(
                         full.to(torch.bfloat16).view(-1)
@@ -2758,35 +2875,56 @@ def _sync_weights_to_vllm_xccl(self) -> None:
                             _scale_local_f32 = _scale_local.to(torch.float32).contiguous()
                             del _scale_local
 
-                            _ep_fp8_parts = [
-                                torch.empty_like(_ep_local_fp8)
-                                for _ in range(_ep_deg)
-                            ]
-                            _ep_scale_parts = [
-                                torch.empty_like(_scale_local_f32)
-                                for _ in range(_ep_deg)
-                            ]
-                            torch.distributed.all_gather(
-                                _ep_fp8_parts, _ep_local_fp8,
+                            # all_gather_into_tensor (single persistent flat
+                            # output buffer) instead of list-style all_gather.
+                            # The list path triggers ProcessGroupXCCL's hidden
+                            # newLikeFlat() temp, which leaks under
+                            # torch.xpu.empty_cache() (Aurora #143 /
+                            # torch-xpu-ops #3744). Bit-exact equivalent.
+                            _local_fp8 = _ep_local_fp8.contiguous()
+                            _local_sc = _scale_local_f32.contiguous()
+                            _out_fp8_cat = torch.empty(
+                                _ep_deg * _local_fp8.shape[0],
+                                *_local_fp8.shape[1:],
+                                dtype=_local_fp8.dtype,
+                                device=_local_fp8.device)
+                            _out_sc_cat = torch.empty(
+                                _ep_deg * _local_sc.shape[0],
+                                *_local_sc.shape[1:],
+                                dtype=_local_sc.dtype,
+                                device=_local_sc.device)
+                            torch.distributed.all_gather_into_tensor(
+                                _out_fp8_cat, _local_fp8,
                                 group=self._shard_pg)
-                            torch.distributed.all_gather(
-                                _ep_scale_parts, _scale_local_f32,
+                            torch.distributed.all_gather_into_tensor(
+                                _out_sc_cat, _local_sc,
                                 group=self._shard_pg)
-                            del _ep_local_fp8, _scale_local_f32
+                            del _ep_local_fp8, _scale_local_f32, _local_fp8, _local_sc
                             if is_active:
+                                # Reshape concatenated buffer to
+                                # [ep_d, n_local, ...] — same layout the old
+                                # torch.stack(list, dim=0) produced.
+                                _n_local_fp8 = _out_fp8_cat.shape[0] // _ep_deg
+                                _n_local_sc = _out_sc_cat.shape[0] // _ep_deg
+                                _fp8_view = _out_fp8_cat.view(
+                                    _ep_deg, _n_local_fp8,
+                                    *_out_fp8_cat.shape[1:])
+                                _sc_view = _out_sc_cat.view(
+                                    _ep_deg, _n_local_sc,
+                                    *_out_sc_cat.shape[1:])
                                 # Per-rank dequantize (shape preserved),
                                 # then unshuffle identically to bf16 path.
                                 _bf16_parts = []
-                                for _f8p, _scp in zip(_ep_fp8_parts,
-                                                      _ep_scale_parts):
+                                for _r in range(_ep_deg):
                                     _bf16_parts.append(
-                                        (_f8p.to(torch.float32) * _scp)
+                                        (_fp8_view[_r].to(torch.float32)
+                                         * _sc_view[_r])
                                         .to(torch.bfloat16))
                                 _ep_stk = torch.stack(_bf16_parts, dim=0)
                                 param = _ep_stk.transpose(0, 1).reshape(
                                     -1, *_ep_stk.shape[2:]).contiguous()
-                                del _ep_stk, _bf16_parts
-                            del _ep_fp8_parts, _ep_scale_parts
+                                del _ep_stk, _bf16_parts, _fp8_view, _sc_view
+                            del _out_fp8_cat, _out_sc_cat
                             if not _fp8_logged_engaged:
                                 log.info(
                                     "Rank %d: EP wsync per-proj fp8 wire engaged "
@@ -2798,18 +2936,34 @@ def _sync_weights_to_vllm_xccl(self) -> None:
                                 )
                                 _fp8_logged_engaged = True
                         else:
-                            _ep_parts_t = [torch.empty_like(_ep_local_t) for _ in range(_ep_deg)]
-                            torch.distributed.all_gather(_ep_parts_t, _ep_local_t,
-                                                         group=self._shard_pg)
+                            # all_gather_into_tensor (single persistent flat
+                            # output buffer) instead of list-style all_gather.
+                            # The list path triggers ProcessGroupXCCL's hidden
+                            # newLikeFlat() temp, which leaks under
+                            # torch.xpu.empty_cache() (Aurora #143 /
+                            # torch-xpu-ops #3744). Bit-exact equivalent of
+                            # the previous torch.stack(list, 0) layout.
+                            _local_c = _ep_local_t.contiguous()
+                            _out_cat = torch.empty(
+                                _ep_deg * _local_c.shape[0],
+                                *_local_c.shape[1:],
+                                dtype=_local_c.dtype,
+                                device=_local_c.device)
+                            torch.distributed.all_gather_into_tensor(
+                                _out_cat, _local_c, group=self._shard_pg)
                             if is_active:
-                                # Unshuffle interleaved → contiguous:
-                                # stack → [ep_d, n_local, …] → transpose → [n_local, ep_d, …]
-                                # → reshape → [total_experts, …]
-                                _ep_stk = torch.stack(_ep_parts_t, dim=0)
+                                # Reshape [ep_d * n_local, ...] to
+                                # [ep_d, n_local, ...] (same layout as
+                                # torch.stack(list, dim=0)), then unshuffle:
+                                # transpose → [n_local, ep_d, ...] → reshape →
+                                # [total_experts, ...]
+                                _n_local = _out_cat.shape[0] // _ep_deg
+                                _ep_stk = _out_cat.view(
+                                    _ep_deg, _n_local, *_out_cat.shape[1:])
                                 param = _ep_stk.transpose(0, 1).reshape(
                                     -1, *_ep_stk.shape[2:]).contiguous()
                                 del _ep_stk
-                            del _ep_parts_t
+                            del _out_cat, _local_c
                         del _ep_local_t
                 if is_active:
                     hf_name = _xccl_accept_and_rename(param_name)

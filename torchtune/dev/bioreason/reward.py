@@ -113,27 +113,7 @@ def bioreason_reward_fn(
     return rewards_t, successes_t, diagnostics
 
 
-def batch_level_advantages(
-    rewards: torch.Tensor,
-    group_size: int,
-    eps: float = 1e-8,
-) -> torch.Tensor:
-    """
-    Compute advantages using batch-level normalization (BioReason-Pro's fix for
-    low-variance rewards from highly similar rollouts).
-
-    Standard GRPO normalizes per-prompt-group; this normalizes over the full batch,
-    giving a non-zero learning signal even when all rollouts for a single prompt
-    receive identical rewards.
-
-    Args:
-        rewards: [B * G] flat rewards tensor
-        group_size: G rollouts per prompt
-        eps: numerical stability
-
-    Returns:
-        advantages: [B * G] normalized advantages
-    """
-    mean = rewards.mean()
-    std = rewards.std() + eps
-    return (rewards - mean) / std
+# Re-export: the canonical location is torchtune.dev.rl.rewards. Kept here for
+# back-compat so the BioReason recipe import path (and any external callers)
+# continue to work without churn.
+from torchtune.dev.rl.rewards import batch_level_advantages  # noqa: E402,F401

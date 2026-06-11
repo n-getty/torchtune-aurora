@@ -649,3 +649,33 @@ def sum_digits_batched_rewards(
 
     metadata = {"func_names": ["accuracy", "format"]}
     return rewards_tensor, successes_tensor, metadata
+
+
+def batch_level_advantages(
+    rewards: torch.Tensor,
+    group_size: int,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """
+    Compute advantages using batch-level normalization (mean/std pooled across
+    the full B*G batch rather than per-prompt-group).
+
+    Standard GRPO normalizes per-prompt-group; this normalizes over the full
+    batch, so a single non-zero-variance prompt anywhere in the batch keeps the
+    learning signal alive for every rollout. Without this, when all G rollouts
+    of a prompt receive identical rewards (common: all wrong, or all earning
+    only the format bonus), per-group std collapses to 0 → advantages collapse
+    to 0 → gradient is exactly zero and only the KL term drives updates.
+
+    Args:
+        rewards: [B * G] flat rewards tensor
+        group_size: G rollouts per prompt (unused; kept for API symmetry)
+        eps: numerical stability
+
+    Returns:
+        advantages: [B * G] normalized advantages
+    """
+    mean = rewards.mean()
+    # unbiased=False so a degenerate single-element batch returns 0 rather than NaN.
+    std = rewards.std(unbiased=False) + eps
+    return (rewards - mean) / std
