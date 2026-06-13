@@ -1,38 +1,43 @@
 #!/bin/bash
-#PBS -N agpt2b_gsm8k_stable
+#PBS -N agpt2b_gsm8k_prod
 #PBS -A ModCon
 #PBS -q debug
 #PBS -l select=2
 #PBS -l walltime=01:00:00
 #PBS -l filesystems=home:flare
-#PBS -o /lus/flare/projects/ModCon/ngetty/torchtune/experiments/auroragpt_2b_bakeoff/logs/pbs_2n_gsm8k_server_stable.out
-#PBS -e /lus/flare/projects/ModCon/ngetty/torchtune/experiments/auroragpt_2b_bakeoff/logs/pbs_2n_gsm8k_server_stable.err
+#PBS -o /lus/flare/projects/ModCon/ngetty/torchtune/experiments/auroragpt_2b_bakeoff/logs/pbs_2n_gsm8k_production.out
+#PBS -e /lus/flare/projects/ModCon/ngetty/torchtune/experiments/auroragpt_2b_bakeoff/logs/pbs_2n_gsm8k_production.err
 
-# 2N AGPT-2B GRPO on GSM8K — STABLE hparam variant.
+# 2N AGPT-2B GRPO on GSM8K — PRODUCTION launcher.
 #
-# Job 8538544 (2026-06-12) proved both wsync-leak and QK fixes work
-# (mem flat at 30.2 GiB across step 60; previously leaked to 48 GiB
-# by step 49 → UR40 crash). The remaining failure mode at the baseline
-# lr=1e-5 + kl_coeff=0 was NaN-induced collapse around step 40 from
-# runaway KL drift. This launcher uses the stable YAML variant:
-#   - lr 5e-6 (halved)
-#   - kl_coeff 0.02 (KL term in gradient)
-#   - warmup 10 (doubled)
-# (epsilon_high not used: GRPOSimpleLoss ignores pi_old; lives on GRPOLoss.)
+# Validated envelope (2026-06-13):
+#   - lr 5e-6, kl_coeff 0.02, warmup 10
+#   - FSDP1 ZeRO-2 (use_fsdp1_zero2: true)
+#   - True chunked train backward (TORCHTUNE_USE_CHUNKED_LOSS=0) clears the
+#     deterministic step-62 single-backward L0 wall (job 8540864: 150/150 clean,
+#     mem flat 24/47.4 GiB).
+#   - Gloo cross-PG wsync (WSYNC_CROSS_METHOD=gloo) avoids CXI MR cache leak.
+#   - vLLM HTTP server mode (TRAIN_TILES=11 + VLLM_DP=12).
+#   - stop_strings = ["</answer>", "User:"] + EOS-injection in recipe (Stage 1
+#     fix 2026-06-13): raw pretraining checkpoint never naturally emits EOS,
+#     so vLLM stops on format markers; recipe writes EOS at boundary so
+#     truncate_sequence_at_first_stop_token + metric_logger report real
+#     response_lengths and num_stop_tokens. Without this, every completion
+#     ran to max_tokens (511) and the model had no learning signal.
 #
-# Compare runs at:
-#   experiments/auroragpt_2b_bakeoff/logs/gsm8k_2n_server_stable_*
+# See docs/reports/agpt2b_2n_gsm8k_production_20260613.md for the full
+# failure-tree → envelope walkthrough.
 
 set -eo pipefail
 
 REPO=/lus/flare/projects/ModCon/ngetty/torchtune
 LAUNCHER=$REPO/experiments/lora_grpo/run_qwen3_4b_dense_2node.sh
 TS=$(date +%Y%m%d_%H%M%S)
-LOGDIR=$REPO/experiments/auroragpt_2b_bakeoff/logs/gsm8k_2n_server_stable_${TS}
+LOGDIR=$REPO/experiments/auroragpt_2b_bakeoff/logs/gsm8k_2n_production_${TS}
 mkdir -p "$LOGDIR"
 
 # --- AGPT-2B specific overrides -------------------------------------------
-export CONFIG=recipes/configs/dev/production/auroragpt_2b_grpo_2n_gsm8k_server_xpu_stable.yaml
+export CONFIG=recipes/configs/dev/production/auroragpt_2b_grpo_2n_gsm8k_xpu.yaml
 export MODEL_PATH=/flare/AuroraGPT/AuroraGPT-v1/Experiments/AuroraGPT-2B/public/sophiag/hf/global_step138650
 
 # --- RL envelope (matches the colocate-2N YAML) ---------------------------
@@ -82,7 +87,7 @@ export VLLM_WSYNC_INTERVAL=${VLLM_WSYNC_INTERVAL:-1}
 # --- Output overrides ----------------------------------------------------
 export EXTRA_OVERRIDES="output_dir=${LOGDIR}/run_out vllm_weight_sync_interval=${VLLM_WSYNC_INTERVAL} ${EXTRA_OVERRIDES_APPEND:-}"
 
-echo "=== AGPT-2B GSM8K 2N SERVER STABLE ===" | tee "${LOGDIR}/launcher.log"
+echo "=== AGPT-2B GSM8K 2N SERVER PRODUCTION ===" | tee "${LOGDIR}/launcher.log"
 echo "  TS=$TS  LOGDIR=$LOGDIR" | tee -a "${LOGDIR}/launcher.log"
 echo "  CONFIG=$CONFIG" | tee -a "${LOGDIR}/launcher.log"
 echo "  hparams: lr=5e-6 kl_coeff=0.02 warmup=10" | tee -a "${LOGDIR}/launcher.log"

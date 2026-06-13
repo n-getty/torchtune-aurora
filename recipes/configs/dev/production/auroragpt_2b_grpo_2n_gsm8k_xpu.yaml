@@ -1,29 +1,34 @@
-# AuroraGPT-2B GRPO — 2N server mode on GSM8K (STABLE-HPARAM variant)
+# AuroraGPT-2B GRPO — 2N server mode on GSM8K (PRODUCTION envelope)
 #
-# Differences from auroragpt_2b_grpo_2n_gsm8k_server_xpu.yaml:
-#   - kl_coeff: 0.0 → 0.02   (bounds policy drift in the gradient; without
-#                              this the policy hits NaN by step 40)
-#   - lr:       1.0e-5 → 5.0e-6
-#                              (the lr=1e-5 optimum from project_lr_sweep
-#                               _torchtune_vs_ezpz.md was validated on the
-#                               sum_digits synthetic task; AGPT-2B on GSM8K
-#                               with 511-token responses sees grad_norm
-#                               spikes of 200+ even with clip_grad_norm=1
-#                               at lr=1e-5)
-#   - num_warmup_steps: 5 → 10 (soften early lr ramp)
-# NOT changed (GRPOSimpleLoss does not accept epsilon_high — see loss block).
+# Pair with launcher: experiments/auroragpt_2b_bakeoff/pbs_2n_gsm8k_production.sh
+# Report:             docs/reports/agpt2b_2n_gsm8k_production_20260613.md
 #
-# All other settings identical to the baseline server-mode YAML.
+# Validated envelope (2026-06-13):
+#   - Job 8540864:  150/150 clean, mem flat 24/47.4 GiB, exit=0
+#   - Job stage1c:   50/50 clean, num_stop_tokens 14.7/16, response_lengths 111
+#                    (was 511 — KEY win). Stage 1 stop-string + EOS-injection
+#                    fix unblocks the learning signal.
 #
-# Validated by job 8538544 (2026-06-12 04:24-05:04): the baseline YAML at
-# lr=1e-5 + kl_coeff=0 reached step 60 before NaN-induced crash with FLAT
-# 30.2 GiB memory (sig#2 leak was bypassed). The crash mechanism was NaN
-# weights from runaway KL drift, not L0 exhaustion. This variant addresses
-# the hyperparameter side; sig#2 mitigation (VLLM_WSYNC_INTERVAL=2) is a
-# separate orthogonal knob in the launcher.
+# Key hparams (vs the earlier "baseline" variant):
+#   - kl_coeff: 0.02       (keeps KL bounded; baseline 0.0 NaN'd by step 40)
+#   - lr:       5.0e-6     (halved from baseline 1e-5; grad_norm spikes 200+
+#                           at 1e-5 with 511-token responses)
+#   - num_warmup_steps: 10 (doubled to soften early ramp)
+#   - stop_strings: ["</answer>", "User:", "\nUser:"]
+#                          (AGPT-2B is a raw pretraining checkpoint that never
+#                           naturally emits EOS; vLLM stops on format markers;
+#                           recipe injects EOS at boundary so truncation finds
+#                           it — see Stage 1 fix description in launcher header)
+#   - TORCHTUNE_USE_CHUNKED_LOSS=0 in launcher (true chunked train backward;
+#     clears the deterministic step-62 single-backward L0 wall)
+#
+# GRPOSimpleLoss does NOT accept epsilon_high (it lives on GRPOLoss, which
+# requires ppo_epochs > 1 or always_compute_rollout_logprobs: true to have a
+# meaningful pi_old to compare against). Single-epoch on-policy → ratios=1.0
+# is correct and expected.
 
-name: grpo_agpt_2b_2n_gsm8k_server_stable
-output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/outputs/grpo_agpt2b_2n_gsm8k_server_stable
+name: grpo_agpt_2b_2n_gsm8k_production
+output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/outputs/grpo_agpt2b_2n_gsm8k_production
 base_model_path: /flare/AuroraGPT/AuroraGPT-v1/Experiments/AuroraGPT-2B/public/sophiag/hf/global_step138650
 
 data_parallel_replicate_dim: 1
@@ -86,6 +91,19 @@ max_seq_len: 1024
 max_generated_tokens: 512
 temperature: 0.7
 top_k: null
+
+# ── Generation stop strings (vLLM-side termination) ─────────────────────────
+# AGPT-2B is a raw pretraining checkpoint that never naturally emits EOS — it
+# generates fluent rambling to max_tokens otherwise. Diagnosed 2026-06-13 with
+# a direct /v1/completions probe (finish_reason: length on a 'capital of France'
+# prompt). The only learnable termination signals from the GSM8K prompt template
+# are the answer-tag close and the conversational turn marker.
+#   - ``</answer>`` — natural answer boundary for FormattedMathCorrectnessReward
+#   - ``User:`` / ``\nUser:`` — hallucinated conversational turn ramble cap
+stop_strings:
+  - "</answer>"
+  - "User:"
+  - "\nUser:"
 
 # ── Training ─────────────────────────────────────────────────────────────────
 epochs: 1

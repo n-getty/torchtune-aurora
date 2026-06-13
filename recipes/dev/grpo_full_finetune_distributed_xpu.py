@@ -1171,6 +1171,14 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                 stop_token_ids = self._tokenizer.stop_tokens
         self._stop_token_ids = torch.tensor(stop_token_ids, device=self._device)
 
+        # Optional string-stop list for vLLM-side termination. Required for raw
+        # pretraining checkpoints (e.g. AuroraGPT-2B base) that never naturally
+        # emit EOS and would otherwise generate to max_tokens every step. The
+        # value is forwarded into the HTTP request's ``stop`` field and consumed
+        # by vLLM's SamplingParams.stop. Empty/None preserves the no-string-stop
+        # default behavior for models that do emit EOS reliably.
+        self._stop_strings = list(cfg.get("stop_strings", []) or [])
+
         # --- vLLM initialization ---
         if self._vllm_mode == "server":
             self._setup_vllm_server_mode()
@@ -2444,6 +2452,17 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             temperature=self._temperature,
             top_k=self._top_k or 0,
         )
+        # Forward stop tokens to vLLM so generation actually halts at EOS
+        # instead of running to max_tokens every step. Without this, vLLM
+        # only knows the model-config default EOS, missing extras the
+        # tokenizer's stop_tokens list adds (e.g. multiple EOS-equivalents).
+        if self._stop_token_ids is not None and self._stop_token_ids.numel() > 0:
+            gen_kwargs["stop_token_ids"] = self._stop_token_ids.cpu().tolist()
+        # Raw pretraining checkpoints never naturally emit EOS — string stops
+        # like ``</answer>`` and ``User:`` are the only learnable termination
+        # signal. Only forwarded when the YAML config sets ``stop_strings``.
+        if self._stop_strings:
+            gen_kwargs["stop"] = list(self._stop_strings)
 
         t0 = time.perf_counter()
         num_clients = len(self._vllm_clients)
@@ -2475,11 +2494,23 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
 
         query_responses = batch_input_ids.new_full((bsz, total_len), self._tokenizer.pad_id)
         query_responses[:, :context_length] = batch_input_ids
+        # When vLLM stops on a string (e.g. ``</answer>`` for AGPT-2B), the
+        # returned tokens do NOT include any model EOS. Downstream metrics
+        # (``response_lengths``, ``num_stop_tokens``) and the truncation in
+        # :func:`rlhf.truncate_sequence_at_first_stop_token` rely on finding
+        # a token from ``self._stop_token_ids`` in the tensor — without one,
+        # every completion looks like it ran to max_tokens. Inject a single
+        # EOS at the first pad position after the actual generated tokens so
+        # the truncation logic finds the real boundary. No-op when the
+        # completion already contains EOS or filled max_generated_tokens.
+        eos_id = self._tokenizer.eos_id
         for i, comp in enumerate(completions):
             length = min(len(comp), self._max_generated_tokens)
             query_responses[i, context_length : context_length + length] = torch.tensor(
                 comp[:length], dtype=batch_input_ids.dtype, device=self._device
             )
+            if eos_id is not None and length < self._max_generated_tokens:
+                query_responses[i, context_length + length] = eos_id
 
         total_tokens = sum(len(c) for c in completions)
         log.info(

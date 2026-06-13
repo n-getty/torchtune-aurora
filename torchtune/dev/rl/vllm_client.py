@@ -130,6 +130,8 @@ class VLLMClient:
         max_tokens: int = 256,
         temperature: float = 1.0,
         top_k: int = 0,
+        stop_token_ids: Optional[list[int]] = None,
+        stop: Optional[list[str]] = None,
     ) -> list[list[int]]:
         """Send prompt token-IDs to vLLM, return completion token-IDs.
 
@@ -139,13 +141,27 @@ class VLLMClient:
             max_tokens: maximum generated tokens per completion.
             temperature: sampling temperature.
             top_k: top-k sampling (0 = disabled).
+            stop_token_ids: token IDs that terminate generation. Forwarded to
+                vLLM's SamplingParams.stop_token_ids. ``None`` preserves the
+                server-side default (which on most stacks is just the model EOS
+                returned via tokenizer config — NOT the tokenizer's full
+                ``stop_tokens`` list).
+            stop: list of strings that terminate generation. Forwarded to
+                vLLM's SamplingParams.stop. Required when the model never
+                naturally emits EOS (raw pretraining checkpoints) and the
+                only learnable stop signal is a format marker like
+                ``</answer>`` or a conversational turn ``User:``.
 
         Returns:
             ``completion_ids`` — list of token-ID lists, length ``len(prompts) * n``.
         """
         if self._api_type == "openai":
-            return self._generate_openai(prompts, n, max_tokens, temperature, top_k)
-        return self._generate_trl(prompts, n, max_tokens, temperature, top_k)
+            return self._generate_openai(
+                prompts, n, max_tokens, temperature, top_k, stop_token_ids, stop
+            )
+        return self._generate_trl(
+            prompts, n, max_tokens, temperature, top_k, stop_token_ids, stop
+        )
 
     def _generate_trl(
         self,
@@ -154,6 +170,8 @@ class VLLMClient:
         max_tokens: int,
         temperature: float,
         top_k: int,
+        stop_token_ids: Optional[list[int]] = None,
+        stop: Optional[list[str]] = None,
     ) -> list[list[int]]:
         """Generate via TRL's /generate/ endpoint (token-ids in/out)."""
         url = f"{self.base_url}/generate/"
@@ -165,6 +183,12 @@ class VLLMClient:
             "max_tokens": max_tokens,
             "logprobs": None,
         }
+        if stop_token_ids:
+            payload["stop_token_ids"] = list(stop_token_ids)
+        if stop:
+            payload["stop"] = list(stop)
+            # Keep the stop string in the output (see _generate_openai for why).
+            payload["include_stop_str_in_output"] = True
         r = self.session.post(url, json=payload, timeout=600)
         if r.status_code != 200:
             raise RuntimeError(f"vLLM /generate/ failed: {r.status_code} {r.text}")
@@ -177,6 +201,8 @@ class VLLMClient:
         max_tokens: int,
         temperature: float,
         top_k: int,
+        stop_token_ids: Optional[list[int]] = None,
+        stop: Optional[list[str]] = None,
     ) -> list[list[int]]:
         """Generate via OpenAI-compatible /v1/completions endpoint.
 
@@ -197,6 +223,15 @@ class VLLMClient:
             "temperature": temperature,
             "echo": False,
         }
+        if stop_token_ids:
+            # vLLM's OpenAI server accepts SamplingParams extras at top level.
+            payload["stop_token_ids"] = list(stop_token_ids)
+        if stop:
+            payload["stop"] = list(stop)
+            # Keep the stop string in the output so downstream regex-based
+            # reward extractors (e.g. ThinkingAnswerFormattingReward, which
+            # requires ``</answer>`` to match) still see the format markers.
+            payload["include_stop_str_in_output"] = True
         r = self.session.post(comp_url, json=payload, timeout=600)
         if r.status_code != 200:
             raise RuntimeError(
