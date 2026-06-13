@@ -193,6 +193,53 @@ Potential workaround noted but not yet tested: a replicated/DDP-style training p
 4. **Keep DDP-style replicated training as an explicit fallback**. If a longer horizon still hits an XPU driver wall, test a DDP/replicated policy path for AGPT-2B if HBM permits.
 5. **Submit to Intel/ALCF as a refinement of `UPSTREAM_FILING_DRAFT_l0_resource_pool.md`**. AGPT-2B's deterministic step-62/80 walls are new data points on top of the existing 4 sig#2/4 reproducers — same family but a fresh sub-mechanism (the per-iteration count is decoupled from explicit `empty_cache()` calls; our code never makes them on XPU).
 
+## 2026-06-13 attribution correction
+
+A re-read of this report's own evidence the morning after shipping identifies
+the dominant lever incorrectly. Three corrections:
+
+1. **The single lever that cleared step 62 was flipping
+   `TORCHTUNE_USE_CHUNKED_LOSS` from `1` to `0` together with
+   `forward_batch_size=8`.** The env-var name is inverted from what it does:
+   `=1` selects single-fwd+single-bwd over all `num_seqs`; `=0` (or unset)
+   selects chunked fwd+bwd at `forward_batch_size`. Jobs 8540485 → 8540864
+   in the late-session addendum are exactly the runs where this flipped.
+   Job 8540432 confirms the negative: `FORWARD_BATCH_SIZE=8` alone with the
+   inherited `TORCHTUNE_USE_CHUNKED_LOSS=1` default still reproduced the
+   step-62 wall — the env value, not the fbs value, is the discriminator.
+
+2. **FSDP1 ZeRO-2 and the stable hparams ship in the same envelope but did
+   not, by themselves, clear the wall.** The 7-run isolation matrix (jobs
+   8538544 → 8539641) already showed FSDP2 ≡ FSDP1 SHARD_GRAD_OP at the
+   wall, with the same staircase signature. They ride along in
+   `auroragpt_2b_grpo_2n_gsm8k_server_xpu_stable.yaml` because they're
+   independently good ideas (FSDP1 doubles iteration count before sig#2
+   fires per the upstream draft; KL-in-the-gradient prevents the NaN
+   collapse at step 40). Neither is the load-bearing change for step 62.
+
+3. **Why the 7-run isolation matrix missed it.** The matrix varied YAML
+   knobs; `TORCHTUNE_USE_CHUNKED_LOSS` and `FORWARD_BATCH_SIZE` lived in
+   the inherited launcher `run_qwen3_4b_dense_2node.sh` as
+   `${VAR:-default}` values. At the baseline `fbs=16, num_seqs=16` the
+   chunked branch produces a single chunk, so the chunked-branch and
+   single-backward branch executed identically — toggling the env alone
+   would have looked like a no-op until `fbs` was also reduced. The class
+   of bug is captured in `memory/feedback_launcher_config_drift.md`; the
+   specific inverted-env trap is now in
+   `memory/feedback_torchtune_use_chunked_loss_is_inverted.md`.
+
+The XCCL Q/K un-permute fix (commit `0c4a08db` `weight_sync.py`) is its own
+real, separate, latent Llama-family bug — but it is **not** what unblocked
+step 62. Rewards trended up before the crash, indicating the policy/ref
+forward was correctness-OK and the run was L0-leak-bounded, not
+correctness-bounded. The fix should be filed in the bug log as a quality
+win that happened to land in the same chapter, not as a step-62 cause.
+
+The `grpo_step()` entrypoint now logs a one-shot
+`grpo_step path: SINGLE_BACKWARD|CHUNKED_BACKWARD|PACKED` line on rank 0 so
+this kind of "did the env engage?" question is unambiguous in any future
+run's log.
+
 ## Related
 
 - `docs/bugs/intel_xpu_resource_leak_bug_report.md` — sig#2 canonical reproducer (FSDP + empty_cache + storage.resize_).

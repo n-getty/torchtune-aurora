@@ -198,6 +198,16 @@ def _sync_colocated_weights(self) -> None:
         param_iter = _default_iter()
 
     _unperm_needed = _needs_qk_unpermute(self)
+    if _unperm_needed and not getattr(self, "_qk_unperm_engaged_logged", False):
+        log.info(
+            "Rank %d: colocated wsync QK un-permute ENGAGED "
+            "(n_heads=%s n_kv_heads=%s head_dim=%s)",
+            self.rank,
+            getattr(self, "_model_num_heads", None),
+            getattr(self, "_model_num_kv_heads", None),
+            getattr(self, "_model_head_dim", None),
+        )
+        self._qk_unperm_engaged_logged = True
     for hf_name, param in param_iter:
         if hasattr(param, 'full_tensor'):
             weight_data = param.full_tensor()
@@ -275,6 +285,20 @@ def _sync_ray_colocate_weights(self) -> None:
     chunk_pairs = []  # list of (hf_name, cpu_tensor) for rank 0
     chunk_numel = 0
     _unperm_needed = _needs_qk_unpermute(self)
+    if (
+        _unperm_needed
+        and is_driver
+        and not getattr(self, "_qk_unperm_ray_engaged_logged", False)
+    ):
+        log.info(
+            "Rank %d: ray-colocate wsync QK un-permute ENGAGED "
+            "(n_heads=%s n_kv_heads=%s head_dim=%s)",
+            self.rank,
+            getattr(self, "_model_num_heads", None),
+            getattr(self, "_model_num_kv_heads", None),
+            getattr(self, "_model_head_dim", None),
+        )
+        self._qk_unperm_ray_engaged_logged = True
 
     for hf_name, param in param_iter:
         # full_tensor() is collective — every FSDP rank must call.
@@ -547,6 +571,19 @@ def _sync_dedicated_vllm_weights(self) -> None:
         t_bcast_total = 0.0
         bcast_bytes_total = 0
         _unperm_needed = _needs_qk_unpermute(self)
+        if (
+            _unperm_needed
+            and self.rank == 0
+            and not getattr(self, "_qk_unperm_dedicated_engaged_logged", False)
+        ):
+            log.info(
+                "Rank 0: dedicated wsync QK un-permute ENGAGED "
+                "(n_heads=%s n_kv_heads=%s head_dim=%s)",
+                getattr(self, "_model_num_heads", None),
+                getattr(self, "_model_num_kv_heads", None),
+                getattr(self, "_model_head_dim", None),
+            )
+            self._qk_unperm_dedicated_engaged_logged = True
         for ci, (pidx_start, pidx_end, chunk_numel) in enumerate(self._wsync_chunk_ranges):
             tp0 = time.perf_counter()
             if self.rank == 0:
@@ -2043,7 +2080,11 @@ def _sync_weights_to_vllm_xccl(self) -> None:
         # multiple shard leaders would race for the same vLLM-side rank.
         is_active = getattr(self, "_is_xccl_leader", self._is_shard_leader)
 
-    use_fsdp1 = getattr(self, '_use_fsdp1', False) and self._dp_replicate > 1
+    # _use_fsdp1 is set by both _setup_model_fsdp1_hsdp (dp_replicate > 1) and
+    # _setup_model_fsdp1_flat_zero2 (flat FSDP1 SHARD_GRAD_OP, dp_replicate == 1).
+    # Both wrap with the FSDP1 API; .full_tensor() doesn't exist on the params
+    # so we MUST go through FSDP.state_dict() in either case.
+    use_fsdp1 = getattr(self, '_use_fsdp1', False)
 
     # BioReason: vLLM only loads the backbone (Qwen3-4B). Strip the
     # 'backbone.' prefix and skip everything else (ESM3, GO encoder,
@@ -2068,12 +2109,32 @@ def _sync_weights_to_vllm_xccl(self) -> None:
         hf_state_dict = {}
         # WS3.5: only the XCCL leader (global rank 0) keeps and broadcasts.
         _is_xccl_leader = getattr(self, "_is_xccl_leader", self._is_shard_leader)
+        # Llama-family Q/K un-permute mirrors the FSDP2 path (line ~2987).
+        # Engages once with a log line for runtime confirmation.
+        _unperm_needed_x = _needs_qk_unpermute(self)
+        if (
+            _unperm_needed_x
+            and _is_xccl_leader
+            and not getattr(self, "_qk_unperm_xccl_fsdp1_engaged_logged", False)
+        ):
+            log.info(
+                "Rank %d: xccl FSDP1 wsync QK un-permute ENGAGED "
+                "(n_heads=%s n_kv_heads=%s head_dim=%s)",
+                self.rank,
+                getattr(self, "_model_num_heads", None),
+                getattr(self, "_model_num_kv_heads", None),
+                getattr(self, "_model_head_dim", None),
+            )
+            self._qk_unperm_xccl_fsdp1_engaged_logged = True
         if _is_xccl_leader:
             for param_name, param in full_sd.items():
                 hf_name = _xccl_accept_and_rename(param_name)
                 if hf_name is None:
                     continue
-                hf_state_dict[hf_name] = param.to(self._device)
+                weight = param.to(self._device)
+                if _unperm_needed_x:
+                    weight = _maybe_unpermute_qk(self, hf_name, weight)
+                hf_state_dict[hf_name] = weight
         del full_sd
 
         if not self._production_mode:
@@ -2648,6 +2709,26 @@ def _sync_weights_to_vllm_xccl(self) -> None:
                 del sharded_sd
                 return
 
+            # Llama-family Q/K un-permute predicate, captured once outside the
+            # loop. See _maybe_unpermute_qk for invariant; applied per-param
+            # below at the point where `param` becomes the full tensor that
+            # vLLM consumes.
+            _unperm_needed_x = _needs_qk_unpermute(self)
+            if (
+                _unperm_needed_x
+                and is_active
+                and not getattr(self, "_qk_unperm_xccl_engaged_logged", False)
+            ):
+                log.info(
+                    "Rank %d: xccl wsync QK un-permute ENGAGED "
+                    "(n_heads=%s n_kv_heads=%s head_dim=%s)",
+                    self.rank,
+                    getattr(self, "_model_num_heads", None),
+                    getattr(self, "_model_num_kv_heads", None),
+                    getattr(self, "_model_head_dim", None),
+                )
+                self._qk_unperm_xccl_engaged_logged = True
+
             for param_name, param in sharded_sd.items():
                 if param.is_cpu:
                     param = param.to(self._device)
@@ -2970,6 +3051,16 @@ def _sync_weights_to_vllm_xccl(self) -> None:
                     if hf_name is None:
                         del param
                         continue
+                    # Llama-family Q/K un-permute: torchtune permutes Q/K at
+                    # checkpoint load (convert_weights.hf_to_tune); vLLM expects
+                    # HF-format unpermuted Q/K. Without this, server-mode XCCL
+                    # wsync silently scrambles Q/K projections on every sync
+                    # (mirrors the colocate fix landed 2026-06-11). Bug latent
+                    # since this xccl path was added — Qwen/Gemma never tripped
+                    # it (they don't permute), AGPT-2B is the first Llama-family
+                    # server-mode GRPO target.
+                    if _unperm_needed_x:
+                        param = _maybe_unpermute_qk(self, hf_name, param)
                     _c0 = time.perf_counter()
                     gpu_tensor = param.to(torch.bfloat16).contiguous()
                     t_cast += time.perf_counter() - _c0
@@ -3264,8 +3355,10 @@ def _sync_weights_to_vllm_shm(self) -> None:
     t0 = time.perf_counter()
     hf_state_dict = {}
 
-    # Phase 1: FSDP gather (same as raw bytes path)
-    if getattr(self, '_use_fsdp1', False) and self._dp_replicate > 1:
+    # Phase 1: FSDP gather (same as raw bytes path).
+    # _use_fsdp1 is set by both the HSDP path (dp_replicate>1) and the new
+    # flat ZeRO-2 path (dp_replicate==1); both wrap with FSDP1 API.
+    if getattr(self, '_use_fsdp1', False):
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, StateDictType
         with FSDP.state_dict_type(self._model, StateDictType.FULL_STATE_DICT):
             full_sd = self._model.state_dict()

@@ -3476,6 +3476,31 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         # estimate logprobs from the policy at the current optimisation step
         _fwd_t0 = time.perf_counter()
 
+        # One-shot per-run rank-0 diagnostic: name the actual grpo_step path
+        # taken. TORCHTUNE_USE_CHUNKED_LOSS is historically inverted (=1 means
+        # single backward, =0 means chunked) and has hidden walls before; this
+        # line eliminates the "is the env engaged?" ambiguity. See
+        # memory/feedback_torchtune_use_chunked_loss_is_inverted.md.
+        if self._is_rank_zero and not getattr(self, "_grpo_path_logged", False):
+            _env_val = os.environ.get("TORCHTUNE_USE_CHUNKED_LOSS", "<unset>")
+            _num_seqs_init = trajectory.query_responses.shape[0]
+            if self._enable_packing:
+                _path = "PACKED"
+                _num_chunks = 1
+            elif _env_val == "1" and self._expert_parallel_degree <= 1:
+                _path = "SINGLE_BACKWARD"
+                _num_chunks = 1
+            else:
+                _path = "CHUNKED_BACKWARD"
+                _fbs_init = self._forward_batch_size
+                _num_chunks = (_num_seqs_init + _fbs_init - 1) // _fbs_init
+            log.info(
+                "grpo_step path: %s (TORCHTUNE_USE_CHUNKED_LOSS=%s, fbs=%d, "
+                "num_seqs=%d, num_chunks=%d, ep_degree=%d)",
+                _path, _env_val, self._forward_batch_size, _num_seqs_init,
+                _num_chunks, self._expert_parallel_degree,
+            )
+            self._grpo_path_logged = True
 
         if self._enable_packing:
             # Pack sequences to eliminate padding waste in forward/backward.

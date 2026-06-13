@@ -141,8 +141,15 @@ def _init_vllm_early_dedicated(self, cfg):
     log.info("Rank %d (vLLM server): early vLLM init on tile %d", rank, local_rank)
 
     # Sequential init: wait for rank-1 before starting to avoid resource conflicts.
+    # /tmp is node-local; use LOCAL_RANK + a shared (non-PID) run_id so all ranks
+    # on the same node land in the same barrier dir. PBS_JOBID under mpiexec, falls
+    # back to TORCHELASTIC_RUN_ID under torchrun, then a fixed default.
     import tempfile
-    run_id = os.environ.get("TORCHELASTIC_RUN_ID", str(os.getpid()))
+    run_id = (
+        os.environ.get("PBS_JOBID")
+        or os.environ.get("TORCHELASTIC_RUN_ID")
+        or "default"
+    )
     barrier_dir = f"/tmp/torchtune/vllm_init_barriers_{run_id}"
     os.makedirs(barrier_dir, exist_ok=True)
 
@@ -260,13 +267,30 @@ def _init_vllm_tp1(self, cfg, rank, world_size, local_rank,
 
     Uses gloo PG (world_size=1) with sequential init via file barriers.
     """
-    # Sequential init to avoid port/resource conflicts.
-    run_id = os.environ.get("TORCHELASTIC_RUN_ID", str(os.getpid()))
+    # Sequential init to avoid port/resource conflicts. /tmp is node-local,
+    # so the barrier serializes per-node by node-local rank (NOT the `local_rank`
+    # passed in — that's the device-index, which `_init_vllm_early` clamps to 0
+    # whenever ZE_AFFINITY_MASK selects a single tile, making it useless for
+    # serializing ranks-per-node). Read the launcher-set LOCAL_RANK from the
+    # environment instead. PBS_JOBID is the shared run_id under mpiexec (per-rank
+    # PIDs differ; falling back to PID would put every rank in its own dir).
+    node_local_rank = int(os.environ.get("LOCAL_RANK", local_rank))
+    local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", world_size))
+    run_id = (
+        os.environ.get("PBS_JOBID")
+        or os.environ.get("TORCHELASTIC_RUN_ID")
+        or "default"
+    )
     barrier_dir = f"/tmp/torchtune/vllm_init_barriers_{run_id}"
     os.makedirs(barrier_dir, exist_ok=True)
-    if rank > 0:
-        prev_barrier = os.path.join(barrier_dir, f"rank_{rank - 1}_done")
-        log.info("Rank %d: waiting for rank %d to finish vLLM init...", rank, rank - 1)
+    if node_local_rank > 0:
+        prev_barrier = os.path.join(
+            barrier_dir, f"local_rank_{node_local_rank - 1}_done"
+        )
+        log.info(
+            "Rank %d (node-local %d): waiting for node-local rank %d to finish vLLM init...",
+            rank, node_local_rank, node_local_rank - 1,
+        )
         while not os.path.exists(prev_barrier):
             time.sleep(0.5)
 
@@ -409,32 +433,34 @@ def _init_vllm_tp1(self, cfg, rank, world_size, local_rank,
         elif key in os.environ:
             del os.environ[key]
 
-    # Signal next rank that we're done
-    my_barrier = os.path.join(barrier_dir, f"rank_{rank}_done")
+    # Signal next node-local rank that we're done
+    my_barrier = os.path.join(barrier_dir, f"local_rank_{node_local_rank}_done")
     with open(my_barrier, "w") as f:
         f.write("done")
 
-    # Wait for ALL ranks to finish vLLM init before returning.
+    # Wait for ALL node-local ranks on this node to finish vLLM init before returning.
     # CCL init (called immediately after _init_vllm_early) maps IPC handles
-    # for every peer tile. If rank 0 enters CCL while rank 1 is still in
-    # its vLLM memory-profiling run, CCL maps rank 0's vLLM weights+KV
-    # (~24 GiB) as non-torch IPC memory on tile 1, causing rank 1's vLLM
-    # KV-cache budget check to fail ("No available memory for cache blocks").
-    for wait_rank in range(world_size):
-        wait_barrier = os.path.join(barrier_dir, f"rank_{wait_rank}_done")
+    # for every peer tile. If node-local rank 0 enters CCL while node-local rank 1
+    # is still in its vLLM memory-profiling run, CCL maps rank 0's vLLM weights+KV
+    # (~24 GiB) as non-torch IPC memory on tile 1, causing rank 1's vLLM KV-cache
+    # budget check to fail ("No available memory for cache blocks"). On multi-node,
+    # cross-node CCL handle exchange is gated by the world-PG init that follows;
+    # we only need to serialize within this node here.
+    for wait_local in range(local_world_size):
+        wait_barrier = os.path.join(barrier_dir, f"local_rank_{wait_local}_done")
         while not os.path.exists(wait_barrier):
             time.sleep(0.2)
     log.info(
-        "Rank %d: all %d ranks completed vLLM init, proceeding to CCL init",
-        rank, world_size,
+        "Rank %d (node-local %d): all %d node-local ranks completed vLLM init, proceeding to CCL init",
+        rank, node_local_rank, local_world_size,
     )
 
-    # Last rank cleans up barrier files
-    if rank == world_size - 1:
+    # Last node-local rank cleans up barrier files for this node
+    if node_local_rank == local_world_size - 1:
         time.sleep(0.5)
-        for i in range(world_size):
+        for i in range(local_world_size):
             try:
-                os.unlink(os.path.join(barrier_dir, f"rank_{i}_done"))
+                os.unlink(os.path.join(barrier_dir, f"local_rank_{i}_done"))
             except OSError:
                 pass
 
