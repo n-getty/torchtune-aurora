@@ -1,0 +1,111 @@
+# AuroraGPT-2B LoRA SFT — 1N Alpaca SMOKE (single-node, ~30 steps)
+#
+# LoRA variant of auroragpt_2b_sft_alpaca_smoke_xpu.yaml. Validates the LoRA
+# XPU recipe end-to-end before committing to the GSM8K LoRA prod run.
+#
+# Pair with launcher: experiments/agpt2b_sft/run_sft_smoke.sh (with LORA=1)
+# Recipe:             recipes/dev/lora_finetune_distributed_xpu.py
+
+name: agpt2b_sft_lora_alpaca_smoke
+output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/experiments/agpt2b_sft/runs/${name}
+base_model_path: /flare/AuroraGPT/AuroraGPT-v1/Experiments/AuroraGPT-2B/public/sophiag/hf/global_step138650
+
+# ── Model (LoRA on q/v projections) ──────────────────────────────────────────
+model:
+  _component_: torchtune.models.llama3.lora_llama3
+  lora_attn_modules: [q_proj, v_proj]
+  apply_lora_to_mlp: false
+  apply_lora_to_output: false
+  vocab_size: 256000
+  num_layers: 12
+  num_heads: 16
+  num_kv_heads: 4
+  embed_dim: 2048
+  max_seq_len: 1024
+  intermediate_dim: 11008
+  rope_base: 50000
+  lora_rank: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+
+tokenizer:
+  _component_: torchtune.dev.rl.ezpz_tasks.auroragpt_tokenizer
+  path: ${base_model_path}/tokenizer.model
+  max_seq_len: 1024
+
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [pytorch_model.bin]
+  recipe_checkpoint: null
+  adapter_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: LLAMA3
+
+resume_from_checkpoint: false
+save_adapter_weights_only: true
+
+dataset:
+  _component_: torchtune.datasets.alpaca_dataset
+  source: tatsu-lab/alpaca
+  split: train[:5%]
+  train_on_input: false
+  packed: false
+seed: 42
+shuffle: true
+
+epochs: 1
+max_steps_per_epoch: 30
+batch_size: 8
+gradient_accumulation_steps: 1
+clip_grad_norm: 1.0
+
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 2.0e-4
+  weight_decay: 0.0
+  fused: false
+
+# Required by lora_finetune_distributed_xpu (cfg.lr_scheduler is mandatory; the
+# full recipe makes it optional via cfg.get). Constant ramp over the 30 smoke
+# steps with 5-step warmup is fine for a recipe-only smoke.
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  num_warmup_steps: 5
+
+loss:
+  _component_: torchtune.modules.loss.LinearCrossEntropyLoss
+
+enable_activation_checkpointing: true
+enable_activation_offloading: false
+fsdp_cpu_offload: false
+fsdp_reshard_after_forward: true
+data_parallel_replicate_dim: 1
+data_parallel_shard_dim: -1
+
+device: xpu
+dtype: bf16
+compile: false
+
+log_level: INFO
+log_every_n_steps: 1
+log_peak_memory_stats: true
+
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: false
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: true
+  cuda: false
+  profile_memory: false
+  with_stack: false
+  record_shapes: false
+  with_flops: false
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1

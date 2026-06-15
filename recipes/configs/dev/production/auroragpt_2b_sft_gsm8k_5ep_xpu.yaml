@@ -1,0 +1,141 @@
+# AuroraGPT-2B SFT — 2N GSM8K (production exemplar)
+#
+# Aim: produce a GSM8K-formatted SFT checkpoint that drops into the existing
+# GRPO recipe (recipes/configs/dev/production/auroragpt_2b_grpo_2n_gsm8k_xpu.yaml)
+# with ZERO recipe changes. Validates the SFT-for-RL handoff and a meaningful
+# initial reward lift vs the raw pretraining checkpoint.
+#
+# Pair with launcher: experiments/agpt2b_sft/pbs_2n_gsm8k_sft.sh
+# Recipe:             recipes/dev/full_finetune_distributed_xpu.py
+#
+# Envelope (2026-06-14 tuning pass-2):
+#   - Conservative 2N config (AC on, ZeRO-3, LinearCE, packed=false) — same as
+#     the validated 2026-06-13 run (job 8542125, 38 steps, loss 0.86→0.61, rc=0).
+#   - ADD backbone-only compile via DictConfig (+12-23% lift on 1N Pass-2);
+#     scalar compile=true SIGSEGVs, the DictConfig form (model=true, others
+#     false) is the working path.
+#   - 3 epochs (was 2) for stronger SFT signal before RL.
+#
+# Dataset wiring:
+#   torchtune.datasets.instruct_dataset converts {input, output} columns to
+#   [user, assistant] Message pairs.  We map gsm8k's {question, answer} columns
+#   onto it. With train_on_input=False, only the assistant span (the GSM8K
+#   solution + #### final answer line) contributes to the loss.
+#
+# HF cache: launcher exports HF_DATASETS_CACHE + HF_HUB_OFFLINE=1; the data
+# loader reads from /lus/flare/projects/ModCon/ngetty/hf_datasets_cache/openai___gsm8k.
+
+name: agpt2b_sft_gsm8k_5ep
+output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/experiments/agpt2b_sft/runs/${name}
+base_model_path: /flare/AuroraGPT/AuroraGPT-v1/Experiments/AuroraGPT-2B/public/sophiag/hf/global_step138650
+
+# ── Model ────────────────────────────────────────────────────────────────────
+model:
+  _component_: torchtune.models.llama3.llama3
+  vocab_size: 256000
+  num_layers: 12
+  num_heads: 16
+  num_kv_heads: 4
+  embed_dim: 2048
+  max_seq_len: 1024
+  intermediate_dim: 11008
+  rope_base: 50000
+
+# ── Tokenizer ────────────────────────────────────────────────────────────────
+tokenizer:
+  _component_: torchtune.dev.rl.ezpz_tasks.auroragpt_tokenizer
+  path: ${base_model_path}/tokenizer.model
+  max_seq_len: 1024
+
+# ── Checkpointer ─────────────────────────────────────────────────────────────
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [pytorch_model.bin]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: LLAMA3
+
+resume_from_checkpoint: false
+
+# ── Dataset (GSM8K train, instruct format) ───────────────────────────────────
+dataset:
+  _component_: torchtune.datasets.instruct_dataset
+  source: openai/gsm8k
+  name: main
+  split: train
+  column_map:
+    input: question
+    output: answer
+  train_on_input: false
+  packed: false                     # more optimizer steps/epoch for stronger
+                                    # SFT signal at AGPT-2B scale; packing
+                                    # collapses 7500 samples to <500 packs.
+seed: 42
+shuffle: true
+
+# ── Training envelope ────────────────────────────────────────────────────────
+epochs: 5                           # was 2; more passes for SFT->RL handoff
+batch_size: 4
+gradient_accumulation_steps: 4      # effective batch 16/rank → 384 across 24 ranks
+max_steps_per_epoch: null
+clip_grad_norm: 1.0
+
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 1.0e-5
+  weight_decay: 0.0
+  fused: false
+
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  num_warmup_steps: 20
+
+loss:
+  _component_: torchtune.modules.loss.LinearCrossEntropyLoss
+
+# ── Distributed / FSDP ───────────────────────────────────────────────────────
+enable_activation_checkpointing: true   # KEEP for 2N memory safety
+enable_activation_offloading: false
+fsdp_cpu_offload: false
+fsdp_reshard_after_forward: true        # ZeRO-3 (safer on 2N)
+data_parallel_replicate_dim: 1
+data_parallel_shard_dim: -1
+tensor_parallel_dim: 1
+
+# ── XPU ──────────────────────────────────────────────────────────────────────
+device: xpu
+dtype: bf16
+
+# ── Compile (backbone only — full=true SIGSEGVs on XPU) ──────────────────────
+# Pass-2 tuning (2026-06-14) shows +12-23% throughput with this DictConfig
+# form. Loss/optimizer compile crash on first step, so leave those false.
+compile:
+  model: true
+  loss: false
+  optimizer_step: false
+  scale_grads: false
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+log_level: INFO
+log_every_n_steps: 1
+log_peak_memory_stats: true
+
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: false
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: true
+  cuda: false
+  profile_memory: false
+  with_stack: false
+  record_shapes: false
+  with_flops: false
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1

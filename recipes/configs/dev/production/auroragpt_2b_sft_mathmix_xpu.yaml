@@ -1,0 +1,144 @@
+# AuroraGPT-2B SFT — 2N multi-corpus math mix (GSM8K + MATH + MetaMathQA)
+#
+# Goal: lift the SFT-to-RL handoff's *success rate* (the GRPO metric that
+# stayed flat at ~2.8% under GSM8K-only SFT) by training on a broader math
+# distribution rendered in the EXACT prompt template the GRPO reward parser
+# expects. Predecessor: auroragpt_2b_sft_gsm8k_xpu.yaml (single corpus, raw
+# instruct_dataset → +28% mean reward, but partial-credit only).
+#
+# What changes vs the GSM8K-only config:
+#   1. dataset → torchtune.dev.sft.auroragpt_math_mix.auroragpt_math_mix_sft
+#      (concatenated SFTDatasets, all wrapped in PREAMBLE + <think>/<answer>
+#       tags so the GRPO formatted-correctness reward can actually trigger).
+#   2. corpus mix: GSM8K x3 replicas (22.5K) + MATH x1 (~12K filtered) +
+#      MetaMathQA subset 25K x1 = ~60K rows/epoch. GSM8K share by *rows* ≈
+#      38%; by *tokens* (GSM8K answers are short) ≈ 25-30% — anchors the
+#      downstream eval distribution without dominating.
+#   3. max_seq_len 1024 → 2048 (MATH solutions can be long; LinearCE + AC
+#      keep the memory envelope safe even at the higher cap).
+#   4. epochs unchanged at 3; total step count up ~8x from GSM8K-only (~57
+#      → ~480 optimizer steps at effective batch 384) — the cosine schedule
+#      is rescaled by torchtune at recipe-load time from total step count,
+#      so warmup_steps=20 still lands inside the first epoch.
+#
+# Pair with launcher: experiments/agpt2b_sft/pbs_2n_mathmix_sft.sh
+# Recipe:             recipes/dev/full_finetune_distributed_xpu.py
+#
+# The compile / FSDP / optimizer envelope is byte-for-byte the validated
+# GSM8K-only setup (DictConfig compile.model=true only; ZeRO-3; AC on;
+# AdamW fused=false lr=1e-5 cosine warmup=20; LinearCE; packed=false).
+
+name: agpt2b_sft_mathmix
+output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/experiments/agpt2b_sft/runs/${name}
+base_model_path: /flare/AuroraGPT/AuroraGPT-v1/Experiments/AuroraGPT-2B/public/sophiag/hf/global_step138650
+
+# ── Model ────────────────────────────────────────────────────────────────────
+model:
+  _component_: torchtune.models.llama3.llama3
+  vocab_size: 256000
+  num_layers: 12
+  num_heads: 16
+  num_kv_heads: 4
+  embed_dim: 2048
+  max_seq_len: 2048          # was 1024; MATH solutions can run ~600-1500 tok
+  intermediate_dim: 11008
+  rope_base: 50000
+
+# ── Tokenizer ────────────────────────────────────────────────────────────────
+tokenizer:
+  _component_: torchtune.dev.rl.ezpz_tasks.auroragpt_tokenizer
+  path: ${base_model_path}/tokenizer.model
+  max_seq_len: 2048
+
+# ── Checkpointer ─────────────────────────────────────────────────────────────
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [pytorch_model.bin]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: LLAMA3
+
+resume_from_checkpoint: false
+
+# ── Dataset (GSM8K + MATH + MetaMathQA, GRPO-templated) ──────────────────────
+dataset:
+  _component_: torchtune.dev.sft.auroragpt_math_mix.auroragpt_math_mix_sft
+  gsm8k_source: openai/gsm8k
+  gsm8k_name: main
+  math_source: qwedsacf/competition_math   # mirror of hendrycks/competition_math
+  metamath_source: meta-math/MetaMathQA
+  metamath_subset: 25000
+  metamath_seed: 42
+  gsm8k_replicas: 3          # 7.5K x 3 = 22.5K rows (GSM8K format anchor)
+  math_replicas: 1           # ~12K rows after \boxed{} filter
+  metamath_replicas: 1       # 25K subset
+
+seed: 42
+shuffle: true
+
+# ── Training envelope ────────────────────────────────────────────────────────
+epochs: 3
+batch_size: 4
+gradient_accumulation_steps: 4   # effective batch 384 across 24 ranks
+max_steps_per_epoch: null
+clip_grad_norm: 1.0
+
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 1.0e-5
+  weight_decay: 0.0
+  fused: false
+
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  num_warmup_steps: 20
+
+loss:
+  _component_: torchtune.modules.loss.LinearCrossEntropyLoss
+
+# ── Distributed / FSDP ───────────────────────────────────────────────────────
+enable_activation_checkpointing: true
+enable_activation_offloading: false
+fsdp_cpu_offload: false
+fsdp_reshard_after_forward: true
+data_parallel_replicate_dim: 1
+data_parallel_shard_dim: -1
+tensor_parallel_dim: 1
+
+# ── XPU ──────────────────────────────────────────────────────────────────────
+device: xpu
+dtype: bf16
+
+# ── Compile DISABLED for variable-length math corpus ─────────────────────────
+# 2026-06-15 first-attempt SFT (job 8543890) died at step ~10 with
+# `torch._dynamo recompile_limit (8)` because variable-length math samples
+# (GSM8K 269 / MATH 326 / MetaMathQA 305 median, p99 600/1356/798) cause
+# dynamo to recompile per shape until the cap is hit. The GSM8K-only +12-23%
+# compile win depended on GSM8K's tight shape distribution (max=606).
+# Re-enable only if packed=true OR all samples are bucketed to fixed shapes.
+compile: false
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+log_level: INFO
+log_every_n_steps: 1
+log_peak_memory_stats: true
+
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: false
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: true
+  cuda: false
+  profile_memory: false
+  with_stack: false
+  record_shapes: false
+  with_flops: false
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1

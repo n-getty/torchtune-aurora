@@ -1,0 +1,103 @@
+# AGPT-2B SFT 2N GSM8K — SAFE FALLBACK (no compile).
+#
+# Identical to auroragpt_2b_sft_gsm8k_xpu.yaml except `compile: false`. Used
+# by the overnight watchdog if the compile path crashes — same 2026-06-13
+# validated envelope as the original prod run (job 8542125: 38 steps clean,
+# loss 0.86→0.61, rc=0).
+
+name: agpt2b_sft_gsm8k_safe
+output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/experiments/agpt2b_sft/runs/${name}
+base_model_path: /flare/AuroraGPT/AuroraGPT-v1/Experiments/AuroraGPT-2B/public/sophiag/hf/global_step138650
+
+model:
+  _component_: torchtune.models.llama3.llama3
+  vocab_size: 256000
+  num_layers: 12
+  num_heads: 16
+  num_kv_heads: 4
+  embed_dim: 2048
+  max_seq_len: 1024
+  intermediate_dim: 11008
+  rope_base: 50000
+
+tokenizer:
+  _component_: torchtune.dev.rl.ezpz_tasks.auroragpt_tokenizer
+  path: ${base_model_path}/tokenizer.model
+  max_seq_len: 1024
+
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [pytorch_model.bin]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: LLAMA3
+
+resume_from_checkpoint: false
+
+dataset:
+  _component_: torchtune.datasets.instruct_dataset
+  source: openai/gsm8k
+  name: main
+  split: train
+  column_map:
+    input: question
+    output: answer
+  train_on_input: false
+  packed: false
+seed: 42
+shuffle: true
+
+epochs: 3
+batch_size: 4
+gradient_accumulation_steps: 4
+max_steps_per_epoch: null
+clip_grad_norm: 1.0
+
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 1.0e-5
+  weight_decay: 0.0
+  fused: false
+
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  num_warmup_steps: 20
+
+loss:
+  _component_: torchtune.modules.loss.LinearCrossEntropyLoss
+
+enable_activation_checkpointing: true
+enable_activation_offloading: false
+fsdp_cpu_offload: false
+fsdp_reshard_after_forward: true
+data_parallel_replicate_dim: 1
+data_parallel_shard_dim: -1
+tensor_parallel_dim: 1
+
+device: xpu
+dtype: bf16
+compile: false
+
+log_level: INFO
+log_every_n_steps: 1
+log_peak_memory_stats: true
+
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: false
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: true
+  cuda: false
+  profile_memory: false
+  with_stack: false
+  record_shapes: false
+  with_flops: false
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1

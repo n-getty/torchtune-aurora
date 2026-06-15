@@ -37,8 +37,18 @@ LOGDIR=$REPO/experiments/auroragpt_2b_bakeoff/logs/gsm8k_2n_production_${TS}
 mkdir -p "$LOGDIR"
 
 # --- AGPT-2B specific overrides -------------------------------------------
-export CONFIG=recipes/configs/dev/production/auroragpt_2b_grpo_2n_gsm8k_xpu.yaml
-export MODEL_PATH=/flare/AuroraGPT/AuroraGPT-v1/Experiments/AuroraGPT-2B/public/sophiag/hf/global_step138650
+# Defaults to the 2026-06-14 SFT'd checkpoint (3-ep lr=1e-5 winner). Validated
+# in docs/reports/agpt2b_sft_to_grpo_20260614.md: +28% mean reward, +50%
+# late-phase vs raw pretraining (paired n=2 replicas both sides). To reproduce
+# the raw-pretraining baseline instead, set:
+#   MODEL_PATH=/flare/AuroraGPT/AuroraGPT-v1/Experiments/AuroraGPT-2B/public/sophiag/hf/global_step138650 \
+#   CONFIG=recipes/configs/dev/production/auroragpt_2b_grpo_2n_gsm8k_xpu.yaml \
+#   qsub <this script>
+# The handshake config is identical to the prod one EXCEPT for
+# `checkpoint_files: [model.safetensors]` (the SFT recipe outputs safetensors,
+# not pytorch_model.bin).
+export CONFIG=${CONFIG:-recipes/configs/dev/production/auroragpt_2b_grpo_2n_gsm8k_xpu_handshake.yaml}
+export MODEL_PATH=${MODEL_PATH:-/lus/flare/projects/ModCon/ngetty/torchtune/experiments/agpt2b_sft/logs/gsm8k_2n_full_20260614_041943/run_out/epoch_2}
 
 # --- RL envelope (matches the colocate-2N YAML) ---------------------------
 export NSTEPS=${NSTEPS:-150}

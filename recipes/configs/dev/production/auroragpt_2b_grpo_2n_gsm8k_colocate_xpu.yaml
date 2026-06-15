@@ -1,0 +1,154 @@
+# AuroraGPT-2B GRPO — 2N colocate on GSM8K
+#
+# Real RL task post-bake-off: switches from ezpz toy tasks (which were used to
+# establish framework parity with ezpz/TRL at the post-sweep optimum lr=1e-5)
+# to GSM8K for actual capability measurement.
+#
+# Hyperparameter rationale:
+#   - lr=1e-5 — post-sweep optimum from cross-framework comparison (see
+#     memory/project_lr_sweep_torchtune_vs_ezpz.md). At lr=5e-6 both stacks
+#     tie at best_acc=0.542; at lr=1e-5 torchtune climbs to 0.667 while ezpz
+#     plateaus from grad_norm collapse.
+#   - G=16, max_gen=512 — GSM8K-standard envelope. ~95% of solutions fit in
+#     512 tokens; G=16 gives strong advantage estimates per prompt.
+#   - vllm_max_model_len=1024 — leaves 512 token prompt budget (GSM8K
+#     prompts average ~150 tokens; comfortable headroom).
+#   - ref_forward_batch_size=16 set EXPLICITLY — avoids the 500x ref_fwd
+#     trap when batch_size×grpo_samples=16 (CLAUDE.md note).
+#   - colocate (no sleep) — 1.36x faster than colocate_sleep on AGPT-2B with
+#     9 GiB peak HBM tradeoff (postfix_20260611_053338/RESULTS.md). 2B model
+#     has comfortable headroom on 64 GiB tiles even at higher gpu_mem_util.
+#   - kl_coeff=0 matches bake-off shape; ref model still used for logging
+#     KL drift but not in loss.
+#   - vllm_gpu_memory_utilization bumped 0.12 -> 0.20: max_model_len=1024
+#     vs bake-off 256 needs more KV cache headroom for G=16 concurrent seqs.
+
+name: grpo_auroragpt_2b_2n_gsm8k_colocate
+output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/outputs/grpo_auroragpt_2b_2n_gsm8k
+base_model_path: /flare/AuroraGPT/AuroraGPT-v1/Experiments/AuroraGPT-2B/public/sophiag/hf/global_step138650
+
+# ── vLLM (colocate — resident weights, TP=1 per rank) ────────────────────────
+vllm_mode: colocate
+vllm_enforce_eager: true
+vllm_gpu_memory_utilization: 0.20
+vllm_max_model_len: 1024
+vllm_max_num_seqs: 16
+reshard_after_forward: true
+
+# ── Model ────────────────────────────────────────────────────────────────────
+model:
+  _component_: torchtune.models.llama3.llama3
+  vocab_size: 256000
+  num_layers: 12
+  num_heads: 16
+  num_kv_heads: 4
+  embed_dim: 2048
+  max_seq_len: 1024
+  intermediate_dim: 11008
+  rope_base: 50000
+
+# ── Tokenizer ────────────────────────────────────────────────────────────────
+tokenizer:
+  _component_: torchtune.dev.rl.ezpz_tasks.auroragpt_tokenizer
+  path: ${base_model_path}/tokenizer.model
+  max_seq_len: 1024
+
+# ── Checkpointers (policy + ref share the base model) ────────────────────────
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [pytorch_model.bin]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: LLAMA3
+
+ref_checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [pytorch_model.bin]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}/ref
+  model_type: LLAMA3
+
+resume_from_checkpoint: false
+save_every_n_epochs: 1
+
+# ── Dataset (full GSM8K train split) ──────────────────────────────────────────
+dataset:
+  _component_: torchtune.dev.rl.gsm8k.gsm8k_dataset
+seed: 42
+shuffle: true
+
+# ── GRPO hparams ─────────────────────────────────────────────────────────────
+batch_size: 1
+grpo_samples: 16
+forward_batch_size: 16
+ref_forward_batch_size: 16          # explicit — avoid the 500x ref_fwd trap
+max_generated_tokens: 512
+top_k: null
+temperature: 0.7
+gen_batch_size: 1                   # one vLLM call per training step
+
+epochs: 1
+num_steps: 150                      # ~50 min @ ~20s/step target; leaves 10 min slack
+ppo_epochs: 1
+gradient_accumulation_steps: 1
+clip_grad_norm: 1.0
+
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 1.0e-5                        # post-sweep optimum
+  weight_decay: 0.01
+  fused: false
+
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  num_warmup_steps: 5
+
+loss:
+  _component_: torchtune.dev.rl.loss.GRPOSimpleLoss
+  kl_coeff: 0.0
+  epsilon: 0.2
+
+# ── Reward — GSM8K uses <answer>NUMBER</answer> + format reward ──────────────
+reward_functions:
+  - _component_: torchtune.dev.rl.rewards.FormattedMathCorrectnessReward
+    answer_tag: answer
+    positive_reward: 1.0
+    negative_reward: 0.0
+  - _component_: torchtune.dev.rl.rewards.ThinkingAnswerFormattingReward
+    think_tag: think
+    answer_tag: answer
+    positive_reward: 0.1
+    negative_reward: 0.0
+
+# ── Distributed / XPU ────────────────────────────────────────────────────────
+data_parallel_replicate_dim: 1
+device: xpu
+dtype: bf16
+compile: false
+enable_activation_checkpointing: true
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+log_every_n_steps: 1
+log_peak_memory_stats: true
+
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+
+# ── Profiler (off) ───────────────────────────────────────────────────────────
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: false
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: true
+  cuda: false
+  profile_memory: false
+  with_stack: false
+  record_shapes: false
+  with_flops: false
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1

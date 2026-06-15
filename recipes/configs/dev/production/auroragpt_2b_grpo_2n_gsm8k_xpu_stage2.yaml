@@ -1,0 +1,202 @@
+# AuroraGPT-2B GRPO — 2N server mode on GSM8K (PRODUCTION envelope)
+#
+# Pair with launcher: experiments/auroragpt_2b_bakeoff/pbs_2n_gsm8k_production.sh
+# Report:             docs/reports/agpt2b_2n_gsm8k_production_20260613.md
+#
+# Validated envelope (2026-06-13):
+#   - Job 8540864:  150/150 clean, mem flat 24/47.4 GiB, exit=0
+#   - Job stage1c:   50/50 clean, num_stop_tokens 14.7/16, response_lengths 111
+#                    (was 511 — KEY win). Stage 1 stop-string + EOS-injection
+#                    fix unblocks the learning signal.
+#
+# Key hparams (vs the earlier "baseline" variant):
+#   - kl_coeff: 0.02       (keeps KL bounded; baseline 0.0 NaN'd by step 40)
+#   - lr:       5.0e-6     (halved from baseline 1e-5; grad_norm spikes 200+
+#                           at 1e-5 with 511-token responses)
+#   - num_warmup_steps: 10 (doubled to soften early ramp)
+#   - stop_strings: ["</answer>", "User:", "\nUser:"]
+#                          (AGPT-2B is a raw pretraining checkpoint that never
+#                           naturally emits EOS; vLLM stops on format markers;
+#                           recipe injects EOS at boundary so truncation finds
+#                           it — see Stage 1 fix description in launcher header)
+#   - TORCHTUNE_USE_CHUNKED_LOSS=0 in launcher (true chunked train backward;
+#     clears the deterministic step-62 single-backward L0 wall)
+#
+# GRPOSimpleLoss does NOT accept epsilon_high (it lives on GRPOLoss, which
+# requires ppo_epochs > 1 or always_compute_rollout_logprobs: true to have a
+# meaningful pi_old to compare against). Single-epoch on-policy → ratios=1.0
+# is correct and expected.
+
+name: grpo_agpt_2b_2n_gsm8k_production
+output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/outputs/grpo_agpt2b_2n_gsm8k_production
+base_model_path: /flare/AuroraGPT/AuroraGPT-v1/Experiments/AuroraGPT-2B/public/sophiag/hf/global_step138650
+
+data_parallel_replicate_dim: 1
+
+vllm_url: "http://localhost:8001"
+vllm_group_port: 51216
+vllm_tensor_parallel_size: 1
+
+vllm_weight_sync: true
+vllm_weight_sync_method: xccl
+vllm_weight_sync_interval: 1
+
+# ── Model ────────────────────────────────────────────────────────────────────
+model:
+  _component_: torchtune.models.llama3.llama3
+  vocab_size: 256000
+  num_layers: 12
+  num_heads: 16
+  num_kv_heads: 4
+  embed_dim: 2048
+  max_seq_len: 1024
+  intermediate_dim: 11008
+  rope_base: 50000
+
+# ── Tokenizer ────────────────────────────────────────────────────────────────
+tokenizer:
+  _component_: torchtune.dev.rl.ezpz_tasks.auroragpt_tokenizer
+  path: ${base_model_path}/tokenizer.model
+  max_seq_len: ${max_seq_len}
+
+# ── Checkpointers (policy + ref share the base model) ────────────────────────
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [pytorch_model.bin]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: LLAMA3
+
+ref_checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [pytorch_model.bin]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}/ref
+  model_type: LLAMA3
+
+resume_from_checkpoint: false
+save_every_n_epochs: 1
+
+# ── Dataset (full GSM8K train split) ──────────────────────────────────────────
+dataset:
+  _component_: torchtune.dev.rl.gsm8k.gsm8k_dataset
+seed: 42
+shuffle: true
+
+# ── RL hparams ───────────────────────────────────────────────────────────────
+grpo_samples: 16
+max_seq_len: 1024
+max_generated_tokens: 512
+temperature: 0.7
+top_k: null
+
+# ── Generation stop strings (vLLM-side termination) ─────────────────────────
+# AGPT-2B is a raw pretraining checkpoint that never naturally emits EOS — it
+# generates fluent rambling to max_tokens otherwise. Diagnosed 2026-06-13 with
+# a direct /v1/completions probe (finish_reason: length on a 'capital of France'
+# prompt). The only learnable termination signals from the GSM8K prompt template
+# are the answer-tag close and the conversational turn marker.
+#   - ``</answer>`` — natural answer boundary for FormattedMathCorrectnessReward
+#   - ``User:`` / ``\nUser:`` — hallucinated conversational turn ramble cap
+stop_strings:
+  - "</answer>"
+  - "User:"
+  - "\nUser:"
+
+# ── Training ─────────────────────────────────────────────────────────────────
+epochs: 1
+num_steps: 150
+ppo_epochs: 1
+batch_size: 1
+# True chunked train backward is required on Aurora/XPU: the single-backward
+# path over all 16 GRPO samples deterministically SIGABRTs at step 62.
+# Validated with TORCHTUNE_USE_CHUNKED_LOSS=0, FBS=8 in jobs 8540485/8540537/8540596.
+forward_batch_size: 8
+# Real ref forward at chunk=16 caused a step-80 GPU banned:1 wall; chunk=8
+# passed 100 steps in job 8540785.
+ref_forward_batch_size: 8
+gradient_accumulation_steps: 1
+clip_grad_norm: 1.0
+
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 5.0e-6                        # STABLE: halved from 1e-5
+  weight_decay: 0.01
+  fused: false
+
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  num_warmup_steps: 10              # STABLE: doubled warmup to soften early drift
+
+loss:
+  _component_: torchtune.dev.rl.loss.GRPOSimpleLoss
+  kl_coeff: 0.02                    # STABLE: KL term now in the gradient
+  epsilon: 0.2
+  # NOTE: GRPOSimpleLoss ignores pi_old_logprobs (ratios = exp(0) = 1.0 by
+  # construction) so it has no use for epsilon_high. The DAPO-style asymmetric
+  # clip lives on torchtune.dev.rl.loss.GRPOLoss (which IS sensitive to pi_old).
+  # To use it: set `loss._component_: torchtune.dev.rl.loss.GRPOLoss` AND set
+  # `ppo_epochs > 1` OR `always_compute_rollout_logprobs: true` so a real
+  # pi_old gets captured.
+
+# ── Reward ───────────────────────────────────────────────────────────────────
+reward_functions:
+  - _component_: torchtune.dev.rl.rewards.FormattedMathCorrectnessReward
+    answer_tag: answer
+    positive_reward: 1.0
+    negative_reward: 0.0
+  - _component_: torchtune.dev.rl.rewards.ThinkingAnswerFormattingReward
+    think_tag: think
+    answer_tag: answer
+    positive_reward: 0.1
+    negative_reward: 0.0
+
+# ── vLLM rollout (server mode) ───────────────────────────────────────────────
+vllm_mode: server
+vllm_max_model_len: 1024
+vllm_max_num_seqs: 16
+
+# ── Distributed / FSDP ────────────────────────────────────────────────────────
+reshard_after_forward: true
+enable_activation_checkpointing: true
+use_fsdp1_zero2: true
+# ref_cpu_offload tested 2026-06-12 — did NOT clear the step-62 wall.
+# Kept as documentation: the BioReason 200-step-stable recipe uses dynamic
+# offload but it apparently helps via some other mechanism we have not yet
+# isolated. AGPT-2B's static ref_cpu_offload is innocuous and saves ~5 GiB.
+ref_cpu_offload: true
+
+# ── XPU ───────────────────────────────────────────────────────────────────────
+device: xpu
+dtype: bf16
+compile: false
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+log_every_n_steps: 1
+log_peak_memory_stats: true
+
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: false
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: true
+  cuda: false
+  profile_memory: false
+  with_stack: false
+  record_shapes: false
+  with_flops: false
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1
+
+# Stage 2 lever (2026-06-13): capture pi_old at rollout time so ratios become
+# non-degenerate and GRPOSimpleLoss's clip term contributes real signal.
+always_compute_rollout_logprobs: true
+

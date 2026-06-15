@@ -22,11 +22,12 @@ from __future__ import annotations
 
 import random
 import re
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 import torch
 from torch.utils.data import Dataset
 
+from torchtune.data import Message, truncate
 from torchtune.dev.rl.rewards import Reward, RewardOutput
 from torchtune.modules.transforms.tokenizers import (
     ModelTokenizer,
@@ -54,6 +55,73 @@ class AuroraGPTTokenizer(SentencePieceBaseTokenizer):
         # The recipe falls back to cfg.stop_token_ids when this isn't set,
         # but exposing it keeps things simple.
         self.stop_tokens = [self.eos_id] if self.eos_id is not None else []
+        self.prompt_template = None
+
+    # ── SFT ModelTokenizer interface ─────────────────────────────────────────
+    # AGPT-2B is a raw pretraining checkpoint with no chat template. The
+    # simplest correct SFT format is plain text concatenation:
+    #     <bos> {user_text} {assistant_text} <eos>
+    # with the user span masked (labels=-100) so loss is computed only on the
+    # assistant continuation. Multi-turn is handled by concatenating turns in
+    # order with role-correct masking.
+
+    def tokenize_messages(
+        self,
+        messages: list[Message],
+        *,
+        add_end_tokens: bool = True,
+    ) -> tuple[list[int], list[bool]]:
+        """Tokenize messages for AGPT-2B SFT (plain-text concat, no chat template).
+
+        Each message's content is encoded with ``add_bos=False, add_eos=False``;
+        a single ``bos_id`` is prepended, an ``eos_id`` is appended when
+        ``add_end_tokens=True``. The mask is per-token, set to ``True`` for any
+        span the recipe must ignore in the loss (system / user / ipython spans,
+        plus the leading bos / trailing eos), and to the message's own
+        ``masked`` attribute for assistant spans.
+        """
+        tokens: list[int] = [self.bos_id]
+        mask: list[bool] = [True]
+        num = len(messages)
+        for i, message in enumerate(messages):
+            # SentencePieceBaseTokenizer.encode supports trim_leading_whitespace; we
+            # add an explicit space separator between user/assistant turns.
+            text = message.text_content
+            if i > 0:
+                text = " " + text
+            ids = self.encode(text, add_bos=False, add_eos=False)
+            tokens.extend(ids)
+            # Mask = True means "ignore in loss". message.masked is True for
+            # system/user/ipython, False for assistant (when train_on_input=False).
+            mask.extend([message.masked] * len(ids))
+            if self.max_seq_len and len(tokens) >= self.max_seq_len:
+                break
+        if add_end_tokens and self.eos_id is not None:
+            tokens.append(self.eos_id)
+            mask.append(True)
+        if self.max_seq_len is not None:
+            tokens = truncate(
+                tokens=tokens,
+                max_seq_len=self.max_seq_len,
+                eos_id=self.eos_id if add_end_tokens else None,
+            )
+            mask = truncate(
+                tokens=mask,
+                max_seq_len=self.max_seq_len,
+                eos_id=True if add_end_tokens else None,
+            )
+        return tokens, mask
+
+    def __call__(
+        self, sample: Mapping[str, Any], inference: bool = False
+    ) -> Mapping[str, Any]:
+        """Apply ``tokenize_messages`` to ``sample["messages"]`` and return the
+        sample with added ``tokens`` and ``mask`` fields (SFTDataset contract)."""
+        messages = sample.pop("messages")
+        tokens, mask = self.tokenize_messages(messages, add_end_tokens=not inference)
+        sample["tokens"] = tokens
+        sample["mask"] = mask
+        return sample
 
 
 def auroragpt_tokenizer(path: str, *, max_seq_len: Optional[int] = None) -> AuroraGPTTokenizer:

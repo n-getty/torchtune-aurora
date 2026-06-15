@@ -1,0 +1,112 @@
+# AuroraGPT-2B SFT — 1N Alpaca SMOKE (single-node, ~30 steps)
+#
+# Validates the XPU SFT recipe end-to-end on the smallest possible footprint:
+#   - single node, 12 XPU tiles
+#   - 5% of tatsu-lab/alpaca (~2.6K samples)
+#   - 30 optimizer steps, loss must decrease monotonically
+#
+# Pair with launcher: experiments/agpt2b_sft/run_sft_smoke.sh
+# Recipe:             recipes/dev/full_finetune_distributed_xpu.py
+#
+# SFT tokenization: AGPT-2B is a raw pretraining checkpoint with no chat
+# template. AuroraGPTTokenizer.tokenize_messages emits the plain-text concat
+#   <bos> {user_text} {assistant_text} <eos>
+# with the user span masked when train_on_input=False.
+
+name: agpt2b_sft_alpaca_smoke
+output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/experiments/agpt2b_sft/runs/${name}
+base_model_path: /flare/AuroraGPT/AuroraGPT-v1/Experiments/AuroraGPT-2B/public/sophiag/hf/global_step138650
+
+# ── Model ────────────────────────────────────────────────────────────────────
+model:
+  _component_: torchtune.models.llama3.llama3
+  vocab_size: 256000
+  num_layers: 12
+  num_heads: 16
+  num_kv_heads: 4
+  embed_dim: 2048
+  max_seq_len: 1024
+  intermediate_dim: 11008
+  rope_base: 50000
+
+# ── Tokenizer ────────────────────────────────────────────────────────────────
+tokenizer:
+  _component_: torchtune.dev.rl.ezpz_tasks.auroragpt_tokenizer
+  path: ${base_model_path}/tokenizer.model
+  max_seq_len: 1024
+
+# ── Checkpointer ─────────────────────────────────────────────────────────────
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [pytorch_model.bin]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: LLAMA3
+
+resume_from_checkpoint: false
+
+# ── Dataset (Alpaca, 5% subset for smoke) ────────────────────────────────────
+dataset:
+  _component_: torchtune.datasets.alpaca_dataset
+  source: tatsu-lab/alpaca
+  split: train[:5%]
+  train_on_input: false
+  packed: false
+seed: 42
+shuffle: true
+
+# ── Training envelope ────────────────────────────────────────────────────────
+epochs: 1
+max_steps_per_epoch: 30
+batch_size: 4
+gradient_accumulation_steps: 2
+clip_grad_norm: 1.0
+
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 1.0e-5
+  weight_decay: 0.0
+  fused: false
+
+# loss: CE over the full vocab, chunked for memory; SFT-safe on XPU.
+loss:
+  _component_: torchtune.modules.loss.LinearCrossEntropyLoss
+
+# ── Distributed / FSDP ───────────────────────────────────────────────────────
+enable_activation_checkpointing: true
+enable_activation_offloading: false
+fsdp_cpu_offload: false
+fsdp_reshard_after_forward: true
+data_parallel_replicate_dim: 1
+data_parallel_shard_dim: -1
+tensor_parallel_dim: 1
+
+# ── XPU ──────────────────────────────────────────────────────────────────────
+device: xpu
+dtype: bf16
+compile: false
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+log_level: INFO
+log_every_n_steps: 1
+log_peak_memory_stats: true
+
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: false
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: true
+  cuda: false
+  profile_memory: false
+  with_stack: false
+  record_shapes: false
+  with_flops: false
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1
