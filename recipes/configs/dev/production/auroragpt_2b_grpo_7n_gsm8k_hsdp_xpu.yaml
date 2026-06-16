@@ -89,6 +89,24 @@ ref_checkpointer:
 
 resume_from_checkpoint: false
 save_every_n_epochs: 1
+# Periodic step checkpointing → each save writes a resumable recipe_state.pt
+# (optimizer + rng + dataloader + global step) under ${output_dir}/epoch_<step>.
+# This is what makes a step-based run (epochs=1) resumable to continue past its
+# num_steps budget. Setting this also makes the FINAL save resumable.
+save_every_n_steps: 50
+#
+# To CONTINUE a finished/interrupted run (e.g. step 150 → 300), set these on the
+# resume job (the launcher does this for you when RESUME_FROM=<epoch_dir> is set).
+# A step-based run (epochs=1) writes every step-save into epoch_0 (epochs_run stays
+# 0), so the latest state is at ${output_dir}/epoch_0 with steps_run=last saved step.
+# Keep base_model_path at the ORIGINAL init (tokenizer + frozen ref resolve from it);
+# override ONLY the policy checkpointer:
+#   resume_from_checkpoint: true
+#   checkpointer.checkpoint_dir: ${output_dir}/epoch_0            # resumed policy weights
+#   checkpointer.recipe_checkpoint: ${output_dir}/epoch_0/recipe_state.pt
+#   num_steps: <new target>          # checkpoint_files stays [model.safetensors] (default)
+# Checkpoints now land under ${output_dir}/epoch_0 (policy dir), NOT /ref/ — the
+# policy/ref checkpointer split fixed the old ref-output_dir quirk.
 
 # ── Dataset (full GSM8K train split) ──────────────────────────────────────────
 dataset:

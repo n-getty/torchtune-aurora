@@ -96,3 +96,168 @@ def test_state_released_after_consumption():
     recipe.setup(ckpt)
     assert recipe._opt_state_dict is None
     assert recipe._dataloader_state_dict is None
+
+
+# ---------------------------------------------------------------------------
+# Step-based resume (STEPS_KEY persist/restore + intermediate_checkpoint gate)
+# Mirrors the save_checkpoint gate, _update_recipe_state restore, and the
+# setup() step-counter derivation in
+# recipes/dev/grpo_full_finetune_distributed_xpu.py. Pure logic — no XPU/recipe.
+# ---------------------------------------------------------------------------
+
+
+class _FakeCheckpointLifecycle:
+    """Mirror the save-gate / restore / step-derivation logic."""
+
+    def __init__(self, *, epochs, num_steps, save_every_n_steps, resume):
+        self.total_epochs = epochs
+        self._total_steps = num_steps
+        self._save_every_n_steps = save_every_n_steps
+        self._resume_from_checkpoint = resume
+        self.global_step = 0
+        self._steps_run = 0
+        self._epochs_run = 0
+
+    # --- save side (mirrors save_checkpoint ~2378 + dict block) -------------
+    def intermediate_checkpoint(self, epoch):
+        return (epoch + 1 < self.total_epochs) or (
+            self._save_every_n_steps is not None
+        )
+
+    def build_recipe_state(self, epoch):
+        if not self.intermediate_checkpoint(epoch):
+            return {training.MODEL_KEY: "weights"}  # weights-only
+        return {
+            training.MODEL_KEY: "weights",
+            training.OPT_KEY: "opt",
+            training.EPOCHS_KEY: self._epochs_run,
+            training.STEPS_KEY: self.global_step,
+            training.DATALOADER_KEY: "dl",
+        }
+
+    # --- restore side (mirrors _update_recipe_state ~866) ------------------
+    def update_recipe_state(self, ckpt):
+        self._epochs_run = ckpt[training.EPOCHS_KEY]
+        self.global_step = ckpt.get(training.STEPS_KEY, 0)
+
+    # --- setup() step-counter derivation (~1149) --------------------------
+    def derive_step_counters(self, steps_per_epoch):
+        self._steps_per_epoch = steps_per_epoch
+        if self._resume_from_checkpoint:
+            # Clamp _epochs_run if it advanced past total_epochs but steps remain
+            # (prior run stopped on step budget then incremented the counter),
+            # else the epoch loop would be empty and resume runs 0 steps.
+            if (
+                self._epochs_run >= self.total_epochs
+                and self.global_step < self._total_steps
+            ):
+                self._epochs_run = self.total_epochs - 1
+            self._steps_run = (
+                self.global_step - self._epochs_run * self._steps_per_epoch
+            )
+        else:
+            self.global_step = self._epochs_run * self._steps_per_epoch
+
+    def epoch_loop_runs(self):
+        # Mirrors `for curr_epoch in range(self._epochs_run, self.total_epochs)`.
+        return self._epochs_run < self.total_epochs
+
+
+def test_intermediate_checkpoint_true_for_step_based_run():
+    # epochs=1, num_steps=150, save_every_n_steps set → resumable even on epoch 0.
+    r = _FakeCheckpointLifecycle(
+        epochs=1, num_steps=150, save_every_n_steps=50, resume=False
+    )
+    assert r.intermediate_checkpoint(epoch=0) is True
+
+
+def test_no_recipe_state_when_save_every_n_steps_unset():
+    # Single-shot config (no save_every_n_steps) keeps weights-only final save.
+    r = _FakeCheckpointLifecycle(
+        epochs=1, num_steps=150, save_every_n_steps=None, resume=False
+    )
+    assert r.intermediate_checkpoint(epoch=0) is False
+    state = r.build_recipe_state(epoch=0)
+    assert training.STEPS_KEY not in state
+    assert training.OPT_KEY not in state
+
+
+def test_steps_key_saved_and_round_trips():
+    r = _FakeCheckpointLifecycle(
+        epochs=1, num_steps=300, save_every_n_steps=50, resume=False
+    )
+    r.global_step = 150
+    state = r.build_recipe_state(epoch=0)
+    assert state[training.STEPS_KEY] == 150
+
+    # Resume run consumes it.
+    r2 = _FakeCheckpointLifecycle(
+        epochs=1, num_steps=300, save_every_n_steps=50, resume=True
+    )
+    r2.update_recipe_state(state)
+    assert r2.global_step == 150
+
+
+def test_missing_steps_key_tolerated():
+    # Older recipe_state without STEPS_KEY → global_step falls back to 0.
+    r = _FakeCheckpointLifecycle(
+        epochs=1, num_steps=300, save_every_n_steps=50, resume=True
+    )
+    r.update_recipe_state(
+        {training.EPOCHS_KEY: 0, training.OPT_KEY: "opt"}
+    )
+    assert r.global_step == 0
+
+
+def test_resume_derives_steps_run_continues_not_restarts():
+    # The crux: resume at step 150 (epochs_run=0) → _steps_run=150 so the loop
+    # continues to num_steps=300 rather than re-running from 0.
+    r = _FakeCheckpointLifecycle(
+        epochs=1, num_steps=300, save_every_n_steps=50, resume=True
+    )
+    r.update_recipe_state(
+        {training.EPOCHS_KEY: 0, training.STEPS_KEY: 150, training.OPT_KEY: "opt"}
+    )
+    r.derive_step_counters(steps_per_epoch=1000)
+    assert r._steps_run == 150  # continues, does not restart
+
+
+def test_fresh_run_step_counter_identical_to_original():
+    # Non-resume path must be byte-identical to the original behavior.
+    r = _FakeCheckpointLifecycle(
+        epochs=1, num_steps=300, save_every_n_steps=50, resume=False
+    )
+    r._epochs_run = 0
+    r.derive_step_counters(steps_per_epoch=1000)
+    assert r.global_step == 0  # original: _epochs_run * steps_per_epoch
+
+
+def test_resume_clamps_advanced_epoch_so_loop_runs():
+    # The job-1 bug: epochs_run got saved as 1 (== total_epochs) after stopping
+    # on the step budget. On resume with num_steps bumped to 300, the epoch loop
+    # would be range(1,1) → empty → 0 steps. The clamp must let it run.
+    r = _FakeCheckpointLifecycle(
+        epochs=1, num_steps=300, save_every_n_steps=50, resume=True
+    )
+    r.update_recipe_state(
+        {training.EPOCHS_KEY: 1, training.STEPS_KEY: 150, training.OPT_KEY: "opt"}
+    )
+    assert r.epoch_loop_runs() is False  # before clamp: range(1,1) empty
+    r.derive_step_counters(steps_per_epoch=1000)
+    assert r._epochs_run == 0  # clamped
+    assert r.epoch_loop_runs() is True  # now range(0,1) runs
+    assert r._steps_run == 150  # continues from 150
+
+
+def test_resume_no_clamp_when_budget_already_met():
+    # If the restored global_step already >= num_steps, do NOT clamp — there is
+    # genuinely nothing left to do; the (empty) loop correctly does nothing.
+    r = _FakeCheckpointLifecycle(
+        epochs=1, num_steps=150, save_every_n_steps=50, resume=True
+    )
+    r.update_recipe_state(
+        {training.EPOCHS_KEY: 1, training.STEPS_KEY: 150, training.OPT_KEY: "opt"}
+    )
+    r.derive_step_counters(steps_per_epoch=1000)
+    assert r._epochs_run == 1  # NOT clamped (no steps owed)
+    assert r.epoch_loop_runs() is False

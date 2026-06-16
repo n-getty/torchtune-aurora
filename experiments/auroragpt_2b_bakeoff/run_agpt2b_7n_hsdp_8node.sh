@@ -49,6 +49,15 @@ CONFIG=${CONFIG:-${PROJDIR}/recipes/configs/dev/production/auroragpt_2b_grpo_7n_
 
 # --- RL envelope (defaults MUST match the YAML) ---------------------------
 NSTEPS=${NSTEPS:-5}
+# Periodic step checkpointing → resumable recipe_state every N steps (and at the
+# final step). Matches the YAML default; set =0/empty to disable.
+SAVE_EVERY_N_STEPS=${SAVE_EVERY_N_STEPS:-50}
+# Resume: set RESUME_FROM=<output_dir>/epoch_<N> (the dir holding the saved policy
+# weights + recipe_state.pt) to continue a finished/interrupted run. Empty =
+# fresh run (default, identical to before). When set, the launcher injects
+# resume_from_checkpoint=true + the checkpointer paths and uses RESUME_FROM as the
+# base_model_path so training continues from those weights.
+RESUME_FROM=${RESUME_FROM:-}
 # Per-replica prompts/step. batch_size=4 (64 seqs/rank at G=16) made torch_resv
 # grow ~5 GiB/step from fragmentation → tile-pinned banned:1 at step ~11 (job
 # 8544991 mem-probe). 2 halves the per-rank peak; global distinct prompts/step =
@@ -462,7 +471,30 @@ unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy ftp_proxy
 # env, but export them explicitly alongside the rest for clarity.
 export NSTEPS MODEL_PATH CONFIG VLLM_URLS PROJDIR WORLD
 export WSYNC_CROSS_METHOD WSYNC_INTRA_METHOD VLLM_WSYNC_INTERVAL
-EXTRA="output_dir=${LOGDIR}/run_out vllm_weight_sync_interval=${VLLM_WSYNC_INTERVAL} ${EXTRA_OVERRIDES:-}"
+
+# save_every_n_steps override (0/empty disables periodic step checkpointing).
+_SAVE_OVERRIDE=""
+if [ -n "${SAVE_EVERY_N_STEPS}" ] && [ "${SAVE_EVERY_N_STEPS}" != "0" ]; then
+    _SAVE_OVERRIDE="save_every_n_steps=${SAVE_EVERY_N_STEPS}"
+fi
+
+# Resume overrides: when RESUME_FROM points at an epoch_<N> dir, continue training
+# from the saved POLICY weights + recipe_state. Keep base_model_path at the ORIGINAL
+# init — that keeps the tokenizer and the FROZEN ref model (ref_checkpointer reads
+# ${base_model_path}/model.safetensors) resolving correctly. Override ONLY the
+# policy checkpointer to read the resumed weights + recipe_state from RESUME_FROM.
+# The policy save writes model.safetensors (verified job 8545510 epoch_0), which is
+# the config default — so checkpoint_files needs no override. Note: a step-based run
+# (epochs=1) writes every step-save into epoch_0 (epochs_run stays 0), so the latest
+# state lives at ${output_dir}/epoch_0/recipe_state.pt (steps_run = last saved step).
+_RESUME_OVERRIDE=""
+_BASE_MODEL="${MODEL_PATH}"
+if [ -n "${RESUME_FROM}" ]; then
+    echo "RESUME_FROM=${RESUME_FROM} → continuing training from this checkpoint." | tee -a "${LOG}"
+    _RESUME_OVERRIDE="resume_from_checkpoint=true checkpointer.checkpoint_dir=${RESUME_FROM} checkpointer.recipe_checkpoint=${RESUME_FROM}/recipe_state.pt"
+fi
+
+EXTRA="output_dir=${LOGDIR}/run_out vllm_weight_sync_interval=${VLLM_WSYNC_INTERVAL} ${_SAVE_OVERRIDE} ${_RESUME_OVERRIDE} ${EXTRA_OVERRIDES:-}"
 TRAIN_LOG=${LOGDIR}/train_mpiexec.log
 
 echo "Launching mpiexec --pmi=pmix -n ${WORLD} -ppn ${NPROC} ..." | tee -a "${LOG}"
@@ -477,7 +509,7 @@ mpiexec \
     bash "${WRAPPER}" \
         ${PROJDIR}/recipes/dev/grpo_full_finetune_distributed_xpu.py \
         --config ${CONFIG} \
-        base_model_path=${MODEL_PATH} \
+        base_model_path=${_BASE_MODEL} \
         num_steps=${NSTEPS} \
         data_parallel_replicate_dim=${DP_REPLICATE} \
         batch_size=${BATCH_SIZE} \

@@ -846,17 +846,36 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
     _init_vllm_ray_colocate = _vllm_backend_module._init_vllm_ray_colocate
     _init_vllm_tp1 = _vllm_backend_module._init_vllm_tp1
     _init_vllm_tp = _vllm_backend_module._init_vllm_tp
-    def load_checkpoint(self, cfg_checkpointer: DictConfig) -> dict[str, Any]:
+    def load_checkpoint(
+        self,
+        cfg_checkpointer: DictConfig,
+        store_as: str = "_checkpointer",
+        resume: Optional[bool] = None,
+    ) -> dict[str, Any]:
         """
         Extract the checkpoint state from file and validate. If resume_from_checkpoint
         is True, this also includes the recipe state.
+
+        ``store_as`` selects which attribute holds the instantiated checkpointer.
+        The POLICY checkpointer must stay on ``self._checkpointer`` because
+        ``save_checkpoint`` and the model-type read use it; the REF checkpointer is
+        stored separately (``_ref_checkpointer``) so it does NOT clobber the policy
+        one — otherwise saves would land under the ref's output_dir (``/ref``).
+
+        ``resume`` overrides the recipe-level resume flag for THIS checkpointer.
+        The REF checkpointer must always pass resume=False: it loads the frozen
+        reference weights from ``base_model_path`` (the SFT init), which has no
+        recipe_state.pt — instantiating it in resume mode makes the HF checkpointer
+        assert "recipe_state.pt not found". Only the POLICY checkpointer resumes.
         """
-        self._checkpointer = config.instantiate(
+        if resume is None:
+            resume = self._resume_from_checkpoint
+        checkpointer = config.instantiate(
             cfg_checkpointer,
-            resume_from_checkpoint=self._resume_from_checkpoint,
+            resume_from_checkpoint=resume,
         )
-        checkpoint_dict = self._checkpointer.load_checkpoint()
-        return checkpoint_dict
+        setattr(self, store_as, checkpointer)
+        return checkpointer.load_checkpoint()
 
     def _update_recipe_state(self, ckpt_dict: dict[str, Any]) -> None:
         """
@@ -865,6 +884,11 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         try:
             self._epochs_run = ckpt_dict[training.EPOCHS_KEY]
             self._rng.set_state(ckpt_dict[training.RNG_KEY])
+            # Restore the global step for step-based resume. .get(...) tolerates
+            # older recipe_state files written before STEPS_KEY was persisted
+            # (they fall back to 0, i.e. epoch-based behavior). setup() derives
+            # _steps_run from this (see the resume guard there).
+            self.global_step = ckpt_dict.get(training.STEPS_KEY, 0)
 
             # on mismatch, warn the user and prevent the override
             if self.seed != ckpt_dict[training.SEED_KEY]:
@@ -1006,9 +1030,13 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                 _dump_mem_init("INIT post-policy-cleanup")
             except Exception:
                 pass
-        # Setup reference model
+        # Setup reference model. Store the ref checkpointer separately so it does
+        # NOT overwrite self._checkpointer (the policy one) — that overwrite was
+        # why GRPO checkpoints used to land under ${output_dir}/ref/epoch_N.
         ref_checkpoint_dict = self.load_checkpoint(
-            cfg_checkpointer=cfg.ref_checkpointer
+            cfg_checkpointer=cfg.ref_checkpointer,
+            store_as="_ref_checkpointer",
+            resume=False,  # ref weights are frozen + have no recipe_state; never resume
         )
         # ref model: use ref_cpu_offload if set (saves ~12 GiB XPU HBM).
         # Policy model stays on GPU for inline generation; ref can live on CPU.
@@ -1119,7 +1147,26 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         # Finally update the recipe state which can only be correctly set after all of the
         # other components have been initialized and updated.
         self._steps_per_epoch = len(self._dataloader)
-        self.global_step = self._epochs_run * self._steps_per_epoch
+        if self._resume_from_checkpoint:
+            # Step-based resume robustness. A checkpoint may carry _epochs_run
+            # advanced past the data (e.g. a prior run that stopped on the step
+            # budget then incremented the epoch counter). If we still owe steps
+            # (num_steps > restored global_step) but _epochs_run >= total_epochs,
+            # the epoch loop `range(_epochs_run, total_epochs)` would be empty and
+            # the resume would run ZERO steps. Clamp _epochs_run so the loop runs.
+            _target_steps = cfg.num_steps
+            if self._epochs_run >= self.total_epochs and self.global_step < _target_steps:
+                self._epochs_run = self.total_epochs - 1
+            # global_step was restored from STEPS_KEY in _update_recipe_state.
+            # Derive the within-epoch counter the train loop uses so it CONTINUES
+            # from the saved step instead of restarting the epoch. For the
+            # step-based config (epochs=1 → _epochs_run=0) this is just
+            # _steps_run = global_step. The lr scheduler below picks up the
+            # restored global_step via last_epoch, keeping the schedule continuous.
+            self._steps_run = self.global_step - self._epochs_run * self._steps_per_epoch
+        else:
+            # Fresh run — original behavior, byte-identical.
+            self.global_step = self._epochs_run * self._steps_per_epoch
 
         # Setup lr scheduler
         self._lr_scheduler = self._setup_lr_scheduler(
@@ -2212,12 +2259,24 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
 
         optimizer = config.instantiate(cfg_optimizer, params)
         if opt_state_dict:
-            training.load_from_full_optimizer_state_dict(
-                self._model,
-                optimizer,
-                opt_state_dict,
-                self._device,
-            )
+            if getattr(self, "_use_fsdp1", False):
+                # FSDP1-native load — symmetric with FSDP.optim_state_dict used in
+                # save_checkpoint. optim_state_dict_to_load reshards the saved full
+                # optimizer state to this rank's FSDP1 flat-sharded params; the DCP
+                # helper would mis-assign full tensors → optimizer.step() shape
+                # mismatch (see save_checkpoint note).
+                from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+                sharded = FSDP.optim_state_dict_to_load(
+                    self._model, optimizer, opt_state_dict
+                )
+                optimizer.load_state_dict(sharded)
+            else:
+                training.load_from_full_optimizer_state_dict(
+                    self._model,
+                    optimizer,
+                    opt_state_dict,
+                    self._device,
+                )
         utils.log_rank_zero(log, "Optimizer is initialized.")
         return optimizer
 
@@ -2375,7 +2434,19 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
     ) -> None:
         checkpoint_dict = {}
 
-        intermediate_checkpoint = epoch + 1 < self.total_epochs
+        # Write a resumable recipe_state (optimizer + rng + dataloader + step
+        # counter) whenever there is more training that could follow this save:
+        #   - genuinely intermediate epoch (epoch + 1 < total_epochs), OR
+        #   - a step-based run that opted into periodic step checkpointing
+        #     (save_every_n_steps set). The standard GRPO config is epochs=1 +
+        #     num_steps=N, so without the second clause `intermediate_checkpoint`
+        #     would always be False and NO run would be resumable. Runs that do
+        #     not set save_every_n_steps keep the old weights-only final save
+        #     (byte-identical behavior).
+        intermediate_checkpoint = (
+            (epoch + 1 < self.total_epochs)
+            or (self._save_every_n_steps is not None)
+        )
 
         utils.log_rank_zero(
             log,
@@ -2401,12 +2472,24 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         if intermediate_checkpoint:
             start = time.perf_counter()
             utils.log_rank_zero(log, "Getting optimizer state dict...")
-            opt_state_dict = training.get_full_optimizer_state_dict(
-                self._model,
-                self._optimizer,
-                self._is_rank_zero,
-                device=self._device,
-            )
+            if getattr(self, "_use_fsdp1", False):
+                # FSDP1 (HYBRID_SHARD / flat ZeRO-2, use_orig_params=True): use the
+                # FSDP1-native full optimizer state API. The DCP helper
+                # (get_full_optimizer_state_dict) is asymmetric with the load side
+                # on this stack (_DISTRIBUTED_STATE_DICT_API_IS_AVAILABLE=False →
+                # load takes a DTensor-only manual branch that can't reshard FSDP1's
+                # plain flat-sharded moments) → optimizer.step() shape mismatch on
+                # resume. FSDP.optim_state_dict + optim_state_dict_to_load handle the
+                # full<->sharded round-trip correctly for FSDP1.
+                from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+                opt_state_dict = FSDP.optim_state_dict(self._model, self._optimizer)
+            else:
+                opt_state_dict = training.get_full_optimizer_state_dict(
+                    self._model,
+                    self._optimizer,
+                    self._is_rank_zero,
+                    device=self._device,
+                )
             utils.log_rank_zero(
                 log,
                 f"Getting optimizer state dict took {time.perf_counter() - start:.2f} secs",
@@ -2427,6 +2510,12 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                         training.TOTAL_EPOCHS_KEY: self.total_epochs,
                         training.RNG_KEY: self._rng.get_state(),
                         training.DATALOADER_KEY: self._dataloader.state_dict(),
+                        # Persist the global step so a step-based run (epochs=1,
+                        # num_steps=N) can resume mid-"epoch" and continue from
+                        # this step instead of restarting. Matches the SFT recipe
+                        # convention (full_finetune_distributed.py). Restored in
+                        # _update_recipe_state.
+                        training.STEPS_KEY: self.global_step,
                     }
                 )
 
@@ -4949,16 +5038,25 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                     training_completed = True
                     break
 
-            self._epochs_run += 1
-            if self._epochs_run % self._save_every_n_epochs == 0:
-                try:
-                    self.save_checkpoint(curr_epoch)
-                except Exception as e:
-                    utils.log_rank_zero(
-                        log,
-                        f"WARNING: Epoch checkpoint save failed: {e}. "
-                        "Continuing training.",
-                    )
+            # Only count the epoch as completed + do the epoch-end save if we
+            # exhausted the dataloader naturally. When we stopped on the step
+            # budget (training_completed, i.e. num_steps reached mid-epoch), the
+            # epoch is NOT complete: incrementing _epochs_run here and re-saving
+            # would (a) overwrite the just-written final recipe_state with
+            # epochs_run=N, which makes a step-based resume's epoch loop
+            # `range(_epochs_run, total_epochs)` empty → resume runs 0 steps; and
+            # (b) double-save. The final save already happened above at step budget.
+            if not training_completed:
+                self._epochs_run += 1
+                if self._epochs_run % self._save_every_n_epochs == 0:
+                    try:
+                        self.save_checkpoint(curr_epoch)
+                    except Exception as e:
+                        utils.log_rank_zero(
+                            log,
+                            f"WARNING: Epoch checkpoint save failed: {e}. "
+                            "Continuing training.",
+                        )
             if training_completed:
                 # Phase 2 Step 4: signal the dedicated vLLM rank to exit its
                 # generation loop cleanly. Only rank 0 is paired with the vLLM
