@@ -1,0 +1,206 @@
+# AuroraGPT-2B GRPO — 7-replica HSDP on GSM8K (8-node scale-up)
+#
+# Pair with launcher: experiments/auroragpt_2b_bakeoff/run_agpt2b_7n_hsdp_8node.sh
+#
+# TOPOLOGY (8 nodes, debug-scaling):
+#   Nodes 0-6 → 7 training replicas: dp_replicate=7 × dp_shard=12 (world=84).
+#               Dense llama3 wrapped FSDP1 HYBRID_SHARD within each node
+#               (one node = one shard group); gradients all-reduced across the
+#               7 replicas (native FSDP1 HYBRID_SHARD — NOT the EP grad-sync path,
+#               which is gated on expert_parallel_degree>1).
+#   Node 7    → 1 dedicated vLLM pool: 12 HTTP servers, SHARED by all 7 replicas.
+#
+# WHAT THIS UNLOCKS vs the 2N production envelope (auroragpt_2b_grpo_2n_gsm8k_xpu_
+# handshake.yaml): true data parallelism. Each replica's shard-leader pulls a
+# DISTINCT prompt slice from the dataloader, generates against the shared pool,
+# and broadcasts node-locally. Global distinct prompts/step = batch_size ×
+# dp_replicate = 4 × 7 = 28 (vs 1 in the 2N path). Lower-variance GRPO advantage.
+#
+# Recipe changes that make server+HSDP give distinct prompts per replica:
+#   - _setup_data: server+dp_replicate>1 → sampler partitions by replicate group.
+#   - _generate_with_vllm / _broadcast_query_responses: each shard-leader POSTs
+#     and broadcasts over the gloo dp_shard PG (node-local), not world.
+#   - vllm_backend._setup_vllm_server_mode: clients built on every shard-leader.
+#
+# v1 SCOPE: weight sync is OFF (frozen policy for the topology-validation run).
+# Syncing 7 replicas to a shared pool (TCPStore/dev-shm cross-node) is a separate
+# follow-up. The validated learning envelope (lr/kl/warmup/stop_strings/rewards/
+# G/fbs/max_gen) is preserved verbatim from the 2N handshake config.
+
+name: grpo_agpt2b_7n_hsdp
+output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/outputs/grpo_agpt2b_7n_gsm8k_hsdp
+base_model_path: /lus/flare/projects/ModCon/ngetty/torchtune/experiments/agpt2b_sft/logs/mathmix_2n_full_20260615_043457/run_out/epoch_2
+
+# ── HSDP: 7 replicas × 12 shard = 84 ranks ───────────────────────────────────
+# dp_replicate>1 auto-selects the dense FSDP1 HYBRID_SHARD path (_setup_model_
+# fsdp1_hsdp). Do NOT set use_fsdp1_zero2 — that flag is the flat (single-replica)
+# SHARD_GRAD_OP path and is dead under the HSDP dispatch.
+data_parallel_replicate_dim: 7
+
+vllm_url: "http://localhost:8001"   # placeholder; launcher injects the 12-URL pool
+vllm_group_port: 51216
+vllm_tensor_parallel_size: 1
+
+# Weight sync ON via the XCCL FSDP1 server path. Under HSDP all 7 replicas hold
+# identical weights after the cross-replica grad all-reduce, so ONLY global rank 0
+# (_is_xccl_leader) gathers the full model and broadcasts to the shared 12-server
+# vLLM pool (world_size = 1 + 12). That path applies the Llama-family Q/K
+# un-permute (model_type LLAMA3 → _needs_qk_unpermute) — required or vLLM emits
+# pretraining noise after the first sync. Launcher sets WSYNC_CROSS_METHOD=gloo
+# (CXI-MR-leak-safe cross transport) + the vLLM --worker-extension-cls.
+vllm_weight_sync: true
+vllm_weight_sync_method: xccl
+vllm_weight_sync_interval: 1
+
+# ── Model ────────────────────────────────────────────────────────────────────
+model:
+  _component_: torchtune.models.llama3.llama3
+  vocab_size: 256000
+  num_layers: 12
+  num_heads: 16
+  num_kv_heads: 4
+  embed_dim: 2048
+  max_seq_len: 1024
+  intermediate_dim: 11008
+  rope_base: 50000
+
+# ── Tokenizer ────────────────────────────────────────────────────────────────
+tokenizer:
+  _component_: torchtune.dev.rl.ezpz_tasks.auroragpt_tokenizer
+  path: ${base_model_path}/tokenizer.model
+  max_seq_len: ${max_seq_len}
+
+# ── Checkpointers (policy + ref share the base model) ────────────────────────
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [model.safetensors]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: LLAMA3
+
+ref_checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [model.safetensors]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}/ref
+  model_type: LLAMA3
+
+resume_from_checkpoint: false
+save_every_n_epochs: 1
+
+# ── Dataset (full GSM8K train split) ──────────────────────────────────────────
+dataset:
+  _component_: torchtune.dev.rl.gsm8k.gsm8k_dataset
+seed: 42
+shuffle: true
+
+# ── RL hparams ───────────────────────────────────────────────────────────────
+# G=8 (NOT 16): per-rank buffer volume = batch_size × G = sequences/rank. G=16/bs=2
+# = 32 seqs/rank RE-TRIGGERS the per-replica data-dependent fragmentation — the
+# unlucky replica's torch_resv climbs to the 62 GiB tile ceiling → banned:1 at
+# step ~12 (job 8545177, external flat ~2 GiB so NOT a wsync/MR leak — same
+# fragmentation as before, G was a driver too, not just bs). G=8/bs=2 = 16 seqs/rank
+# is the VALIDATED-clean point (~30 GiB reserved, 40 steps clean job 8545037).
+# The data-parallelism win (14 distinct prompts/step) comes from bs×replicas and is
+# INDEPENDENT of G; G=8 is still a standard GRPO group. See memory/project_agpt2b_7n_hsdp_launcher.md.
+grpo_samples: 8
+max_seq_len: 1024
+max_generated_tokens: 512
+temperature: 0.7
+top_k: null
+
+# ── Generation stop strings (vLLM-side termination) ─────────────────────────
+# AGPT-2B is a raw pretraining checkpoint that never naturally emits EOS. The
+# only learnable termination signals from the GSM8K prompt template are the
+# answer-tag close and the conversational turn marker.
+stop_strings:
+  - "</answer>"
+  - "User:"
+  - "\nUser:"
+
+# ── Training ─────────────────────────────────────────────────────────────────
+epochs: 1
+num_steps: 5
+ppo_epochs: 1
+# batch_size = prompts/step PER REPLICA. Global distinct prompts/step =
+# batch_size × dp_replicate (= 14 at 7 replicas, vs 1 on the 2N path). KEEP at 2:
+# batch_size=4 (with G=16 → 64 seqs/rank) was the fragmentation driver that grew
+# PyTorch reserved ~5 GiB/step → tile-pinned banned:1 at step ~11 (job 8544991).
+# bs=2 + G=16 = 32 seqs/rank sits at ~30 GiB reserved with headroom.
+batch_size: 2
+# True chunked train backward (TORCHTUNE_USE_CHUNKED_LOSS=0 in launcher) bounds
+# the per-backward L0-resource footprint at forward_batch_size. fbs=4 is the
+# validated-clean value (job 8545037, 40 steps); keep it with G=8.
+forward_batch_size: 4
+ref_forward_batch_size: 4
+gradient_accumulation_steps: 1
+clip_grad_norm: 1.0
+
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 5.0e-6                        # STABLE (2N-validated)
+  weight_decay: 0.01
+  fused: false
+
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  num_warmup_steps: 10
+
+loss:
+  _component_: torchtune.dev.rl.loss.GRPOSimpleLoss
+  kl_coeff: 0.02
+  epsilon: 0.2
+
+# ── Reward ───────────────────────────────────────────────────────────────────
+reward_functions:
+  - _component_: torchtune.dev.rl.rewards.FormattedMathCorrectnessReward
+    answer_tag: answer
+    positive_reward: 1.0
+    negative_reward: 0.0
+  - _component_: torchtune.dev.rl.rewards.ThinkingAnswerFormattingReward
+    think_tag: think
+    answer_tag: answer
+    positive_reward: 0.1
+    negative_reward: 0.0
+
+# ── vLLM rollout (server mode, shared pool) ──────────────────────────────────
+vllm_mode: server
+vllm_max_model_len: 1024
+# Each engine now serves up to 7 replicas' interleaved requests — raise the
+# in-flight cap to reduce queueing (throughput only; correctness is unaffected).
+vllm_max_num_seqs: 64
+
+# ── Distributed / FSDP ────────────────────────────────────────────────────────
+reshard_after_forward: true          # → HYBRID_SHARD (FULL_SHARD intra-node)
+enable_activation_checkpointing: true
+ref_cpu_offload: true
+
+# ── XPU ───────────────────────────────────────────────────────────────────────
+device: xpu
+dtype: bf16
+compile: false
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+log_every_n_steps: 1
+log_peak_memory_stats: true
+
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: false
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: true
+  cuda: false
+  profile_memory: false
+  with_stack: false
+  record_shapes: false
+  with_flops: false
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1

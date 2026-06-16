@@ -89,6 +89,19 @@ _XCCL_DP_SHARD_PG = None # XCCL dp_shard group (XPU fabric); used by iter2 grad-
 _DP_REP_DEGREE = 1        # dp_replicate world size
 _DP_SHARD_DEGREE = 1      # dp_shard world size
 
+# Set True by the recipe (via enable_fsdp1_hsdp_inter_node_gloo()) ONLY on the
+# dense FSDP1 HYBRID_SHARD path. FSDP1 HYBRID_SHARD fires its inter-node grad
+# reduction as `dist.all_reduce(new_sharded_grad, group=state._inter_node_pg)`
+# (torch/distributed/fsdp/_runtime_utils.py) on the XCCL replicate group every
+# backward. On Aurora that cross-node XCCL/RDMA all_reduce leaks CXI MR handles
+# (same class as the Qwen3-32B XCCL-cross leak fixed by the gloo cross-PG reroute)
+# → GPU PDE page-fault / banned:1 after ~10 steps at 84 ranks. When this flag is
+# set, _xpu_all_reduce_inter_node_gloo CPU-bounces that specific call over
+# _GLOO_DP_REP_PG. Left False for EP/FSDP2 (all_reduce must stay unpatched there —
+# reduce_grads=False means FSDP2 never fires it) and for flat single-node FSDP1
+# (no inter-node PG at all).
+_FSDP1_HSDP_INTER_NODE_GLOO = False
+
 # Iter2 opt-in: route _ep_release_fsdp_unsharded_grads's per-param all_reduce
 # through native XCCL on the XPU dp_shard PG instead of the gloo CPU-bounce
 # (D2H → gloo all_reduce → H2D → chunk). Default off for the same reason
@@ -222,6 +235,64 @@ def _xpu_reduce_scatter_via_allreduce(output, input, op=None, group=None, async_
     output.copy_(input_sum[r * chunk_rows : (r + 1) * chunk_rows])
     if async_op:
         return _DoneWork()
+
+
+def _xpu_all_reduce_inter_node_gloo(tensor, op=None, group=None, async_op=False):
+    """Drop-in for dist.all_reduce that CPU-bounces the FSDP1 HYBRID_SHARD
+    inter-node grad reduction over gloo instead of XCCL/RDMA.
+
+    Only active when ``_FSDP1_HSDP_INTER_NODE_GLOO`` is set (dense FSDP1 HSDP).
+    FSDP1 HYBRID_SHARD calls ``dist.all_reduce(new_sharded_grad,
+    group=state._inter_node_pg)`` every backward on the XCCL replicate group; on
+    Aurora that cross-node XCCL/RDMA collective leaks CXI MR handles and crashes
+    with a GPU PDE page-fault (banned:1) after ~10 steps at 84 ranks. We detect
+    that specific call by matching the group's world size against
+    ``_DP_REP_DEGREE`` (the inter-node / replicate dimension) and reroute it
+    through ``_GLOO_DP_REP_PG`` (D2H → gloo all_reduce → H2D), mirroring the
+    reduce_scatter→gloo patch used for the intra-node collective.
+
+    Everything else — CPU tensors, non-replicate groups, the default/world group,
+    and (critically) the EP/FSDP2 path where this flag stays False — falls through
+    to the original XCCL all_reduce unchanged.
+    """
+    import torch.distributed as _d
+    if op is None:
+        op = _d.ReduceOp.SUM
+    if (
+        _FSDP1_HSDP_INTER_NODE_GLOO
+        and _GLOO_DP_REP_PG is not None
+        and group is not None
+        and tensor.device.type != "cpu"
+    ):
+        try:
+            _n = _d.get_world_size(group)
+        except Exception:
+            _n = None
+        # Match the inter-node (replicate) collective by group size. The intra-node
+        # reduce_scatter is already gloo-routed separately; only the replicate-dim
+        # all_reduce reaches here on the XCCL fabric.
+        if _n is not None and _n == _DP_REP_DEGREE and _DP_REP_DEGREE > 1:
+            tensor_cpu = tensor.contiguous().to("cpu")
+            _orig_all_reduce(tensor_cpu, op=op, group=_GLOO_DP_REP_PG)
+            tensor.copy_(tensor_cpu.to(tensor.device))
+            if async_op:
+                return _DoneWork()
+            return
+    return _orig_all_reduce(tensor, op=op, group=group, async_op=async_op)
+
+
+def enable_fsdp1_hsdp_inter_node_gloo() -> None:
+    """Activate the gloo CPU-bounce for the FSDP1 HYBRID_SHARD inter-node
+    all_reduce. Call from the recipe AFTER set_process_groups() and ONLY on the
+    dense FSDP1 HSDP path (not EP/FSDP2, not flat single-node)."""
+    global _FSDP1_HSDP_INTER_NODE_GLOO
+    _FSDP1_HSDP_INTER_NODE_GLOO = True
+    _tdist_patch.all_reduce = _xpu_all_reduce_inter_node_gloo
+    log.info(
+        "Patched dist.all_reduce → gloo CPU-bounce for FSDP1 HSDP inter-node "
+        "grad reduction (dp_rep_degree=%d) to avoid XCCL/RDMA CXI MR leak",
+        _DP_REP_DEGREE,
+    )
 
 
 # ---------------------------------------------------------------------------

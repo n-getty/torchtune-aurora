@@ -693,14 +693,19 @@ def _init_vllm_tp(self, cfg, rank, world_size, local_rank, tp_size,
 def _setup_vllm_server_mode(self):
     """Initialize vLLM in server mode.
 
-    Only global rank 0 creates HTTP clients and calls vLLM for generation.
-    Results are broadcast to all ranks via the world process group.
+    Single-replicate (dp_replicate==1): only global rank 0 creates HTTP clients
+    and calls vLLM for generation. Results are broadcast to all ranks via the
+    world process group.
 
-    NOTE: XCCL on Aurora deadlocks when using shard-level sub-communicators,
-    so per-node vLLM generation with shard-level broadcast is not possible.
-    Only rank 0's vLLM server is used; other nodes' vLLM servers are idle.
+    HSDP (dp_replicate>1): each replica's shard-leader (one rank per node) creates
+    HTTP clients against the SHARED vLLM pool and generates ITS replica's distinct
+    prompts; completions are broadcast NODE-LOCALLY over the gloo dp_shard PG (not
+    XCCL — see note below and _broadcast_query_responses). All shard-leaders share
+    the same URL list and fan their prompts across the pool round-robin.
     """
-    should_init_client = self._is_rank_zero
+    should_init_client = self._is_rank_zero or (
+        self._dp_replicate > 1 and self._is_shard_leader
+    )
 
     if should_init_client:
         from torchtune.dev.rl.vllm_client import VLLMClient

@@ -126,6 +126,7 @@ from torchtune.training.lr_schedulers import get_lr
 from torchtune.dev.rl.distributed import (
     install_xpu_patches,
     set_process_groups,
+    enable_fsdp1_hsdp_inter_node_gloo,
     _apply_split_ac,
     _ep_post_backward_grad_sync,
     _ep_post_backward_grad_sync_xccl,
@@ -547,6 +548,15 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                 _GLOO_DP_REP_PG, _GLOO_DP_SHARD_PG,
                 _GLOO_GLOBAL_PG, _XCCL_DP_REP_PG,
             )
+            # Stash the node-local gloo dp_shard group on self for side-band
+            # broadcasts (e.g. HSDP server-mode generation: each shard-leader
+            # broadcasts its replica's query_responses node-locally — see
+            # _broadcast_query_responses). Mirrors the non-HSDP branch (line ~600).
+            # We deliberately use this gloo group, NOT the XCCL self._shard_pg:
+            # explicit collectives on the FSDP device-mesh group EPERM/deadlock on
+            # Aurora.
+            self._gloo_dp_shard_pg = _GLOO_DP_SHARD_PG
+            self._gloo_global_pg = _GLOO_GLOBAL_PG
             # Shard group leader = local rank 0 within each shard group (= each node).
             # For replicated vLLM, each shard leader talks to its local vLLM.
             self._shard_rank = torch.distributed.get_rank(self._shard_pg)
@@ -736,6 +746,21 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         _async_cfg = cfg.get("async_generation", {}) or {}
         self._async_generation_enabled = bool(_async_cfg.get("enabled", False))
         self._async_generation_max_staleness = int(_async_cfg.get("max_staleness", 1))
+        # HSDP guard: the async lookahead path (_async_lookahead_iter /
+        # _pending_async_query_responses) assumes a SINGLE generator (global rank 0)
+        # and a world broadcast. Under HSDP (dp_replicate>1) generation is per-replica
+        # via each shard-leader with a node-local broadcast, which the async producer
+        # thread does not yet implement. Force async OFF rather than silently mixing
+        # the two handshakes. Per-replica async is a planned follow-up.
+        if self._async_generation_enabled and self._dp_replicate > 1:
+            log.warning(
+                "async_generation requested but disabled: not supported with HSDP "
+                "(dp_replicate=%d). The async lookahead assumes single-generator "
+                "rank-0 + world broadcast; HSDP uses per-replica shard-leader "
+                "generation + node-local broadcast. Running synchronously.",
+                self._dp_replicate,
+            )
+            self._async_generation_enabled = False
         # Behavior-policy correctness guard.
         # Async lookahead generates batch N+1 under vLLM weights v_k while the
         # trainer is still on step N. After step N's optimizer.step + weight
@@ -1376,6 +1401,15 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         _ep_active = self._expert_parallel_degree > 1 and self._dp_mesh is not None
         if self._dp_replicate > 1 and model_gib < 50.0 and not _ep_active:
             self._use_fsdp1 = True
+            # Dense FSDP1 HYBRID_SHARD fires its inter-node grad reduction as
+            # dist.all_reduce on the XCCL replicate group every backward; on Aurora
+            # that cross-node XCCL/RDMA collective leaks CXI MR handles and crashes
+            # with banned:1 after ~10 steps (validated job 8544731, step 11). Reroute
+            # that specific call over the gloo replicate PG (same fix family as the
+            # Qwen3-32B XCCL-cross leak). Only engaged on this dense-FSDP1-HSDP path;
+            # EP/FSDP2 leaves all_reduce unpatched (reduce_grads=False) and flat
+            # single-node FSDP1 has no inter-node PG.
+            enable_fsdp1_hsdp_inter_node_gloo()
             return self._setup_model_fsdp1_hsdp(
                 cfg_model=cfg_model,
                 enable_activation_checkpointing=enable_activation_checkpointing,
@@ -2018,6 +2052,16 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
 
         disable_dropout(model)
 
+        # Dense FSDP1 HYBRID_SHARD needs no manual grad-sync metadata: the
+        # cross-replica all-reduce is native to HYBRID_SHARD and the EP path is
+        # inactive (ep_degree==1). Set the same empty markers the FSDP2 and flat
+        # ZeRO-2 paths set, so grpo_step's `not self._fsdp2_param_groups_meta`
+        # guard (and any _expert_fsdp_modules consumer) doesn't AttributeError on
+        # this path. (Bug surfaced on the first dense-HSDP multi-node run,
+        # 2026-06-16: this path returned without defining these attrs.)
+        self._expert_fsdp_modules = []
+        self._fsdp2_param_groups_meta = []
+
         return model
 
     def _setup_model_fsdp1_flat_zero2(
@@ -2205,9 +2249,22 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         # (they're FSDP shards of the same model copy). Only dp_replicate copies
         # need different data. So sampler_replicas = dp_replicate, sampler_rank =
         # replicate index.
-        if self._vllm_mode == "server":
-            # vLLM server mode: rank 0 generates and broadcasts to all ranks.
-            # All ranks must see the same batch for matching tensor shapes.
+        if self._vllm_mode == "server" and self._dp_replicate > 1:
+            # HSDP + server mode: each dp_replicate group is an independent model
+            # copy and MUST process a DISTINCT prompt slice (true data parallelism).
+            # Ranks WITHIN a shard group share the same slice — they are FSDP
+            # shards of one copy; the shard-leader generates and broadcasts the
+            # completions node-locally over the gloo dp_shard PG. So the sampler
+            # partitions by replicate group: num_replicas = dp_replicate, and
+            # rank = replicate index = self.rank // self._dp_shard (matches the
+            # init_device_mesh((dp_replicate, dp_shard)) layout: one node = one
+            # shard group). See _generate_with_vllm / _broadcast_query_responses.
+            sampler_replicas = self._dp_replicate
+            sampler_rank = self.rank // self._dp_shard
+        elif self._vllm_mode == "server":
+            # vLLM server mode (single replicate): rank 0 generates and broadcasts
+            # to all ranks. All ranks must see the same batch for matching tensor
+            # shapes.
             sampler_replicas = 1
             sampler_rank = 0
         elif self._dp_replicate > 1:
@@ -2389,12 +2446,31 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             torch.distributed.barrier()
 
     def _broadcast_query_responses(self, query_responses: torch.Tensor) -> torch.Tensor:
-        """Broadcast rank-0 query_responses to training ranks.
+        """Broadcast a shard-leader's query_responses to its training ranks.
 
-        In dedicated_rank mode the vLLM rank is outside `_training_pg` and
-        must NOT participate (it's busy generating / receiving weights).
-        Server / colocate modes still use the world PG.
+        Single-replicate (dp_replicate==1): rank 0 generates and broadcasts to
+        all training ranks. In dedicated_rank mode the vLLM rank is outside
+        `_training_pg` and must NOT participate (it's busy generating / receiving
+        weights). Server / colocate modes use the world PG.
+
+        HSDP (dp_replicate>1) server mode: each replica's shard-leader generated
+        ITS replica's distinct completions, so the broadcast is NODE-LOCAL — over
+        the gloo dp_shard PG (`_gloo_dp_shard_pg`), from the shard-leader's GLOBAL
+        rank. We deliberately use the gloo PG and a CPU bounce, NOT the XCCL
+        device-mesh `_shard_pg`: explicit collectives on the FSDP device-mesh group
+        race FSDP's own communicator and EPERM/deadlock on Aurora (same reason the
+        dedicated_rank path uses gloo; see vllm_backend.py). Shapes are fixed
+        (bsz x (context_length + max_generated_tokens)) so no shape handshake is
+        needed — every follower pre-allocates the identical empty buffer.
         """
+        if self._dp_replicate > 1:
+            qr_cpu = query_responses.cpu()
+            torch.distributed.broadcast(
+                qr_cpu,
+                src=self._shard_leader_global_rank,
+                group=self._gloo_dp_shard_pg,
+            )
+            return qr_cpu.to(self._device)
         _grp = (
             self._training_pg
             if (self._vllm_mode == "dedicated_rank" and getattr(self, "_training_pg", None) is not None)
@@ -2408,19 +2484,26 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         batch_input_ids: torch.Tensor,
         context_length: int,
     ) -> torch.Tensor:
-        """Call vLLM server for generation, broadcast results to all ranks.
+        """Call vLLM server for generation, broadcast results to training ranks.
 
-        Only global rank 0 calls vLLM and broadcasts to all ranks via the world
-        process group. Uses a fixed buffer size (tokenizer.max_seq_len) so all
-        ranks have matching tensor shapes regardless of per-rank batch variation.
+        Single-replicate (dp_replicate==1): only global rank 0 calls vLLM and
+        broadcasts to all ranks via the world process group.
+
+        HSDP (dp_replicate>1): each replica's shard-leader POSTs ITS replica's
+        distinct prompts to the shared vLLM pool, then broadcasts the completions
+        to its node-local shard followers (see _broadcast_query_responses). Uses a
+        fixed buffer size so all followers have matching tensor shapes.
 
         Returns:
-            query_responses: ``[B*G, max_seq_len]`` (padded to fixed length)
+            query_responses: ``[B*G, context_length + max_generated_tokens]``
         """
         bsz = batch_input_ids.shape[0]
         total_len = context_length + self._max_generated_tokens
 
-        if self._is_rank_zero:
+        _is_generator = (
+            self._is_shard_leader if self._dp_replicate > 1 else self._is_rank_zero
+        )
+        if _is_generator:
             query_responses = self._call_vllm_http(batch_input_ids, context_length)
         else:
             query_responses = batch_input_ids.new_empty(bsz, total_len)
@@ -2431,9 +2514,11 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         batch_input_ids: torch.Tensor,
         context_length: int,
     ) -> torch.Tensor:
-        """Rank-0-only vLLM HTTP round-trip. No collectives — safe from a
-        producer thread. Caller is responsible for broadcasting the result
-        to other ranks (see :meth:`_broadcast_query_responses`).
+        """Single-generator vLLM HTTP round-trip (rank 0, or each replica's
+        shard-leader under HSDP). No collectives — safe from a producer thread.
+        Caller is responsible for broadcasting the result to other ranks (see
+        :meth:`_broadcast_query_responses`). All generators share the same
+        ``_vllm_clients`` pool and fan their prompts across it round-robin.
         """
         bsz = batch_input_ids.shape[0]
         total_len = context_length + self._max_generated_tokens
@@ -3360,16 +3445,27 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         rewards = rewards.sum(dim=-1)
         successes = successes.sum(dim=-1)
 
-        # Log sample responses for verification (rank 0 only, first sample)
-        if self._is_rank_zero:
+        # Log sample responses for verification. Single-replicate: rank 0 only.
+        # HSDP: also each replica's shard-leader, tagged with its replicate index,
+        # so the smoke can confirm the 7 replicas pulled DISTINCT prompts (different
+        # `answer=`/`response=` across leaders ⇒ data parallelism is live).
+        _log_sample = self._is_rank_zero or (
+            self._dp_replicate > 1 and self._is_shard_leader
+        )
+        if _log_sample:
             try:
                 sample_resp = responses[0, 0]  # first prompt, first sample
                 # Decode only non-pad tokens
                 non_pad = sample_resp[sample_resp != self._tokenizer.pad_id]
                 decoded = self._tokenizer.decode(non_pad.tolist())
+                _replica_idx = (
+                    self.rank // self._dp_shard if self._dp_replicate > 1 else 0
+                )
                 log.info(
-                    "SAMPLE_RESPONSE step=%d reward=%.1f success=%.1f answer=%s response=%s",
+                    "SAMPLE_RESPONSE step=%d replica=%d rank=%d reward=%.1f success=%.1f answer=%s response=%s",
                     self._steps_run,
+                    _replica_idx,
+                    self.rank,
                     rewards[0, 0].item(),
                     successes[0, 0].item(),
                     answers[0][:80],
@@ -4944,6 +5040,22 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                 log_dict.update(training.get_memory_stats(device=self._device))
             except RuntimeError:
                 pass
+        # HSDP smoke diagnostic: each replica's shard-leader logs its LOCAL rewards
+        # (should DIFFER across replicas ⇒ distinct prompts) and grad_norm (should
+        # MATCH across replicas ⇒ cross-replica grad all-reduce is live). Note the
+        # rewards above are NOT world-reduced under HSDP (see _shard_pg guard), so
+        # this prints each replica's own data.
+        if self._dp_replicate > 1 and self._is_shard_leader:
+            _gn = log_dict.get("grad_norm", 0.0)
+            log.info(
+                "HSDP_REPLICA step=%d replica=%d rank=%d rewards=%.4f successes=%.4f grad_norm=%.4f",
+                self.global_step,
+                self.rank // self._dp_shard,
+                self.rank,
+                rewards.item() if hasattr(rewards, "item") else rewards,
+                successes.item() if hasattr(successes, "item") else successes,
+                _gn.item() if hasattr(_gn, "item") else _gn,
+            )
         if self._is_rank_zero:
             self._metric_logger.log_dict(log_dict, step=self.global_step)
             # Phase 2 Step 3: producer telemetry (dedicated/server async modes)
