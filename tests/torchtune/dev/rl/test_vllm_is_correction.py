@@ -30,6 +30,7 @@ import types
 import unittest
 from pathlib import Path
 
+import pytest
 import torch
 
 from torchtune.dev.rl.loss import GRPOSimpleLoss, GRPOLoss
@@ -37,6 +38,20 @@ from torchtune.dev.rl.loss import GRPOSimpleLoss, GRPOLoss
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 BASE_RECIPE = REPO_ROOT / "recipes/dev/grpo_full_finetune_distributed_xpu.py"
+
+# The IS-correction implementation these tests pin was written on 2026-06-11 then
+# lost as collateral when the recipe files were `git checkout c58acbed`'d to undo
+# the bad "Antigravity walkthrough" mask/temperature patches. The feature was judged
+# correct-but-not-load-bearing (the ezpz "gap" was the Llama Q/K wsync bug + the
+# lr=1e-6 dead zone, not an algorithm gap), so it was parked rather than re-landed.
+# These tests are kept as the executable spec for that re-land; the partial impl is
+# preserved at git tag `parked/is-dapo-impl`. Re-landing needs manual re-wiring onto
+# the current recipe — delete this skip then. See
+# memory/project_ezpz_gap_was_lr_not_code.md + project_vllm_is_correction_phase4_results.md.
+pytestmark = pytest.mark.skip(
+    reason="IS-correction impl parked (collateral revert 2026-06-11); spec kept, "
+    "code at tag parked/is-dapo-impl. See project_ezpz_gap_was_lr_not_code.md."
+)
 
 
 def _make_stub_recipe(mode="sequence_truncate", cap=2.0, loss=None):
