@@ -261,3 +261,59 @@ def test_resume_no_clamp_when_budget_already_met():
     r.derive_step_counters(steps_per_epoch=1000)
     assert r._epochs_run == 1  # NOT clamped (no steps owed)
     assert r.epoch_loop_runs() is False
+
+
+# ---------------------------------------------------------------------------
+# Resume-at-a-different-lr: (1) the lr_scheduler "no scheduler" guard tolerates
+# CLI null forms; (2) the config lr is re-applied to param_groups after the
+# optimizer-state load (which would otherwise restore the checkpoint's saved lr).
+# Mirrors _setup_lr_scheduler (~1367) and _setup_optimizer (~2291) logic.
+# ---------------------------------------------------------------------------
+
+
+def _no_scheduler(cfg_lr_scheduler):
+    # Mirror of the recipe's _no_sched guard.
+    return (
+        cfg_lr_scheduler is None
+        or isinstance(cfg_lr_scheduler, str)
+        or cfg_lr_scheduler.get("_component_", None) in (None, "None", "null")
+    )
+
+
+def test_scheduler_guard_tolerates_null_forms():
+    # None, the string "null"/"None", and a node with _component_=None all mean
+    # "constant lr" — must NOT try to instantiate (was "Invalid path: 'None'").
+    assert _no_scheduler(None) is True
+    assert _no_scheduler("null") is True
+    assert _no_scheduler("None") is True
+    assert _no_scheduler({"_component_": None}) is True
+    assert _no_scheduler({"_component_": "None"}) is True
+    # A real scheduler node must still instantiate.
+    assert _no_scheduler(
+        {"_component_": "torchtune.training.lr_schedulers.x", "num_warmup_steps": 10}
+    ) is False
+
+
+def _reapply_lr(param_groups, cfg_optimizer):
+    # Mirror of the recipe's post-load lr re-apply.
+    cfg_lr = cfg_optimizer.get("lr", None)
+    if cfg_lr is not None:
+        for pg in param_groups:
+            pg["lr"] = float(cfg_lr)
+    return param_groups
+
+
+def test_resume_reapplies_config_lr_over_saved():
+    # After optimizer.load_state_dict restores the checkpoint's lr (e.g. the
+    # cosine-scheduled 4.17e-6 at step 150), the config lr=1e-5 must win so a
+    # resume can change lr.
+    restored = [{"lr": 4.17e-6}, {"lr": 4.17e-6}]
+    out = _reapply_lr(restored, {"lr": 1e-5})
+    assert all(pg["lr"] == 1e-5 for pg in out)
+
+
+def test_resume_lr_noop_when_config_lr_absent():
+    # If the optimizer config has no lr, leave the restored lr untouched.
+    restored = [{"lr": 4.17e-6}]
+    out = _reapply_lr(restored, {})
+    assert out[0]["lr"] == 4.17e-6

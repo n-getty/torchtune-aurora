@@ -1364,7 +1364,18 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         num_training_steps: int,
         last_epoch: int,
     ) -> Optional[Optimizer]:
-        if cfg_lr_scheduler is None:
+        # Treat None, or a node without a usable _component_, as "no scheduler"
+        # (constant lr). A CLI override like `lr_scheduler=null` does not always
+        # parse to a clean Python None through torchtune's arg merge — it can land
+        # as the string "null"/"None" or a node whose _component_ is None, which
+        # then fails instantiation with "Invalid path: 'None'". Be defensive so a
+        # resume can disable the cosine schedule and run at constant lr.
+        _no_sched = (
+            cfg_lr_scheduler is None
+            or isinstance(cfg_lr_scheduler, str)
+            or cfg_lr_scheduler.get("_component_", None) in (None, "None", "null")
+        )
+        if _no_sched:
             if self._is_rank_zero:
                 log.info(
                     "No learning rate scheduler configured. Using constant learning rate."
@@ -2276,6 +2287,22 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                     optimizer,
                     opt_state_dict,
                     self._device,
+                )
+            # Re-apply the config lr AFTER the resume load. load_state_dict
+            # restores the saved param_groups (including the lr that was active at
+            # checkpoint time, e.g. the cosine-scheduled value), which would
+            # silently override an intentional lr change on resume. Restoring the
+            # moments (exp_avg/exp_avg_sq) but using the config lr is the correct
+            # "continue training at a new lr" semantics. No-op when the config lr
+            # equals the saved lr.
+            _cfg_lr = cfg_optimizer.get("lr", None)
+            if _cfg_lr is not None:
+                for _pg in optimizer.param_groups:
+                    _pg["lr"] = float(_cfg_lr)
+                utils.log_rank_zero(
+                    log,
+                    f"Resume: re-applied config lr={float(_cfg_lr)} to optimizer "
+                    "param_groups (overriding the checkpoint's saved lr).",
                 )
         utils.log_rank_zero(log, "Optimizer is initialized.")
         return optimizer
