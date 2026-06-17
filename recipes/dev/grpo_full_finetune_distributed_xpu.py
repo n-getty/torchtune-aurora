@@ -4307,6 +4307,163 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                             _g.detach().mul_(_clip_coef)
         return grad_norm
 
+
+    def _emit_timing_detail(self, phase_vals) -> None:
+        """Emit the per-rank TIMING_DETAIL line (min/max/avg over dp_shard).
+
+        Extracted verbatim from train() (no behavior change). phase_vals is the
+        11-tuple of phase durations in _phase_names order. On EP runs it does one
+        async all_reduce on _shard_pg for rank-skew visibility; on non-EP runs it
+        logs rank-0 values only. Writes nothing back to the caller."""
+        _phase_vals = phase_vals
+        _phase_names = (
+            "total", "gen", "grpo", "clip", "opt",
+            "post_opt_sync", "lr_sched",
+            "wsync_prev_wait", "wsync_gather", "wsync_bcast_wait",
+            "other",
+        )
+        # Per-rank reduce is gated on EP mode: in dense FSDP with the
+        # default deferred wsync, a broadcast on _xccl_wsync_pg may still
+        # be in flight here and would share Slingshot with our TIMING all_reduce
+        # on _shard_pg — different PGs but same fabric, an Aurora contention
+        # hazard. EP mode runs sync wsync (deferred=false) so dp_shard XCCL
+        # is idle by the time we get here.
+        _detail_pg = self._shard_pg if (
+            self._expert_parallel_degree > 1 and self._shard_pg is not None
+        ) else None
+        _detail_min = _detail_max = _detail_sum = None
+        _detail_world = 1
+        if _detail_pg is not None:
+            try:
+                _detail_world = torch.distributed.get_world_size(_detail_pg)
+            except Exception:
+                _detail_world = 1
+        if _detail_world > 1:
+            try:
+                _t = torch.tensor(_phase_vals, dtype=torch.float32, device=self._device)
+                _t_min = _t.clone()
+                _t_max = _t.clone()
+                _t_sum = _t.clone()
+                _orig_all_reduce(_t_min, op=torch.distributed.ReduceOp.MIN, group=_detail_pg)
+                _orig_all_reduce(_t_max, op=torch.distributed.ReduceOp.MAX, group=_detail_pg)
+                _orig_all_reduce(_t_sum, op=torch.distributed.ReduceOp.SUM, group=_detail_pg)
+                _detail_min = _t_min.tolist()
+                _detail_max = _t_max.tolist()
+                _detail_sum = _t_sum.tolist()
+            except Exception as _detail_exc:
+                if self._is_rank_zero:
+                    log.warning(
+                        "TIMING_DETAIL all_reduce failed (%r) — falling back to rank-0 only",
+                        _detail_exc,
+                    )
+        if self._is_rank_zero:
+            if _detail_min is not None:
+                _parts = [f"step={self._steps_run}"]
+                for _name, _v0, _vmin, _vmax, _vsum in zip(
+                    _phase_names, _phase_vals, _detail_min, _detail_max, _detail_sum,
+                ):
+                    _vavg = _vsum / _detail_world
+                    _parts.append(
+                        f"{_name}=r0:{_v0:.1f}/min:{_vmin:.1f}/max:{_vmax:.1f}/avg:{_vavg:.1f}"
+                    )
+                log.info("TIMING_DETAIL  " + "  ".join(_parts))
+            else:
+                _parts = [f"step={self._steps_run}"]
+                for _name, _v0 in zip(_phase_names, _phase_vals):
+                    _parts.append(f"{_name}=r0:{_v0:.1f}")
+                log.info("TIMING_DETAIL  " + "  ".join(_parts))
+
+
+    def _run_wsync_block(self):
+        """Sync updated weights to vLLM after the ppo_epochs (per vllm_mode).
+
+        Extracted verbatim from train() (no behavior change). Dispatches on
+        self._vllm_mode (colocate / colocate_ray / dedicated_rank / server) and
+        returns the (prev_wait, gather, bcast_wait) timing triple the caller folds
+        into the step TIMING line. colocate_sleep syncs in generate_trajectory."""
+        _wsync_prev_wait_time = 0.0
+        _wsync_gather_time = 0.0
+        _wsync_bcast_wait_time = 0.0
+        if self._vllm_mode == "colocate":
+            _wsync_gather_t0 = time.perf_counter()
+            self._sync_colocated_weights()
+            _wsync_gather_time = time.perf_counter() - _wsync_gather_t0
+        elif self._vllm_mode == "colocate_ray":
+            _wsync_gather_t0 = time.perf_counter()
+            # ── W18: respawn vLLM if W17 killed it after gen ────
+            # When TORCHTUNE_RAY_COLOCATE_KILL_AFTER_GEN=1, the gen
+            # block tore down the LLM driver + ray.shutdown() to
+            # avoid the live-co-tenancy BWD wedge. Before we can
+            # ship fresh trainer weights to vLLM, re-attach: rank 0
+            # restarts ray.init() + LLM(...). Other ranks barrier.
+            # The respawn cost (~30-60s on warm cache) is the price
+            # of fully-colocated TP=8 under this driver.
+            if (
+                os.environ.get(
+                    "TORCHTUNE_RAY_COLOCATE_KILL_AFTER_GEN", "0"
+                ) == "1"
+                and self._vllm_llm is None
+            ):
+                _t_respawn = time.perf_counter()
+                # ── W19 fix ─────────────────────────────────────────
+                # W18 deadlocked here: the trainer xccl barrier on
+                # ranks 1-7 was a LIVE L0 collective on the same 8
+                # tiles where vLLM's TP=8 init was posting its own
+                # all_reduce. Symmetric live co-tenancy = same wedge
+                # we proved in W17, just rotated. Fix: ranks 1-7 must
+                # hold NO live XPU work while vLLM initializes. Use
+                # the gloo gen_pg (CPU-only, fully decoupled from
+                # XCCL) for the wait. Rank 0 finishes LLM(...) →
+                # gloo barrier → all 8 ranks meet on CPU and only
+                # then proceed to the wsync collective.
+                if self._is_rank_zero:
+                    log.info(
+                        "Rank 0: [W19] respawning vLLM Ray actors "
+                        "(post-BWD, pre-wsync); peers wait on gloo"
+                    )
+                    self._init_vllm_ray_colocate(self._cfg)
+                    log.info(
+                        "Rank 0: [W19] respawn took %.1fs",
+                        time.perf_counter() - _t_respawn,
+                    )
+                if getattr(self, "_ray_colocate_gen_pg", None) is not None:
+                    torch.distributed.barrier(
+                        group=self._ray_colocate_gen_pg
+                    )
+                elif not self._production_mode:
+                    torch.distributed.barrier()
+            self._sync_ray_colocate_weights()
+            _wsync_gather_time = time.perf_counter() - _wsync_gather_t0
+        elif self._vllm_mode == "dedicated_rank" and not self._is_vllm_rank:
+            # summon_full_params in _sync_dedicated_vllm_weights is a collective
+            # (all training ranks 0-10 must enter it); only rank 0 sends the broadcast.
+            _wsync_gather_t0 = time.perf_counter()
+            self._sync_dedicated_vllm_weights()
+            _wsync_gather_time = time.perf_counter() - _wsync_gather_t0
+        elif self._vllm_mode == "server" and self._vllm_weight_sync:
+            if self._steps_run % self._vllm_weight_sync_interval == 0:
+                # Wait for previous async broadcast to complete before starting a new one.
+                # This ensures the XCCL PG is free and vLLM has applied the previous weights.
+                _wsync_prev_wait_t0 = time.perf_counter()
+                self._wait_for_sync_complete()
+                _wsync_prev_wait_time = time.perf_counter() - _wsync_prev_wait_t0
+
+                _wsync_gather_t0 = time.perf_counter()
+                self._sync_weights_to_vllm()
+                _wsync_gather_time = time.perf_counter() - _wsync_gather_t0
+                # Synchronous wsync (EP path): broadcast immediately after gather and
+                # block until vLLM has the new weights, so step N+1 generation runs on
+                # fresh weights. Default deferred mode overlaps the broadcast with the
+                # next step's GRPO/backward, which contends with EP grad-release on the
+                # dp_shard XCCL fabric — see docs/reports/MoE_EP_status.md section #5.
+                if (self._vllm_weight_sync_method == "xccl"
+                        and not self._vllm_weight_sync_deferred):
+                    _wsync_bcast_wait_t0 = time.perf_counter()
+                    self._start_deferred_broadcast()
+                    self._wait_for_sync_complete()
+                    _wsync_bcast_wait_time = time.perf_counter() - _wsync_bcast_wait_t0
+        return _wsync_prev_wait_time, _wsync_gather_time, _wsync_bcast_wait_time
+
     def train(self) -> None:
         """
         The core training loop with gradient accumulation and no_sync() support.
@@ -4767,87 +4924,8 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
 
                 # Sync updated weights to vLLM (after all ppo_epochs)
                 # For colocate_sleep, sync happens during wake_up in generate_trajectory
-                _wsync_prev_wait_time = 0.0
-                _wsync_gather_time = 0.0
-                _wsync_bcast_wait_time = 0.0
-                if self._vllm_mode == "colocate":
-                    _wsync_gather_t0 = time.perf_counter()
-                    self._sync_colocated_weights()
-                    _wsync_gather_time = time.perf_counter() - _wsync_gather_t0
-                elif self._vllm_mode == "colocate_ray":
-                    _wsync_gather_t0 = time.perf_counter()
-                    # ── W18: respawn vLLM if W17 killed it after gen ────
-                    # When TORCHTUNE_RAY_COLOCATE_KILL_AFTER_GEN=1, the gen
-                    # block tore down the LLM driver + ray.shutdown() to
-                    # avoid the live-co-tenancy BWD wedge. Before we can
-                    # ship fresh trainer weights to vLLM, re-attach: rank 0
-                    # restarts ray.init() + LLM(...). Other ranks barrier.
-                    # The respawn cost (~30-60s on warm cache) is the price
-                    # of fully-colocated TP=8 under this driver.
-                    if (
-                        os.environ.get(
-                            "TORCHTUNE_RAY_COLOCATE_KILL_AFTER_GEN", "0"
-                        ) == "1"
-                        and self._vllm_llm is None
-                    ):
-                        _t_respawn = time.perf_counter()
-                        # ── W19 fix ─────────────────────────────────────────
-                        # W18 deadlocked here: the trainer xccl barrier on
-                        # ranks 1-7 was a LIVE L0 collective on the same 8
-                        # tiles where vLLM's TP=8 init was posting its own
-                        # all_reduce. Symmetric live co-tenancy = same wedge
-                        # we proved in W17, just rotated. Fix: ranks 1-7 must
-                        # hold NO live XPU work while vLLM initializes. Use
-                        # the gloo gen_pg (CPU-only, fully decoupled from
-                        # XCCL) for the wait. Rank 0 finishes LLM(...) →
-                        # gloo barrier → all 8 ranks meet on CPU and only
-                        # then proceed to the wsync collective.
-                        if self._is_rank_zero:
-                            log.info(
-                                "Rank 0: [W19] respawning vLLM Ray actors "
-                                "(post-BWD, pre-wsync); peers wait on gloo"
-                            )
-                            self._init_vllm_ray_colocate(self._cfg)
-                            log.info(
-                                "Rank 0: [W19] respawn took %.1fs",
-                                time.perf_counter() - _t_respawn,
-                            )
-                        if getattr(self, "_ray_colocate_gen_pg", None) is not None:
-                            torch.distributed.barrier(
-                                group=self._ray_colocate_gen_pg
-                            )
-                        elif not self._production_mode:
-                            torch.distributed.barrier()
-                    self._sync_ray_colocate_weights()
-                    _wsync_gather_time = time.perf_counter() - _wsync_gather_t0
-                elif self._vllm_mode == "dedicated_rank" and not self._is_vllm_rank:
-                    # summon_full_params in _sync_dedicated_vllm_weights is a collective
-                    # (all training ranks 0-10 must enter it); only rank 0 sends the broadcast.
-                    _wsync_gather_t0 = time.perf_counter()
-                    self._sync_dedicated_vllm_weights()
-                    _wsync_gather_time = time.perf_counter() - _wsync_gather_t0
-                elif self._vllm_mode == "server" and self._vllm_weight_sync:
-                    if self._steps_run % self._vllm_weight_sync_interval == 0:
-                        # Wait for previous async broadcast to complete before starting a new one.
-                        # This ensures the XCCL PG is free and vLLM has applied the previous weights.
-                        _wsync_prev_wait_t0 = time.perf_counter()
-                        self._wait_for_sync_complete()
-                        _wsync_prev_wait_time = time.perf_counter() - _wsync_prev_wait_t0
-
-                        _wsync_gather_t0 = time.perf_counter()
-                        self._sync_weights_to_vllm()
-                        _wsync_gather_time = time.perf_counter() - _wsync_gather_t0
-                        # Synchronous wsync (EP path): broadcast immediately after gather and
-                        # block until vLLM has the new weights, so step N+1 generation runs on
-                        # fresh weights. Default deferred mode overlaps the broadcast with the
-                        # next step's GRPO/backward, which contends with EP grad-release on the
-                        # dp_shard XCCL fabric — see docs/reports/MoE_EP_status.md section #5.
-                        if (self._vllm_weight_sync_method == "xccl"
-                                and not self._vllm_weight_sync_deferred):
-                            _wsync_bcast_wait_t0 = time.perf_counter()
-                            self._start_deferred_broadcast()
-                            self._wait_for_sync_complete()
-                            _wsync_bcast_wait_time = time.perf_counter() - _wsync_bcast_wait_t0
+                (_wsync_prev_wait_time, _wsync_gather_time,
+                 _wsync_bcast_wait_time) = self._run_wsync_block()
 
                 # Stop tracking memory
                 if (
@@ -4883,68 +4961,12 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                 # docs/reports/MoE_status_feedback.md item 5: "Rank 0 grpo=38.6s
                 # can look good while slow-rank imbalance is paid in the
                 # post-opt shard sync or next-step synchronization").
-                _phase_names = (
-                    "total", "gen", "grpo", "clip", "opt",
-                    "post_opt_sync", "lr_sched",
-                    "wsync_prev_wait", "wsync_gather", "wsync_bcast_wait",
-                    "other",
-                )
-                _phase_vals = (
+                self._emit_timing_detail((
                     _step_time, _gen_time, _grpo_time, _clip_time, _opt_time,
                     _post_opt_sync_time, _lr_sched_time,
                     _wsync_prev_wait_time, _wsync_gather_time, _wsync_bcast_wait_time,
                     _other_time,
-                )
-                # Per-rank reduce is gated on EP mode: in dense FSDP with the
-                # default deferred wsync, a broadcast on _xccl_wsync_pg may still
-                # be in flight here and would share Slingshot with our TIMING all_reduce
-                # on _shard_pg — different PGs but same fabric, an Aurora contention
-                # hazard. EP mode runs sync wsync (deferred=false) so dp_shard XCCL
-                # is idle by the time we get here.
-                _detail_pg = self._shard_pg if (
-                    self._expert_parallel_degree > 1 and self._shard_pg is not None
-                ) else None
-                _detail_min = _detail_max = _detail_sum = None
-                _detail_world = 1
-                if _detail_pg is not None:
-                    try:
-                        _detail_world = torch.distributed.get_world_size(_detail_pg)
-                    except Exception:
-                        _detail_world = 1
-                if _detail_world > 1:
-                    try:
-                        _t = torch.tensor(_phase_vals, dtype=torch.float32, device=self._device)
-                        _t_min = _t.clone()
-                        _t_max = _t.clone()
-                        _t_sum = _t.clone()
-                        _orig_all_reduce(_t_min, op=torch.distributed.ReduceOp.MIN, group=_detail_pg)
-                        _orig_all_reduce(_t_max, op=torch.distributed.ReduceOp.MAX, group=_detail_pg)
-                        _orig_all_reduce(_t_sum, op=torch.distributed.ReduceOp.SUM, group=_detail_pg)
-                        _detail_min = _t_min.tolist()
-                        _detail_max = _t_max.tolist()
-                        _detail_sum = _t_sum.tolist()
-                    except Exception as _detail_exc:
-                        if self._is_rank_zero:
-                            log.warning(
-                                "TIMING_DETAIL all_reduce failed (%r) — falling back to rank-0 only",
-                                _detail_exc,
-                            )
-                if self._is_rank_zero:
-                    if _detail_min is not None:
-                        _parts = [f"step={self._steps_run}"]
-                        for _name, _v0, _vmin, _vmax, _vsum in zip(
-                            _phase_names, _phase_vals, _detail_min, _detail_max, _detail_sum,
-                        ):
-                            _vavg = _vsum / _detail_world
-                            _parts.append(
-                                f"{_name}=r0:{_v0:.1f}/min:{_vmin:.1f}/max:{_vmax:.1f}/avg:{_vavg:.1f}"
-                            )
-                        log.info("TIMING_DETAIL  " + "  ".join(_parts))
-                    else:
-                        _parts = [f"step={self._steps_run}"]
-                        for _name, _v0 in zip(_phase_names, _phase_vals):
-                            _parts.append(f"{_name}=r0:{_v0:.1f}")
-                        log.info("TIMING_DETAIL  " + "  ".join(_parts))
+                ))
 
                 self._steps_run += 1
                 if self._steps_run % self._log_every_n_steps == 0:

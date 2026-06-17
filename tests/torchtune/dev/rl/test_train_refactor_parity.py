@@ -136,32 +136,41 @@ def test_train_calls_extract_batch_kwargs_and_splats(base_cls):
 
 def test_train_syncs_weights_after_optimizer(base_cls):
     """Pin the post-optimizer weight-sync sequence — the exact thing the
-    BioReason subclass once silently dropped."""
-    train = _methods(base_cls)["train"]
-    src = ast.unparse(train)
-    # All three vLLM modes must wire in a sync after optimizer.step().
-    assert "self._optimizer.step()" in src, "train() must call optimizer.step()"
-    assert "_sync_colocated_weights" in src, (
+    BioReason subclass once silently dropped.
+
+    The per-mode sync dispatch was extracted from train() into the
+    _run_wsync_block() helper (2026-06-17); train() calls it after
+    optimizer.step(). This guard therefore scans the COMBINED source of
+    train() + _run_wsync_block() so it still catches a dropped sync, and
+    separately verifies train() invokes _run_wsync_block after the optimizer.
+    """
+    methods = _methods(base_cls)
+    train = methods["train"]
+    train_src = ast.unparse(train)
+    assert "_run_wsync_block" in methods, (
+        "train() weight-sync was extracted to _run_wsync_block — helper missing"
+    )
+    wsync_src = ast.unparse(methods["_run_wsync_block"])
+    combined = train_src + "\n" + wsync_src
+
+    assert "self._optimizer.step()" in train_src, "train() must call optimizer.step()"
+    # All three vLLM modes must wire in a sync (now inside _run_wsync_block).
+    assert "_sync_colocated_weights" in combined, (
         "colocate vLLM mode must call _sync_colocated_weights"
     )
-    assert "_sync_dedicated_vllm_weights" in src, (
+    assert "_sync_dedicated_vllm_weights" in combined, (
         "dedicated_rank vLLM mode must call _sync_dedicated_vllm_weights"
     )
-    assert "_sync_weights_to_vllm" in src, (
+    assert "_sync_weights_to_vllm" in combined, (
         "server vLLM mode must call _sync_weights_to_vllm"
     )
-    # Order: optimizer.step() must appear before the sync calls in source.
-    opt_idx = src.index("self._optimizer.step()")
-    for sync_name in (
-        "_sync_colocated_weights",
-        "_sync_dedicated_vllm_weights",
-        "_sync_weights_to_vllm",
-    ):
-        sync_idx = src.index(sync_name)
-        assert sync_idx > opt_idx, (
-            f"{sync_name} must appear AFTER optimizer.step() in train() — "
-            "weight sync precedes optimizer step is a correctness bug"
-        )
+    # Order: train() must invoke the wsync block AFTER optimizer.step().
+    opt_idx = train_src.index("self._optimizer.step()")
+    wsync_call_idx = train_src.index("_run_wsync_block")
+    assert wsync_call_idx > opt_idx, (
+        "_run_wsync_block must be called AFTER optimizer.step() in train() — "
+        "weight sync preceding the optimizer step is a correctness bug"
+    )
 
 
 def test_train_short_circuits_vllm_rank(base_cls):

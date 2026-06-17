@@ -216,6 +216,8 @@ outputs/
 # Development iteration artifacts — launcher history, one-off experiments
 # Anchored to repo root so docs/experiments/ remains tracked.
 /experiments/
+# Scratch space for repros, drafts, vendored source checkouts — never tracked.
+/scratch/
 recipes/configs/dev/experimental/*
 # Whitelist EP yamls referenced by committed launchers in recipes/dev/run_qwen3_30b_ep*.sh
 !recipes/configs/dev/experimental/qwen3_30b_a3b_grpo_ep4_xpu.yaml
