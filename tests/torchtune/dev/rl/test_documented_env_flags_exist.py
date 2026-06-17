@@ -35,8 +35,13 @@ CODE_DIRS = [REPO_ROOT / "torchtune", REPO_ROOT / "recipes"]
 
 FLAG_RE = re.compile(r"TORCHTUNE_[A-Z0-9_]+")
 
-# Backticked flags in the CLAUDE.md table are the "supported, documented" set.
-DOC_FLAG_RE = re.compile(r"`(TORCHTUNE_[A-Z0-9_]+)")
+# The "supported, documented" set is the flags that appear as the FIRST cell of
+# a CLAUDE.md table row: `| `TORCHTUNE_X=...` | ...`. We deliberately parse only
+# table rows (not prose) so explanatory mentions of prefixes/families elsewhere
+# (e.g. "the `TORCHTUNE_SKIP_*` family") are not mistaken for real flags. The
+# trailing `=` or backtick after the name distinguishes a concrete flag from a
+# `TORCHTUNE_PREFIX_*` glob.
+DOC_ROW_FLAG_RE = re.compile(r"^\|\s*`(TORCHTUNE_[A-Z0-9_]+)(?:=[^`]*)?`", re.MULTILINE)
 
 # Debug-only / diagnostic flags that intentionally stay out of the supported
 # table — do not report these as "undocumented".
@@ -49,7 +54,7 @@ UNDOCUMENTED_OK_EXACT = {
 
 def _documented_flags() -> set[str]:
     text = CLAUDE_MD.read_text()
-    return set(DOC_FLAG_RE.findall(text))
+    return set(DOC_ROW_FLAG_RE.findall(text))
 
 
 def _code_flags() -> set[str]:
