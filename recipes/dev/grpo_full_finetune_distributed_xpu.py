@@ -2633,92 +2633,25 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         """Single-generator vLLM HTTP round-trip (rank 0, or each replica's
         shard-leader under HSDP). No collectives — safe from a producer thread.
         Caller is responsible for broadcasting the result to other ranks (see
-        :meth:`_broadcast_query_responses`). All generators share the same
-        ``_vllm_clients`` pool and fan their prompts across it round-robin.
+        :meth:`_broadcast_query_responses`). Delegates to the shared
+        ``vllm_http_generate`` helper so the dense and LoRA recipes stay in sync.
         """
-        bsz = batch_input_ids.shape[0]
-        total_len = context_length + self._max_generated_tokens
-        # Strip padding and convert to Python lists for HTTP.
-        # Truncate to vllm_max_model_len - max_generated_tokens.
-        max_prompt_len = self._vllm_max_model_len - self._max_generated_tokens
-        prompts = []
-        for i in range(bsz):
-            ids = batch_input_ids[i].cpu().tolist()
-            ids = [t for t in ids if t != self._tokenizer.pad_id]
-            prompts.append(ids[-max_prompt_len:] if len(ids) > max_prompt_len else ids)
+        from torchtune.dev.rl.vllm_client import vllm_http_generate
 
-        gen_kwargs = dict(
-            n=1,  # prompts already expanded by grpo_samples
-            max_tokens=self._max_generated_tokens,
+        return vllm_http_generate(
+            batch_input_ids,
+            context_length,
+            vllm_clients=self._vllm_clients,
+            pad_id=self._tokenizer.pad_id,
+            eos_id=self._tokenizer.eos_id,
+            max_generated_tokens=self._max_generated_tokens,
+            vllm_max_model_len=self._vllm_max_model_len,
             temperature=self._temperature,
-            top_k=self._top_k or 0,
+            top_k=self._top_k,
+            stop_token_ids=self._stop_token_ids,
+            stop_strings=self._stop_strings,
+            device=self._device,
         )
-        # Forward stop tokens to vLLM so generation actually halts at EOS
-        # instead of running to max_tokens every step. Without this, vLLM
-        # only knows the model-config default EOS, missing extras the
-        # tokenizer's stop_tokens list adds (e.g. multiple EOS-equivalents).
-        if self._stop_token_ids is not None and self._stop_token_ids.numel() > 0:
-            gen_kwargs["stop_token_ids"] = self._stop_token_ids.cpu().tolist()
-        # Raw pretraining checkpoints never naturally emit EOS — string stops
-        # like ``</answer>`` and ``User:`` are the only learnable termination
-        # signal. Only forwarded when the YAML config sets ``stop_strings``.
-        if self._stop_strings:
-            gen_kwargs["stop"] = list(self._stop_strings)
-
-        t0 = time.perf_counter()
-        num_clients = len(self._vllm_clients)
-        if num_clients > 1:
-            from concurrent.futures import ThreadPoolExecutor, as_completed
-            chunks = [prompts[i::num_clients] for i in range(num_clients)]
-
-            def _call_vllm(client, chunk):
-                return client.generate(prompts=chunk, **gen_kwargs) if chunk else []
-
-            with ThreadPoolExecutor(max_workers=num_clients) as pool:
-                futures = {
-                    pool.submit(_call_vllm, client, chunk): idx
-                    for idx, (client, chunk) in enumerate(zip(self._vllm_clients, chunks))
-                }
-                chunk_results = [None] * num_clients
-                for future in as_completed(futures):
-                    idx = futures[future]
-                    chunk_results[idx] = future.result()
-
-            completions = [None] * bsz
-            for i in range(bsz):
-                client_idx = i % num_clients
-                within_idx = i // num_clients
-                completions[i] = chunk_results[client_idx][within_idx]
-        else:
-            completions = self._vllm_client.generate(prompts=prompts, **gen_kwargs)
-        gen_time = time.perf_counter() - t0
-
-        query_responses = batch_input_ids.new_full((bsz, total_len), self._tokenizer.pad_id)
-        query_responses[:, :context_length] = batch_input_ids
-        # When vLLM stops on a string (e.g. ``</answer>`` for AGPT-2B), the
-        # returned tokens do NOT include any model EOS. Downstream metrics
-        # (``response_lengths``, ``num_stop_tokens``) and the truncation in
-        # :func:`rlhf.truncate_sequence_at_first_stop_token` rely on finding
-        # a token from ``self._stop_token_ids`` in the tensor — without one,
-        # every completion looks like it ran to max_tokens. Inject a single
-        # EOS at the first pad position after the actual generated tokens so
-        # the truncation logic finds the real boundary. No-op when the
-        # completion already contains EOS or filled max_generated_tokens.
-        eos_id = self._tokenizer.eos_id
-        for i, comp in enumerate(completions):
-            length = min(len(comp), self._max_generated_tokens)
-            query_responses[i, context_length : context_length + length] = torch.tensor(
-                comp[:length], dtype=batch_input_ids.dtype, device=self._device
-            )
-            if eos_id is not None and length < self._max_generated_tokens:
-                query_responses[i, context_length + length] = eos_id
-
-        total_tokens = sum(len(c) for c in completions)
-        log.info(
-            "Rank %d: vLLM generation: %d sequences (%d clients), %d tokens in %.1fs (%.1f tok/s)",
-            self.rank, bsz, num_clients, total_tokens, gen_time, total_tokens / max(gen_time, 0.01),
-        )
-        return query_responses
 
     def _generate_with_ray_colocate_vllm(
         self,
@@ -3040,6 +2973,8 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
     _init_xccl_weight_sync = _weight_sync_module._init_xccl_weight_sync
     _build_ws10_sharded_pgs = _weight_sync_module._build_ws10_sharded_pgs
     _sync_weights_to_vllm_xccl = _weight_sync_module._sync_weights_to_vllm_xccl
+    _xccl_gather_fsdp1 = _weight_sync_module._xccl_gather_fsdp1
+    _xccl_gather_and_stage_fsdp2 = _weight_sync_module._xccl_gather_and_stage_fsdp2
     _sync_weights_to_vllm_shm = _weight_sync_module._sync_weights_to_vllm_shm
     _wait_for_sync_complete = _weight_sync_module._wait_for_sync_complete
     _start_deferred_broadcast = _weight_sync_module._start_deferred_broadcast
@@ -4227,6 +4162,151 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             None,  # metadata
         )
 
+
+    def _prewarm_fsdp1_allgather_buffer(self) -> None:
+        """Pre-warm the FSDP1 summon_full_params AllGather buffer before training.
+
+        Extracted verbatim from train() (no behavior change). Puts the 7.49 GiB
+        AllGather buffer in cache BEFORE the first backward so summon_full_params
+        at weight-sync time reuses it instead of forcing a new L0 alloc that would
+        push reserved past the GC threshold and stale the XCCL IPC handles."""
+        # Pre-warm FSDP1 summon_full_params AllGather buffer before training.
+        #
+        # Root cause of banned:1 / UR:40 at step 1 (runs 32-36):
+        #   - After step 0 backward ReduceScatter, 7.49 GiB param buffer is freed to cache.
+        #   - summon_full_params (weight sync) needs 7.49 GiB on ALL training ranks.
+        #   - If cache lacks a matching block, L0 allocates a NEW 7.49 GiB block.
+        #   - New L0 alloc pushes reserved past GC threshold → GC calls zeMemFree on
+        #     backward's XCCL-registered AllGather buffers → stale IPC handles at step 1.
+        #
+        # Fix: pre-warm puts 7.49 GiB in cache BEFORE the first backward. Subsequent FSDP
+        # AllGathers reuse this cached block, so summon_full_params also reuses it (no new
+        # L0 alloc at weight sync time). Pool stays ≤54 GiB → GC never fires.
+        if hasattr(self._model, '_fsdp_wrapped_module') or (
+            hasattr(torch.distributed.fsdp, 'FullyShardedDataParallel')
+            and isinstance(self._model, torch.distributed.fsdp.FullyShardedDataParallel)
+        ):
+            if self._vllm_mode == "dedicated_rank":
+                from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+                log.info(
+                    "Rank %d: pre-warming FSDP summon_full_params cache (7.49 GiB AllGather buffer)...",
+                    self.rank,
+                )
+                with FSDP.summon_full_params(self._model, writeback=False, rank0_only=True):
+                    pass  # warm the AllGather buffer into cache; reused by fwd/bwd + weight sync
+                if self._device.type == "xpu":
+                    log.info(
+                        "Rank %d: post-prewarm: alloc=%.2f GiB, resv=%.2f GiB",
+                        self.rank,
+                        torch.xpu.memory_allocated() / 1024**3,
+                        torch.xpu.memory_reserved() / 1024**3,
+                    )
+
+    def _clip_gradients(self, grad_norm):
+        """Clip gradients per self._clip_grad_norm; return the (new) grad norm.
+
+        Extracted verbatim from train() (no behavior change). Returns grad_norm
+        unchanged when clipping is disabled. Handles the EP-local-norm path, the
+        FSDP1 AllReduce path, and the FSDP2 on-device single-.item() path."""
+        if self._clip_grad_norm is not None:
+            if self._expert_parallel_degree > 1:
+                # EP mixes two DTensor meshes: non-expert params on dp_mesh
+                # (2D: dp_replicate×dp_shard) and expert params on ep_mesh
+                # (1D: dp_shard). torch.nn.utils.clip_grad_norm_ calls
+                # torch.stack on per-param norm DTensors, which fails when
+                # the tensors have different meshes.
+                #
+                # v77: compute both non-EP and EP norms purely locally.
+                # v76 root cause: clip_grad_norm_(_non_ep_params, inf) on FSDP2
+                # DTensor params triggers an XCCL all_reduce on self._shard_pg
+                # internally (for DTensor norm aggregation). The subsequent
+                # explicit _orig_all_reduce(_ep_norm_sq_xpu, group=self._shard_pg)
+                # is then a SECOND XCCL collective on the same communicator.
+                # With token routing imbalance (ep_rank 0: 32k tokens, ep_ranks 2,3:
+                # 0 tokens), SHARD groups finish backward at different times → the
+                # two sequential XCCL ops on shard_pg arrive at different clock offsets
+                # across the 4 ranks → communicator sequence mismatch → 1800s timeout.
+                # Fix: compute all norms manually (local tensors only, no distributed
+                # collectives in the norm computation). Each rank computes its local
+                # approximation of the global norm and applies clip_coef locally.
+                # This is already a valid approximation for FSDP2 sharded grads.
+                from torchtune.modules.moe.experts import GroupedExperts
+                from torchtune.models.qwen3_moe._experts import GroupedExpertsHF
+                _ep_param_ids = set()
+                _ep_params = []
+                for _mn, _mm in self._model.named_modules():
+                    if _mn.endswith(".experts") and isinstance(_mm, (GroupedExperts, GroupedExpertsHF)):
+                        for _p in _mm.parameters(recurse=False):
+                            _ep_param_ids.add(id(_p))
+                            _ep_params.append(_p)
+                _non_ep_params = [
+                    _p for _p in self._model.parameters()
+                    if id(_p) not in _ep_param_ids
+                ]
+                # Compute local norm_sq for non-EP params (no XCCL, no DTensor norm).
+                _non_ep_norm_sq_val = 0.0
+                for _p in _non_ep_params:
+                    if _p.grad is not None:
+                        _g = _p.grad
+                        if hasattr(_g, '_local_tensor'):
+                            _g = _g._local_tensor
+                        _non_ep_norm_sq_val += float(_g.float().norm().item() ** 2)
+                # Compute local norm_sq for EP params.
+                _ep_norm_sq_val = 0.0
+                for _p in _ep_params:
+                    if _p.grad is not None:
+                        _g = _p.grad
+                        if hasattr(_g, '_local_tensor'):
+                            _g = _g._local_tensor
+                        _ep_norm_sq_val += float(_g.float().norm().item() ** 2)
+                # Local total norm (no cross-rank all_reduce — see v77 comment above).
+                _total_norm_f = (_non_ep_norm_sq_val + _ep_norm_sq_val) ** 0.5
+                _max_norm_f = float(self._clip_grad_norm)
+                _clip_coef = _max_norm_f / max(_total_norm_f, 1e-6)
+                if _clip_coef < 1.0:
+                    for _p in self._model.parameters():
+                        if _p.grad is not None:
+                            _g = _p.grad
+                            if hasattr(_g, '_local_tensor'):
+                                _g._local_tensor.detach().mul_(_clip_coef)
+                            else:
+                                _g.detach().mul_(_clip_coef)
+                grad_norm = torch.tensor(_total_norm_f, device=self._device)
+            else:
+                from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+                if getattr(self, '_use_fsdp1', False) and isinstance(self._model, FSDP):
+                    # FSDP1 SHARD_GRAD_OP: grads are sharded — local norm ≠ global.
+                    # Use FSDP.clip_grad_norm_ which AllReduces norm² across _training_pg
+                    # before clipping. Safe here since training ranks are isolated
+                    # from vLLM rank (no shared L0 fabric contention).
+                    grad_norm = self._model.clip_grad_norm_(float(self._clip_grad_norm))
+                else:
+                    # Non-EP path: avoid torch.nn.utils.clip_grad_norm_ on FSDP2
+                    # DTensor params (its internal XCCL all_reduce on shard_pg
+                    # deadlocks with vLLM L0/fabric usage when colocated).
+                    # ALSO avoid per-param .item() — that's ~700 D2H syncs which
+                    # also deadlocks with concurrent vLLM activity (Test D
+                    # 2026-04-22). Compute the norm fully on-device with a
+                    # single .item() at the end.
+                    _local_norm_sq = torch.zeros((), device=self._device, dtype=torch.float32)
+                    _grads_to_clip = []
+                    for _p in self._model.parameters():
+                        if _p.grad is not None:
+                            _g = _p.grad
+                            if hasattr(_g, '_local_tensor'):
+                                _g = _g._local_tensor
+                            _local_norm_sq = _local_norm_sq + _g.float().pow(2).sum()
+                            _grads_to_clip.append(_p.grad)
+                    grad_norm = _local_norm_sq.sqrt()
+                    _max_norm = float(self._clip_grad_norm)
+                    _clip_coef = (_max_norm / (grad_norm + 1e-6)).clamp(max=1.0)
+                    for _g in _grads_to_clip:
+                        if hasattr(_g, '_local_tensor'):
+                            _g._local_tensor.detach().mul_(_clip_coef)
+                        else:
+                            _g.detach().mul_(_clip_coef)
+        return grad_norm
+
     def train(self) -> None:
         """
         The core training loop with gradient accumulation and no_sync() support.
@@ -4278,37 +4358,7 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         # zero out the gradients before starting training
         self._optimizer.zero_grad()
 
-        # Pre-warm FSDP1 summon_full_params AllGather buffer before training.
-        #
-        # Root cause of banned:1 / UR:40 at step 1 (runs 32-36):
-        #   - After step 0 backward ReduceScatter, 7.49 GiB param buffer is freed to cache.
-        #   - summon_full_params (weight sync) needs 7.49 GiB on ALL training ranks.
-        #   - If cache lacks a matching block, L0 allocates a NEW 7.49 GiB block.
-        #   - New L0 alloc pushes reserved past GC threshold → GC calls zeMemFree on
-        #     backward's XCCL-registered AllGather buffers → stale IPC handles at step 1.
-        #
-        # Fix: pre-warm puts 7.49 GiB in cache BEFORE the first backward. Subsequent FSDP
-        # AllGathers reuse this cached block, so summon_full_params also reuses it (no new
-        # L0 alloc at weight sync time). Pool stays ≤54 GiB → GC never fires.
-        if hasattr(self._model, '_fsdp_wrapped_module') or (
-            hasattr(torch.distributed.fsdp, 'FullyShardedDataParallel')
-            and isinstance(self._model, torch.distributed.fsdp.FullyShardedDataParallel)
-        ):
-            if self._vllm_mode == "dedicated_rank":
-                from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-                log.info(
-                    "Rank %d: pre-warming FSDP summon_full_params cache (7.49 GiB AllGather buffer)...",
-                    self.rank,
-                )
-                with FSDP.summon_full_params(self._model, writeback=False, rank0_only=True):
-                    pass  # warm the AllGather buffer into cache; reused by fwd/bwd + weight sync
-                if self._device.type == "xpu":
-                    log.info(
-                        "Rank %d: post-prewarm: alloc=%.2f GiB, resv=%.2f GiB",
-                        self.rank,
-                        torch.xpu.memory_allocated() / 1024**3,
-                        torch.xpu.memory_reserved() / 1024**3,
-                    )
+        self._prewarm_fsdp1_allgather_buffer()
 
         # Initialize tokens count and running loss (for grad accumulation)
         grad_norm = None
@@ -4609,103 +4659,7 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                     # No separate expert grad averaging needed here.
 
                     _clip_t0 = time.perf_counter()
-                    if self._clip_grad_norm is not None:
-                        if self._expert_parallel_degree > 1:
-                            # EP mixes two DTensor meshes: non-expert params on dp_mesh
-                            # (2D: dp_replicate×dp_shard) and expert params on ep_mesh
-                            # (1D: dp_shard). torch.nn.utils.clip_grad_norm_ calls
-                            # torch.stack on per-param norm DTensors, which fails when
-                            # the tensors have different meshes.
-                            #
-                            # v77: compute both non-EP and EP norms purely locally.
-                            # v76 root cause: clip_grad_norm_(_non_ep_params, inf) on FSDP2
-                            # DTensor params triggers an XCCL all_reduce on self._shard_pg
-                            # internally (for DTensor norm aggregation). The subsequent
-                            # explicit _orig_all_reduce(_ep_norm_sq_xpu, group=self._shard_pg)
-                            # is then a SECOND XCCL collective on the same communicator.
-                            # With token routing imbalance (ep_rank 0: 32k tokens, ep_ranks 2,3:
-                            # 0 tokens), SHARD groups finish backward at different times → the
-                            # two sequential XCCL ops on shard_pg arrive at different clock offsets
-                            # across the 4 ranks → communicator sequence mismatch → 1800s timeout.
-                            # Fix: compute all norms manually (local tensors only, no distributed
-                            # collectives in the norm computation). Each rank computes its local
-                            # approximation of the global norm and applies clip_coef locally.
-                            # This is already a valid approximation for FSDP2 sharded grads.
-                            from torchtune.modules.moe.experts import GroupedExperts
-                            from torchtune.models.qwen3_moe._experts import GroupedExpertsHF
-                            _ep_param_ids = set()
-                            _ep_params = []
-                            for _mn, _mm in self._model.named_modules():
-                                if _mn.endswith(".experts") and isinstance(_mm, (GroupedExperts, GroupedExpertsHF)):
-                                    for _p in _mm.parameters(recurse=False):
-                                        _ep_param_ids.add(id(_p))
-                                        _ep_params.append(_p)
-                            _non_ep_params = [
-                                _p for _p in self._model.parameters()
-                                if id(_p) not in _ep_param_ids
-                            ]
-                            # Compute local norm_sq for non-EP params (no XCCL, no DTensor norm).
-                            _non_ep_norm_sq_val = 0.0
-                            for _p in _non_ep_params:
-                                if _p.grad is not None:
-                                    _g = _p.grad
-                                    if hasattr(_g, '_local_tensor'):
-                                        _g = _g._local_tensor
-                                    _non_ep_norm_sq_val += float(_g.float().norm().item() ** 2)
-                            # Compute local norm_sq for EP params.
-                            _ep_norm_sq_val = 0.0
-                            for _p in _ep_params:
-                                if _p.grad is not None:
-                                    _g = _p.grad
-                                    if hasattr(_g, '_local_tensor'):
-                                        _g = _g._local_tensor
-                                    _ep_norm_sq_val += float(_g.float().norm().item() ** 2)
-                            # Local total norm (no cross-rank all_reduce — see v77 comment above).
-                            _total_norm_f = (_non_ep_norm_sq_val + _ep_norm_sq_val) ** 0.5
-                            _max_norm_f = float(self._clip_grad_norm)
-                            _clip_coef = _max_norm_f / max(_total_norm_f, 1e-6)
-                            if _clip_coef < 1.0:
-                                for _p in self._model.parameters():
-                                    if _p.grad is not None:
-                                        _g = _p.grad
-                                        if hasattr(_g, '_local_tensor'):
-                                            _g._local_tensor.detach().mul_(_clip_coef)
-                                        else:
-                                            _g.detach().mul_(_clip_coef)
-                            grad_norm = torch.tensor(_total_norm_f, device=self._device)
-                        else:
-                            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-                            if getattr(self, '_use_fsdp1', False) and isinstance(self._model, FSDP):
-                                # FSDP1 SHARD_GRAD_OP: grads are sharded — local norm ≠ global.
-                                # Use FSDP.clip_grad_norm_ which AllReduces norm² across _training_pg
-                                # before clipping. Safe here since training ranks are isolated
-                                # from vLLM rank (no shared L0 fabric contention).
-                                grad_norm = self._model.clip_grad_norm_(float(self._clip_grad_norm))
-                            else:
-                                # Non-EP path: avoid torch.nn.utils.clip_grad_norm_ on FSDP2
-                                # DTensor params (its internal XCCL all_reduce on shard_pg
-                                # deadlocks with vLLM L0/fabric usage when colocated).
-                                # ALSO avoid per-param .item() — that's ~700 D2H syncs which
-                                # also deadlocks with concurrent vLLM activity (Test D
-                                # 2026-04-22). Compute the norm fully on-device with a
-                                # single .item() at the end.
-                                _local_norm_sq = torch.zeros((), device=self._device, dtype=torch.float32)
-                                _grads_to_clip = []
-                                for _p in self._model.parameters():
-                                    if _p.grad is not None:
-                                        _g = _p.grad
-                                        if hasattr(_g, '_local_tensor'):
-                                            _g = _g._local_tensor
-                                        _local_norm_sq = _local_norm_sq + _g.float().pow(2).sum()
-                                        _grads_to_clip.append(_p.grad)
-                                grad_norm = _local_norm_sq.sqrt()
-                                _max_norm = float(self._clip_grad_norm)
-                                _clip_coef = (_max_norm / (grad_norm + 1e-6)).clamp(max=1.0)
-                                for _g in _grads_to_clip:
-                                    if hasattr(_g, '_local_tensor'):
-                                        _g._local_tensor.detach().mul_(_clip_coef)
-                                    else:
-                                        _g.detach().mul_(_clip_coef)
+                    grad_norm = self._clip_gradients(grad_norm)
                     if self._device.type == "xpu":
                         torch.xpu.synchronize()
                     _clip_time = time.perf_counter() - _clip_t0

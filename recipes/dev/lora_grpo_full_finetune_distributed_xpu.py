@@ -106,6 +106,7 @@ from torchtune.dev.rl.lora_helpers import (
     _TUNE_MODULE_TO_HF,
 )
 from torchtune.dev.rl.weight_sync import _save_raw_bytes
+import torchtune.dev.rl.weight_sync as _weight_sync_module
 import torchtune.dev.rl.vllm_backend as _vllm_backend_module
 from tqdm import tqdm
 
@@ -250,9 +251,20 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
         else:
             self._vllm_urls = []
         self._vllm_group_port = cfg.get("vllm_group_port", 51216)
+        # Single-replicate defaults for the shared _setup_vllm_server_mode helper
+        # (vllm_backend.py). That helper grew HSDP attribute reads in 8b5f0f3f
+        # (_dp_replicate / _is_shard_leader); this fork is server-mode,
+        # single-replicate only and never set them, so setup() crashed with
+        # AttributeError. Pin the non-HSDP values the base recipe uses on its
+        # single-replicate path (data_parallel_replicate_dim=1).
+        self._dp_replicate = 1
+        self._is_shard_leader = self._is_rank_zero
         # vllm_weight_sync must be False for LoRA recipe (different sync path)
         self._vllm_weight_sync = False
         self._vllm_max_model_len = cfg.get("vllm_max_model_len", 2048)
+        # Stop strings forwarded to vLLM for raw checkpoints that never emit EOS
+        # (e.g. </answer>). Consumed by the shared vllm_http_generate helper.
+        self._stop_strings = cfg.get("stop_strings", None)
         self._vllm_clients = []
         self._vllm_client = None
 
@@ -267,9 +279,24 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
         self._save_every_n_steps = cfg.get("save_every_n_steps", None)
         self._save_final_checkpoint = cfg.get("save_final_checkpoint", True)
         self._save_adapter_only = cfg.get("save_adapter_weights_only", True)
+        # Batch-level advantage normalization (matches base GRPO recipe). At B=1
+        # this is mathematically identical to per-prompt; for B>1 it keeps the
+        # learning signal alive when a prompt-group's rewards are degenerate.
+        # Opt out with batch_level_advantages: false to reproduce legacy runs.
+        self._batch_level_advantages = cfg.get("batch_level_advantages", True)
 
     # Inject vLLM server mode setup from shared backend module
     _setup_vllm_server_mode = _vllm_backend_module._setup_vllm_server_mode
+
+    # Inject the shared Llama-family Q/K un-permute helpers from weight_sync.
+    # The merged-weight publish path (_gather_merged_lora_weights) sends weights
+    # straight to vLLM's load_weights, which expects HF-format unpermuted Q/K.
+    # Llama-family checkpointers (LLAMA2/3/3_2/3_VISION) permute Q/K at load
+    # time, so without inverting it vLLM's attention is scrambled after the
+    # first sync. No-op for Qwen3/Gemma (their hf_to_tune doesn't permute).
+    # See torchtune/dev/rl/weight_sync.py and the base GRPO recipe.
+    _needs_qk_unpermute = _weight_sync_module._needs_qk_unpermute
+    _maybe_unpermute_qk = _weight_sync_module._maybe_unpermute_qk
 
     def load_checkpoint(self, cfg_checkpointer: DictConfig) -> dict[str, Any]:
         self._checkpointer = config.instantiate(cfg_checkpointer)
@@ -627,6 +654,32 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
             if self._resume_from_checkpoint
             else None
         )
+
+        # Cache model attention dims for the Q/K un-permute path in
+        # _gather_merged_lora_weights → _maybe_unpermute_qk (weight_sync.py).
+        # Mirrors the base GRPO recipe; read from cfg.model so it works for any
+        # architecture parameterization. No-op for non-permuting checkpointers.
+        try:
+            _cfg_model = cfg.get("model", {})
+            _nh = _cfg_model.get("num_heads")
+            _nkv = _cfg_model.get("num_kv_heads")
+            _ed = _cfg_model.get("embed_dim")
+            _hd = _cfg_model.get("head_dim")
+            if _nh is not None:
+                self._model_num_heads = int(_nh)
+            if _nkv is not None:
+                self._model_num_kv_heads = int(_nkv)
+            elif _nh is not None:
+                self._model_num_kv_heads = int(_nh)
+            if _hd is not None:
+                self._model_head_dim = int(_hd)
+            elif _ed is not None and _nh is not None:
+                self._model_head_dim = int(_ed) // int(_nh)
+        except Exception as _dim_exc:
+            log.warning(
+                "Failed to cache model attention dims for wsync Q/K un-permute: %r",
+                _dim_exc,
+            )
 
         # Build LoRA model (no separate ref model)
         self._model = self._setup_model_lora(cfg, checkpoint_dict[training.MODEL_KEY])
@@ -1077,7 +1130,11 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
                 )
                 continue
             hf_name = f"model.layers.{layer_idx}.{hf_module}.weight"
-            merged[hf_name] = w.cpu().contiguous()
+            w = w.cpu().contiguous()
+            # Invert the Llama-family Q/K permutation before handing to vLLM.
+            # No-op unless this run uses a permuting checkpointer (LLAMA*).
+            w = self._maybe_unpermute_qk(hf_name, w)
+            merged[hf_name] = w
         return merged
 
     def _publish_merged_weights_background(self, hf_state_dict: dict) -> None:
@@ -1198,57 +1255,30 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
         batch_input_ids: torch.Tensor,
         context_length: int,
     ) -> torch.Tensor:
-        """Rank-0-only vLLM HTTP round-trip (mirrors base recipe implementation)."""
-        bsz = batch_input_ids.shape[0]
-        total_len = context_length + self._max_generated_tokens
+        """Rank-0-only vLLM HTTP round-trip.
 
-        prompts = []
-        for i in range(bsz):
-            ids = batch_input_ids[i].cpu().tolist()
-            ids = [t for t in ids if t != self._tokenizer.pad_id]
-            prompts.append(ids)
+        Delegates to the shared ``vllm_http_generate`` helper so this recipe
+        gets the same prompt-truncation, stop-token/stop-string forwarding, and
+        EOS-injection behavior as the dense GRPO recipe (previously this fork's
+        inline copy was missing all three — a silent learning-signal gap for
+        raw checkpoints, mirroring the AGPT-2B Stage-1 fix).
+        """
+        from torchtune.dev.rl.vllm_client import vllm_http_generate
 
-        gen_kwargs = dict(
-            n=1,
-            max_tokens=self._max_generated_tokens,
+        return vllm_http_generate(
+            batch_input_ids,
+            context_length,
+            vllm_clients=self._vllm_clients,
+            pad_id=self._tokenizer.pad_id,
+            eos_id=self._tokenizer.eos_id,
+            max_generated_tokens=self._max_generated_tokens,
+            vllm_max_model_len=self._vllm_max_model_len,
             temperature=self._temperature,
-            top_k=self._top_k or 0,
+            top_k=self._top_k,
+            stop_token_ids=getattr(self, "_stop_token_ids", None),
+            stop_strings=getattr(self, "_stop_strings", None),
+            device=self._device,
         )
-
-        t0 = time.perf_counter()
-        num_clients = len(self._vllm_clients)
-        if num_clients > 1:
-            chunks = [prompts[i::num_clients] for i in range(num_clients)]
-
-            def _call(client, chunk):
-                return client.generate(prompts=chunk, **gen_kwargs) if chunk else []
-
-            with ThreadPoolExecutor(max_workers=num_clients) as pool:
-                futures = {
-                    pool.submit(_call, client, chunk): idx
-                    for idx, (client, chunk) in enumerate(zip(self._vllm_clients, chunks))
-                }
-                chunk_results = [None] * num_clients
-                for future in as_completed(futures):
-                    idx = futures[future]
-                    chunk_results[idx] = future.result()
-
-            completions = [None] * bsz
-            for i in range(bsz):
-                completions[i] = chunk_results[i % num_clients][i // num_clients]
-        else:
-            completions = self._vllm_client.generate(prompts=prompts, **gen_kwargs)
-
-        log.info("Rank 0: vLLM generate %.1fs (%d prompts)", time.perf_counter() - t0, bsz)
-
-        query_responses = batch_input_ids.new_full((bsz, total_len), self._tokenizer.pad_id)
-        query_responses[:, :context_length] = batch_input_ids
-        for i, comp in enumerate(completions):
-            length = min(len(comp), self._max_generated_tokens)
-            query_responses[i, context_length : context_length + length] = torch.tensor(
-                comp[:length], dtype=batch_input_ids.dtype
-            )
-        return query_responses
 
     def _broadcast_query_responses(self, query_responses: torch.Tensor) -> torch.Tensor:
         """Broadcast rank-0's query_responses to all ranks."""
@@ -1451,13 +1481,20 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
                 self._steps_run, rewards_mean, rewards_std, successes.float().mean().item(),
             )
 
-        # Advantages. Use unbiased=False so std at G=1 is 0 (not NaN). For G>=2
-        # the population vs sample std differs by sqrt((G-1)/G) — a constant per
-        # batch — and gets normalized away by the +1e-4 floor / downstream loss.
-        advantages = (rewards - rewards.mean(1, keepdim=True)) / (
-            rewards.std(1, keepdim=True, unbiased=False) + 1e-4
-        )
-        advantages = advantages.reshape(batch_size * grpo_size)
+        # Advantages. batch_level_advantages (default) pools mean/std across the
+        # full B*G batch so a single non-degenerate prompt keeps the signal alive
+        # (matches base GRPO recipe). Legacy per-prompt path uses unbiased=False
+        # so std at G=1 is 0 (not NaN). At B=1 the two are identical.
+        if self._batch_level_advantages:
+            from torchtune.dev.rl.rewards import batch_level_advantages
+            advantages = batch_level_advantages(
+                rewards.reshape(batch_size * grpo_size), group_size=grpo_size,
+            )
+        else:
+            advantages = (rewards - rewards.mean(1, keepdim=True)) / (
+                rewards.std(1, keepdim=True, unbiased=False) + 1e-4
+            )
+            advantages = advantages.reshape(batch_size * grpo_size)
         del responses
         device_empty_cache(self._device)
 

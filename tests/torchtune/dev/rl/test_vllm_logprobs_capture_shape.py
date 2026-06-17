@@ -25,9 +25,23 @@ import unittest
 from dataclasses import dataclass
 from typing import Optional
 
+import pytest
 import torch
 
 from torchtune.dev.rl.types import GRPOTrajectory
+
+# The vLLM sampled-logprob capture (GRPOTrajectory.vllm_sampled_logprobs slot +
+# _extract_vllm_sampled_logprobs) these tests pin was written on 2026-06-11 then lost
+# as collateral when the recipe files were `git checkout c58acbed`'d to undo the bad
+# "Antigravity walkthrough" patches. It is the rollout-side half of the parked
+# IS-correction feature (only needed for off-policy/async GRPO, not the current
+# on-policy sync recipe). Kept as the executable spec; partial impl preserved at git
+# tag `parked/is-dapo-impl`. Delete this skip when re-landing. See
+# memory/project_ezpz_gap_was_lr_not_code.md + project_vllm_is_correction_phase4_results.md.
+pytestmark = pytest.mark.skip(
+    reason="vLLM logprob-capture impl parked (collateral revert 2026-06-11); spec kept, "
+    "code at tag parked/is-dapo-impl. See project_ezpz_gap_was_lr_not_code.md."
+)
 
 
 @dataclass

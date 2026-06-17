@@ -20,6 +20,7 @@ import re
 import unittest
 from pathlib import Path
 
+import pytest
 import torch
 
 from torchtune.dev.rl.loss import GRPOSimpleLoss
@@ -27,6 +28,20 @@ from torchtune.dev.rl.loss import GRPOSimpleLoss
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 BASE_RECIPE = REPO_ROOT / "recipes/dev/grpo_full_finetune_distributed_xpu.py"
+
+# The DAPO/dr_grpo/bnpo loss_type implementation these tests pin was written on
+# 2026-06-11 then lost as collateral when the recipe files were `git checkout
+# c58acbed`'d to undo the bad "Antigravity walkthrough" patches. The feature was
+# judged correct-but-not-load-bearing (the ezpz "gap" was the Llama Q/K wsync bug +
+# the lr=1e-6 dead zone, not a loss-aggregation gap), so it was parked rather than
+# re-landed. These tests are kept as the executable spec; the partial impl is
+# preserved at git tag `parked/is-dapo-impl` (note: dapo_normalizer was not captured
+# in that stash and must be reconstructed from these tests + TRL on re-land). Delete
+# this skip when re-landing. See memory/project_ezpz_gap_was_lr_not_code.md.
+pytestmark = pytest.mark.skip(
+    reason="DAPO loss_type impl parked (collateral revert 2026-06-11); spec kept, "
+    "partial code at tag parked/is-dapo-impl. See project_ezpz_gap_was_lr_not_code.md."
+)
 
 
 def _trl_grpo_loss(per_token_loss, mask):
