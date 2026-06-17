@@ -33,11 +33,30 @@ import unittest
 import torchtune.dev.rl.weight_sync as ws
 
 
+def _xccl_sync_source() -> str:
+    """Combined source of the xccl wsync path.
+
+    The gather logic was extracted from ``_sync_weights_to_vllm_xccl`` into
+    two per-FSDP-mode helpers (``_xccl_gather_fsdp1`` /
+    ``_xccl_gather_and_stage_fsdp2``) on 2026-06-17. The dispatcher now just
+    builds the rename closure and calls the right helper, so the Q/K
+    un-permute code lives in the helpers. These source-scan guards therefore
+    inspect all three functions together — any of them dropping the unpermute
+    still trips the test, which is the whole point.
+    """
+    parts = [inspect.getsource(ws._sync_weights_to_vllm_xccl)]
+    for _name in ("_xccl_gather_fsdp1", "_xccl_gather_and_stage_fsdp2"):
+        _fn = getattr(ws, _name, None)
+        if _fn is not None:
+            parts.append(inspect.getsource(_fn))
+    return "\n".join(parts)
+
+
 class TestXcclSyncCallsUnpermute(unittest.TestCase):
     def test_unperm_predicate_captured_before_loop(self):
         """The xccl sync must compute the unpermute predicate outside the
         per-param loop (cheap) and apply it inside."""
-        src = inspect.getsource(ws._sync_weights_to_vllm_xccl)
+        src = _xccl_sync_source()
         # Captured once outside the loop (any of these forms is fine).
         self.assertRegex(
             src,
@@ -49,7 +68,7 @@ class TestXcclSyncCallsUnpermute(unittest.TestCase):
     def test_unpermute_called_inside_loop(self):
         """`_maybe_unpermute_qk` must be invoked on the full tensor before the
         bf16 cast that ships the weight to vLLM."""
-        src = inspect.getsource(ws._sync_weights_to_vllm_xccl)
+        src = _xccl_sync_source()
         # Match the precise call site we added.
         match = re.search(
             r"if\s+_unperm_needed_x:\s*\n\s*param\s*=\s*_maybe_unpermute_qk\(\s*self,\s*hf_name,\s*param\s*\)",
@@ -68,7 +87,7 @@ class TestXcclSyncCallsUnpermute(unittest.TestCase):
         and the bf16 cast that produces `gpu_tensor`. Otherwise the staged
         copy that flows to vLLM would have wrong Q/K. This pins the exact
         ordering in the non-MoE path."""
-        src = inspect.getsource(ws._sync_weights_to_vllm_xccl)
+        src = _xccl_sync_source()
         # The block we care about is the canonical 4-line sequence:
         #   hf_name = _xccl_accept_and_rename(param_name)
         #   ...

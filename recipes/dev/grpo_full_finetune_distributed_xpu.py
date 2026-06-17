@@ -2973,6 +2973,8 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
     _init_xccl_weight_sync = _weight_sync_module._init_xccl_weight_sync
     _build_ws10_sharded_pgs = _weight_sync_module._build_ws10_sharded_pgs
     _sync_weights_to_vllm_xccl = _weight_sync_module._sync_weights_to_vllm_xccl
+    _xccl_gather_fsdp1 = _weight_sync_module._xccl_gather_fsdp1
+    _xccl_gather_and_stage_fsdp2 = _weight_sync_module._xccl_gather_and_stage_fsdp2
     _sync_weights_to_vllm_shm = _weight_sync_module._sync_weights_to_vllm_shm
     _wait_for_sync_complete = _weight_sync_module._wait_for_sync_complete
     _start_deferred_broadcast = _weight_sync_module._start_deferred_broadcast

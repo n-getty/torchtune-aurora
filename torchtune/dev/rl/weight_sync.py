@@ -2044,6 +2044,1245 @@ def _ws10_unify_manifests(per_rank_metas: list, sort_key=None) -> list:
     return flat
 
 
+
+def _xccl_gather_fsdp1(self, _xccl_accept_and_rename, t0):
+    """FSDP1 XCCL weight-sync gather branch, extracted verbatim from
+    _sync_weights_to_vllm_xccl (no behavior change). Builds flat_gpu /
+    tensors_meta on the XCCL leader. _xccl_accept_and_rename is the
+    per-call rename closure; t0 is the wsync-start perf_counter stamp."""
+    # FSDP1: state_dict() handles gathering; result is on CPU already
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, StateDictType
+    with FSDP.state_dict_type(self._model, StateDictType.FULL_STATE_DICT):
+        full_sd = self._model.state_dict()
+    hf_state_dict = {}
+    # WS3.5: only the XCCL leader (global rank 0) keeps and broadcasts.
+    _is_xccl_leader = getattr(self, "_is_xccl_leader", self._is_shard_leader)
+    # Llama-family Q/K un-permute mirrors the FSDP2 path (line ~2987).
+    # Engages once with a log line for runtime confirmation.
+    _unperm_needed_x = _needs_qk_unpermute(self)
+    if (
+        _unperm_needed_x
+        and _is_xccl_leader
+        and not getattr(self, "_qk_unperm_xccl_fsdp1_engaged_logged", False)
+    ):
+        log.info(
+            "Rank %d: xccl FSDP1 wsync QK un-permute ENGAGED "
+            "(n_heads=%s n_kv_heads=%s head_dim=%s)",
+            self.rank,
+            getattr(self, "_model_num_heads", None),
+            getattr(self, "_model_num_kv_heads", None),
+            getattr(self, "_model_head_dim", None),
+        )
+        self._qk_unperm_xccl_fsdp1_engaged_logged = True
+    if _is_xccl_leader:
+        for param_name, param in full_sd.items():
+            hf_name = _xccl_accept_and_rename(param_name)
+            if hf_name is None:
+                continue
+            weight = param.to(self._device)
+            if _unperm_needed_x:
+                weight = _maybe_unpermute_qk(self, hf_name, weight)
+            hf_state_dict[hf_name] = weight
+    del full_sd
+
+    if not self._production_mode:
+        torch.distributed.barrier()
+    t_gather = time.perf_counter() - t0
+
+    if _is_xccl_leader:
+        tensors_meta = []
+        total_elements = 0
+        for hf_name, tensor in hf_state_dict.items():
+            numel = tensor.numel()
+            tensors_meta.append({"name": hf_name, "shape": list(tensor.shape),
+                                 "dtype": str(tensor.dtype), "numel": numel})
+            total_elements += numel
+        flat_gpu = torch.empty(total_elements, dtype=torch.bfloat16, device=self._device)
+        offset = 0
+        for tensor in hf_state_dict.values():
+            flat_gpu[offset:offset + tensor.numel()] = tensor.to(torch.bfloat16).flatten()
+            offset += tensor.numel()
+        del hf_state_dict
+
+def _xccl_gather_and_stage_fsdp2(self, is_active, pool, _xccl_accept_and_rename, t0):
+    """FSDP2/EP XCCL weight-sync gather+stage branch, extracted verbatim
+    from _sync_weights_to_vllm_xccl (no behavior change). Gathers sharded
+    params, stages to CPU, and sets self._deferred_broadcast_args for the
+    post-gen broadcast. is_active/pool select the sender; t0 is the start
+    stamp; _xccl_accept_and_rename is the rename closure."""
+    # These were module-imported in the dispatcher prologue before this branch
+    # was extracted; the FSDP2 path uses json.dumps for the broadcast manifest.
+    import json
+    import requests  # noqa: F401  (kept for scope parity with the dispatcher)
+    # FSDP2 weight sync: gather sharded params and broadcast to vLLM.
+    # Two sub-modes selected by TORCHTUNE_XCCL_BATCHED_AG:
+    #
+    #   0 (default): per-param full_tensor() + batched XCCL broadcast
+    #      AllGather per param: <0.12ms for 3B, ~0.8ms for 32B (negligible).
+    #      Real bottleneck: XCCL broadcast bandwidth (1.7 GB/s at 12 receivers
+    #      = 35.9s for 61 GiB). Tests CD/CE/CF confirm this floor.
+    #
+    #   1 (BROKEN): batched all_gather_into_tensor() + reconstruct + broadcast
+    #      Saves ~0.2s for 3B (<1% for 32B). Leaves FSDP2 shard state
+    #      inconsistent → checkpoint save hangs after sync. Do not use.
+    _USE_BATCHED_AG = os.environ.get("TORCHTUNE_XCCL_BATCHED_AG", "0") == "1"
+    _USE_PINNED_BUF = os.environ.get("TORCHTUNE_PINNED_CPU_BUF", "0") == "1"
+    _USE_D2H_STREAM = os.environ.get("TORCHTUNE_D2H_STREAM", "0") == "1"
+    if _USE_BATCHED_AG:
+        log.warning(
+            "TORCHTUNE_XCCL_BATCHED_AG=1 is BROKEN: it leaves FSDP2 shard state "
+            "inconsistent, causing the post-training checkpoint save to hang. "
+            "Savings are <1%% for 32B (0.2s vs 38s floor). Do not use."
+        )
+    import threading as _threading
+
+    _BATCH_MAX_NUMEL = 512 * 1024 * 1024  # 512M bf16 elements = 1 GiB
+
+    sharded_sd = self._model.state_dict()
+
+    if is_active:
+        self._sync_done_event.clear()
+        self._sync_error = None
+        self._sync_id_counter += 1
+        self._pending_sync_id = self._sync_id_counter
+
+    # Detect MoE model for expert fusing (used by Mode 0).
+    from torchtune.training.checkpointing._utils import ModelType as _MT
+    _is_moe = getattr(self._checkpointer, '_model_type', None) == _MT.QWEN3_MOE if self._checkpointer is not None else False
+
+    t_ag = 0.0
+    t_bcast = 0.0
+    n_params = 0
+    n_batches = 0
+
+    if _USE_BATCHED_AG:
+        # Mode 1: batched AllGather — reduces AllGather calls from N_params to
+        # N_batches by manually gathering local shards with all_gather_into_tensor().
+        # All training ranks contribute local shards; rank 0 reconstructs full
+        # params from the interleaved output then broadcasts to vLLM.
+        _training_ws = torch.distributed.get_world_size()
+
+        # local batch: local shards from THIS rank, accumulated until threshold
+        _lb_parts: list = []      # list of bf16 contiguous local shard tensors
+        _lb_numel = 0             # total local numel accumulated so far
+        _lb_metas: list = []      # (local_numel, full_numel) per param in batch
+        _batch_full_numel = 0     # full numel accumulated (for threshold check)
+
+        def _flush_batched_ag():
+            nonlocal t_ag, t_bcast, n_batches
+            local_flat = torch.cat([p.flatten() for p in _lb_parts])
+            # AllGather: shape [world_size * _lb_numel], layout:
+            #   [rank0_local | rank1_local | ... | rank_{W-1}_local]
+            full_batch = torch.empty(
+                _training_ws * _lb_numel,
+                dtype=torch.bfloat16, device=self._device,
+            )
+            tb0 = time.perf_counter()
+            torch.distributed.all_gather_into_tensor(full_batch, local_flat)
+            t_ag += time.perf_counter() - tb0
+            del local_flat
+
+            # WS3.5: only XCCL leader broadcasts to vLLM.
+            if getattr(self, "_is_xccl_leader", self._is_shard_leader):
+                # Reconstruct full params from interleaved AllGather output.
+                # For param_i with local_numel=lnu at local_offset=cum_lnu:
+                #   full_param = cat(full_batch[r*_lb_numel+cum : r*_lb_numel+cum+lnu]
+                #                    for r in range(_training_ws))[:full_numel]
+                bcast_parts = []
+                cum_lnu = 0
+                for lnu, fnu in _lb_metas:
+                    slices = [
+                        full_batch[r * _lb_numel + cum_lnu:
+                                   r * _lb_numel + cum_lnu + lnu]
+                        for r in range(_training_ws)
+                    ]
+                    bcast_parts.append(torch.cat(slices)[:fnu])
+                    cum_lnu += lnu
+                bcast_flat = torch.cat([p.flatten() for p in bcast_parts])
+                bcast_parts.clear()
+                del full_batch
+
+                tb1 = time.perf_counter()
+                _bcast_pgs = getattr(self, '_xccl_wsync_pgs', [self._xccl_wsync_pg])
+                _bworks = [_bpg.broadcast(bcast_flat, root=0) for _bpg in _bcast_pgs]
+                for _bw in _bworks:
+                    _bw.wait()
+                t_bcast += time.perf_counter() - tb1
+                del bcast_flat
+            else:
+                del full_batch
+            n_batches += 1
+
+        for param_name, param in sharded_sd.items():
+            if param.is_cpu:
+                param = param.to(self._device)
+            fnu = param.numel()
+            if hasattr(param, "_local_tensor"):
+                local_shard = param._local_tensor.to(torch.bfloat16).contiguous()
+            else:
+                local_shard = param.to(torch.bfloat16).contiguous()
+            lnu = local_shard.numel()
+
+            # Flush if adding this param would exceed batch threshold
+            if _batch_full_numel > 0 and _batch_full_numel + fnu > _BATCH_MAX_NUMEL:
+                _flush_batched_ag()
+                _lb_parts.clear()
+                _lb_metas.clear()
+                _lb_numel = 0
+                _batch_full_numel = 0
+
+            _lb_parts.append(local_shard)
+            _lb_numel += lnu
+            _lb_metas.append((lnu, fnu))
+            _batch_full_numel += fnu
+            n_params += 1
+            del param
+
+        if _lb_parts:
+            _flush_batched_ag()
+
+    else:
+        # Mode 0 (default): per-param full_tensor() + ASYNC batched XCCL broadcast.
+        #
+        # Phase A (synchronous, all ranks): full_tensor() loop gathers each param.
+        #   Shard leader stages each batch to CPU instead of broadcasting inline.
+        #   AllGather per param is negligible (~0.1s total for 32B).
+        #
+        # Phase B (async, shard leader only): background thread copies CPU-staged
+        #   batches back to GPU and broadcasts via XCCL. Overlaps with next step's
+        #   vLLM generation (~15s), hiding the 7.7s broadcast cost entirely.
+        #
+        # 2-hop mode: training rank 0 → vLLM rank 1 (Slingshot), then
+        #   rank 1 → ranks 2-12 (XeLink). ~3s vs 38s flat.
+
+        # Streaming gather: full_tensor() each param, immediately copy to
+        # CPU, build batches from CPU tensors. Keeps GPU peak at ~1 GiB
+        # (one batch) instead of ~60 GiB (full model). Critical for 32B+
+        # models where the full model exceeds single-tile 64 GiB capacity.
+        _ep_deg = getattr(self, '_expert_parallel_degree', 1)
+        if is_active:
+            tensors_meta = []
+            cpu_batches: list = []
+            batch_numel = 0
+
+            if _is_moe:
+                hf_state_dict = {}
+
+            if _ep_deg > 1 and _is_moe:
+                # Post EP all-gather, fused expert tensors are ep_degree× larger than
+                # the pre-allocated pinned buffer (sized from local 16-expert shards).
+                # Disable pinned buf for EP MoE to avoid overflow and flush-path mixing.
+                _USE_PINNED_BUF = False
+            if not _USE_PINNED_BUF:
+                batch_parts_cpu: list = []
+
+        t_ft = 0.0
+        t_cast = 0.0
+        t_d2h = 0.0
+
+        if _USE_PINNED_BUF and is_active:
+            if not hasattr(self, '_pinned_cpu_buf') or self._pinned_cpu_buf is None:
+                _total_numel = 0
+                for _scan_name, _scan_p in sharded_sd.items():
+                    _total_numel += _scan_p.numel()
+                buf = torch.empty(_total_numel, dtype=torch.bfloat16)
+                _pinned = False
+                try:
+                    buf = buf.pin_memory()
+                    _pinned = True
+                except Exception:
+                    pass
+                self._pinned_cpu_buf = buf
+                self._cpu_buf_is_pinned = _pinned
+                log.info(
+                    "Rank %d: pre-allocated CPU buffer: %d elements (%.2f GiB), pinned=%s",
+                    self.rank, _total_numel, _total_numel * 2 / 1024**3, _pinned,
+                )
+            if _USE_D2H_STREAM and not hasattr(self, '_d2h_stream'):
+                try:
+                    self._d2h_stream = torch.xpu.Stream(device=self._device)
+                    log.info("Rank %d: D2H XPU stream created", self.rank)
+                except Exception as _e:
+                    self._d2h_stream = None
+                    log.info("Rank %d: D2H stream not available: %s", self.rank, _e)
+            _buf_offset = 0
+            _batch_start = 0
+
+        # EP expert streaming: all-gather EP-sharded slices across shard group,
+        # fuse per layer immediately to avoid accumulating 128-expert tensors on GPU.
+        # With ep_degree=8, each rank holds 16 experts; full model needs 128.
+        # Streaming fuse (gate+up+down → w13/w2 per layer) keeps GPU peak at ~1.4 GiB.
+        # _ep_deg already computed above (before pinned-buf allocation).
+        _ep_expert_re = re.compile(r"\.mlp\.experts\.(gate_proj|up_proj|down_proj)")
+        _ep_layer_re = re.compile(r"layers\.(\d+)\.")
+        if is_active and _ep_deg > 1 and _is_moe:
+            _ep_stream_buf: dict = {}  # layer_idx -> {proj -> bf16 tensor}
+
+        # WS6 opt-in: batch the 3 expert projections of each layer into a
+        # single all_gather_into_tensor on _shard_pg. Reduces wsync_gather
+        # collective count from 3*L to L (e.g. 144 → 48 for Qwen3-30B-A3B
+        # EP=16). Bit-exact equivalent — see
+        # tests/torchtune/dev/rl/test_ep_wsync_layer_batch_equivalence.py.
+        _LAYER_BATCH_AG = os.environ.get(
+            "TORCHTUNE_EP_WSYNC_LAYER_BATCH", "0") == "1"
+        _layer_batch_active = (
+            _LAYER_BATCH_AG and _ep_deg > 1 and _is_moe
+            and getattr(self, '_shard_pg', None) is not None
+        )
+        # Pending local shards keyed by layer_id (string). Populated on
+        # ALL ranks (both is_active and others) — the AG is a collective.
+        _lb_pending: dict = {} if _layer_batch_active else None
+        _lb_logged_engaged = False
+
+        # WS7 opt-in: replace AllGather with gather(dst=active_rank). Only
+        # the is_active rank consumes the full expert tensor; the other
+        # _ep_deg-1 ranks discard. AllGather pays N-way fan-out for 1-way
+        # consumption; gather sends N-1 shards into the root NIC for the
+        # same final bytes. Bit-exact equivalent — see
+        # tests/torchtune/dev/rl/test_ep_wsync_gather_root_equivalence.py.
+        _GATHER_ROOT = os.environ.get(
+            "TORCHTUNE_EP_WSYNC_GATHER_ROOT", "0") == "1"
+        _gather_root_active = (
+            _GATHER_ROOT and _ep_deg > 1 and _is_moe
+            and getattr(self, '_shard_pg', None) is not None
+        )
+        _gr_active_shard_rank = 0  # is_active rank == rank 0 of _shard_pg
+        _gr_logged_engaged = False
+
+        # WS8 opt-in: cast expert shards to fp8 (E4M3) with per-output-row
+        # scales before the per-projection AllGather, AllGather fp8+scale
+        # only, and decompress on the active rank back to bf16. Cuts wire
+        # bytes ~2× on _shard_pg (the ~70s wsync_gather floor at EP=16).
+        # Numerics: per-element err bounded by row_amax/4 (E4M3 has 3
+        # mantissa bits + per-row scaling). NOT bit-exact — do not enable
+        # this on workloads where rollouts are sensitive to weight noise
+        # without first running a KL-drift check.
+        #
+        # Scope: ONLY expert gate_proj/up_proj/down_proj. Norms, attention,
+        # router, embedding stay bf16 (per MoE_status_feedback.md §10).
+        # Mutually exclusive with WS6/WS7 below — they exit early on the
+        # expert path so this branch only triggers when LAYER_BATCH and
+        # GATHER_ROOT are both off.
+        #
+        # See tests/torchtune/dev/rl/test_ep_wsync_fp8_wire_equivalence.py
+        # for the round-trip + unshuffle pin-down.
+        _FP8_WIRE = os.environ.get(
+            "TORCHTUNE_EP_WSYNC_FP8_WIRE", "0") == "1"
+        _fp8_wire_active = (
+            _FP8_WIRE and _ep_deg > 1 and _is_moe
+            and getattr(self, '_shard_pg', None) is not None
+            and not _layer_batch_active and not _gather_root_active
+            and hasattr(torch, 'float8_e4m3fn')
+        )
+
+        # WS10 Commit B (opt-in): per-rank sharded broadcast.
+        # Each trainer EP rank R in [0..ep_d-1] broadcasts its OWN local
+        # expert shard direct to the vLLM root over a per-rank 2-rank
+        # cross-PG (`_xccl_wsync_sharded_pgs[R]`). The receiver assembles
+        # the global tensor via FusedMoE.expert_map. Skips the
+        # `_shard_pg` AllGather entirely on the expert path. Non-expert
+        # params (norms, attention, embedding, router) are sent only by
+        # rank 0 (no `trainer_ep_rank` tag → routed via R=0's PG on
+        # the receiver). Mutually exclusive with WS6/WS7/WS8.
+        # See docs/reports/MoE_EP_status_ws8_ws10_design.md §"WS10 Phase B+C".
+        _SHARDED_WIRE = os.environ.get(
+            "TORCHTUNE_EP_WSYNC_SHARDED", "0") == "1"
+        _ws10_pgs_dict = getattr(self, "_xccl_wsync_sharded_pgs", {}) or {}
+        _shard_rank_int = int(getattr(self, "_shard_rank", -1))
+        _sharded_active = (
+            _SHARDED_WIRE and _ep_deg > 1 and _is_moe
+            and getattr(self, '_shard_pg', None) is not None
+            and 0 <= _shard_rank_int < int(_ep_deg)
+            and _shard_rank_int in _ws10_pgs_dict
+            and not _layer_batch_active
+            and not _gather_root_active
+            and not _fp8_wire_active
+            # HSDP+EP would split trainer ranks into [0..ep_d-1]
+            # members and non-members; the non-members would fall
+            # through to the legacy AllGather path while the EP
+            # members early-return → deadlock. Single-replica EP only.
+            and getattr(self, '_dp_replicate', 1) <= 1
+        )
+        if (_SHARDED_WIRE and not _sharded_active and self.rank == 0
+                and not getattr(self, "_ws10_skip_warned", False)):
+            if _layer_batch_active or _gather_root_active or _fp8_wire_active:
+                log.warning(
+                    "Rank %d: TORCHTUNE_EP_WSYNC_SHARDED=1 requested but "
+                    "skipping (mutually exclusive with WS6=%s WS7=%s WS8=%s)",
+                    self.rank, _layer_batch_active,
+                    _gather_root_active, _fp8_wire_active,
+                )
+            else:
+                log.warning(
+                    "Rank %d: TORCHTUNE_EP_WSYNC_SHARDED=1 requested but "
+                    "skipping (ep_deg=%d, is_moe=%s, _shard_pg=%s, "
+                    "shard_rank=%d, ws10_pgs=%s)",
+                    self.rank, _ep_deg, _is_moe,
+                    getattr(self, '_shard_pg', None) is not None,
+                    _shard_rank_int, sorted(_ws10_pgs_dict.keys()),
+                )
+            self._ws10_skip_warned = True
+        if _sharded_active and self.rank == 0 and not getattr(
+                self, "_ws10_engaged_warned", False):
+            log.info(
+                "Rank %d: WS10 sharded broadcast ENGAGED "
+                "(ep_d=%d, sharded_method=%s, my_R=%d)",
+                self.rank, _ep_deg,
+                getattr(self, "_xccl_wsync_sharded_method", None),
+                _shard_rank_int,
+            )
+            self._ws10_engaged_warned = True
+        if _FP8_WIRE and not _fp8_wire_active:
+            log.info(
+                "Rank %d: TORCHTUNE_EP_WSYNC_FP8_WIRE=1 requested but "
+                "skipping (ep_deg=%d, is_moe=%s, _shard_pg=%s, "
+                "layer_batch=%s, gather_root=%s, e4m3=%s)",
+                self.rank, _ep_deg, _is_moe,
+                getattr(self, '_shard_pg', None) is not None,
+                _layer_batch_active, _gather_root_active,
+                hasattr(torch, 'float8_e4m3fn'),
+            )
+        _fp8_logged_engaged = False
+
+        if _sharded_active:
+            # WS10 Commit B sender path. ALL trainer ranks in [0..ep_d-1]
+            # participate (the non-expert .full_tensor() calls below are
+            # collectives on _shard_pg). Rank 0 uniquely stages the
+            # non-expert tail and POSTs the manifest.
+            _ws10_R = _shard_rank_int
+            _ws10_t0 = time.perf_counter()
+            _local_experts: dict = {}      # hf_name -> CPU bf16 tensor
+            _ws10_pending_proj: dict = {}  # layer_idx -> {gate/up/down: local_tensor (bf16, CPU)}
+            _ws10_non_expert_meta: list = []
+            _ws10_non_expert_cpu_parts: list = []
+            _ws10_non_expert_local_count = 0
+            _ws10_non_expert_full_count = 0
+
+            # First pass: walk sharded_sd. Expert params are kept local
+            # (no _shard_pg AllGather). Non-expert params still need
+            # global tensors (small) — call full_tensor() on ALL ranks
+            # (collective), but only rank 0 keeps the result.
+            for param_name, param in sharded_sd.items():
+                if param.is_cpu:
+                    param = param.to(self._device)
+
+                _cpn = param_name.replace(
+                    "_fsdp_wrapped_module.", "").replace(
+                    "_checkpoint_wrapped_module.", "")
+                _is_expert = bool(_ep_expert_re.search(_cpn))
+
+                if _is_expert:
+                    # Take the local shard ONLY — no AllGather over
+                    # _shard_pg. Each EP rank already owns its
+                    # interleaved n_local experts for this projection.
+                    if hasattr(param, "_local_tensor"):
+                        _loc = param._local_tensor
+                    else:
+                        _loc = param
+                    _loc_bf16 = _loc.to(torch.bfloat16).contiguous()
+                    # Stage to CPU now to keep GPU peak low.
+                    _loc_cpu = _loc_bf16.detach().cpu().contiguous()
+                    del _loc_bf16
+                    _m_lid = _ep_layer_re.search(_cpn)
+                    _m_proj = _ep_expert_re.search(_cpn)
+                    if _m_lid and _m_proj:
+                        _lid = int(_m_lid.group(1))
+                        _proj = _m_proj.group(1)
+                        _ws10_pending_proj.setdefault(_lid, {})[_proj] = _loc_cpu
+                        if len(_ws10_pending_proj[_lid]) == 3:
+                            _bundle = _ws10_pending_proj.pop(_lid)
+                            # Fuse gate+up -> w13 ALONG dim=1 (local
+                            # n_local rows preserved). Same convention
+                            # as fuse_experts_for_vllm. Then the local
+                            # shard for the layer's w13 has shape
+                            # [n_local, 2*intermediate_per_tp, hidden]
+                            # for gate/up (matches global shape with
+                            # n_local instead of total_experts).
+                            _w13_local = torch.cat(
+                                [_bundle["gate_proj"], _bundle["up_proj"]],
+                                dim=1).contiguous()
+                            _w2_local = _bundle["down_proj"].contiguous()
+                            _local_experts[
+                                f"model.layers.{_lid}.mlp.experts.w13_weight"
+                            ] = _w13_local
+                            _local_experts[
+                                f"model.layers.{_lid}.mlp.experts.w2_weight"
+                            ] = _w2_local
+                    del param, _loc, _loc_cpu
+                    continue
+
+                # Non-expert: full_tensor() is a collective on _shard_pg —
+                # ALL ranks must call. Rank 0 keeps it; others discard.
+                if hasattr(param, "_local_tensor"):
+                    _ft0 = time.perf_counter()
+                    param = param.full_tensor()
+                    t_ft += time.perf_counter() - _ft0
+                if _ws10_R == 0:
+                    _hf_name = _xccl_accept_and_rename(param_name)
+                    if _hf_name is None:
+                        del param
+                        continue
+                    _ne_bf = param.to(torch.bfloat16).contiguous()
+                    _ne_cpu = _ne_bf.detach().cpu()
+                    del _ne_bf
+                    _ws10_non_expert_meta.append({
+                        "name": _hf_name,
+                        "shape": list(_ne_cpu.shape),
+                        "numel": int(_ne_cpu.numel()),
+                    })
+                    _ws10_non_expert_cpu_parts.append(_ne_cpu.flatten())
+                    _ws10_non_expert_full_count += int(_ne_cpu.numel())
+                    del _ne_cpu
+                del param
+
+            if _ws10_pending_proj:
+                raise RuntimeError(
+                    f"WS10: rank {self.rank} has {len(_ws10_pending_proj)} "
+                    f"layer(s) with incomplete projections after staging: "
+                    f"{sorted(_ws10_pending_proj.keys())[:8]}"
+                )
+
+            # Build per-rank payload via the shared helper.
+            _local_cpu_batches, _local_meta = _ws10_build_local_payload(
+                _local_experts, _ws10_R, int(_ep_deg),
+                batch_max_numel=_BATCH_MAX_NUMEL,
+            )
+            del _local_experts
+
+            # Rank 0 also appends its non-expert tail (no trainer_ep_rank
+            # tag in meta — receiver routes by absence). Keep them in
+            # rank 0's broadcast batches so they ride R=0's PG.
+            if _ws10_R == 0 and _ws10_non_expert_meta:
+                # Reorder non-experts to match the receiver's unified
+                # manifest order. The receiver sorts every entry with
+                # _ws10_sort_key_by_rank, which places non-experts at
+                # (R=0, layer_idx=10**9, kind_rank=9, name) — i.e.
+                # lexicographic by name. The sender previously packed
+                # in sharded_sd.items() walk order (module registration
+                # order), so the greedy split landed at different byte
+                # boundaries even though total bytes matched. That is
+                # the run #7 wire size mismatch (1064400384 vs 622329856,
+                # constant across runs because both orderings are
+                # deterministic but different). Sort meta + the
+                # parallel cpu_parts list by the same key, then pack.
+                _ne_pairs = sorted(
+                    zip(_ws10_non_expert_meta, _ws10_non_expert_cpu_parts),
+                    key=lambda p: _ws10_sort_key_by_rank(p[0]),
+                )
+                _ws10_non_expert_meta = [p[0] for p in _ne_pairs]
+                _ws10_non_expert_cpu_parts = [p[1] for p in _ne_pairs]
+                _ne_flat = torch.cat(_ws10_non_expert_cpu_parts)
+                # Greedy split same as expert batching.
+                _cur_parts = []
+                _cur_n = 0
+                _ne_offset = 0
+                for _ne_e in _ws10_non_expert_meta:
+                    _n = int(_ne_e["numel"])
+                    if _cur_n > 0 and _cur_n + _n > _BATCH_MAX_NUMEL:
+                        _local_cpu_batches.append(torch.cat(_cur_parts))
+                        _cur_parts = []
+                        _cur_n = 0
+                    _cur_parts.append(_ne_flat[_ne_offset:_ne_offset + _n])
+                    _cur_n += _n
+                    _ne_offset += _n
+                if _cur_parts:
+                    _local_cpu_batches.append(torch.cat(_cur_parts))
+                del _ne_flat
+            _ws10_non_expert_cpu_parts.clear()
+
+            # Mark this rank as the 'active' sender for sync-id bookkeeping.
+            # In WS10 every trainer EP rank in [0..ep_d-1] is its own sender;
+            # all of them set the done event/counters. Pool semantics differ.
+            self._sync_done_event.clear()
+            self._sync_error = None
+            self._sync_id_counter += 1
+            self._pending_sync_id = self._sync_id_counter
+
+            # Gather meta across all trainer EP ranks (object collective on
+            # the default PG — payload is small dict-of-dicts).
+            _per_rank_metas = [None] * int(_ep_deg)
+            # all_gather_object on _shard_pg (size = ep_d).
+            torch.distributed.all_gather_object(
+                _per_rank_metas, _local_meta, group=self._shard_pg,
+            )
+            _meta_json = None
+            if _ws10_R == 0:
+                # Merge non-expert tail INTO rank 0's per-rank slot
+                # (the validator in _ws10_unify_manifests requires
+                # len(per_rank_metas) == ep_degree). Mirrors the CPU
+                # pin-down test in test_ws10_commitB_sender_manifest.
+                _per_rank_metas_for_unify = list(_per_rank_metas)
+                if _ws10_non_expert_meta and len(_per_rank_metas_for_unify) > 0:
+                    _r0_meta = list(_per_rank_metas_for_unify[0] or [])
+                    _r0_meta.extend(_ws10_non_expert_meta)
+                    _per_rank_metas_for_unify[0] = _r0_meta
+                _unified = _ws10_unify_manifests(
+                    _per_rank_metas_for_unify,
+                    sort_key=_ws10_sort_key_by_rank,
+                )
+                pool_index = pool.index(self.rank) if pool else 0
+                _meta_json = json.dumps({
+                    "tensors": _unified,
+                    "batch_max_numel": _BATCH_MAX_NUMEL,
+                    "sender_index": pool_index,
+                })
+
+            if not self._production_mode:
+                torch.distributed.barrier()
+            t_gather = time.perf_counter() - _ws10_t0
+
+            # Each rank stores its own (cpu_batches, per-rank PG list) for
+            # the deferred broadcast loop. The PG list has one entry per
+            # vLLM replica — every replica root gets the data and fans
+            # out to its TP workers via its existing intra PG.
+            # The 'sharded' flag distinguishes this from the legacy
+            # single-PG path.
+            _my_pgs = _ws10_pgs_dict[_ws10_R]
+            if not isinstance(_my_pgs, list):
+                _my_pgs = [_my_pgs]
+            self._deferred_broadcast_args = (
+                _local_cpu_batches,        # cpu_batches
+                _meta_json,                # rank 0 only; other ranks None
+                _local_meta,               # used for byte accounting
+                _ws10_t0,                  # t0
+                self._device,              # device
+                _my_pgs,                   # pgs (one per replica)
+                self._vllm_clients,        # only rank 0 will call them
+                self._vllm_urls,           # only rank 0 will POST
+                True,                      # _ws10_sharded marker
+            )
+
+            _total_gb = (sum(e["numel"] for e in _local_meta)
+                         + _ws10_non_expert_full_count) * 2 / 1024**3
+            log.info(
+                "Rank %d: WS10 sharded gather done: %d expert entries "
+                "(R=%d) + %d non-expert (rank0=%s) %.2f GiB local in "
+                "%.1fs (no _shard_pg AllGather) — broadcast deferred",
+                self.rank, len(_local_meta), _ws10_R,
+                len(_ws10_non_expert_meta), _ws10_R == 0,
+                _total_gb, t_gather,
+            )
+
+            self._wsync_round += 1
+            del sharded_sd
+            return
+
+        # Llama-family Q/K un-permute predicate, captured once outside the
+        # loop. See _maybe_unpermute_qk for invariant; applied per-param
+        # below at the point where `param` becomes the full tensor that
+        # vLLM consumes.
+        _unperm_needed_x = _needs_qk_unpermute(self)
+        if (
+            _unperm_needed_x
+            and is_active
+            and not getattr(self, "_qk_unperm_xccl_engaged_logged", False)
+        ):
+            log.info(
+                "Rank %d: xccl wsync QK un-permute ENGAGED "
+                "(n_heads=%s n_kv_heads=%s head_dim=%s)",
+                self.rank,
+                getattr(self, "_model_num_heads", None),
+                getattr(self, "_model_num_kv_heads", None),
+                getattr(self, "_model_head_dim", None),
+            )
+            self._qk_unperm_xccl_engaged_logged = True
+
+        for param_name, param in sharded_sd.items():
+            if param.is_cpu:
+                param = param.to(self._device)
+
+            # WS6 layer-batched EP path: short-circuit expert params before
+            # the per-projection AG. Buffer locally; on the 3rd projection
+            # of a layer, emit one batched AG, slice, unshuffle, and hand
+            # each per-projection full tensor back to the existing fuse
+            # path via _ep_stream_buf (is_active only).
+            if _layer_batch_active:
+                _lb_cpn = param_name.replace(
+                    "_fsdp_wrapped_module.", "").replace(
+                    "_checkpoint_wrapped_module.", "")
+                _lb_m_proj = _ep_expert_re.search(_lb_cpn)
+                _lb_m_lid = _ep_layer_re.search(_lb_cpn)
+                if _lb_m_proj and _lb_m_lid:
+                    if hasattr(param, "_local_tensor"):
+                        _ft0 = time.perf_counter()
+                        param = param.full_tensor()
+                        t_ft += time.perf_counter() - _ft0
+                    _c0 = time.perf_counter()
+                    _lb_local = param.to(self._device).to(
+                        torch.bfloat16).contiguous()
+                    t_cast += time.perf_counter() - _c0
+                    _lb_proj = _lb_m_proj.group(1)
+                    _lb_lid = _lb_m_lid.group(1)
+                    # Resolve the hf-side param name once now so the
+                    # is_active fuse-path entry matches the per-projection
+                    # path bit-for-bit. Non-active ranks won't use it.
+                    _lb_hf = _xccl_accept_and_rename(param_name) if is_active else None
+                    _lb_pending.setdefault(_lb_lid, {})[_lb_proj] = (
+                        _lb_hf, _lb_local, tuple(_lb_local.shape))
+                    del param
+
+                    if len(_lb_pending[_lb_lid]) == 3:
+                        _bundle = _lb_pending.pop(_lb_lid)
+                        _g_hf, _g_loc, _g_sh = _bundle["gate_proj"]
+                        _u_hf, _u_loc, _u_sh = _bundle["up_proj"]
+                        _d_hf, _d_loc, _d_sh = _bundle["down_proj"]
+                        _n_g = _g_loc.numel()
+                        _n_u = _u_loc.numel()
+                        _n_d = _d_loc.numel()
+                        _local_cat = torch.cat([
+                            _g_loc.flatten(), _u_loc.flatten(), _d_loc.flatten()
+                        ])
+                        _cat_size = _local_cat.numel()
+                        if _gather_root_active:
+                            # WS7: gather(dst=active). Root materializes
+                            # _out_cat; other ranks send only their local.
+                            _shard_rank_lb = torch.distributed.get_rank(
+                                self._shard_pg)
+                            if _shard_rank_lb == _gr_active_shard_rank:
+                                _gather_list = [
+                                    torch.empty_like(_local_cat)
+                                    for _ in range(_ep_deg)
+                                ]
+                                torch.distributed.gather(
+                                    _local_cat, gather_list=_gather_list,
+                                    dst=_gr_active_shard_rank,
+                                    group=self._shard_pg)
+                                _out_cat = torch.cat(_gather_list)
+                                del _gather_list
+                            else:
+                                torch.distributed.gather(
+                                    _local_cat, gather_list=None,
+                                    dst=_gr_active_shard_rank,
+                                    group=self._shard_pg)
+                                _out_cat = None
+                            if not _gr_logged_engaged:
+                                log.info(
+                                    "Rank %d: EP wsync layer-batched gather-to-root engaged",
+                                    self.rank)
+                                _gr_logged_engaged = True
+                        else:
+                            _out_cat = torch.empty(
+                                _ep_deg * _cat_size,
+                                dtype=torch.bfloat16, device=self._device,
+                            )
+                            torch.distributed.all_gather_into_tensor(
+                                _out_cat, _local_cat, group=self._shard_pg)
+                        del _local_cat, _g_loc, _u_loc, _d_loc
+
+                        if not _lb_logged_engaged:
+                            log.info(
+                                "Rank %d: EP wsync layer-batched AG engaged "
+                                "(3-proj per call)", self.rank)
+                            _lb_logged_engaged = True
+
+                        if is_active:
+                            # Slice each rank's chunk into per-projection
+                            # sub-tensors, then stack + interleave-unshuffle
+                            # — same final shape as the per-projection path.
+                            _g_parts, _u_parts, _d_parts = [], [], []
+                            for _r in range(_ep_deg):
+                                _b = _r * _cat_size
+                                _g_parts.append(
+                                    _out_cat[_b:_b + _n_g].reshape(_g_sh))
+                                _u_parts.append(
+                                    _out_cat[_b + _n_g:_b + _n_g + _n_u].reshape(_u_sh))
+                                _d_parts.append(
+                                    _out_cat[_b + _n_g + _n_u:_b + _n_g + _n_u + _n_d].reshape(_d_sh))
+                            for _hf, _parts in (
+                                (_g_hf, _g_parts),
+                                (_u_hf, _u_parts),
+                                (_d_hf, _d_parts),
+                            ):
+                                if _hf is None:
+                                    continue
+                                _stk = torch.stack(_parts, dim=0)
+                                _full = _stk.transpose(0, 1).reshape(
+                                    -1, *_stk.shape[2:]).contiguous()
+                                del _stk
+                                # Hand off to the existing _ep_stream_buf
+                                # fuse path (mirrors the per-projection
+                                # branch below). The fuse trigger fires on
+                                # the 3rd projection identically.
+                                _m_proj_full = _ep_expert_re.search(_hf)
+                                _m_lid_full = _ep_layer_re.search(_hf)
+                                if _m_proj_full and _m_lid_full:
+                                    _lid_full = _m_lid_full.group(1)
+                                    _ep_stream_buf.setdefault(
+                                        _lid_full, {})[_m_proj_full.group(1)] = _full
+                                    if len(_ep_stream_buf[_lid_full]) == 3:
+                                        _d_inner = _ep_stream_buf.pop(_lid_full)
+                                        _w13 = torch.cat(
+                                            [_d_inner["gate_proj"], _d_inner["up_proj"]], dim=1)
+                                        _w2 = _d_inner["down_proj"]
+                                        del _d_inner
+                                        for _fhname, _ftensor in [
+                                            (f"model.layers.{_lid_full}.mlp.experts.w13_weight", _w13),
+                                            (f"model.layers.{_lid_full}.mlp.experts.w2_weight", _w2),
+                                        ]:
+                                            _fpn = _ftensor.numel()
+                                            tensors_meta.append({
+                                                "name": _fhname,
+                                                "shape": list(_ftensor.shape),
+                                                "numel": _fpn,
+                                            })
+                                            if _USE_PINNED_BUF:
+                                                if batch_numel > 0 and batch_numel + _fpn > _BATCH_MAX_NUMEL:
+                                                    torch.xpu.synchronize()
+                                                    cpu_batches.append(
+                                                        self._pinned_cpu_buf[_batch_start:_buf_offset])
+                                                    _batch_start = _buf_offset
+                                                    batch_numel = 0
+                                                    n_batches += 1
+                                                self._pinned_cpu_buf[_buf_offset:_buf_offset + _fpn].copy_(
+                                                    _ftensor.flatten(), non_blocking=True)
+                                                _buf_offset += _fpn
+                                            else:
+                                                _fcpu = _ftensor.flatten().cpu()
+                                                if batch_numel > 0 and batch_numel + _fpn > _BATCH_MAX_NUMEL:
+                                                    cpu_batches.append(torch.cat(batch_parts_cpu))
+                                                    batch_parts_cpu = []
+                                                    batch_numel = 0
+                                                    n_batches += 1
+                                                batch_parts_cpu.append(_fcpu)
+                                            batch_numel += _fpn
+                                            n_params += 1
+                                        del _w13, _w2
+                        del _out_cat
+                    continue  # expert param handled by layer-batch path
+
+            if hasattr(param, "_local_tensor"):
+                _ft0 = time.perf_counter()
+                param = param.full_tensor()
+                t_ft += time.perf_counter() - _ft0
+            # EP expert all-gather: each rank holds an interleaved slice of experts
+            # (rank r owns global experts r, r+ep_d, r+2*ep_d, …).  Gather all slices
+            # so the active sender has the full expert tensor.  Collective: all ranks
+            # participate regardless of is_active.
+            _ep_is_expert = False
+            if _ep_deg > 1 and _is_moe and getattr(self, '_shard_pg', None) is not None:
+                _cpn = param_name.replace("_fsdp_wrapped_module.", "").replace(
+                    "_checkpoint_wrapped_module.", "")
+                if _ep_expert_re.search(_cpn):
+                    _ep_is_expert = True
+                    _ep_local_t = param.to(self._device).contiguous()
+                    if _gather_root_active:
+                        # WS7: gather(dst=active). Root reassembles from
+                        # _ep_deg shards; non-root ranks just send.
+                        _shard_rank_pp = torch.distributed.get_rank(
+                            self._shard_pg)
+                        if _shard_rank_pp == _gr_active_shard_rank:
+                            _ep_parts_t = [
+                                torch.empty_like(_ep_local_t)
+                                for _ in range(_ep_deg)
+                            ]
+                            torch.distributed.gather(
+                                _ep_local_t, gather_list=_ep_parts_t,
+                                dst=_gr_active_shard_rank,
+                                group=self._shard_pg)
+                            _ep_stk = torch.stack(_ep_parts_t, dim=0)
+                            param = _ep_stk.transpose(0, 1).reshape(
+                                -1, *_ep_stk.shape[2:]).contiguous()
+                            del _ep_stk, _ep_parts_t
+                        else:
+                            torch.distributed.gather(
+                                _ep_local_t, gather_list=None,
+                                dst=_gr_active_shard_rank,
+                                group=self._shard_pg)
+                        if not _gr_logged_engaged:
+                            log.info(
+                                "Rank %d: EP wsync per-proj gather-to-root engaged",
+                                self.rank)
+                            _gr_logged_engaged = True
+                    elif _fp8_wire_active:
+                        # WS8: cast local shard to E4M3 with per-row
+                        # scale, AllGather fp8 + scale, decompress on
+                        # active rank. Reduces wire bytes ~2× on
+                        # _shard_pg vs the bf16 baseline below.
+                        _ep_local_bf = _ep_local_t.to(torch.bfloat16)
+                        _ep_local_f32 = _ep_local_bf.to(torch.float32)
+                        # Per-output-row scaling (last dim is the
+                        # row dim for both gate/up [E, I, H] and down
+                        # [E, H, I]; the row whose error matters is
+                        # the GEMM input dim).
+                        _row_amax = _ep_local_f32.abs().amax(
+                            dim=-1, keepdim=True)
+                        _scale_local = (_row_amax / 448.0).clamp(min=1e-12)
+                        _ep_local_fp8 = (
+                            (_ep_local_f32 / _scale_local).clamp(-448.0, 448.0)
+                            .to(torch.float8_e4m3fn).contiguous())
+                        del _ep_local_bf, _ep_local_f32
+                        _scale_local_f32 = _scale_local.to(torch.float32).contiguous()
+                        del _scale_local
+
+                        # all_gather_into_tensor (single persistent flat
+                        # output buffer) instead of list-style all_gather.
+                        # The list path triggers ProcessGroupXCCL's hidden
+                        # newLikeFlat() temp, which leaks under
+                        # torch.xpu.empty_cache() (Aurora #143 /
+                        # torch-xpu-ops #3744). Bit-exact equivalent.
+                        _local_fp8 = _ep_local_fp8.contiguous()
+                        _local_sc = _scale_local_f32.contiguous()
+                        _out_fp8_cat = torch.empty(
+                            _ep_deg * _local_fp8.shape[0],
+                            *_local_fp8.shape[1:],
+                            dtype=_local_fp8.dtype,
+                            device=_local_fp8.device)
+                        _out_sc_cat = torch.empty(
+                            _ep_deg * _local_sc.shape[0],
+                            *_local_sc.shape[1:],
+                            dtype=_local_sc.dtype,
+                            device=_local_sc.device)
+                        torch.distributed.all_gather_into_tensor(
+                            _out_fp8_cat, _local_fp8,
+                            group=self._shard_pg)
+                        torch.distributed.all_gather_into_tensor(
+                            _out_sc_cat, _local_sc,
+                            group=self._shard_pg)
+                        del _ep_local_fp8, _scale_local_f32, _local_fp8, _local_sc
+                        if is_active:
+                            # Reshape concatenated buffer to
+                            # [ep_d, n_local, ...] — same layout the old
+                            # torch.stack(list, dim=0) produced.
+                            _n_local_fp8 = _out_fp8_cat.shape[0] // _ep_deg
+                            _n_local_sc = _out_sc_cat.shape[0] // _ep_deg
+                            _fp8_view = _out_fp8_cat.view(
+                                _ep_deg, _n_local_fp8,
+                                *_out_fp8_cat.shape[1:])
+                            _sc_view = _out_sc_cat.view(
+                                _ep_deg, _n_local_sc,
+                                *_out_sc_cat.shape[1:])
+                            # Per-rank dequantize (shape preserved),
+                            # then unshuffle identically to bf16 path.
+                            _bf16_parts = []
+                            for _r in range(_ep_deg):
+                                _bf16_parts.append(
+                                    (_fp8_view[_r].to(torch.float32)
+                                     * _sc_view[_r])
+                                    .to(torch.bfloat16))
+                            _ep_stk = torch.stack(_bf16_parts, dim=0)
+                            param = _ep_stk.transpose(0, 1).reshape(
+                                -1, *_ep_stk.shape[2:]).contiguous()
+                            del _ep_stk, _bf16_parts, _fp8_view, _sc_view
+                        del _out_fp8_cat, _out_sc_cat
+                        if not _fp8_logged_engaged:
+                            log.info(
+                                "Rank %d: EP wsync per-proj fp8 wire engaged "
+                                "(local bytes %d → %d + %d scale)",
+                                self.rank,
+                                _ep_local_t.numel() * _ep_local_t.element_size(),
+                                _ep_local_t.numel() * 1,
+                                int(_row_amax.numel() * 4),
+                            )
+                            _fp8_logged_engaged = True
+                    else:
+                        # all_gather_into_tensor (single persistent flat
+                        # output buffer) instead of list-style all_gather.
+                        # The list path triggers ProcessGroupXCCL's hidden
+                        # newLikeFlat() temp, which leaks under
+                        # torch.xpu.empty_cache() (Aurora #143 /
+                        # torch-xpu-ops #3744). Bit-exact equivalent of
+                        # the previous torch.stack(list, 0) layout.
+                        _local_c = _ep_local_t.contiguous()
+                        _out_cat = torch.empty(
+                            _ep_deg * _local_c.shape[0],
+                            *_local_c.shape[1:],
+                            dtype=_local_c.dtype,
+                            device=_local_c.device)
+                        torch.distributed.all_gather_into_tensor(
+                            _out_cat, _local_c, group=self._shard_pg)
+                        if is_active:
+                            # Reshape [ep_d * n_local, ...] to
+                            # [ep_d, n_local, ...] (same layout as
+                            # torch.stack(list, dim=0)), then unshuffle:
+                            # transpose → [n_local, ep_d, ...] → reshape →
+                            # [total_experts, ...]
+                            _n_local = _out_cat.shape[0] // _ep_deg
+                            _ep_stk = _out_cat.view(
+                                _ep_deg, _n_local, *_out_cat.shape[1:])
+                            param = _ep_stk.transpose(0, 1).reshape(
+                                -1, *_ep_stk.shape[2:]).contiguous()
+                            del _ep_stk
+                        del _out_cat, _local_c
+                    del _ep_local_t
+            if is_active:
+                hf_name = _xccl_accept_and_rename(param_name)
+                if hf_name is None:
+                    del param
+                    continue
+                # Llama-family Q/K un-permute: torchtune permutes Q/K at
+                # checkpoint load (convert_weights.hf_to_tune); vLLM expects
+                # HF-format unpermuted Q/K. Without this, server-mode XCCL
+                # wsync silently scrambles Q/K projections on every sync
+                # (mirrors the colocate fix landed 2026-06-11). Bug latent
+                # since this xccl path was added — Qwen/Gemma never tripped
+                # it (they don't permute), AGPT-2B is the first Llama-family
+                # server-mode GRPO target.
+                if _unperm_needed_x:
+                    param = _maybe_unpermute_qk(self, hf_name, param)
+                _c0 = time.perf_counter()
+                gpu_tensor = param.to(torch.bfloat16).contiguous()
+                t_cast += time.perf_counter() - _c0
+                if _ep_is_expert:
+                    # Streaming EP fuse: accumulate gate/up/down per layer; fuse+stage
+                    # to CPU when all 3 projections for a layer have arrived.  Keeps GPU
+                    # peak at ~3 expert tensors instead of 48 layers × 128 experts.
+                    _m_proj = _ep_expert_re.search(hf_name)
+                    _m_lid = _ep_layer_re.search(hf_name)
+                    if _m_proj and _m_lid:
+                        _lid = _m_lid.group(1)
+                        _ep_stream_buf.setdefault(_lid, {})[_m_proj.group(1)] = gpu_tensor
+                        if len(_ep_stream_buf[_lid]) == 3:
+                            _d = _ep_stream_buf.pop(_lid)
+                            _w13 = torch.cat([_d["gate_proj"], _d["up_proj"]], dim=1)
+                            _w2 = _d["down_proj"]
+                            del _d
+                            for _fhname, _ftensor in [
+                                (f"model.layers.{_lid}.mlp.experts.w13_weight", _w13),
+                                (f"model.layers.{_lid}.mlp.experts.w2_weight", _w2),
+                            ]:
+                                _fpn = _ftensor.numel()
+                                tensors_meta.append({
+                                    "name": _fhname,
+                                    "shape": list(_ftensor.shape),
+                                    "numel": _fpn,
+                                })
+                                if _USE_PINNED_BUF:
+                                    if batch_numel > 0 and batch_numel + _fpn > _BATCH_MAX_NUMEL:
+                                        torch.xpu.synchronize()
+                                        cpu_batches.append(
+                                            self._pinned_cpu_buf[_batch_start:_buf_offset])
+                                        _batch_start = _buf_offset
+                                        batch_numel = 0
+                                        n_batches += 1
+                                    self._pinned_cpu_buf[_buf_offset:_buf_offset + _fpn].copy_(
+                                        _ftensor.flatten(), non_blocking=True)
+                                    _buf_offset += _fpn
+                                else:
+                                    _fcpu = _ftensor.flatten().cpu()
+                                    if batch_numel > 0 and batch_numel + _fpn > _BATCH_MAX_NUMEL:
+                                        cpu_batches.append(torch.cat(batch_parts_cpu))
+                                        batch_parts_cpu = []
+                                        batch_numel = 0
+                                        n_batches += 1
+                                    batch_parts_cpu.append(_fcpu)
+                                batch_numel += _fpn
+                                n_params += 1
+                            del _w13, _w2
+                    del param  # gpu_tensor stays alive in _ep_stream_buf if layer incomplete
+                    continue   # skip normal staging path; outer del param already done
+                # For MoE, non-expert params go to hf_state_dict and are
+                # added to tensors_meta + cpu_batches after fuse_experts_for_vllm.
+                # Adding to tensors_meta here would duplicate every non-expert
+                # entry for EP mode (which appends rather than resets tensors_meta),
+                # causing tensors_meta (966) vs cpu_batches (531) desync → n_expert_ready=0.
+                # Non-EP mode resets tensors_meta at line 1882, so the duplicate
+                # is discarded anyway — skip for clarity.
+                if not _is_moe:
+                    tensors_meta.append({
+                        "name": hf_name,
+                        "shape": list(gpu_tensor.shape),
+                        "numel": gpu_tensor.numel(),
+                    })
+                if _is_moe:
+                    hf_state_dict[hf_name] = gpu_tensor
+                elif _USE_PINNED_BUF:
+                    pn = gpu_tensor.numel()
+                    if batch_numel > 0 and batch_numel + pn > _BATCH_MAX_NUMEL:
+                        torch.xpu.synchronize()
+                        cpu_batches.append(self._pinned_cpu_buf[_batch_start:_buf_offset])
+                        _batch_start = _buf_offset
+                        batch_numel = 0
+                        n_batches += 1
+                    _d2h0 = time.perf_counter()
+                    if _USE_D2H_STREAM and hasattr(self, '_d2h_stream') and self._d2h_stream is not None:
+                        _ev = torch.xpu.Event()
+                        _ev.record()
+                        with torch.xpu.stream(self._d2h_stream):
+                            _ev.wait()
+                            self._pinned_cpu_buf[_buf_offset:_buf_offset + pn].copy_(
+                                gpu_tensor.flatten(), non_blocking=True)
+                    else:
+                        self._pinned_cpu_buf[_buf_offset:_buf_offset + pn].copy_(
+                            gpu_tensor.flatten(), non_blocking=True)
+                    t_d2h += time.perf_counter() - _d2h0
+                    _buf_offset += pn
+                    del gpu_tensor
+                    batch_numel += pn
+                    n_params += 1
+                else:
+                    pn = gpu_tensor.numel()
+                    _d2h0 = time.perf_counter()
+                    cpu_tensor = gpu_tensor.flatten().cpu()
+                    t_d2h += time.perf_counter() - _d2h0
+                    del gpu_tensor
+                    if batch_numel > 0 and batch_numel + pn > _BATCH_MAX_NUMEL:
+                        cpu_batches.append(torch.cat(batch_parts_cpu))
+                        batch_parts_cpu = []
+                        batch_numel = 0
+                        n_batches += 1
+                    batch_parts_cpu.append(cpu_tensor)
+                    batch_numel += pn
+                    n_params += 1
+            del param
+
+        # WS6: sanity check that no layer-batched expert pairs are
+        # dangling. If they are, a layer didn't have all 3 projections
+        # in sharded_sd (unexpected for Qwen3-30B-A3B; would silently
+        # drop weights from the wsync round).
+        if _layer_batch_active and _lb_pending:
+            _dangling = sorted(_lb_pending.keys())
+            raise RuntimeError(
+                f"EP wsync layer-batch path: {len(_dangling)} layer(s) had "
+                f"incomplete projection set after param loop: {_dangling[:8]}. "
+                "This means the model state_dict is missing one of "
+                "{gate_proj, up_proj, down_proj} for those layers."
+            )
+
+        if is_active:
+            if _is_moe:
+                from torchtune.models.qwen3_moe._convert_weights import fuse_experts_for_vllm
+                if _ep_deg > 1:
+                    # EP mode: expert params already streamed + fused above (tensors_meta
+                    # already has w13/w2 entries).  hf_state_dict has only non-expert
+                    # params (attention, norms, embeddings).  Pass through fuse (no-op
+                    # for non-expert keys) and APPEND — do NOT reset tensors_meta.
+                    hf_state_dict = fuse_experts_for_vllm(hf_state_dict)
+                    for hf_name, tensor in hf_state_dict.items():
+                        pn = tensor.numel()
+                        tensors_meta.append({
+                            "name": hf_name,
+                            "shape": list(tensor.shape),
+                            "numel": pn,
+                        })
+                        if _USE_PINNED_BUF:
+                            if batch_numel > 0 and batch_numel + pn > _BATCH_MAX_NUMEL:
+                                torch.xpu.synchronize()
+                                cpu_batches.append(
+                                    self._pinned_cpu_buf[_batch_start:_buf_offset])
+                                _batch_start = _buf_offset
+                                batch_numel = 0
+                                n_batches += 1
+                            self._pinned_cpu_buf[_buf_offset:_buf_offset + pn].copy_(
+                                tensor.flatten(), non_blocking=True)
+                            _buf_offset += pn
+                        else:
+                            cpu_tensor = tensor.flatten().cpu()
+                            if batch_numel > 0 and batch_numel + pn > _BATCH_MAX_NUMEL:
+                                cpu_batches.append(torch.cat(batch_parts_cpu))
+                                batch_parts_cpu = []
+                                batch_numel = 0
+                                n_batches += 1
+                            batch_parts_cpu.append(cpu_tensor)
+                        batch_numel += pn
+                        n_params += 1
+                    del hf_state_dict
+                else:
+                    # Non-EP MoE: fuse all experts, reset tensors_meta from fused output.
+                    hf_state_dict = fuse_experts_for_vllm(hf_state_dict)
+                    tensors_meta = []
+                    for hf_name, tensor in hf_state_dict.items():
+                        tensors_meta.append({
+                            "name": hf_name,
+                            "shape": list(tensor.shape),
+                            "numel": tensor.numel(),
+                        })
+                        pn = tensor.numel()
+                        if _USE_PINNED_BUF:
+                            if batch_numel > 0 and batch_numel + pn > _BATCH_MAX_NUMEL:
+                                torch.xpu.synchronize()
+                                cpu_batches.append(
+                                    self._pinned_cpu_buf[_batch_start:_buf_offset])
+                                _batch_start = _buf_offset
+                                batch_numel = 0
+                                n_batches += 1
+                            _d2h0 = time.perf_counter()
+                            self._pinned_cpu_buf[_buf_offset:_buf_offset + pn].copy_(
+                                tensor.flatten(), non_blocking=True)
+                            t_d2h += time.perf_counter() - _d2h0
+                            _buf_offset += pn
+                        else:
+                            cpu_tensor = tensor.flatten().cpu()
+                            if batch_numel > 0 and batch_numel + pn > _BATCH_MAX_NUMEL:
+                                cpu_batches.append(torch.cat(batch_parts_cpu))
+                                batch_parts_cpu = []
+                                batch_numel = 0
+                                n_batches += 1
+                            batch_parts_cpu.append(cpu_tensor)
+                        batch_numel += pn
+                        n_params += 1
+                    del hf_state_dict
+
+            if _USE_PINNED_BUF:
+                if batch_numel > 0:
+                    if _USE_D2H_STREAM and hasattr(self, '_d2h_stream') and self._d2h_stream is not None:
+                        self._d2h_stream.synchronize()
+                    else:
+                        torch.xpu.synchronize()
+                    cpu_batches.append(self._pinned_cpu_buf[_batch_start:_buf_offset])
+                    n_batches += 1
+            else:
+                if batch_parts_cpu:
+                    cpu_batches.append(torch.cat(batch_parts_cpu))
+                    batch_parts_cpu = []
+                    n_batches += 1
+
+            pool_index = pool.index(self.rank) if pool else 0
+            meta_json = json.dumps({
+                "tensors": tensors_meta,
+                "batch_max_numel": _BATCH_MAX_NUMEL,
+                "sender_index": pool_index,
+            })
+
+    del sharded_sd
+
+    if not self._production_mode:
+        torch.distributed.barrier()
+    t_gather = time.perf_counter() - t0
+
+    if is_active:
+        if _USE_BATCHED_AG:
+            # Batched-AG mode (BROKEN, kept for reference): sync path
+            for mt in manifest_threads:
+                mt.join(timeout=600)
+            if post_errors:
+                log.error("Rank %d: XCCL streaming sync errors: %s", self.rank, post_errors)
+                self._sync_error = RuntimeError(str(post_errors))
+            for client in self._vllm_clients:
+                client.reset_prefix_cache()
+            log.info(
+                "Rank %d: XCCL batched-AG sync: %d params %d batches in %.1fs "
+                "(ag=%.1fs bcast=%.1fs)",
+                self.rank, n_params, n_batches,
+                time.perf_counter() - t0, t_ag, t_bcast,
+            )
+            self._sync_done_event.set()
+        else:
+            # Mode 0 async: defer broadcast to after generation completes.
+            _cross_pgs = [self._my_cross_pg] if pool else getattr(self, '_xccl_wsync_pgs', [self._xccl_wsync_pg])
+            total_gb = sum(e["numel"] for e in tensors_meta) * 2 / 1024**3
+            _buf_info = ""
+            if _USE_PINNED_BUF:
+                _buf_info = (
+                    f", pinned={getattr(self, '_cpu_buf_is_pinned', False)}"
+                    f", d2h_stream={_USE_D2H_STREAM and getattr(self, '_d2h_stream', None) is not None}"
+                )
+            log.info(
+                "Rank %d: XCCL async gather done: %d params %d batches %.2f GiB "
+                "staged to CPU in %.1fs (ft=%.1fs cast=%.1fs d2h=%.1fs%s), "
+                "broadcast deferred to post-gen (sender pool round %d)",
+                self.rank, n_params, n_batches, total_gb, t_gather,
+                t_ft, t_cast, t_d2h, _buf_info,
+                self._wsync_round,
+            )
+            self._deferred_broadcast_args = (
+                cpu_batches, meta_json,
+                tensors_meta, t0, self._device,
+                _cross_pgs, self._vllm_clients,
+                self._vllm_urls,
+            )
+
+    self._wsync_round += 1
+
 def _sync_weights_to_vllm_xccl(self) -> None:
     """Gather sharded params then broadcast to vLLM via XCCL (GPU→GPU).
 
@@ -2054,9 +3293,6 @@ def _sync_weights_to_vllm_xccl(self) -> None:
     For 32B+ models where the full flat buffer won't fit on one tile,
     falls back to CPU staging (same as SHM path).
     """
-    import json
-    import requests
-
     t0 = time.perf_counter()
 
     # Init sender pool on first call (ALL ranks participate)
@@ -2102,1228 +3338,9 @@ def _sync_weights_to_vllm_xccl(self) -> None:
         return self._tune_to_hf_map.get(name, name)
 
     if use_fsdp1:
-        # FSDP1: state_dict() handles gathering; result is on CPU already
-        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, StateDictType
-        with FSDP.state_dict_type(self._model, StateDictType.FULL_STATE_DICT):
-            full_sd = self._model.state_dict()
-        hf_state_dict = {}
-        # WS3.5: only the XCCL leader (global rank 0) keeps and broadcasts.
-        _is_xccl_leader = getattr(self, "_is_xccl_leader", self._is_shard_leader)
-        # Llama-family Q/K un-permute mirrors the FSDP2 path (line ~2987).
-        # Engages once with a log line for runtime confirmation.
-        _unperm_needed_x = _needs_qk_unpermute(self)
-        if (
-            _unperm_needed_x
-            and _is_xccl_leader
-            and not getattr(self, "_qk_unperm_xccl_fsdp1_engaged_logged", False)
-        ):
-            log.info(
-                "Rank %d: xccl FSDP1 wsync QK un-permute ENGAGED "
-                "(n_heads=%s n_kv_heads=%s head_dim=%s)",
-                self.rank,
-                getattr(self, "_model_num_heads", None),
-                getattr(self, "_model_num_kv_heads", None),
-                getattr(self, "_model_head_dim", None),
-            )
-            self._qk_unperm_xccl_fsdp1_engaged_logged = True
-        if _is_xccl_leader:
-            for param_name, param in full_sd.items():
-                hf_name = _xccl_accept_and_rename(param_name)
-                if hf_name is None:
-                    continue
-                weight = param.to(self._device)
-                if _unperm_needed_x:
-                    weight = _maybe_unpermute_qk(self, hf_name, weight)
-                hf_state_dict[hf_name] = weight
-        del full_sd
-
-        if not self._production_mode:
-            torch.distributed.barrier()
-        t_gather = time.perf_counter() - t0
-
-        if _is_xccl_leader:
-            tensors_meta = []
-            total_elements = 0
-            for hf_name, tensor in hf_state_dict.items():
-                numel = tensor.numel()
-                tensors_meta.append({"name": hf_name, "shape": list(tensor.shape),
-                                     "dtype": str(tensor.dtype), "numel": numel})
-                total_elements += numel
-            flat_gpu = torch.empty(total_elements, dtype=torch.bfloat16, device=self._device)
-            offset = 0
-            for tensor in hf_state_dict.values():
-                flat_gpu[offset:offset + tensor.numel()] = tensor.to(torch.bfloat16).flatten()
-                offset += tensor.numel()
-            del hf_state_dict
+        self._xccl_gather_fsdp1(_xccl_accept_and_rename, t0)
     else:
-        # FSDP2 weight sync: gather sharded params and broadcast to vLLM.
-        # Two sub-modes selected by TORCHTUNE_XCCL_BATCHED_AG:
-        #
-        #   0 (default): per-param full_tensor() + batched XCCL broadcast
-        #      AllGather per param: <0.12ms for 3B, ~0.8ms for 32B (negligible).
-        #      Real bottleneck: XCCL broadcast bandwidth (1.7 GB/s at 12 receivers
-        #      = 35.9s for 61 GiB). Tests CD/CE/CF confirm this floor.
-        #
-        #   1 (BROKEN): batched all_gather_into_tensor() + reconstruct + broadcast
-        #      Saves ~0.2s for 3B (<1% for 32B). Leaves FSDP2 shard state
-        #      inconsistent → checkpoint save hangs after sync. Do not use.
-        _USE_BATCHED_AG = os.environ.get("TORCHTUNE_XCCL_BATCHED_AG", "0") == "1"
-        _USE_PINNED_BUF = os.environ.get("TORCHTUNE_PINNED_CPU_BUF", "0") == "1"
-        _USE_D2H_STREAM = os.environ.get("TORCHTUNE_D2H_STREAM", "0") == "1"
-        if _USE_BATCHED_AG:
-            log.warning(
-                "TORCHTUNE_XCCL_BATCHED_AG=1 is BROKEN: it leaves FSDP2 shard state "
-                "inconsistent, causing the post-training checkpoint save to hang. "
-                "Savings are <1%% for 32B (0.2s vs 38s floor). Do not use."
-            )
-        import threading as _threading
-
-        _BATCH_MAX_NUMEL = 512 * 1024 * 1024  # 512M bf16 elements = 1 GiB
-
-        sharded_sd = self._model.state_dict()
-
-        if is_active:
-            self._sync_done_event.clear()
-            self._sync_error = None
-            self._sync_id_counter += 1
-            self._pending_sync_id = self._sync_id_counter
-
-        # Detect MoE model for expert fusing (used by Mode 0).
-        from torchtune.training.checkpointing._utils import ModelType as _MT
-        _is_moe = getattr(self._checkpointer, '_model_type', None) == _MT.QWEN3_MOE if self._checkpointer is not None else False
-
-        t_ag = 0.0
-        t_bcast = 0.0
-        n_params = 0
-        n_batches = 0
-
-        if _USE_BATCHED_AG:
-            # Mode 1: batched AllGather — reduces AllGather calls from N_params to
-            # N_batches by manually gathering local shards with all_gather_into_tensor().
-            # All training ranks contribute local shards; rank 0 reconstructs full
-            # params from the interleaved output then broadcasts to vLLM.
-            _training_ws = torch.distributed.get_world_size()
-
-            # local batch: local shards from THIS rank, accumulated until threshold
-            _lb_parts: list = []      # list of bf16 contiguous local shard tensors
-            _lb_numel = 0             # total local numel accumulated so far
-            _lb_metas: list = []      # (local_numel, full_numel) per param in batch
-            _batch_full_numel = 0     # full numel accumulated (for threshold check)
-
-            def _flush_batched_ag():
-                nonlocal t_ag, t_bcast, n_batches
-                local_flat = torch.cat([p.flatten() for p in _lb_parts])
-                # AllGather: shape [world_size * _lb_numel], layout:
-                #   [rank0_local | rank1_local | ... | rank_{W-1}_local]
-                full_batch = torch.empty(
-                    _training_ws * _lb_numel,
-                    dtype=torch.bfloat16, device=self._device,
-                )
-                tb0 = time.perf_counter()
-                torch.distributed.all_gather_into_tensor(full_batch, local_flat)
-                t_ag += time.perf_counter() - tb0
-                del local_flat
-
-                # WS3.5: only XCCL leader broadcasts to vLLM.
-                if getattr(self, "_is_xccl_leader", self._is_shard_leader):
-                    # Reconstruct full params from interleaved AllGather output.
-                    # For param_i with local_numel=lnu at local_offset=cum_lnu:
-                    #   full_param = cat(full_batch[r*_lb_numel+cum : r*_lb_numel+cum+lnu]
-                    #                    for r in range(_training_ws))[:full_numel]
-                    bcast_parts = []
-                    cum_lnu = 0
-                    for lnu, fnu in _lb_metas:
-                        slices = [
-                            full_batch[r * _lb_numel + cum_lnu:
-                                       r * _lb_numel + cum_lnu + lnu]
-                            for r in range(_training_ws)
-                        ]
-                        bcast_parts.append(torch.cat(slices)[:fnu])
-                        cum_lnu += lnu
-                    bcast_flat = torch.cat([p.flatten() for p in bcast_parts])
-                    bcast_parts.clear()
-                    del full_batch
-
-                    tb1 = time.perf_counter()
-                    _bcast_pgs = getattr(self, '_xccl_wsync_pgs', [self._xccl_wsync_pg])
-                    _bworks = [_bpg.broadcast(bcast_flat, root=0) for _bpg in _bcast_pgs]
-                    for _bw in _bworks:
-                        _bw.wait()
-                    t_bcast += time.perf_counter() - tb1
-                    del bcast_flat
-                else:
-                    del full_batch
-                n_batches += 1
-
-            for param_name, param in sharded_sd.items():
-                if param.is_cpu:
-                    param = param.to(self._device)
-                fnu = param.numel()
-                if hasattr(param, "_local_tensor"):
-                    local_shard = param._local_tensor.to(torch.bfloat16).contiguous()
-                else:
-                    local_shard = param.to(torch.bfloat16).contiguous()
-                lnu = local_shard.numel()
-
-                # Flush if adding this param would exceed batch threshold
-                if _batch_full_numel > 0 and _batch_full_numel + fnu > _BATCH_MAX_NUMEL:
-                    _flush_batched_ag()
-                    _lb_parts.clear()
-                    _lb_metas.clear()
-                    _lb_numel = 0
-                    _batch_full_numel = 0
-
-                _lb_parts.append(local_shard)
-                _lb_numel += lnu
-                _lb_metas.append((lnu, fnu))
-                _batch_full_numel += fnu
-                n_params += 1
-                del param
-
-            if _lb_parts:
-                _flush_batched_ag()
-
-        else:
-            # Mode 0 (default): per-param full_tensor() + ASYNC batched XCCL broadcast.
-            #
-            # Phase A (synchronous, all ranks): full_tensor() loop gathers each param.
-            #   Shard leader stages each batch to CPU instead of broadcasting inline.
-            #   AllGather per param is negligible (~0.1s total for 32B).
-            #
-            # Phase B (async, shard leader only): background thread copies CPU-staged
-            #   batches back to GPU and broadcasts via XCCL. Overlaps with next step's
-            #   vLLM generation (~15s), hiding the 7.7s broadcast cost entirely.
-            #
-            # 2-hop mode: training rank 0 → vLLM rank 1 (Slingshot), then
-            #   rank 1 → ranks 2-12 (XeLink). ~3s vs 38s flat.
-
-            # Streaming gather: full_tensor() each param, immediately copy to
-            # CPU, build batches from CPU tensors. Keeps GPU peak at ~1 GiB
-            # (one batch) instead of ~60 GiB (full model). Critical for 32B+
-            # models where the full model exceeds single-tile 64 GiB capacity.
-            _ep_deg = getattr(self, '_expert_parallel_degree', 1)
-            if is_active:
-                tensors_meta = []
-                cpu_batches: list = []
-                batch_numel = 0
-
-                if _is_moe:
-                    hf_state_dict = {}
-
-                if _ep_deg > 1 and _is_moe:
-                    # Post EP all-gather, fused expert tensors are ep_degree× larger than
-                    # the pre-allocated pinned buffer (sized from local 16-expert shards).
-                    # Disable pinned buf for EP MoE to avoid overflow and flush-path mixing.
-                    _USE_PINNED_BUF = False
-                if not _USE_PINNED_BUF:
-                    batch_parts_cpu: list = []
-
-            t_ft = 0.0
-            t_cast = 0.0
-            t_d2h = 0.0
-
-            if _USE_PINNED_BUF and is_active:
-                if not hasattr(self, '_pinned_cpu_buf') or self._pinned_cpu_buf is None:
-                    _total_numel = 0
-                    for _scan_name, _scan_p in sharded_sd.items():
-                        _total_numel += _scan_p.numel()
-                    buf = torch.empty(_total_numel, dtype=torch.bfloat16)
-                    _pinned = False
-                    try:
-                        buf = buf.pin_memory()
-                        _pinned = True
-                    except Exception:
-                        pass
-                    self._pinned_cpu_buf = buf
-                    self._cpu_buf_is_pinned = _pinned
-                    log.info(
-                        "Rank %d: pre-allocated CPU buffer: %d elements (%.2f GiB), pinned=%s",
-                        self.rank, _total_numel, _total_numel * 2 / 1024**3, _pinned,
-                    )
-                if _USE_D2H_STREAM and not hasattr(self, '_d2h_stream'):
-                    try:
-                        self._d2h_stream = torch.xpu.Stream(device=self._device)
-                        log.info("Rank %d: D2H XPU stream created", self.rank)
-                    except Exception as _e:
-                        self._d2h_stream = None
-                        log.info("Rank %d: D2H stream not available: %s", self.rank, _e)
-                _buf_offset = 0
-                _batch_start = 0
-
-            # EP expert streaming: all-gather EP-sharded slices across shard group,
-            # fuse per layer immediately to avoid accumulating 128-expert tensors on GPU.
-            # With ep_degree=8, each rank holds 16 experts; full model needs 128.
-            # Streaming fuse (gate+up+down → w13/w2 per layer) keeps GPU peak at ~1.4 GiB.
-            # _ep_deg already computed above (before pinned-buf allocation).
-            _ep_expert_re = re.compile(r"\.mlp\.experts\.(gate_proj|up_proj|down_proj)")
-            _ep_layer_re = re.compile(r"layers\.(\d+)\.")
-            if is_active and _ep_deg > 1 and _is_moe:
-                _ep_stream_buf: dict = {}  # layer_idx -> {proj -> bf16 tensor}
-
-            # WS6 opt-in: batch the 3 expert projections of each layer into a
-            # single all_gather_into_tensor on _shard_pg. Reduces wsync_gather
-            # collective count from 3*L to L (e.g. 144 → 48 for Qwen3-30B-A3B
-            # EP=16). Bit-exact equivalent — see
-            # tests/torchtune/dev/rl/test_ep_wsync_layer_batch_equivalence.py.
-            _LAYER_BATCH_AG = os.environ.get(
-                "TORCHTUNE_EP_WSYNC_LAYER_BATCH", "0") == "1"
-            _layer_batch_active = (
-                _LAYER_BATCH_AG and _ep_deg > 1 and _is_moe
-                and getattr(self, '_shard_pg', None) is not None
-            )
-            # Pending local shards keyed by layer_id (string). Populated on
-            # ALL ranks (both is_active and others) — the AG is a collective.
-            _lb_pending: dict = {} if _layer_batch_active else None
-            _lb_logged_engaged = False
-
-            # WS7 opt-in: replace AllGather with gather(dst=active_rank). Only
-            # the is_active rank consumes the full expert tensor; the other
-            # _ep_deg-1 ranks discard. AllGather pays N-way fan-out for 1-way
-            # consumption; gather sends N-1 shards into the root NIC for the
-            # same final bytes. Bit-exact equivalent — see
-            # tests/torchtune/dev/rl/test_ep_wsync_gather_root_equivalence.py.
-            _GATHER_ROOT = os.environ.get(
-                "TORCHTUNE_EP_WSYNC_GATHER_ROOT", "0") == "1"
-            _gather_root_active = (
-                _GATHER_ROOT and _ep_deg > 1 and _is_moe
-                and getattr(self, '_shard_pg', None) is not None
-            )
-            _gr_active_shard_rank = 0  # is_active rank == rank 0 of _shard_pg
-            _gr_logged_engaged = False
-
-            # WS8 opt-in: cast expert shards to fp8 (E4M3) with per-output-row
-            # scales before the per-projection AllGather, AllGather fp8+scale
-            # only, and decompress on the active rank back to bf16. Cuts wire
-            # bytes ~2× on _shard_pg (the ~70s wsync_gather floor at EP=16).
-            # Numerics: per-element err bounded by row_amax/4 (E4M3 has 3
-            # mantissa bits + per-row scaling). NOT bit-exact — do not enable
-            # this on workloads where rollouts are sensitive to weight noise
-            # without first running a KL-drift check.
-            #
-            # Scope: ONLY expert gate_proj/up_proj/down_proj. Norms, attention,
-            # router, embedding stay bf16 (per MoE_status_feedback.md §10).
-            # Mutually exclusive with WS6/WS7 below — they exit early on the
-            # expert path so this branch only triggers when LAYER_BATCH and
-            # GATHER_ROOT are both off.
-            #
-            # See tests/torchtune/dev/rl/test_ep_wsync_fp8_wire_equivalence.py
-            # for the round-trip + unshuffle pin-down.
-            _FP8_WIRE = os.environ.get(
-                "TORCHTUNE_EP_WSYNC_FP8_WIRE", "0") == "1"
-            _fp8_wire_active = (
-                _FP8_WIRE and _ep_deg > 1 and _is_moe
-                and getattr(self, '_shard_pg', None) is not None
-                and not _layer_batch_active and not _gather_root_active
-                and hasattr(torch, 'float8_e4m3fn')
-            )
-
-            # WS10 Commit B (opt-in): per-rank sharded broadcast.
-            # Each trainer EP rank R in [0..ep_d-1] broadcasts its OWN local
-            # expert shard direct to the vLLM root over a per-rank 2-rank
-            # cross-PG (`_xccl_wsync_sharded_pgs[R]`). The receiver assembles
-            # the global tensor via FusedMoE.expert_map. Skips the
-            # `_shard_pg` AllGather entirely on the expert path. Non-expert
-            # params (norms, attention, embedding, router) are sent only by
-            # rank 0 (no `trainer_ep_rank` tag → routed via R=0's PG on
-            # the receiver). Mutually exclusive with WS6/WS7/WS8.
-            # See docs/reports/MoE_EP_status_ws8_ws10_design.md §"WS10 Phase B+C".
-            _SHARDED_WIRE = os.environ.get(
-                "TORCHTUNE_EP_WSYNC_SHARDED", "0") == "1"
-            _ws10_pgs_dict = getattr(self, "_xccl_wsync_sharded_pgs", {}) or {}
-            _shard_rank_int = int(getattr(self, "_shard_rank", -1))
-            _sharded_active = (
-                _SHARDED_WIRE and _ep_deg > 1 and _is_moe
-                and getattr(self, '_shard_pg', None) is not None
-                and 0 <= _shard_rank_int < int(_ep_deg)
-                and _shard_rank_int in _ws10_pgs_dict
-                and not _layer_batch_active
-                and not _gather_root_active
-                and not _fp8_wire_active
-                # HSDP+EP would split trainer ranks into [0..ep_d-1]
-                # members and non-members; the non-members would fall
-                # through to the legacy AllGather path while the EP
-                # members early-return → deadlock. Single-replica EP only.
-                and getattr(self, '_dp_replicate', 1) <= 1
-            )
-            if (_SHARDED_WIRE and not _sharded_active and self.rank == 0
-                    and not getattr(self, "_ws10_skip_warned", False)):
-                if _layer_batch_active or _gather_root_active or _fp8_wire_active:
-                    log.warning(
-                        "Rank %d: TORCHTUNE_EP_WSYNC_SHARDED=1 requested but "
-                        "skipping (mutually exclusive with WS6=%s WS7=%s WS8=%s)",
-                        self.rank, _layer_batch_active,
-                        _gather_root_active, _fp8_wire_active,
-                    )
-                else:
-                    log.warning(
-                        "Rank %d: TORCHTUNE_EP_WSYNC_SHARDED=1 requested but "
-                        "skipping (ep_deg=%d, is_moe=%s, _shard_pg=%s, "
-                        "shard_rank=%d, ws10_pgs=%s)",
-                        self.rank, _ep_deg, _is_moe,
-                        getattr(self, '_shard_pg', None) is not None,
-                        _shard_rank_int, sorted(_ws10_pgs_dict.keys()),
-                    )
-                self._ws10_skip_warned = True
-            if _sharded_active and self.rank == 0 and not getattr(
-                    self, "_ws10_engaged_warned", False):
-                log.info(
-                    "Rank %d: WS10 sharded broadcast ENGAGED "
-                    "(ep_d=%d, sharded_method=%s, my_R=%d)",
-                    self.rank, _ep_deg,
-                    getattr(self, "_xccl_wsync_sharded_method", None),
-                    _shard_rank_int,
-                )
-                self._ws10_engaged_warned = True
-            if _FP8_WIRE and not _fp8_wire_active:
-                log.info(
-                    "Rank %d: TORCHTUNE_EP_WSYNC_FP8_WIRE=1 requested but "
-                    "skipping (ep_deg=%d, is_moe=%s, _shard_pg=%s, "
-                    "layer_batch=%s, gather_root=%s, e4m3=%s)",
-                    self.rank, _ep_deg, _is_moe,
-                    getattr(self, '_shard_pg', None) is not None,
-                    _layer_batch_active, _gather_root_active,
-                    hasattr(torch, 'float8_e4m3fn'),
-                )
-            _fp8_logged_engaged = False
-
-            if _sharded_active:
-                # WS10 Commit B sender path. ALL trainer ranks in [0..ep_d-1]
-                # participate (the non-expert .full_tensor() calls below are
-                # collectives on _shard_pg). Rank 0 uniquely stages the
-                # non-expert tail and POSTs the manifest.
-                _ws10_R = _shard_rank_int
-                _ws10_t0 = time.perf_counter()
-                _local_experts: dict = {}      # hf_name -> CPU bf16 tensor
-                _ws10_pending_proj: dict = {}  # layer_idx -> {gate/up/down: local_tensor (bf16, CPU)}
-                _ws10_non_expert_meta: list = []
-                _ws10_non_expert_cpu_parts: list = []
-                _ws10_non_expert_local_count = 0
-                _ws10_non_expert_full_count = 0
-
-                # First pass: walk sharded_sd. Expert params are kept local
-                # (no _shard_pg AllGather). Non-expert params still need
-                # global tensors (small) — call full_tensor() on ALL ranks
-                # (collective), but only rank 0 keeps the result.
-                for param_name, param in sharded_sd.items():
-                    if param.is_cpu:
-                        param = param.to(self._device)
-
-                    _cpn = param_name.replace(
-                        "_fsdp_wrapped_module.", "").replace(
-                        "_checkpoint_wrapped_module.", "")
-                    _is_expert = bool(_ep_expert_re.search(_cpn))
-
-                    if _is_expert:
-                        # Take the local shard ONLY — no AllGather over
-                        # _shard_pg. Each EP rank already owns its
-                        # interleaved n_local experts for this projection.
-                        if hasattr(param, "_local_tensor"):
-                            _loc = param._local_tensor
-                        else:
-                            _loc = param
-                        _loc_bf16 = _loc.to(torch.bfloat16).contiguous()
-                        # Stage to CPU now to keep GPU peak low.
-                        _loc_cpu = _loc_bf16.detach().cpu().contiguous()
-                        del _loc_bf16
-                        _m_lid = _ep_layer_re.search(_cpn)
-                        _m_proj = _ep_expert_re.search(_cpn)
-                        if _m_lid and _m_proj:
-                            _lid = int(_m_lid.group(1))
-                            _proj = _m_proj.group(1)
-                            _ws10_pending_proj.setdefault(_lid, {})[_proj] = _loc_cpu
-                            if len(_ws10_pending_proj[_lid]) == 3:
-                                _bundle = _ws10_pending_proj.pop(_lid)
-                                # Fuse gate+up -> w13 ALONG dim=1 (local
-                                # n_local rows preserved). Same convention
-                                # as fuse_experts_for_vllm. Then the local
-                                # shard for the layer's w13 has shape
-                                # [n_local, 2*intermediate_per_tp, hidden]
-                                # for gate/up (matches global shape with
-                                # n_local instead of total_experts).
-                                _w13_local = torch.cat(
-                                    [_bundle["gate_proj"], _bundle["up_proj"]],
-                                    dim=1).contiguous()
-                                _w2_local = _bundle["down_proj"].contiguous()
-                                _local_experts[
-                                    f"model.layers.{_lid}.mlp.experts.w13_weight"
-                                ] = _w13_local
-                                _local_experts[
-                                    f"model.layers.{_lid}.mlp.experts.w2_weight"
-                                ] = _w2_local
-                        del param, _loc, _loc_cpu
-                        continue
-
-                    # Non-expert: full_tensor() is a collective on _shard_pg —
-                    # ALL ranks must call. Rank 0 keeps it; others discard.
-                    if hasattr(param, "_local_tensor"):
-                        _ft0 = time.perf_counter()
-                        param = param.full_tensor()
-                        t_ft += time.perf_counter() - _ft0
-                    if _ws10_R == 0:
-                        _hf_name = _xccl_accept_and_rename(param_name)
-                        if _hf_name is None:
-                            del param
-                            continue
-                        _ne_bf = param.to(torch.bfloat16).contiguous()
-                        _ne_cpu = _ne_bf.detach().cpu()
-                        del _ne_bf
-                        _ws10_non_expert_meta.append({
-                            "name": _hf_name,
-                            "shape": list(_ne_cpu.shape),
-                            "numel": int(_ne_cpu.numel()),
-                        })
-                        _ws10_non_expert_cpu_parts.append(_ne_cpu.flatten())
-                        _ws10_non_expert_full_count += int(_ne_cpu.numel())
-                        del _ne_cpu
-                    del param
-
-                if _ws10_pending_proj:
-                    raise RuntimeError(
-                        f"WS10: rank {self.rank} has {len(_ws10_pending_proj)} "
-                        f"layer(s) with incomplete projections after staging: "
-                        f"{sorted(_ws10_pending_proj.keys())[:8]}"
-                    )
-
-                # Build per-rank payload via the shared helper.
-                _local_cpu_batches, _local_meta = _ws10_build_local_payload(
-                    _local_experts, _ws10_R, int(_ep_deg),
-                    batch_max_numel=_BATCH_MAX_NUMEL,
-                )
-                del _local_experts
-
-                # Rank 0 also appends its non-expert tail (no trainer_ep_rank
-                # tag in meta — receiver routes by absence). Keep them in
-                # rank 0's broadcast batches so they ride R=0's PG.
-                if _ws10_R == 0 and _ws10_non_expert_meta:
-                    # Reorder non-experts to match the receiver's unified
-                    # manifest order. The receiver sorts every entry with
-                    # _ws10_sort_key_by_rank, which places non-experts at
-                    # (R=0, layer_idx=10**9, kind_rank=9, name) — i.e.
-                    # lexicographic by name. The sender previously packed
-                    # in sharded_sd.items() walk order (module registration
-                    # order), so the greedy split landed at different byte
-                    # boundaries even though total bytes matched. That is
-                    # the run #7 wire size mismatch (1064400384 vs 622329856,
-                    # constant across runs because both orderings are
-                    # deterministic but different). Sort meta + the
-                    # parallel cpu_parts list by the same key, then pack.
-                    _ne_pairs = sorted(
-                        zip(_ws10_non_expert_meta, _ws10_non_expert_cpu_parts),
-                        key=lambda p: _ws10_sort_key_by_rank(p[0]),
-                    )
-                    _ws10_non_expert_meta = [p[0] for p in _ne_pairs]
-                    _ws10_non_expert_cpu_parts = [p[1] for p in _ne_pairs]
-                    _ne_flat = torch.cat(_ws10_non_expert_cpu_parts)
-                    # Greedy split same as expert batching.
-                    _cur_parts = []
-                    _cur_n = 0
-                    _ne_offset = 0
-                    for _ne_e in _ws10_non_expert_meta:
-                        _n = int(_ne_e["numel"])
-                        if _cur_n > 0 and _cur_n + _n > _BATCH_MAX_NUMEL:
-                            _local_cpu_batches.append(torch.cat(_cur_parts))
-                            _cur_parts = []
-                            _cur_n = 0
-                        _cur_parts.append(_ne_flat[_ne_offset:_ne_offset + _n])
-                        _cur_n += _n
-                        _ne_offset += _n
-                    if _cur_parts:
-                        _local_cpu_batches.append(torch.cat(_cur_parts))
-                    del _ne_flat
-                _ws10_non_expert_cpu_parts.clear()
-
-                # Mark this rank as the 'active' sender for sync-id bookkeeping.
-                # In WS10 every trainer EP rank in [0..ep_d-1] is its own sender;
-                # all of them set the done event/counters. Pool semantics differ.
-                self._sync_done_event.clear()
-                self._sync_error = None
-                self._sync_id_counter += 1
-                self._pending_sync_id = self._sync_id_counter
-
-                # Gather meta across all trainer EP ranks (object collective on
-                # the default PG — payload is small dict-of-dicts).
-                _per_rank_metas = [None] * int(_ep_deg)
-                # all_gather_object on _shard_pg (size = ep_d).
-                torch.distributed.all_gather_object(
-                    _per_rank_metas, _local_meta, group=self._shard_pg,
-                )
-                _meta_json = None
-                if _ws10_R == 0:
-                    # Merge non-expert tail INTO rank 0's per-rank slot
-                    # (the validator in _ws10_unify_manifests requires
-                    # len(per_rank_metas) == ep_degree). Mirrors the CPU
-                    # pin-down test in test_ws10_commitB_sender_manifest.
-                    _per_rank_metas_for_unify = list(_per_rank_metas)
-                    if _ws10_non_expert_meta and len(_per_rank_metas_for_unify) > 0:
-                        _r0_meta = list(_per_rank_metas_for_unify[0] or [])
-                        _r0_meta.extend(_ws10_non_expert_meta)
-                        _per_rank_metas_for_unify[0] = _r0_meta
-                    _unified = _ws10_unify_manifests(
-                        _per_rank_metas_for_unify,
-                        sort_key=_ws10_sort_key_by_rank,
-                    )
-                    pool_index = pool.index(self.rank) if pool else 0
-                    _meta_json = json.dumps({
-                        "tensors": _unified,
-                        "batch_max_numel": _BATCH_MAX_NUMEL,
-                        "sender_index": pool_index,
-                    })
-
-                if not self._production_mode:
-                    torch.distributed.barrier()
-                t_gather = time.perf_counter() - _ws10_t0
-
-                # Each rank stores its own (cpu_batches, per-rank PG list) for
-                # the deferred broadcast loop. The PG list has one entry per
-                # vLLM replica — every replica root gets the data and fans
-                # out to its TP workers via its existing intra PG.
-                # The 'sharded' flag distinguishes this from the legacy
-                # single-PG path.
-                _my_pgs = _ws10_pgs_dict[_ws10_R]
-                if not isinstance(_my_pgs, list):
-                    _my_pgs = [_my_pgs]
-                self._deferred_broadcast_args = (
-                    _local_cpu_batches,        # cpu_batches
-                    _meta_json,                # rank 0 only; other ranks None
-                    _local_meta,               # used for byte accounting
-                    _ws10_t0,                  # t0
-                    self._device,              # device
-                    _my_pgs,                   # pgs (one per replica)
-                    self._vllm_clients,        # only rank 0 will call them
-                    self._vllm_urls,           # only rank 0 will POST
-                    True,                      # _ws10_sharded marker
-                )
-
-                _total_gb = (sum(e["numel"] for e in _local_meta)
-                             + _ws10_non_expert_full_count) * 2 / 1024**3
-                log.info(
-                    "Rank %d: WS10 sharded gather done: %d expert entries "
-                    "(R=%d) + %d non-expert (rank0=%s) %.2f GiB local in "
-                    "%.1fs (no _shard_pg AllGather) — broadcast deferred",
-                    self.rank, len(_local_meta), _ws10_R,
-                    len(_ws10_non_expert_meta), _ws10_R == 0,
-                    _total_gb, t_gather,
-                )
-
-                self._wsync_round += 1
-                del sharded_sd
-                return
-
-            # Llama-family Q/K un-permute predicate, captured once outside the
-            # loop. See _maybe_unpermute_qk for invariant; applied per-param
-            # below at the point where `param` becomes the full tensor that
-            # vLLM consumes.
-            _unperm_needed_x = _needs_qk_unpermute(self)
-            if (
-                _unperm_needed_x
-                and is_active
-                and not getattr(self, "_qk_unperm_xccl_engaged_logged", False)
-            ):
-                log.info(
-                    "Rank %d: xccl wsync QK un-permute ENGAGED "
-                    "(n_heads=%s n_kv_heads=%s head_dim=%s)",
-                    self.rank,
-                    getattr(self, "_model_num_heads", None),
-                    getattr(self, "_model_num_kv_heads", None),
-                    getattr(self, "_model_head_dim", None),
-                )
-                self._qk_unperm_xccl_engaged_logged = True
-
-            for param_name, param in sharded_sd.items():
-                if param.is_cpu:
-                    param = param.to(self._device)
-
-                # WS6 layer-batched EP path: short-circuit expert params before
-                # the per-projection AG. Buffer locally; on the 3rd projection
-                # of a layer, emit one batched AG, slice, unshuffle, and hand
-                # each per-projection full tensor back to the existing fuse
-                # path via _ep_stream_buf (is_active only).
-                if _layer_batch_active:
-                    _lb_cpn = param_name.replace(
-                        "_fsdp_wrapped_module.", "").replace(
-                        "_checkpoint_wrapped_module.", "")
-                    _lb_m_proj = _ep_expert_re.search(_lb_cpn)
-                    _lb_m_lid = _ep_layer_re.search(_lb_cpn)
-                    if _lb_m_proj and _lb_m_lid:
-                        if hasattr(param, "_local_tensor"):
-                            _ft0 = time.perf_counter()
-                            param = param.full_tensor()
-                            t_ft += time.perf_counter() - _ft0
-                        _c0 = time.perf_counter()
-                        _lb_local = param.to(self._device).to(
-                            torch.bfloat16).contiguous()
-                        t_cast += time.perf_counter() - _c0
-                        _lb_proj = _lb_m_proj.group(1)
-                        _lb_lid = _lb_m_lid.group(1)
-                        # Resolve the hf-side param name once now so the
-                        # is_active fuse-path entry matches the per-projection
-                        # path bit-for-bit. Non-active ranks won't use it.
-                        _lb_hf = _xccl_accept_and_rename(param_name) if is_active else None
-                        _lb_pending.setdefault(_lb_lid, {})[_lb_proj] = (
-                            _lb_hf, _lb_local, tuple(_lb_local.shape))
-                        del param
-
-                        if len(_lb_pending[_lb_lid]) == 3:
-                            _bundle = _lb_pending.pop(_lb_lid)
-                            _g_hf, _g_loc, _g_sh = _bundle["gate_proj"]
-                            _u_hf, _u_loc, _u_sh = _bundle["up_proj"]
-                            _d_hf, _d_loc, _d_sh = _bundle["down_proj"]
-                            _n_g = _g_loc.numel()
-                            _n_u = _u_loc.numel()
-                            _n_d = _d_loc.numel()
-                            _local_cat = torch.cat([
-                                _g_loc.flatten(), _u_loc.flatten(), _d_loc.flatten()
-                            ])
-                            _cat_size = _local_cat.numel()
-                            if _gather_root_active:
-                                # WS7: gather(dst=active). Root materializes
-                                # _out_cat; other ranks send only their local.
-                                _shard_rank_lb = torch.distributed.get_rank(
-                                    self._shard_pg)
-                                if _shard_rank_lb == _gr_active_shard_rank:
-                                    _gather_list = [
-                                        torch.empty_like(_local_cat)
-                                        for _ in range(_ep_deg)
-                                    ]
-                                    torch.distributed.gather(
-                                        _local_cat, gather_list=_gather_list,
-                                        dst=_gr_active_shard_rank,
-                                        group=self._shard_pg)
-                                    _out_cat = torch.cat(_gather_list)
-                                    del _gather_list
-                                else:
-                                    torch.distributed.gather(
-                                        _local_cat, gather_list=None,
-                                        dst=_gr_active_shard_rank,
-                                        group=self._shard_pg)
-                                    _out_cat = None
-                                if not _gr_logged_engaged:
-                                    log.info(
-                                        "Rank %d: EP wsync layer-batched gather-to-root engaged",
-                                        self.rank)
-                                    _gr_logged_engaged = True
-                            else:
-                                _out_cat = torch.empty(
-                                    _ep_deg * _cat_size,
-                                    dtype=torch.bfloat16, device=self._device,
-                                )
-                                torch.distributed.all_gather_into_tensor(
-                                    _out_cat, _local_cat, group=self._shard_pg)
-                            del _local_cat, _g_loc, _u_loc, _d_loc
-
-                            if not _lb_logged_engaged:
-                                log.info(
-                                    "Rank %d: EP wsync layer-batched AG engaged "
-                                    "(3-proj per call)", self.rank)
-                                _lb_logged_engaged = True
-
-                            if is_active:
-                                # Slice each rank's chunk into per-projection
-                                # sub-tensors, then stack + interleave-unshuffle
-                                # — same final shape as the per-projection path.
-                                _g_parts, _u_parts, _d_parts = [], [], []
-                                for _r in range(_ep_deg):
-                                    _b = _r * _cat_size
-                                    _g_parts.append(
-                                        _out_cat[_b:_b + _n_g].reshape(_g_sh))
-                                    _u_parts.append(
-                                        _out_cat[_b + _n_g:_b + _n_g + _n_u].reshape(_u_sh))
-                                    _d_parts.append(
-                                        _out_cat[_b + _n_g + _n_u:_b + _n_g + _n_u + _n_d].reshape(_d_sh))
-                                for _hf, _parts in (
-                                    (_g_hf, _g_parts),
-                                    (_u_hf, _u_parts),
-                                    (_d_hf, _d_parts),
-                                ):
-                                    if _hf is None:
-                                        continue
-                                    _stk = torch.stack(_parts, dim=0)
-                                    _full = _stk.transpose(0, 1).reshape(
-                                        -1, *_stk.shape[2:]).contiguous()
-                                    del _stk
-                                    # Hand off to the existing _ep_stream_buf
-                                    # fuse path (mirrors the per-projection
-                                    # branch below). The fuse trigger fires on
-                                    # the 3rd projection identically.
-                                    _m_proj_full = _ep_expert_re.search(_hf)
-                                    _m_lid_full = _ep_layer_re.search(_hf)
-                                    if _m_proj_full and _m_lid_full:
-                                        _lid_full = _m_lid_full.group(1)
-                                        _ep_stream_buf.setdefault(
-                                            _lid_full, {})[_m_proj_full.group(1)] = _full
-                                        if len(_ep_stream_buf[_lid_full]) == 3:
-                                            _d_inner = _ep_stream_buf.pop(_lid_full)
-                                            _w13 = torch.cat(
-                                                [_d_inner["gate_proj"], _d_inner["up_proj"]], dim=1)
-                                            _w2 = _d_inner["down_proj"]
-                                            del _d_inner
-                                            for _fhname, _ftensor in [
-                                                (f"model.layers.{_lid_full}.mlp.experts.w13_weight", _w13),
-                                                (f"model.layers.{_lid_full}.mlp.experts.w2_weight", _w2),
-                                            ]:
-                                                _fpn = _ftensor.numel()
-                                                tensors_meta.append({
-                                                    "name": _fhname,
-                                                    "shape": list(_ftensor.shape),
-                                                    "numel": _fpn,
-                                                })
-                                                if _USE_PINNED_BUF:
-                                                    if batch_numel > 0 and batch_numel + _fpn > _BATCH_MAX_NUMEL:
-                                                        torch.xpu.synchronize()
-                                                        cpu_batches.append(
-                                                            self._pinned_cpu_buf[_batch_start:_buf_offset])
-                                                        _batch_start = _buf_offset
-                                                        batch_numel = 0
-                                                        n_batches += 1
-                                                    self._pinned_cpu_buf[_buf_offset:_buf_offset + _fpn].copy_(
-                                                        _ftensor.flatten(), non_blocking=True)
-                                                    _buf_offset += _fpn
-                                                else:
-                                                    _fcpu = _ftensor.flatten().cpu()
-                                                    if batch_numel > 0 and batch_numel + _fpn > _BATCH_MAX_NUMEL:
-                                                        cpu_batches.append(torch.cat(batch_parts_cpu))
-                                                        batch_parts_cpu = []
-                                                        batch_numel = 0
-                                                        n_batches += 1
-                                                    batch_parts_cpu.append(_fcpu)
-                                                batch_numel += _fpn
-                                                n_params += 1
-                                            del _w13, _w2
-                            del _out_cat
-                        continue  # expert param handled by layer-batch path
-
-                if hasattr(param, "_local_tensor"):
-                    _ft0 = time.perf_counter()
-                    param = param.full_tensor()
-                    t_ft += time.perf_counter() - _ft0
-                # EP expert all-gather: each rank holds an interleaved slice of experts
-                # (rank r owns global experts r, r+ep_d, r+2*ep_d, …).  Gather all slices
-                # so the active sender has the full expert tensor.  Collective: all ranks
-                # participate regardless of is_active.
-                _ep_is_expert = False
-                if _ep_deg > 1 and _is_moe and getattr(self, '_shard_pg', None) is not None:
-                    _cpn = param_name.replace("_fsdp_wrapped_module.", "").replace(
-                        "_checkpoint_wrapped_module.", "")
-                    if _ep_expert_re.search(_cpn):
-                        _ep_is_expert = True
-                        _ep_local_t = param.to(self._device).contiguous()
-                        if _gather_root_active:
-                            # WS7: gather(dst=active). Root reassembles from
-                            # _ep_deg shards; non-root ranks just send.
-                            _shard_rank_pp = torch.distributed.get_rank(
-                                self._shard_pg)
-                            if _shard_rank_pp == _gr_active_shard_rank:
-                                _ep_parts_t = [
-                                    torch.empty_like(_ep_local_t)
-                                    for _ in range(_ep_deg)
-                                ]
-                                torch.distributed.gather(
-                                    _ep_local_t, gather_list=_ep_parts_t,
-                                    dst=_gr_active_shard_rank,
-                                    group=self._shard_pg)
-                                _ep_stk = torch.stack(_ep_parts_t, dim=0)
-                                param = _ep_stk.transpose(0, 1).reshape(
-                                    -1, *_ep_stk.shape[2:]).contiguous()
-                                del _ep_stk, _ep_parts_t
-                            else:
-                                torch.distributed.gather(
-                                    _ep_local_t, gather_list=None,
-                                    dst=_gr_active_shard_rank,
-                                    group=self._shard_pg)
-                            if not _gr_logged_engaged:
-                                log.info(
-                                    "Rank %d: EP wsync per-proj gather-to-root engaged",
-                                    self.rank)
-                                _gr_logged_engaged = True
-                        elif _fp8_wire_active:
-                            # WS8: cast local shard to E4M3 with per-row
-                            # scale, AllGather fp8 + scale, decompress on
-                            # active rank. Reduces wire bytes ~2× on
-                            # _shard_pg vs the bf16 baseline below.
-                            _ep_local_bf = _ep_local_t.to(torch.bfloat16)
-                            _ep_local_f32 = _ep_local_bf.to(torch.float32)
-                            # Per-output-row scaling (last dim is the
-                            # row dim for both gate/up [E, I, H] and down
-                            # [E, H, I]; the row whose error matters is
-                            # the GEMM input dim).
-                            _row_amax = _ep_local_f32.abs().amax(
-                                dim=-1, keepdim=True)
-                            _scale_local = (_row_amax / 448.0).clamp(min=1e-12)
-                            _ep_local_fp8 = (
-                                (_ep_local_f32 / _scale_local).clamp(-448.0, 448.0)
-                                .to(torch.float8_e4m3fn).contiguous())
-                            del _ep_local_bf, _ep_local_f32
-                            _scale_local_f32 = _scale_local.to(torch.float32).contiguous()
-                            del _scale_local
-
-                            # all_gather_into_tensor (single persistent flat
-                            # output buffer) instead of list-style all_gather.
-                            # The list path triggers ProcessGroupXCCL's hidden
-                            # newLikeFlat() temp, which leaks under
-                            # torch.xpu.empty_cache() (Aurora #143 /
-                            # torch-xpu-ops #3744). Bit-exact equivalent.
-                            _local_fp8 = _ep_local_fp8.contiguous()
-                            _local_sc = _scale_local_f32.contiguous()
-                            _out_fp8_cat = torch.empty(
-                                _ep_deg * _local_fp8.shape[0],
-                                *_local_fp8.shape[1:],
-                                dtype=_local_fp8.dtype,
-                                device=_local_fp8.device)
-                            _out_sc_cat = torch.empty(
-                                _ep_deg * _local_sc.shape[0],
-                                *_local_sc.shape[1:],
-                                dtype=_local_sc.dtype,
-                                device=_local_sc.device)
-                            torch.distributed.all_gather_into_tensor(
-                                _out_fp8_cat, _local_fp8,
-                                group=self._shard_pg)
-                            torch.distributed.all_gather_into_tensor(
-                                _out_sc_cat, _local_sc,
-                                group=self._shard_pg)
-                            del _ep_local_fp8, _scale_local_f32, _local_fp8, _local_sc
-                            if is_active:
-                                # Reshape concatenated buffer to
-                                # [ep_d, n_local, ...] — same layout the old
-                                # torch.stack(list, dim=0) produced.
-                                _n_local_fp8 = _out_fp8_cat.shape[0] // _ep_deg
-                                _n_local_sc = _out_sc_cat.shape[0] // _ep_deg
-                                _fp8_view = _out_fp8_cat.view(
-                                    _ep_deg, _n_local_fp8,
-                                    *_out_fp8_cat.shape[1:])
-                                _sc_view = _out_sc_cat.view(
-                                    _ep_deg, _n_local_sc,
-                                    *_out_sc_cat.shape[1:])
-                                # Per-rank dequantize (shape preserved),
-                                # then unshuffle identically to bf16 path.
-                                _bf16_parts = []
-                                for _r in range(_ep_deg):
-                                    _bf16_parts.append(
-                                        (_fp8_view[_r].to(torch.float32)
-                                         * _sc_view[_r])
-                                        .to(torch.bfloat16))
-                                _ep_stk = torch.stack(_bf16_parts, dim=0)
-                                param = _ep_stk.transpose(0, 1).reshape(
-                                    -1, *_ep_stk.shape[2:]).contiguous()
-                                del _ep_stk, _bf16_parts, _fp8_view, _sc_view
-                            del _out_fp8_cat, _out_sc_cat
-                            if not _fp8_logged_engaged:
-                                log.info(
-                                    "Rank %d: EP wsync per-proj fp8 wire engaged "
-                                    "(local bytes %d → %d + %d scale)",
-                                    self.rank,
-                                    _ep_local_t.numel() * _ep_local_t.element_size(),
-                                    _ep_local_t.numel() * 1,
-                                    int(_row_amax.numel() * 4),
-                                )
-                                _fp8_logged_engaged = True
-                        else:
-                            # all_gather_into_tensor (single persistent flat
-                            # output buffer) instead of list-style all_gather.
-                            # The list path triggers ProcessGroupXCCL's hidden
-                            # newLikeFlat() temp, which leaks under
-                            # torch.xpu.empty_cache() (Aurora #143 /
-                            # torch-xpu-ops #3744). Bit-exact equivalent of
-                            # the previous torch.stack(list, 0) layout.
-                            _local_c = _ep_local_t.contiguous()
-                            _out_cat = torch.empty(
-                                _ep_deg * _local_c.shape[0],
-                                *_local_c.shape[1:],
-                                dtype=_local_c.dtype,
-                                device=_local_c.device)
-                            torch.distributed.all_gather_into_tensor(
-                                _out_cat, _local_c, group=self._shard_pg)
-                            if is_active:
-                                # Reshape [ep_d * n_local, ...] to
-                                # [ep_d, n_local, ...] (same layout as
-                                # torch.stack(list, dim=0)), then unshuffle:
-                                # transpose → [n_local, ep_d, ...] → reshape →
-                                # [total_experts, ...]
-                                _n_local = _out_cat.shape[0] // _ep_deg
-                                _ep_stk = _out_cat.view(
-                                    _ep_deg, _n_local, *_out_cat.shape[1:])
-                                param = _ep_stk.transpose(0, 1).reshape(
-                                    -1, *_ep_stk.shape[2:]).contiguous()
-                                del _ep_stk
-                            del _out_cat, _local_c
-                        del _ep_local_t
-                if is_active:
-                    hf_name = _xccl_accept_and_rename(param_name)
-                    if hf_name is None:
-                        del param
-                        continue
-                    # Llama-family Q/K un-permute: torchtune permutes Q/K at
-                    # checkpoint load (convert_weights.hf_to_tune); vLLM expects
-                    # HF-format unpermuted Q/K. Without this, server-mode XCCL
-                    # wsync silently scrambles Q/K projections on every sync
-                    # (mirrors the colocate fix landed 2026-06-11). Bug latent
-                    # since this xccl path was added — Qwen/Gemma never tripped
-                    # it (they don't permute), AGPT-2B is the first Llama-family
-                    # server-mode GRPO target.
-                    if _unperm_needed_x:
-                        param = _maybe_unpermute_qk(self, hf_name, param)
-                    _c0 = time.perf_counter()
-                    gpu_tensor = param.to(torch.bfloat16).contiguous()
-                    t_cast += time.perf_counter() - _c0
-                    if _ep_is_expert:
-                        # Streaming EP fuse: accumulate gate/up/down per layer; fuse+stage
-                        # to CPU when all 3 projections for a layer have arrived.  Keeps GPU
-                        # peak at ~3 expert tensors instead of 48 layers × 128 experts.
-                        _m_proj = _ep_expert_re.search(hf_name)
-                        _m_lid = _ep_layer_re.search(hf_name)
-                        if _m_proj and _m_lid:
-                            _lid = _m_lid.group(1)
-                            _ep_stream_buf.setdefault(_lid, {})[_m_proj.group(1)] = gpu_tensor
-                            if len(_ep_stream_buf[_lid]) == 3:
-                                _d = _ep_stream_buf.pop(_lid)
-                                _w13 = torch.cat([_d["gate_proj"], _d["up_proj"]], dim=1)
-                                _w2 = _d["down_proj"]
-                                del _d
-                                for _fhname, _ftensor in [
-                                    (f"model.layers.{_lid}.mlp.experts.w13_weight", _w13),
-                                    (f"model.layers.{_lid}.mlp.experts.w2_weight", _w2),
-                                ]:
-                                    _fpn = _ftensor.numel()
-                                    tensors_meta.append({
-                                        "name": _fhname,
-                                        "shape": list(_ftensor.shape),
-                                        "numel": _fpn,
-                                    })
-                                    if _USE_PINNED_BUF:
-                                        if batch_numel > 0 and batch_numel + _fpn > _BATCH_MAX_NUMEL:
-                                            torch.xpu.synchronize()
-                                            cpu_batches.append(
-                                                self._pinned_cpu_buf[_batch_start:_buf_offset])
-                                            _batch_start = _buf_offset
-                                            batch_numel = 0
-                                            n_batches += 1
-                                        self._pinned_cpu_buf[_buf_offset:_buf_offset + _fpn].copy_(
-                                            _ftensor.flatten(), non_blocking=True)
-                                        _buf_offset += _fpn
-                                    else:
-                                        _fcpu = _ftensor.flatten().cpu()
-                                        if batch_numel > 0 and batch_numel + _fpn > _BATCH_MAX_NUMEL:
-                                            cpu_batches.append(torch.cat(batch_parts_cpu))
-                                            batch_parts_cpu = []
-                                            batch_numel = 0
-                                            n_batches += 1
-                                        batch_parts_cpu.append(_fcpu)
-                                    batch_numel += _fpn
-                                    n_params += 1
-                                del _w13, _w2
-                        del param  # gpu_tensor stays alive in _ep_stream_buf if layer incomplete
-                        continue   # skip normal staging path; outer del param already done
-                    # For MoE, non-expert params go to hf_state_dict and are
-                    # added to tensors_meta + cpu_batches after fuse_experts_for_vllm.
-                    # Adding to tensors_meta here would duplicate every non-expert
-                    # entry for EP mode (which appends rather than resets tensors_meta),
-                    # causing tensors_meta (966) vs cpu_batches (531) desync → n_expert_ready=0.
-                    # Non-EP mode resets tensors_meta at line 1882, so the duplicate
-                    # is discarded anyway — skip for clarity.
-                    if not _is_moe:
-                        tensors_meta.append({
-                            "name": hf_name,
-                            "shape": list(gpu_tensor.shape),
-                            "numel": gpu_tensor.numel(),
-                        })
-                    if _is_moe:
-                        hf_state_dict[hf_name] = gpu_tensor
-                    elif _USE_PINNED_BUF:
-                        pn = gpu_tensor.numel()
-                        if batch_numel > 0 and batch_numel + pn > _BATCH_MAX_NUMEL:
-                            torch.xpu.synchronize()
-                            cpu_batches.append(self._pinned_cpu_buf[_batch_start:_buf_offset])
-                            _batch_start = _buf_offset
-                            batch_numel = 0
-                            n_batches += 1
-                        _d2h0 = time.perf_counter()
-                        if _USE_D2H_STREAM and hasattr(self, '_d2h_stream') and self._d2h_stream is not None:
-                            _ev = torch.xpu.Event()
-                            _ev.record()
-                            with torch.xpu.stream(self._d2h_stream):
-                                _ev.wait()
-                                self._pinned_cpu_buf[_buf_offset:_buf_offset + pn].copy_(
-                                    gpu_tensor.flatten(), non_blocking=True)
-                        else:
-                            self._pinned_cpu_buf[_buf_offset:_buf_offset + pn].copy_(
-                                gpu_tensor.flatten(), non_blocking=True)
-                        t_d2h += time.perf_counter() - _d2h0
-                        _buf_offset += pn
-                        del gpu_tensor
-                        batch_numel += pn
-                        n_params += 1
-                    else:
-                        pn = gpu_tensor.numel()
-                        _d2h0 = time.perf_counter()
-                        cpu_tensor = gpu_tensor.flatten().cpu()
-                        t_d2h += time.perf_counter() - _d2h0
-                        del gpu_tensor
-                        if batch_numel > 0 and batch_numel + pn > _BATCH_MAX_NUMEL:
-                            cpu_batches.append(torch.cat(batch_parts_cpu))
-                            batch_parts_cpu = []
-                            batch_numel = 0
-                            n_batches += 1
-                        batch_parts_cpu.append(cpu_tensor)
-                        batch_numel += pn
-                        n_params += 1
-                del param
-
-            # WS6: sanity check that no layer-batched expert pairs are
-            # dangling. If they are, a layer didn't have all 3 projections
-            # in sharded_sd (unexpected for Qwen3-30B-A3B; would silently
-            # drop weights from the wsync round).
-            if _layer_batch_active and _lb_pending:
-                _dangling = sorted(_lb_pending.keys())
-                raise RuntimeError(
-                    f"EP wsync layer-batch path: {len(_dangling)} layer(s) had "
-                    f"incomplete projection set after param loop: {_dangling[:8]}. "
-                    "This means the model state_dict is missing one of "
-                    "{gate_proj, up_proj, down_proj} for those layers."
-                )
-
-            if is_active:
-                if _is_moe:
-                    from torchtune.models.qwen3_moe._convert_weights import fuse_experts_for_vllm
-                    if _ep_deg > 1:
-                        # EP mode: expert params already streamed + fused above (tensors_meta
-                        # already has w13/w2 entries).  hf_state_dict has only non-expert
-                        # params (attention, norms, embeddings).  Pass through fuse (no-op
-                        # for non-expert keys) and APPEND — do NOT reset tensors_meta.
-                        hf_state_dict = fuse_experts_for_vllm(hf_state_dict)
-                        for hf_name, tensor in hf_state_dict.items():
-                            pn = tensor.numel()
-                            tensors_meta.append({
-                                "name": hf_name,
-                                "shape": list(tensor.shape),
-                                "numel": pn,
-                            })
-                            if _USE_PINNED_BUF:
-                                if batch_numel > 0 and batch_numel + pn > _BATCH_MAX_NUMEL:
-                                    torch.xpu.synchronize()
-                                    cpu_batches.append(
-                                        self._pinned_cpu_buf[_batch_start:_buf_offset])
-                                    _batch_start = _buf_offset
-                                    batch_numel = 0
-                                    n_batches += 1
-                                self._pinned_cpu_buf[_buf_offset:_buf_offset + pn].copy_(
-                                    tensor.flatten(), non_blocking=True)
-                                _buf_offset += pn
-                            else:
-                                cpu_tensor = tensor.flatten().cpu()
-                                if batch_numel > 0 and batch_numel + pn > _BATCH_MAX_NUMEL:
-                                    cpu_batches.append(torch.cat(batch_parts_cpu))
-                                    batch_parts_cpu = []
-                                    batch_numel = 0
-                                    n_batches += 1
-                                batch_parts_cpu.append(cpu_tensor)
-                            batch_numel += pn
-                            n_params += 1
-                        del hf_state_dict
-                    else:
-                        # Non-EP MoE: fuse all experts, reset tensors_meta from fused output.
-                        hf_state_dict = fuse_experts_for_vllm(hf_state_dict)
-                        tensors_meta = []
-                        for hf_name, tensor in hf_state_dict.items():
-                            tensors_meta.append({
-                                "name": hf_name,
-                                "shape": list(tensor.shape),
-                                "numel": tensor.numel(),
-                            })
-                            pn = tensor.numel()
-                            if _USE_PINNED_BUF:
-                                if batch_numel > 0 and batch_numel + pn > _BATCH_MAX_NUMEL:
-                                    torch.xpu.synchronize()
-                                    cpu_batches.append(
-                                        self._pinned_cpu_buf[_batch_start:_buf_offset])
-                                    _batch_start = _buf_offset
-                                    batch_numel = 0
-                                    n_batches += 1
-                                _d2h0 = time.perf_counter()
-                                self._pinned_cpu_buf[_buf_offset:_buf_offset + pn].copy_(
-                                    tensor.flatten(), non_blocking=True)
-                                t_d2h += time.perf_counter() - _d2h0
-                                _buf_offset += pn
-                            else:
-                                cpu_tensor = tensor.flatten().cpu()
-                                if batch_numel > 0 and batch_numel + pn > _BATCH_MAX_NUMEL:
-                                    cpu_batches.append(torch.cat(batch_parts_cpu))
-                                    batch_parts_cpu = []
-                                    batch_numel = 0
-                                    n_batches += 1
-                                batch_parts_cpu.append(cpu_tensor)
-                            batch_numel += pn
-                            n_params += 1
-                        del hf_state_dict
-
-                if _USE_PINNED_BUF:
-                    if batch_numel > 0:
-                        if _USE_D2H_STREAM and hasattr(self, '_d2h_stream') and self._d2h_stream is not None:
-                            self._d2h_stream.synchronize()
-                        else:
-                            torch.xpu.synchronize()
-                        cpu_batches.append(self._pinned_cpu_buf[_batch_start:_buf_offset])
-                        n_batches += 1
-                else:
-                    if batch_parts_cpu:
-                        cpu_batches.append(torch.cat(batch_parts_cpu))
-                        batch_parts_cpu = []
-                        n_batches += 1
-
-                pool_index = pool.index(self.rank) if pool else 0
-                meta_json = json.dumps({
-                    "tensors": tensors_meta,
-                    "batch_max_numel": _BATCH_MAX_NUMEL,
-                    "sender_index": pool_index,
-                })
-
-        del sharded_sd
-
-        if not self._production_mode:
-            torch.distributed.barrier()
-        t_gather = time.perf_counter() - t0
-
-        if is_active:
-            if _USE_BATCHED_AG:
-                # Batched-AG mode (BROKEN, kept for reference): sync path
-                for mt in manifest_threads:
-                    mt.join(timeout=600)
-                if post_errors:
-                    log.error("Rank %d: XCCL streaming sync errors: %s", self.rank, post_errors)
-                    self._sync_error = RuntimeError(str(post_errors))
-                for client in self._vllm_clients:
-                    client.reset_prefix_cache()
-                log.info(
-                    "Rank %d: XCCL batched-AG sync: %d params %d batches in %.1fs "
-                    "(ag=%.1fs bcast=%.1fs)",
-                    self.rank, n_params, n_batches,
-                    time.perf_counter() - t0, t_ag, t_bcast,
-                )
-                self._sync_done_event.set()
-            else:
-                # Mode 0 async: defer broadcast to after generation completes.
-                _cross_pgs = [self._my_cross_pg] if pool else getattr(self, '_xccl_wsync_pgs', [self._xccl_wsync_pg])
-                total_gb = sum(e["numel"] for e in tensors_meta) * 2 / 1024**3
-                _buf_info = ""
-                if _USE_PINNED_BUF:
-                    _buf_info = (
-                        f", pinned={getattr(self, '_cpu_buf_is_pinned', False)}"
-                        f", d2h_stream={_USE_D2H_STREAM and getattr(self, '_d2h_stream', None) is not None}"
-                    )
-                log.info(
-                    "Rank %d: XCCL async gather done: %d params %d batches %.2f GiB "
-                    "staged to CPU in %.1fs (ft=%.1fs cast=%.1fs d2h=%.1fs%s), "
-                    "broadcast deferred to post-gen (sender pool round %d)",
-                    self.rank, n_params, n_batches, total_gb, t_gather,
-                    t_ft, t_cast, t_d2h, _buf_info,
-                    self._wsync_round,
-                )
-                self._deferred_broadcast_args = (
-                    cpu_batches, meta_json,
-                    tensors_meta, t0, self._device,
-                    _cross_pgs, self._vllm_clients,
-                    self._vllm_urls,
-                )
-
-        self._wsync_round += 1
+        self._xccl_gather_and_stage_fsdp2(is_active, pool, _xccl_accept_and_rename, t0)
 
 def _sync_weights_to_vllm_shm(self) -> None:
     """Gather sharded params then async-dispatch to vLLM via POSIX shared memory.
