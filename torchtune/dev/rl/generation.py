@@ -24,7 +24,9 @@ from tqdm.auto import trange
 #   1. The `return_logits` argument - we can optionally omit keeping track of logits during generation, which
 #        drastically improves generation speed.
 #   2. Stop token-based breaking now communicates across multiple devices in a distributed setting.
-# TODO: Figure out the right abstractions to be used in the main repository, and remove this function.
+# NOTE: XPU/GRPO fork of torchtune.generation.generate (adds optional logit
+# retention + distributed stop-token sync). Kept local to this Aurora fork; not
+# planned for upstream.
 @torch.no_grad()
 def generate(
     model: TransformerDecoder,

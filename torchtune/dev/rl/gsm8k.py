@@ -11,7 +11,6 @@ from torchtune.modules.tokenizers import ModelTokenizer
 
 from .data import ReasoningProblem, RLDataset
 
-# TODO: dedup this between here and _rl
 PREAMBLE_PROMPT = (
     "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. "
     "The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. "
