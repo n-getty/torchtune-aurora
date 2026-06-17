@@ -2633,92 +2633,25 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         """Single-generator vLLM HTTP round-trip (rank 0, or each replica's
         shard-leader under HSDP). No collectives — safe from a producer thread.
         Caller is responsible for broadcasting the result to other ranks (see
-        :meth:`_broadcast_query_responses`). All generators share the same
-        ``_vllm_clients`` pool and fan their prompts across it round-robin.
+        :meth:`_broadcast_query_responses`). Delegates to the shared
+        ``vllm_http_generate`` helper so the dense and LoRA recipes stay in sync.
         """
-        bsz = batch_input_ids.shape[0]
-        total_len = context_length + self._max_generated_tokens
-        # Strip padding and convert to Python lists for HTTP.
-        # Truncate to vllm_max_model_len - max_generated_tokens.
-        max_prompt_len = self._vllm_max_model_len - self._max_generated_tokens
-        prompts = []
-        for i in range(bsz):
-            ids = batch_input_ids[i].cpu().tolist()
-            ids = [t for t in ids if t != self._tokenizer.pad_id]
-            prompts.append(ids[-max_prompt_len:] if len(ids) > max_prompt_len else ids)
+        from torchtune.dev.rl.vllm_client import vllm_http_generate
 
-        gen_kwargs = dict(
-            n=1,  # prompts already expanded by grpo_samples
-            max_tokens=self._max_generated_tokens,
+        return vllm_http_generate(
+            batch_input_ids,
+            context_length,
+            vllm_clients=self._vllm_clients,
+            pad_id=self._tokenizer.pad_id,
+            eos_id=self._tokenizer.eos_id,
+            max_generated_tokens=self._max_generated_tokens,
+            vllm_max_model_len=self._vllm_max_model_len,
             temperature=self._temperature,
-            top_k=self._top_k or 0,
+            top_k=self._top_k,
+            stop_token_ids=self._stop_token_ids,
+            stop_strings=self._stop_strings,
+            device=self._device,
         )
-        # Forward stop tokens to vLLM so generation actually halts at EOS
-        # instead of running to max_tokens every step. Without this, vLLM
-        # only knows the model-config default EOS, missing extras the
-        # tokenizer's stop_tokens list adds (e.g. multiple EOS-equivalents).
-        if self._stop_token_ids is not None and self._stop_token_ids.numel() > 0:
-            gen_kwargs["stop_token_ids"] = self._stop_token_ids.cpu().tolist()
-        # Raw pretraining checkpoints never naturally emit EOS — string stops
-        # like ``</answer>`` and ``User:`` are the only learnable termination
-        # signal. Only forwarded when the YAML config sets ``stop_strings``.
-        if self._stop_strings:
-            gen_kwargs["stop"] = list(self._stop_strings)
-
-        t0 = time.perf_counter()
-        num_clients = len(self._vllm_clients)
-        if num_clients > 1:
-            from concurrent.futures import ThreadPoolExecutor, as_completed
-            chunks = [prompts[i::num_clients] for i in range(num_clients)]
-
-            def _call_vllm(client, chunk):
-                return client.generate(prompts=chunk, **gen_kwargs) if chunk else []
-
-            with ThreadPoolExecutor(max_workers=num_clients) as pool:
-                futures = {
-                    pool.submit(_call_vllm, client, chunk): idx
-                    for idx, (client, chunk) in enumerate(zip(self._vllm_clients, chunks))
-                }
-                chunk_results = [None] * num_clients
-                for future in as_completed(futures):
-                    idx = futures[future]
-                    chunk_results[idx] = future.result()
-
-            completions = [None] * bsz
-            for i in range(bsz):
-                client_idx = i % num_clients
-                within_idx = i // num_clients
-                completions[i] = chunk_results[client_idx][within_idx]
-        else:
-            completions = self._vllm_client.generate(prompts=prompts, **gen_kwargs)
-        gen_time = time.perf_counter() - t0
-
-        query_responses = batch_input_ids.new_full((bsz, total_len), self._tokenizer.pad_id)
-        query_responses[:, :context_length] = batch_input_ids
-        # When vLLM stops on a string (e.g. ``</answer>`` for AGPT-2B), the
-        # returned tokens do NOT include any model EOS. Downstream metrics
-        # (``response_lengths``, ``num_stop_tokens``) and the truncation in
-        # :func:`rlhf.truncate_sequence_at_first_stop_token` rely on finding
-        # a token from ``self._stop_token_ids`` in the tensor — without one,
-        # every completion looks like it ran to max_tokens. Inject a single
-        # EOS at the first pad position after the actual generated tokens so
-        # the truncation logic finds the real boundary. No-op when the
-        # completion already contains EOS or filled max_generated_tokens.
-        eos_id = self._tokenizer.eos_id
-        for i, comp in enumerate(completions):
-            length = min(len(comp), self._max_generated_tokens)
-            query_responses[i, context_length : context_length + length] = torch.tensor(
-                comp[:length], dtype=batch_input_ids.dtype, device=self._device
-            )
-            if eos_id is not None and length < self._max_generated_tokens:
-                query_responses[i, context_length + length] = eos_id
-
-        total_tokens = sum(len(c) for c in completions)
-        log.info(
-            "Rank %d: vLLM generation: %d sequences (%d clients), %d tokens in %.1fs (%.1f tok/s)",
-            self.rank, bsz, num_clients, total_tokens, gen_time, total_tokens / max(gen_time, 0.01),
-        )
-        return query_responses
 
     def _generate_with_ray_colocate_vllm(
         self,

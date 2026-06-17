@@ -251,9 +251,20 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
         else:
             self._vllm_urls = []
         self._vllm_group_port = cfg.get("vllm_group_port", 51216)
+        # Single-replicate defaults for the shared _setup_vllm_server_mode helper
+        # (vllm_backend.py). That helper grew HSDP attribute reads in 8b5f0f3f
+        # (_dp_replicate / _is_shard_leader); this fork is server-mode,
+        # single-replicate only and never set them, so setup() crashed with
+        # AttributeError. Pin the non-HSDP values the base recipe uses on its
+        # single-replicate path (data_parallel_replicate_dim=1).
+        self._dp_replicate = 1
+        self._is_shard_leader = self._is_rank_zero
         # vllm_weight_sync must be False for LoRA recipe (different sync path)
         self._vllm_weight_sync = False
         self._vllm_max_model_len = cfg.get("vllm_max_model_len", 2048)
+        # Stop strings forwarded to vLLM for raw checkpoints that never emit EOS
+        # (e.g. </answer>). Consumed by the shared vllm_http_generate helper.
+        self._stop_strings = cfg.get("stop_strings", None)
         self._vllm_clients = []
         self._vllm_client = None
 
@@ -1244,57 +1255,30 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
         batch_input_ids: torch.Tensor,
         context_length: int,
     ) -> torch.Tensor:
-        """Rank-0-only vLLM HTTP round-trip (mirrors base recipe implementation)."""
-        bsz = batch_input_ids.shape[0]
-        total_len = context_length + self._max_generated_tokens
+        """Rank-0-only vLLM HTTP round-trip.
 
-        prompts = []
-        for i in range(bsz):
-            ids = batch_input_ids[i].cpu().tolist()
-            ids = [t for t in ids if t != self._tokenizer.pad_id]
-            prompts.append(ids)
+        Delegates to the shared ``vllm_http_generate`` helper so this recipe
+        gets the same prompt-truncation, stop-token/stop-string forwarding, and
+        EOS-injection behavior as the dense GRPO recipe (previously this fork's
+        inline copy was missing all three — a silent learning-signal gap for
+        raw checkpoints, mirroring the AGPT-2B Stage-1 fix).
+        """
+        from torchtune.dev.rl.vllm_client import vllm_http_generate
 
-        gen_kwargs = dict(
-            n=1,
-            max_tokens=self._max_generated_tokens,
+        return vllm_http_generate(
+            batch_input_ids,
+            context_length,
+            vllm_clients=self._vllm_clients,
+            pad_id=self._tokenizer.pad_id,
+            eos_id=self._tokenizer.eos_id,
+            max_generated_tokens=self._max_generated_tokens,
+            vllm_max_model_len=self._vllm_max_model_len,
             temperature=self._temperature,
-            top_k=self._top_k or 0,
+            top_k=self._top_k,
+            stop_token_ids=getattr(self, "_stop_token_ids", None),
+            stop_strings=getattr(self, "_stop_strings", None),
+            device=self._device,
         )
-
-        t0 = time.perf_counter()
-        num_clients = len(self._vllm_clients)
-        if num_clients > 1:
-            chunks = [prompts[i::num_clients] for i in range(num_clients)]
-
-            def _call(client, chunk):
-                return client.generate(prompts=chunk, **gen_kwargs) if chunk else []
-
-            with ThreadPoolExecutor(max_workers=num_clients) as pool:
-                futures = {
-                    pool.submit(_call, client, chunk): idx
-                    for idx, (client, chunk) in enumerate(zip(self._vllm_clients, chunks))
-                }
-                chunk_results = [None] * num_clients
-                for future in as_completed(futures):
-                    idx = futures[future]
-                    chunk_results[idx] = future.result()
-
-            completions = [None] * bsz
-            for i in range(bsz):
-                completions[i] = chunk_results[i % num_clients][i // num_clients]
-        else:
-            completions = self._vllm_client.generate(prompts=prompts, **gen_kwargs)
-
-        log.info("Rank 0: vLLM generate %.1fs (%d prompts)", time.perf_counter() - t0, bsz)
-
-        query_responses = batch_input_ids.new_full((bsz, total_len), self._tokenizer.pad_id)
-        query_responses[:, :context_length] = batch_input_ids
-        for i, comp in enumerate(completions):
-            length = min(len(comp), self._max_generated_tokens)
-            query_responses[i, context_length : context_length + length] = torch.tensor(
-                comp[:length], dtype=batch_input_ids.dtype
-            )
-        return query_responses
 
     def _broadcast_query_responses(self, query_responses: torch.Tensor) -> torch.Tensor:
         """Broadcast rank-0's query_responses to all ranks."""

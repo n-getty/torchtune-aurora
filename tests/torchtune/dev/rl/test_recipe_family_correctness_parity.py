@@ -30,6 +30,7 @@ Implementation: pure source/AST inspection. No torch, no XPU, no device init.
 from __future__ import annotations
 
 import ast
+import re
 from pathlib import Path
 
 import pytest
@@ -154,6 +155,47 @@ def test_lora_grpo_specifically_has_both_fixes():
     assert _references(source, ADVANTAGE_TOKENS), (
         "lora_grpo computes advantages in its own generate_trajectory — it "
         "must honor batch_level_advantages."
+    )
+
+
+# Attributes the SHARED _setup_vllm_server_mode (vllm_backend.py) reads
+# unconditionally (i.e. before the `if self._vllm_weight_sync:` gate). Any
+# recipe that BINDS that shared method but does NOT subclass the base recipe
+# must set these in its own __init__, or setup() AttributeErrors at launch.
+# This pins the real bug the Phase-2 smoke caught: 8b5f0f3f added _dp_replicate
+# / _is_shard_leader reads to the shared helper, and the standalone lora_grpo
+# fork (which binds the helper but isn't a subclass) had set neither — it was
+# crash-on-setup from 2026-06-16 until this fix.
+SERVER_MODE_REQUIRED_ATTRS = ("_dp_replicate", "_is_shard_leader")
+
+
+def _binds_shared_server_mode(source: str) -> bool:
+    return "_setup_vllm_server_mode = _vllm_backend_module._setup_vllm_server_mode" in source
+
+
+def _sets_attr(source: str, attr: str) -> bool:
+    # Matches `self._attr = ...` (an assignment, not just a read).
+    return re.search(rf"self\.{re.escape(attr)}\s*=", source) is not None
+
+
+@pytest.mark.parametrize("recipe", GRPO_RECIPES)
+def test_standalone_recipe_sets_shared_server_mode_attrs(recipe):
+    """A standalone recipe binding _setup_vllm_server_mode must set its attrs.
+
+    Subclasses inherit the base __init__ that sets them; the base itself sets
+    them. Only a standalone recipe that binds the shared helper is at risk.
+    """
+    source = _recipe_source(recipe)
+    if _is_base_recipe(recipe, source) or _inherits_base(source):
+        return  # base sets them; subclasses inherit them
+    if not _binds_shared_server_mode(source):
+        return  # doesn't use the shared helper, no contract to meet
+    missing = [a for a in SERVER_MODE_REQUIRED_ATTRS if not _sets_attr(source, a)]
+    assert not missing, (
+        f"{recipe} binds the shared _setup_vllm_server_mode but does not set "
+        f"{missing} in __init__. That helper reads them unconditionally "
+        "(added 8b5f0f3f) — setup() will AttributeError at launch. Set them to "
+        "single-replicate defaults (_dp_replicate=1, _is_shard_leader=_is_rank_zero)."
     )
 
 

@@ -462,3 +462,119 @@ class VLLMClient:
             del self.communicator
             self.communicator = None
             self.rank = None
+
+
+def vllm_http_generate(
+    batch_input_ids: torch.Tensor,
+    context_length: int,
+    *,
+    vllm_clients: list,
+    pad_id: int,
+    eos_id: Optional[int],
+    max_generated_tokens: int,
+    vllm_max_model_len: int,
+    temperature: float,
+    top_k: Optional[int],
+    stop_token_ids: Optional[torch.Tensor] = None,
+    stop_strings: Optional[list] = None,
+    device=None,
+) -> torch.Tensor:
+    """Single-generator vLLM HTTP round-trip — no collectives, producer-safe.
+
+    Shared by the dense GRPO recipe and the LoRA-GRPO recipe so both get the
+    same prompt-truncation / stop-token / EOS-injection behavior. The caller is
+    responsible for broadcasting the result to other ranks. All generators share
+    one ``vllm_clients`` pool and fan their prompts across it round-robin.
+
+    Args:
+        batch_input_ids: [bsz, context_length] prompt token ids (padded).
+        context_length: prompt length; output is [bsz, context_length + max_gen].
+        vllm_clients: list of VLLMClient; >1 fans out round-robin via threads.
+        pad_id: tokenizer pad id (stripped from prompts, fills the output).
+        eos_id: tokenizer eos id; injected at the first pad position after a
+            short completion so downstream stop-token truncation finds a real
+            boundary. ``None`` disables injection.
+        max_generated_tokens: max new tokens per prompt.
+        vllm_max_model_len: prompts are left-truncated to
+            ``vllm_max_model_len - max_generated_tokens`` to avoid vLLM overflow.
+        temperature, top_k: sampling params (top_k None/0 → 0).
+        stop_token_ids: optional tensor of stop token ids forwarded to vLLM.
+        stop_strings: optional list of stop strings forwarded to vLLM.
+        device: device for the output tensor (defaults to input's device).
+
+    Returns:
+        [bsz, context_length + max_generated_tokens] query+response tensor.
+    """
+    bsz = batch_input_ids.shape[0]
+    total_len = context_length + max_generated_tokens
+    if device is None:
+        device = batch_input_ids.device
+
+    # Strip padding, left-truncate to the model-len budget, convert to lists.
+    max_prompt_len = vllm_max_model_len - max_generated_tokens
+    prompts = []
+    for i in range(bsz):
+        ids = batch_input_ids[i].cpu().tolist()
+        ids = [t for t in ids if t != pad_id]
+        prompts.append(ids[-max_prompt_len:] if len(ids) > max_prompt_len else ids)
+
+    gen_kwargs = dict(
+        n=1,  # prompts already expanded by grpo_samples
+        max_tokens=max_generated_tokens,
+        temperature=temperature,
+        top_k=top_k or 0,
+    )
+    # Forward stop tokens so generation halts at EOS instead of running to
+    # max_tokens. Forward stop strings for raw checkpoints that never emit EOS
+    # (e.g. ``</answer>``) — only when configured.
+    if stop_token_ids is not None and stop_token_ids.numel() > 0:
+        gen_kwargs["stop_token_ids"] = stop_token_ids.cpu().tolist()
+    if stop_strings:
+        gen_kwargs["stop"] = list(stop_strings)
+
+    t0 = time.perf_counter()
+    num_clients = len(vllm_clients)
+    if num_clients > 1:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        chunks = [prompts[i::num_clients] for i in range(num_clients)]
+
+        def _call_vllm(client, chunk):
+            return client.generate(prompts=chunk, **gen_kwargs) if chunk else []
+
+        with ThreadPoolExecutor(max_workers=num_clients) as pool:
+            futures = {
+                pool.submit(_call_vllm, client, chunk): idx
+                for idx, (client, chunk) in enumerate(zip(vllm_clients, chunks))
+            }
+            chunk_results = [None] * num_clients
+            for future in as_completed(futures):
+                idx = futures[future]
+                chunk_results[idx] = future.result()
+
+        completions = [None] * bsz
+        for i in range(bsz):
+            completions[i] = chunk_results[i % num_clients][i // num_clients]
+    else:
+        completions = vllm_clients[0].generate(prompts=prompts, **gen_kwargs)
+    gen_time = time.perf_counter() - t0
+
+    query_responses = batch_input_ids.new_full((bsz, total_len), pad_id)
+    query_responses[:, :context_length] = batch_input_ids
+    # Inject one EOS at the first pad after the generated tokens so the
+    # stop-token truncation logic finds the real boundary (no-op when the
+    # completion already filled max_generated_tokens or contains EOS).
+    for i, comp in enumerate(completions):
+        length = min(len(comp), max_generated_tokens)
+        query_responses[i, context_length : context_length + length] = torch.tensor(
+            comp[:length], dtype=batch_input_ids.dtype, device=device
+        )
+        if eos_id is not None and length < max_generated_tokens:
+            query_responses[i, context_length + length] = eos_id
+
+    total_tokens = sum(len(c) for c in completions)
+    logger.info(
+        "vLLM generation: %d sequences (%d clients), %d tokens in %.1fs (%.1f tok/s)",
+        bsz, num_clients, total_tokens, gen_time, total_tokens / max(gen_time, 0.01),
+    )
+    return query_responses
