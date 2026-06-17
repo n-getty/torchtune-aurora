@@ -106,6 +106,7 @@ from torchtune.dev.rl.lora_helpers import (
     _TUNE_MODULE_TO_HF,
 )
 from torchtune.dev.rl.weight_sync import _save_raw_bytes
+import torchtune.dev.rl.weight_sync as _weight_sync_module
 import torchtune.dev.rl.vllm_backend as _vllm_backend_module
 from tqdm import tqdm
 
@@ -267,9 +268,24 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
         self._save_every_n_steps = cfg.get("save_every_n_steps", None)
         self._save_final_checkpoint = cfg.get("save_final_checkpoint", True)
         self._save_adapter_only = cfg.get("save_adapter_weights_only", True)
+        # Batch-level advantage normalization (matches base GRPO recipe). At B=1
+        # this is mathematically identical to per-prompt; for B>1 it keeps the
+        # learning signal alive when a prompt-group's rewards are degenerate.
+        # Opt out with batch_level_advantages: false to reproduce legacy runs.
+        self._batch_level_advantages = cfg.get("batch_level_advantages", True)
 
     # Inject vLLM server mode setup from shared backend module
     _setup_vllm_server_mode = _vllm_backend_module._setup_vllm_server_mode
+
+    # Inject the shared Llama-family Q/K un-permute helpers from weight_sync.
+    # The merged-weight publish path (_gather_merged_lora_weights) sends weights
+    # straight to vLLM's load_weights, which expects HF-format unpermuted Q/K.
+    # Llama-family checkpointers (LLAMA2/3/3_2/3_VISION) permute Q/K at load
+    # time, so without inverting it vLLM's attention is scrambled after the
+    # first sync. No-op for Qwen3/Gemma (their hf_to_tune doesn't permute).
+    # See torchtune/dev/rl/weight_sync.py and the base GRPO recipe.
+    _needs_qk_unpermute = _weight_sync_module._needs_qk_unpermute
+    _maybe_unpermute_qk = _weight_sync_module._maybe_unpermute_qk
 
     def load_checkpoint(self, cfg_checkpointer: DictConfig) -> dict[str, Any]:
         self._checkpointer = config.instantiate(cfg_checkpointer)
@@ -627,6 +643,32 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
             if self._resume_from_checkpoint
             else None
         )
+
+        # Cache model attention dims for the Q/K un-permute path in
+        # _gather_merged_lora_weights → _maybe_unpermute_qk (weight_sync.py).
+        # Mirrors the base GRPO recipe; read from cfg.model so it works for any
+        # architecture parameterization. No-op for non-permuting checkpointers.
+        try:
+            _cfg_model = cfg.get("model", {})
+            _nh = _cfg_model.get("num_heads")
+            _nkv = _cfg_model.get("num_kv_heads")
+            _ed = _cfg_model.get("embed_dim")
+            _hd = _cfg_model.get("head_dim")
+            if _nh is not None:
+                self._model_num_heads = int(_nh)
+            if _nkv is not None:
+                self._model_num_kv_heads = int(_nkv)
+            elif _nh is not None:
+                self._model_num_kv_heads = int(_nh)
+            if _hd is not None:
+                self._model_head_dim = int(_hd)
+            elif _ed is not None and _nh is not None:
+                self._model_head_dim = int(_ed) // int(_nh)
+        except Exception as _dim_exc:
+            log.warning(
+                "Failed to cache model attention dims for wsync Q/K un-permute: %r",
+                _dim_exc,
+            )
 
         # Build LoRA model (no separate ref model)
         self._model = self._setup_model_lora(cfg, checkpoint_dict[training.MODEL_KEY])
@@ -1077,7 +1119,11 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
                 )
                 continue
             hf_name = f"model.layers.{layer_idx}.{hf_module}.weight"
-            merged[hf_name] = w.cpu().contiguous()
+            w = w.cpu().contiguous()
+            # Invert the Llama-family Q/K permutation before handing to vLLM.
+            # No-op unless this run uses a permuting checkpointer (LLAMA*).
+            w = self._maybe_unpermute_qk(hf_name, w)
+            merged[hf_name] = w
         return merged
 
     def _publish_merged_weights_background(self, hf_state_dict: dict) -> None:
@@ -1451,13 +1497,20 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
                 self._steps_run, rewards_mean, rewards_std, successes.float().mean().item(),
             )
 
-        # Advantages. Use unbiased=False so std at G=1 is 0 (not NaN). For G>=2
-        # the population vs sample std differs by sqrt((G-1)/G) — a constant per
-        # batch — and gets normalized away by the +1e-4 floor / downstream loss.
-        advantages = (rewards - rewards.mean(1, keepdim=True)) / (
-            rewards.std(1, keepdim=True, unbiased=False) + 1e-4
-        )
-        advantages = advantages.reshape(batch_size * grpo_size)
+        # Advantages. batch_level_advantages (default) pools mean/std across the
+        # full B*G batch so a single non-degenerate prompt keeps the signal alive
+        # (matches base GRPO recipe). Legacy per-prompt path uses unbiased=False
+        # so std at G=1 is 0 (not NaN). At B=1 the two are identical.
+        if self._batch_level_advantages:
+            from torchtune.dev.rl.rewards import batch_level_advantages
+            advantages = batch_level_advantages(
+                rewards.reshape(batch_size * grpo_size), group_size=grpo_size,
+            )
+        else:
+            advantages = (rewards - rewards.mean(1, keepdim=True)) / (
+                rewards.std(1, keepdim=True, unbiased=False) + 1e-4
+            )
+            advantages = advantages.reshape(batch_size * grpo_size)
         del responses
         device_empty_cache(self._device)
 
