@@ -57,34 +57,58 @@ Takeaways:
 > at a fixed value. Each framework has its own productive range; matching a
 > hyperparameter tuned for one stack penalizes the other.
 
-## Step-time / throughput (2-node, matched `B=1, G=4`)
+## Step-time / throughput (2-node)
 
-Accuracy is one axis; wall-clock per step is the other. At the matched ezpz envelope
-(`B=1, G=4, max_gen=64`, 24 ranks):
+Accuracy is one axis; wall-clock per step is the other. Two important caveats up front so
+the two tables below aren't mis-read against each other:
 
-| stack / topology | s/step | notes |
-|------------------|-------:|-------|
-| ezpz/TRL 2N (HF `.generate()`) | ~5.7 | in-process generation, single FSDP shard |
-| torchtune 2N — flat colocate (`dp_replicate=1`) | ~11.4 | 24-way **cross-node** FSDP shard — the slow topology |
+- **The torchtune topology study ran at `G=16`; the ezpz runs only exist at `G=4`.** So the
+  only *matched-envelope* ezpz-vs-torchtune step-time point is the `G=4` flat-colocate row
+  (Table A). The full torchtune topology spread (Table B) is `G=16` and is **not** directly
+  comparable to the ezpz number — it shows where torchtune's own best 2N config lands.
+- Step time is **not** monotonic in `G` here: flat-colocate is 11.4 s at `G=4` but 7.8 s at
+  `G=16`, because the `G=4` sweep used a different backward-chunking config. Do not infer
+  ezpz's `G=16` time from its `G=4` time, or cross-read the two tables.
 
-At this matched envelope ezpz is ~2× faster per step — but the torchtune number above is
-its **slowest** 2-node topology: `dp_replicate=1` shards one model 24-way *across both
-nodes*, so every layer's AllGather/ReduceScatter crosses the inter-node link. The 2-node
-topology study (`docs/reports/agpt2b_2n_topology_throughput_20260618.md`) found the FSDP
-**replicate dimension** is the dominant 2N lever: switching to `dp_replicate=2` (two
-intra-node 12-way shards, one replica per node) keeps the heavy shard collective on-node
-and cuts step time **−29%** (7.8 → 5.5 s at `G=16`). That brings torchtune's best 2N
-configuration close to ezpz's per-step time while retaining its accuracy/stability
-advantage.
+**Table A — matched envelope (`B=1, G=4, max_gen=64`, 24 ranks).** The only apples-to-apples
+step-time comparison:
 
-> **Caveat (don't over-read this row).** The −29% `dp_replicate=2` figure was measured at
-> `G=16` (5.5 s vs 7.8 s flat), not at the `G=4` envelope of the ezpz step-time cell — a
-> matched-`G=4` `dp_replicate=2` run hasn't been done, so this is not yet a clean
-> like-for-like throughput win, only a directional one. The **accuracy** comparison above
-> is fully matched (`B=1, G=4`); the step-time comparison is matched only for the
-> flat-colocate row. ezpz could not be run at <24 ranks (single-node crashes early on an
-> Intel L0 event-pool exhaustion in HF Trainer's per-step cache cleanup), so all ezpz
-> cells are 24-rank.
+| stack | s/step |
+|-------|-------:|
+| ezpz/TRL 2N (HF `.generate()`) | ~5.7 |
+| torchtune 2N — flat colocate (`dp_replicate=1`) | ~11.4 |
+
+At matched `G=4`, ezpz is ~2× faster per step — but flat colocate (`dp_replicate=1`) is
+torchtune's **slowest** 2N topology: it shards one model 24-way *across both nodes*, so
+every layer's collective crosses the inter-node link. A matched-`G=4` run of torchtune's
+*best* topology hasn't been done; Table B shows that best at `G=16`.
+
+**Table B — torchtune 2N topology spread (`G=16`, internal study, NOT matched to ezpz).**
+From `docs/reports/agpt2b_2n_topology_throughput_20260618.md`:
+
+| torchtune 2N topology | dp_rep | train tiles | s/step | best success |
+|-----------------------|:------:|:-----------:|-------:|:------------:|
+| flat colocate          | 1 | 24 | 7.8 | 0.80 |
+| **colocate-HSDP**      | **2** | **24** | **5.5** | **1.00** |
+| 11+1 per-node          | 2 | 22 | 5.9 | 0.44* |
+| dedicated vLLM node    | 1 | 12 | 7.6 | 0.50* |
+
+\* server-mode topologies (11+1, dedicated) at their stable envelope; lower convergence is
+a topology property (fewer training ranks / distinct prompts), not instability — all 0 NaN.
+
+**The headline from Table B:** the dominant 2N lever is the FSDP **replicate dimension**, not
+vLLM placement. `dp_replicate=2` (two intra-node 12-way shards, one replica per node) keeps
+the heavy shard collective on-node and is both the fastest (**5.5 s/step, −29% vs flat**) and
+the most accurate (best_acc 1.00). So torchtune's *best* 2N configuration is ~5.5 s at `G=16`
+— in the neighbourhood of ezpz's `G=4` 5.7 s, while carrying the accuracy/stability edge from
+the sweep above.
+
+> **What's not yet measured (honest gap):** a matched-`G=4` `dp_replicate=2` torchtune run.
+> Until that exists, "torchtune's best 2N ≈ ezpz on step time" is **directional** (different
+> `G`), not a clean like-for-like throughput claim. The **accuracy** comparison is fully
+> matched (`B=1, G=4`). ezpz could not be run at <24 ranks (single-node crashes early on an
+> Intel L0 event-pool exhaustion in HF Trainer's per-step cache cleanup), so all ezpz cells
+> are 24-rank.
 
 ## Production result — GSM8K success rate
 
