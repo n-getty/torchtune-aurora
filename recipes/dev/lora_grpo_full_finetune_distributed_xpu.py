@@ -208,6 +208,14 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
         self._lora_tmpfs_transfer = bool(_get("tmpfs_transfer", False))
         self._lora_train_shm = str(_get("train_shm", "/dev/shm/lora_adapters"))
         self._lora_vllm_shm = str(_get("vllm_shm", "/dev/shm/lora_adapters"))
+        # Merged-weight (Path A) transport. When BOTH are set, the ~6.77 GiB
+        # merged weights.bin is written to train-node tmpfs, rsync'd ONCE to the
+        # vLLM node over the HSN (reusing the persistent SSH ControlMaster), and
+        # vLLM reads it from local tmpfs instead of contending on Lustre. When
+        # unset (default), the file goes to _lora_shm_root (Lustre) and is read
+        # cross-node from Lustre — the validated 2026-05-05 behavior.
+        self._lora_merged_train_shm = _get("merged_train_shm", None)
+        self._lora_merged_vllm_shm = _get("merged_vllm_shm", None)
         # SSH ControlMaster socket for rsync multiplexing (avoids per-rsync conn overhead)
         self._ssh_control_socket: Optional[str] = None
         self._ssh_control_proc: Optional[subprocess.Popen] = None
@@ -219,6 +227,36 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
         #     PDE crash on Aurora XPU (docs/reports/enable_lora_issue.md).
         #   use_runtime_lora=True — legacy PEFT dir + /v1/load_lora_adapter path.
         self._lora_use_runtime = bool(_get("use_runtime_lora", False))
+
+        # Publish mode (supersedes use_runtime_lora; the latter is kept for
+        # back-compat). Three values:
+        #   "merged"  (default) — Path A: ship the full ~6.77 GiB W_eff every
+        #             step via load_weights_from_raw. Bit-exact, but bandwidth-
+        #             bound and on the critical path (~28s/step at 4B/2N).
+        #   "delta"   — Path C (merge-at-receiver): ship the base ONCE (~6.77 GiB)
+        #             then only the ~66 MB lora_a/lora_b each step; the vLLM
+        #             worker re-merges W_eff = base + scale*(B@A) from a cached
+        #             CPU base. Bit-exact to "merged", ~100x less per-step wire,
+        #             no --enable-lora, any TP. See load_lora_delta_from_raw in
+        #             torchtune/dev/vllm_weight_sync_worker.py.
+        #   "runtime" — Path B: vLLM-native hot-swap (/v1/load_lora_adapter).
+        #             Requires --enable-lora + the torch211 venv (TP=1 only).
+        # Back-compat: use_runtime_lora=True forces "runtime" unless an explicit
+        # publish_mode is given.
+        _publish_mode = str(_get("publish_mode", "") or "").strip().lower()
+        if not _publish_mode:
+            _publish_mode = "runtime" if self._lora_use_runtime else "merged"
+        if _publish_mode not in ("merged", "delta", "runtime"):
+            raise ValueError(
+                f"lora.publish_mode must be one of merged|delta|runtime, "
+                f"got {_publish_mode!r}"
+            )
+        self._lora_publish_mode = _publish_mode
+        # Keep use_runtime in sync so the rest of the recipe (PG setup, vLLM
+        # client wiring) that branches on it stays correct.
+        self._lora_use_runtime = (_publish_mode == "runtime")
+        # One-time base-ship guard for the delta path.
+        self._lora_base_shipped = False
 
         # Derive LoRA target_modules from model config
         _model_cfg = cfg.get("model", {}) or {}
@@ -284,6 +322,18 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
         # learning signal alive when a prompt-group's rewards are degenerate.
         # Opt out with batch_level_advantages: false to reproduce legacy runs.
         self._batch_level_advantages = cfg.get("batch_level_advantages", True)
+        # Fail-fast on a failed adapter publish to vLLM. The merged-weight POST
+        # path historically logged a warning and continued — training then ran
+        # off-policy against STALE vLLM weights with no signal. Default True:
+        # surface the failure so the next-step publish-thread join aborts.
+        # Set lora.fail_on_publish_error: false for best-effort (legacy) behavior.
+        self._fail_on_publish_error = bool(_get("fail_on_publish_error", True))
+        # Publish/transfer timeouts (config-driven; defaults preserve prior behavior).
+        self._publish_join_timeout = float(_get("publish_join_timeout", 120))
+        self._collective_rpc_timeout = float(_get("collective_rpc_timeout", 600))
+        self._load_lora_http_timeout = float(_get("load_lora_http_timeout", 120))
+        self._rsync_timeout = float(_get("rsync_timeout", 60))
+        self._ssh_mkdir_timeout = float(_get("ssh_mkdir_timeout", 30))
 
     # Inject vLLM server mode setup from shared backend module
     _setup_vllm_server_mode = _vllm_backend_module._setup_vllm_server_mode
@@ -814,24 +864,52 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
         if self._is_rank_zero:
             os.makedirs(self._lora_shm_root, exist_ok=True)
             log.info("LoRA checkpoint adapter dir: %s", self._lora_shm_root)
-            if self._lora_tmpfs_transfer:
+            # The merged-weight path (Path A) also uses tmpfs + rsync when
+            # merged_train_shm/merged_vllm_shm are set — it needs the same
+            # ControlMaster + dest-dir pre-creation set up here.
+            _merged_tmpfs = bool(
+                self._lora_merged_train_shm and self._lora_merged_vllm_shm
+            )
+            if self._lora_tmpfs_transfer or _merged_tmpfs:
                 os.makedirs(self._lora_train_shm, exist_ok=True)
-                log.info("LoRA publish: tmpfs_transfer=True — train_shm=%s  vllm_shm=%s",
-                         self._lora_train_shm, self._lora_vllm_shm)
-                # Pre-create vllm_shm parent on VLLM_NODE so first rsync succeeds
+                if _merged_tmpfs:
+                    os.makedirs(self._lora_merged_train_shm, exist_ok=True)
+                log.info("LoRA publish: tmpfs_transfer=%s merged_tmpfs=%s — "
+                         "train_shm=%s vllm_shm=%s merged_train_shm=%s merged_vllm_shm=%s",
+                         self._lora_tmpfs_transfer, _merged_tmpfs,
+                         self._lora_train_shm, self._lora_vllm_shm,
+                         self._lora_merged_train_shm, self._lora_merged_vllm_shm)
+                # tmpfs_transfer rsyncs node-local /dev/shm to a SINGLE vLLM host
+                # (clients[0]). With multiple distinct vLLM hosts, the others would
+                # silently serve a stale adapter dir. Refuse rather than train on
+                # inconsistent adapters — use Lustre shm_root (tmpfs_transfer=False)
+                # for multi-host vLLM.
+                _distinct_hosts = {c.host for c in self._vllm_clients}
+                if len(_distinct_hosts) > 1:
+                    raise ValueError(
+                        "lora.tmpfs_transfer=True is single-vLLM-host only, but the "
+                        f"configured vLLM clients span {len(_distinct_hosts)} hosts "
+                        f"({sorted(_distinct_hosts)}). Set tmpfs_transfer=False (use "
+                        "the cross-node-visible Lustre lora.shm_root) for multi-host vLLM."
+                    )
+                # Pre-create vllm_shm parent(s) on VLLM_NODE so first rsync succeeds.
+                # Include the merged dir when the merged-tmpfs path is active.
                 if self._vllm_clients:
                     vllm_ip = self._vllm_clients[0].host
                     user = os.environ.get("USER", "")
                     dest = f"{user}@{vllm_ip}" if user else vllm_ip
+                    _dirs = [self._lora_vllm_shm] if self._lora_tmpfs_transfer else []
+                    if _merged_tmpfs:
+                        _dirs.append(self._lora_merged_vllm_shm)
                     result = subprocess.run(
                         ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
-                         dest, f"mkdir -p {self._lora_vllm_shm}"],
-                        capture_output=True, text=True, timeout=30,
+                         dest, "mkdir -p " + " ".join(_dirs)],
+                        capture_output=True, text=True, timeout=self._ssh_mkdir_timeout,
                     )
                     if result.returncode != 0:
-                        log.warning("Failed to pre-create vllm_shm on %s: %s", dest, result.stderr)
+                        log.warning("Failed to pre-create vllm_shm dirs on %s: %s", dest, result.stderr)
                     else:
-                        log.info("Pre-created vllm_shm on %s:%s", dest, self._lora_vllm_shm)
+                        log.info("Pre-created vllm_shm dirs on %s: %s", dest, _dirs)
                     # Open a persistent SSH ControlMaster so subsequent rsync calls reuse
                     # the existing connection instead of paying ~1s per-handshake.
                     ctrl_socket = f"/tmp/torchtune_ssh_ctrl_{vllm_ip.replace('.', '_')}"
@@ -954,7 +1032,9 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
                 local_path + "/", dest,
             ]
             t_rsync = time.perf_counter()
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=self._rsync_timeout
+            )
             if result.returncode != 0:
                 raise RuntimeError(f"rsync to {dest} failed (rc={result.returncode}): {result.stderr}")
             log.info("Rank 0: rsync adapter to %s in %.2fs", dest, time.perf_counter() - t_rsync)
@@ -969,7 +1049,8 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
             futures = {
                 pool.submit(
                     load_lora_adapter_http,
-                    c.session, c.base_url, adapter_name, vllm_path, 120,
+                    c.session, c.base_url, adapter_name, vllm_path,
+                    self._load_lora_http_timeout,
                 ): i
                 for i, c in enumerate(self._vllm_clients)
             }
@@ -1155,9 +1236,24 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
         # POST doesn't read a half-written file. _lora_max_loras already
         # bounds slot count for the legacy path; reuse it here.
         slot = self._steps_run % max(self._lora_max_loras, 1)
-        save_path = os.path.join(
-            self._lora_shm_root, f"merged_slot_{slot}", "weights.bin"
+        _use_tmpfs = bool(
+            self._lora_merged_train_shm and self._lora_merged_vllm_shm
         )
+        if _use_tmpfs:
+            # Write to train-node tmpfs; vLLM reads from its own tmpfs after the
+            # rsync below. save_path = what we write + rsync FROM; vllm_path =
+            # what the POST tells vLLM to read.
+            save_path = os.path.join(
+                self._lora_merged_train_shm, f"merged_slot_{slot}", "weights.bin"
+            )
+            vllm_path = os.path.join(
+                self._lora_merged_vllm_shm, f"merged_slot_{slot}", "weights.bin"
+            )
+        else:
+            save_path = os.path.join(
+                self._lora_shm_root, f"merged_slot_{slot}", "weights.bin"
+            )
+            vllm_path = save_path  # Lustre is cross-node visible
 
         t_save0 = time.perf_counter()
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
@@ -1171,34 +1267,89 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
             (size_gb / t_save) if t_save > 0 else 0.0, save_path,
         )
 
+        # Cross-node transport: rsync the file to the vLLM node's tmpfs ONCE,
+        # reusing the persistent SSH ControlMaster. No-op in the Lustre default.
+        if _use_tmpfs and self._vllm_clients:
+            vllm_ip = self._vllm_clients[0].host
+            user = os.environ.get("USER", "")
+            dest = (
+                f"{user}@{vllm_ip}:{os.path.dirname(vllm_path)}/"
+                if user else f"{vllm_ip}:{os.path.dirname(vllm_path)}/"
+            )
+            if self._ssh_control_socket:
+                ssh_cmd = (
+                    "ssh -o StrictHostKeyChecking=no -o BatchMode=yes "
+                    f"-o ControlMaster=no -o ControlPath={self._ssh_control_socket}"
+                )
+            else:
+                ssh_cmd = "ssh -o StrictHostKeyChecking=no -o BatchMode=yes"
+            subprocess.run(
+                ["ssh"] + ssh_cmd.split()[1:] + [
+                    f"{user}@{vllm_ip}" if user else vllm_ip,
+                    f"mkdir -p {os.path.dirname(vllm_path)}",
+                ],
+                capture_output=True, text=True, timeout=self._ssh_mkdir_timeout,
+            )
+            t_rsync = time.perf_counter()
+            _r = subprocess.run(
+                ["rsync", "-a", "--inplace", "-e", ssh_cmd, save_path, dest],
+                capture_output=True, text=True, timeout=self._rsync_timeout,
+            )
+            if _r.returncode != 0:
+                raise RuntimeError(
+                    f"merged-weight rsync to {dest} failed "
+                    f"(rc={_r.returncode}): {_r.stderr}"
+                )
+            log.info(
+                "Rank 0: rsync merged weights.bin (%.2f GiB) to %s in %.2fs",
+                size_gb, dest, time.perf_counter() - t_rsync,
+            )
+
         t_http0 = time.perf_counter()
 
-        def _post_one(url: str):
+        def _post_one(url: str) -> Optional[str]:
+            """Return None on success, or an error string on failure."""
             try:
                 r = requests.post(
                     f"{url}/collective_rpc",
-                    json={"method": "load_weights_from_raw", "args": [save_path]},
-                    timeout=600,
+                    json={"method": "load_weights_from_raw", "args": [vllm_path]},
+                    timeout=self._collective_rpc_timeout,
                 )
                 if r.status_code != 200:
-                    log.warning(
-                        "Merged-weight reload failed (%s): %s %s",
-                        url, r.status_code, r.text[:200],
-                    )
-                    return
+                    msg = f"{url}: HTTP {r.status_code} {r.text[:200]}"
+                    log.warning("Merged-weight reload failed (%s)", msg)
+                    return msg
                 results = r.json().get("results", [{}])
                 first = results[0] if results else {}
                 if isinstance(first, dict) and first.get("status") not in (None, "ok"):
-                    log.warning("Merged-weight reload error (%s): %s", url, first)
+                    msg = f"{url}: {first}"
+                    log.warning("Merged-weight reload error (%s)", msg)
+                    return msg
+                return None
             except Exception as _e:
-                log.error("Merged-weight HTTP error (%s): %s", url, _e)
+                msg = f"{url}: {_e!r}"
+                log.error("Merged-weight HTTP error (%s)", msg)
+                return msg
 
+        failed: list[str] = []
         with ThreadPoolExecutor(max_workers=max(1, len(self._vllm_urls))) as pool:
             for f in as_completed(
                 [pool.submit(_post_one, u) for u in self._vllm_urls]
             ):
-                f.result()
+                err = f.result()
+                if err is not None:
+                    failed.append(err)
         t_http = time.perf_counter() - t_http0
+        if failed:
+            _summary = (
+                f"Merged-weight publish failed on {len(failed)}/"
+                f"{len(self._vllm_urls)} vLLM tiles: {failed}"
+            )
+            if self._fail_on_publish_error:
+                # Raise so the _bg wrapper records _publish_error and the
+                # next-step join aborts before generating off-policy rollouts.
+                raise RuntimeError(_summary)
+            log.error("%s — continuing (fail_on_publish_error=False)", _summary)
 
         # Reset prefix cache so the new weights are not aliased by stale KV.
         if self._vllm_clients:
@@ -1209,6 +1360,272 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
             "Rank 0: merged-weight publish: %d params, save=%.2fs http=%.2fs",
             n_params, t_save, t_http,
         )
+
+    # -------------------------------------------------------------------------
+    # Delta publish path (Path C — merge-at-receiver)
+    # -------------------------------------------------------------------------
+    #
+    # Instead of shipping the full ~6.77 GiB merged W_eff every step (Path A),
+    # ship the frozen base ONCE (~6.77 GiB, reusing _cached_base_weights) and
+    # then only the ~66 MB lora_a/lora_b adapter each step. The vLLM worker
+    # re-merges W_eff = base + scale*(B@A) from a cached CPU base, then routes
+    # the result through the SAME model.load_weights() call Path A uses — so the
+    # placement (and thus the resident weights) is bit-identical to Path A.
+    #
+    # Q/K un-permute (LLAMA-family) is applied SENDER-side, to BOTH the one-time
+    # base and the per-step delta. This works because un-permute is a row
+    # permutation on the output dim, so
+    #     unpermute(base + scale*(B@A)) == unpermute(base) + unpermute(scale*(B@A))
+    # The receiver just adds the two already-unpermuted tensors and needs no
+    # checkpointer / head-dim knowledge. No-op for Qwen3 (non-permuting).
+
+    def _gather_lora_base_payload(self) -> Optional[dict]:
+        """Build the one-time base-weight payload for the delta path.
+
+        Reuses ``self._cached_base_weights`` (the frozen LoRA-target base
+        weights gathered once at setup by ``_cache_lora_base_weights``), renamed
+        tune->HF and Q/K-unpermuted exactly as ``_gather_merged_lora_weights``
+        does for the merged W_eff. Returns ``{hf_name: bf16_cpu_tensor}`` on
+        rank 0, ``None`` elsewhere. Shipped once; the receiver caches it.
+        """
+        if not self._is_rank_zero:
+            return None
+        if getattr(self, "_cached_base_weights", None) is None:
+            raise RuntimeError(
+                "_gather_lora_base_payload: _cached_base_weights not initialized — "
+                "_cache_lora_base_weights must be called once after FSDP wrap."
+            )
+        import re as _re
+        from torchtune.modules.peft.lora import LoRALinear
+
+        # Map each LoRALinear's base weight (tune name) -> HF name, reusing the
+        # cached base tensor. Iterating LoRALinear modules (not the cache dict)
+        # keeps the HF-name derivation identical to the merged path.
+        base: dict[str, torch.Tensor] = {}
+        for mod_name, module in self._model.named_modules():
+            if not isinstance(module, LoRALinear):
+                continue
+            tune_name = f"{mod_name}.weight"
+            clean = tune_name.replace("_fsdp_wrapped_module.", "").replace(
+                "_checkpoint_wrapped_module.", ""
+            )
+            base_w = self._cached_base_weights.get(tune_name)
+            if base_w is None:
+                base_w = self._cached_base_weights.get(clean)
+            if base_w is None:
+                raise KeyError(
+                    f"_gather_lora_base_payload: base weight for {tune_name!r} "
+                    f"missing from _cached_base_weights"
+                )
+            m = _re.match(r"^(?:.*\.)?layers\.(\d+)\.(.+)\.weight$", clean)
+            if m is None:
+                log.warning("Skipping base weight (no layer match): %s", tune_name)
+                continue
+            layer_idx, module_path = m.group(1), m.group(2)
+            hf_module = _TUNE_MODULE_TO_HF.get(module_path)
+            if hf_module is None:
+                log.warning("Skipping unknown base module path %r in %s", module_path, tune_name)
+                continue
+            hf_name = f"model.layers.{layer_idx}.{hf_module}.weight"
+            w = base_w.to(torch.bfloat16).cpu().contiguous()
+            w = self._maybe_unpermute_qk(hf_name, w)
+            base[hf_name] = w
+        return base
+
+    def _gather_lora_delta_payload(self) -> Optional[tuple]:
+        """Rank-0-only adapter snapshot for the delta path. No FSDP collective.
+
+        Reads the live (replicated, bf16) ``lora_a``/``lora_b`` weights of every
+        ``LoRALinear`` — the same tensors the merged path consumes via
+        ``iter_merged_lora_layers`` — and emits a flat tensor dict plus a JSON
+        ``meta`` mapping each base HF weight name to its A/B keys + scale, so the
+        receiver can compute ``delta = scale * (B @ A)`` and add it to the cached
+        base. Q/K un-permute is NOT applied here (the per-layer delta is small);
+        it is applied by the receiver-side merge in ``load_lora_delta_from_raw``
+        for q/k — but because we ship the base ALREADY unpermuted, we must also
+        unpermute the delta. To keep the receiver checkpointer-agnostic we
+        unpermute the delta SENDER-side. Since A/B are shipped raw, the meta
+        carries an ``unpermute`` spec per q/k entry and head dims.
+
+        Returns ``(tensors, meta)`` on rank 0, where ``tensors`` is
+        ``{key: bf16_cpu_tensor}`` (keys ``<hf>::lora_A`` / ``<hf>::lora_B``)
+        and ``meta`` is a JSON-serializable dict; ``None`` on other ranks.
+        """
+        if not self._is_rank_zero:
+            return None
+        import re as _re
+        from torchtune.modules.peft.lora import LoRALinear
+
+        tensors: dict[str, torch.Tensor] = {}
+        entries: list[dict] = []
+        n_modules = 0
+        for mod_name, module in self._model.named_modules():
+            if not isinstance(module, LoRALinear):
+                continue
+            n_modules += 1
+            tune_name = f"{mod_name}.weight"
+            clean = tune_name.replace("_fsdp_wrapped_module.", "").replace(
+                "_checkpoint_wrapped_module.", ""
+            )
+            m = _re.match(r"^(?:.*\.)?layers\.(\d+)\.(.+)\.weight$", clean)
+            if m is None:
+                log.warning("Skipping adapter (no layer match): %s", tune_name)
+                continue
+            layer_idx, module_path = m.group(1), m.group(2)
+            hf_module = _TUNE_MODULE_TO_HF.get(module_path)
+            if hf_module is None:
+                log.warning("Skipping unknown adapter module path %r in %s", module_path, tune_name)
+                continue
+            hf_name = f"model.layers.{layer_idx}.{hf_module}.weight"
+            a_w = module.lora_a.weight.detach().to(torch.bfloat16).cpu().contiguous()
+            b_w = module.lora_b.weight.detach().to(torch.bfloat16).cpu().contiguous()
+            a_key = f"{hf_name}::lora_A"
+            b_key = f"{hf_name}::lora_B"
+            tensors[a_key] = a_w
+            tensors[b_key] = b_w
+            entries.append({
+                "hf_name": hf_name,
+                "a_key": a_key,
+                "b_key": b_key,
+                "scale": float(module.alpha) / float(module.rank),
+            })
+
+        # Fail closed: one A and one B per LoRALinear.
+        if n_modules == 0 or len(tensors) != 2 * len(entries) or len(entries) != n_modules:
+            raise RuntimeError(
+                f"_gather_lora_delta_payload: adapter count mismatch — "
+                f"modules={n_modules} entries={len(entries)} tensors={len(tensors)}. "
+                f"Refusing to publish a partial adapter."
+            )
+
+        # Q/K un-permute spec for the receiver to apply to the assembled delta.
+        # Mirrors _maybe_unpermute_qk's gate (LLAMA-family checkpointers only).
+        needs_unpermute = bool(self._needs_qk_unpermute())
+        meta = {
+            "entries": entries,
+            "needs_qk_unpermute": needs_unpermute,
+            "num_heads": int(getattr(self, "_model_num_heads", 0) or 0),
+            "num_kv_heads": int(getattr(self, "_model_num_kv_heads", 0) or 0),
+            "head_dim": int(getattr(self, "_model_head_dim", 0) or 0),
+        }
+        return tensors, meta
+
+    def _publish_lora_delta_background(self, payload: tuple) -> None:
+        """Rank-0 background: ship base once (if needed) + per-step adapter delta.
+
+        Mirrors ``_publish_merged_weights_background``'s transport (slot dir,
+        optional tmpfs rsync, ThreadPool POST fan-out, fail-fast on error,
+        prefix-cache reset) but ships ~66 MB/step instead of ~6.77 GiB.
+        """
+        import json
+        import requests
+
+        if not self._vllm_urls:
+            log.warning("Rank 0: no vLLM URLs configured — skipping delta publish")
+            return
+
+        tensors, meta = payload
+
+        # --- One-time base ship -------------------------------------------------
+        if not self._lora_base_shipped:
+            base_sd = self._gather_lora_base_payload()
+            if base_sd is None:
+                raise RuntimeError("delta publish: base payload empty on rank 0")
+            base_path = os.path.join(self._lora_shm_root, "delta_base", "base.bin")
+            os.makedirs(os.path.dirname(base_path), exist_ok=True)
+            _t0 = time.perf_counter()
+            n_base = _save_raw_bytes(base_sd, base_path)
+            _base_gb = os.path.getsize(base_path) / 1024**3
+            del base_sd
+            log.info(
+                "Rank 0: delta base raw_bytes %d params %.2f GiB in %.2fs → %s",
+                n_base, _base_gb, time.perf_counter() - _t0, base_path,
+            )
+            self._post_collective_rpc(
+                "load_lora_base_from_raw", [base_path],
+                what="delta base", n=n_base,
+            )
+            self._lora_base_shipped = True
+
+        # --- Per-step adapter delta --------------------------------------------
+        slot = self._steps_run % max(self._lora_max_loras, 1)
+        save_path = os.path.join(self._lora_shm_root, f"delta_slot_{slot}", "adapter.bin")
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        t_save0 = time.perf_counter()
+        n_params = _save_raw_bytes(tensors, save_path)
+        t_save = time.perf_counter() - t_save0
+        size_mb = os.path.getsize(save_path) / 1024**2
+        del tensors
+        log.info(
+            "Rank 0: delta adapter raw_bytes %d tensors %.1f MB in %.2fs (%.2f GB/s) → %s",
+            n_params, size_mb, t_save,
+            (size_mb / 1024 / t_save) if t_save > 0 else 0.0, save_path,
+        )
+
+        meta_json = json.dumps(meta)
+        t_http0 = time.perf_counter()
+        self._post_collective_rpc(
+            "load_lora_delta_from_raw", [save_path, meta_json],
+            what="delta adapter", n=n_params,
+        )
+        t_http = time.perf_counter() - t_http0
+
+        # Reset prefix cache so the new weights are not aliased by stale KV.
+        if self._vllm_clients:
+            with ThreadPoolExecutor(max_workers=len(self._vllm_clients)) as pool:
+                list(pool.map(lambda c: c.reset_prefix_cache(), self._vllm_clients))
+
+        log.info(
+            "Rank 0: delta publish: %d tensors, save=%.2fs http=%.2fs",
+            n_params, t_save, t_http,
+        )
+
+    def _post_collective_rpc(self, method: str, args: list, what: str, n: int) -> None:
+        """POST a /collective_rpc {method,args} to all vLLM URLs, fail-fast.
+
+        Shared by the delta base-ship and per-step delta publish. Honors
+        ``self._collective_rpc_timeout`` and ``self._fail_on_publish_error``
+        (same contract as ``_publish_merged_weights_background``).
+        """
+        import requests
+
+        def _post_one(url: str) -> Optional[str]:
+            try:
+                r = requests.post(
+                    f"{url}/collective_rpc",
+                    json={"method": method, "args": args},
+                    timeout=self._collective_rpc_timeout,
+                )
+                if r.status_code != 200:
+                    msg = f"{url}: HTTP {r.status_code} {r.text[:200]}"
+                    log.warning("%s reload failed (%s)", what, msg)
+                    return msg
+                results = r.json().get("results", [{}])
+                first = results[0] if results else {}
+                if isinstance(first, dict) and first.get("status") not in (None, "ok"):
+                    msg = f"{url}: {first}"
+                    log.warning("%s reload error (%s)", what, msg)
+                    return msg
+                return None
+            except Exception as _e:
+                msg = f"{url}: {_e!r}"
+                log.error("%s HTTP error (%s)", what, msg)
+                return msg
+
+        failed: list[str] = []
+        with ThreadPoolExecutor(max_workers=max(1, len(self._vllm_urls))) as pool:
+            for f in as_completed([pool.submit(_post_one, u) for u in self._vllm_urls]):
+                err = f.result()
+                if err is not None:
+                    failed.append(err)
+        if failed:
+            _summary = (
+                f"{what} publish failed on {len(failed)}/{len(self._vllm_urls)} "
+                f"vLLM tiles: {failed}"
+            )
+            if self._fail_on_publish_error:
+                raise RuntimeError(_summary)
+            log.error("%s — continuing (fail_on_publish_error=False)", _summary)
 
     # -------------------------------------------------------------------------
     # Generation
@@ -1782,7 +2199,7 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
                     # policy diverges from training policy), so we fail fast here.
                     if self._publish_thread is not None:
                         _join_t0 = time.perf_counter()
-                        self._publish_thread.join(timeout=120)
+                        self._publish_thread.join(timeout=self._publish_join_timeout)
                         _timed_out = self._publish_thread.is_alive()
                         _pub_err = self._publish_error
                         self._publish_thread = None
@@ -1791,8 +2208,9 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
                             log.info("Rank 0: publish join %.2fs", time.perf_counter() - _join_t0)
                         if _timed_out:
                             raise RuntimeError(
-                                "Adapter publish thread timed out (120s) — vLLM adapter "
-                                "may not have been updated. Aborting to avoid stale-policy training."
+                                f"Adapter publish thread timed out "
+                                f"({self._publish_join_timeout}s) — vLLM adapter may not "
+                                "have been updated. Aborting to avoid stale-policy training."
                             )
                         if _pub_err is not None:
                             raise RuntimeError(
@@ -1964,15 +2382,23 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
                                             self._steps_run, float(_h_min.item()),
                                         )
 
-                    # Adapter publish to vLLM. Two paths:
-                    #   merged (default) — collective FSDP gather, rank 0 builds
-                    #     merged W_eff state dict, raw_bytes file + POST. Sidesteps
-                    #     vLLM --enable-lora PDE crash on Aurora XPU.
+                    # Adapter publish to vLLM. Three modes (self._lora_publish_mode):
+                    #   merged (default) — rank-0 builds the full merged W_eff
+                    #     state dict from cached base + live adapter, raw_bytes
+                    #     file + POST load_weights_from_raw. ~6.77 GiB/step.
+                    #   delta — rank-0 ships the base ONCE then ~66 MB lora_a/b
+                    #     each step; the vLLM worker re-merges. Bit-exact to
+                    #     merged, ~100x less per-step wire.
                     #   runtime (legacy) — rank-0 adapter snapshot, PEFT dir +
                     #     /v1/load_lora_adapter HTTP. Requires --enable-lora.
+                    # All three gather rank-0-ONLY (no collective) and publish in a
+                    # daemon thread joined before next-step generation (~line 1904).
+                    # Non-rank-0 ranks legitimately get None and skip; rank 0 never
+                    # blocks on a collective, so do NOT add a barrier here.
                     if self._steps_run % self._lora_publish_every == 0:
                         _pub_t0 = time.perf_counter()
-                        if self._lora_use_runtime:
+                        _mode = self._lora_publish_mode
+                        if _mode == "runtime":
                             publish_state = self._gather_lora_state_dict()  # rank-0 only; non-rank-0 returns None
                             if self._is_rank_zero and publish_state is not None:
                                 _gather_time = time.perf_counter() - _pub_t0
@@ -1992,10 +2418,35 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
 
                                 self._publish_thread = threading.Thread(target=_bg, daemon=True)
                                 self._publish_thread.start()
+                        elif _mode == "delta":
+                            # Path C: rank-0-ONLY adapter snapshot (~66 MB); the
+                            # vLLM worker re-merges against a cached base shipped
+                            # once on the first publish.
+                            delta_payload = self._gather_lora_delta_payload()
+                            if self._is_rank_zero and delta_payload is not None:
+                                _gather_time = time.perf_counter() - _pub_t0
+                                log.info(
+                                    "Rank 0: delta gather done in %.2fs (%d tensors) — starting async publish",
+                                    _gather_time, len(delta_payload[0]),
+                                )
+                                self._publish_error = None
+                                _dp = delta_payload
+
+                                def _bg(_s=_dp):
+                                    try:
+                                        self._publish_lora_delta_background(_s)
+                                    except Exception as _e:
+                                        self._publish_error = _e
+                                        log.error("Rank 0: delta async publish failed: %s", _e)
+
+                                self._publish_thread = threading.Thread(target=_bg, daemon=True)
+                                self._publish_thread.start()
                         else:
-                            # Merged path: COLLECTIVE — every rank must enter the
-                            # FSDP FULL_STATE_DICT context together. Non-rank-0 ranks
-                            # get None back and skip the background spawn.
+                            # Merged path (default): rank-0-ONLY, NO collective.
+                            # _gather_merged_lora_weights reads the frozen base
+                            # weights from self._cached_base_weights (gathered ONCE
+                            # in _cache_lora_base_weights at setup) and the live,
+                            # FSDP-ignored (replicated) lora_a/lora_b adapter tensors.
                             merged_sd = self._gather_merged_lora_weights()
                             if self._is_rank_zero and merged_sd is not None:
                                 _gather_time = time.perf_counter() - _pub_t0
@@ -2081,7 +2532,7 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
             self._metric_logger.close()
             # Join the last publish thread before closing ControlMaster / destroying PG.
             if self._publish_thread is not None:
-                self._publish_thread.join(timeout=120)
+                self._publish_thread.join(timeout=self._publish_join_timeout)
                 self._publish_thread = None
             if self._ssh_control_proc is not None:
                 try:

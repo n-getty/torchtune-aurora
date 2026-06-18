@@ -577,9 +577,47 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             self._dp_shard = self.world_size
             self._dp_degree = self.world_size
             self._dp_rank = self.rank
-            self._dp_mesh = None
-            self._shard_pg = None
-            self._shard_rank = self.rank
+            # Multi-node colocate (dp_replicate=1, non-EP) needs an EXPLICIT 1D
+            # dp_shard mesh. Leaving _dp_mesh=None makes shard_model() pass
+            # mesh=None to fully_shard, which falls back to FSDP2's
+            # _init_default_fully_shard_mesh(). On XPU that default builder
+            # misenumerates cross-node ranks: node-1 ranks get shard_mesh_size=12
+            # (one node) but shard_process_group.rank()=12..23 (global), so
+            # _init_sharded_param does chunks[shard_rank] with shard_rank >=
+            # len(chunks) → "IndexError: list index out of range" at setup. The
+            # HSDP branch (line ~416) and the EP single-replica branch (line ~629)
+            # already build explicit meshes for exactly this reason; the plain
+            # colocate path was the one cross-node case that didn't. Build the
+            # same 1D dp_shard mesh used by the EP branch. Single-node keeps
+            # _dp_mesh=None so the validated 1N path is byte-for-byte unchanged.
+            # NB: EP is handled by its own branch (line ~627) which builds the
+            # dp_shard mesh + EP gloo PGs inside `if self._dp_mesh is None`. Do
+            # NOT pre-build the mesh when EP is active or that setup is skipped
+            # and EP=16 breaks. EP degree is read below (line ~618), so consult
+            # cfg directly here.
+            _is_multinode_dp = self.world_size > int(
+                os.environ.get("LOCAL_WORLD_SIZE", self.world_size)
+            )
+            _ep_will_be_active = cfg.get("expert_parallel_degree", 1) > 1
+            if _is_multinode_dp and not _ep_will_be_active:
+                from torch.distributed.device_mesh import init_device_mesh
+                self._dp_mesh = init_device_mesh(
+                    self._device.type,
+                    (self.world_size,),
+                    mesh_dim_names=("dp_shard",),
+                )
+                self._shard_pg = self._dp_mesh.get_group("dp_shard")
+                self._shard_rank = torch.distributed.get_rank(self._shard_pg)
+                log.info(
+                    "Multi-node colocate (dp_replicate=1): built explicit 1D "
+                    "dp_shard mesh (world=%d) — avoids FSDP2 default-mesh "
+                    "cross-node IndexError on XPU.",
+                    self.world_size,
+                )
+            else:
+                self._dp_mesh = None
+                self._shard_pg = None
+                self._shard_rank = self.rank
             self._is_shard_leader = self._is_rank_zero
             self._is_xccl_leader = self._is_rank_zero
 
@@ -614,6 +652,29 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                 "_xpu_reduce_scatter_via_allreduce CPU-bounce path",
                 self.world_size,
             )
+            # Multi-node colocate: REGISTER the world-sized gloo PG with the
+            # reduce_scatter patch so FSDP2's cross-node reduce_scatter (on the
+            # XCCL dp_shard mesh group, size == world_size) routes through the
+            # gloo CPU-bounce instead of the XCCL fallback (distributed.py:227).
+            # The XCCL fallback is only safe single-node (no cross-node CXI MR
+            # leak); at 2N it reintroduces the v44-v58 UR-handle leak. Single-node
+            # deliberately skips this — its XCCL fallback is safe and faster.
+            # (The EP branch registers its own groups separately at line ~684.)
+            if _is_multinode_dp and not _ep_will_be_active:
+                set_process_groups(
+                    None,                       # gloo_dp_rep_pg — unused at dp_replicate=1
+                    self._gloo_dp_shard_pg,     # world-sized gloo (matches _shard_pg size)
+                    self._gloo_global_pg,       # same group
+                    None,                       # xccl_dp_rep_pg — unused at dp_replicate=1
+                    1,                          # dp_rep_degree
+                    self.world_size,            # dp_shard_degree (== reduce_scatter group size)
+                    xccl_dp_shard_pg=self._shard_pg,
+                )
+                log.info(
+                    "Multi-node colocate: registered world-sized gloo PG with "
+                    "reduce_scatter patch (dp_shard_degree=%d).",
+                    self.world_size,
+                )
 
         # Expert Parallelism (reuses dp_shard process group — no new communicators)
         self._expert_parallel_degree = cfg.get("expert_parallel_degree", 1)
@@ -4001,6 +4062,48 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                         self._expert_parallel_degree <= 1:
                     # Non-EP FSDP2: standard grad accumulation (suppress all but last chunk).
                     self._model.set_requires_gradient_sync(_is_last_chunk)
+
+                # Bypass the gloo CPU-AllReduce reduce_scatter patch on the chunked
+                # backward — NON-EP ONLY. Mirror of the SINGLE_BACKWARD bypass above
+                # (~lines 3790-3809). install_xpu_patches() routes
+                # dist.reduce_scatter_tensor through D2H + gloo AllReduce + H2D (the
+                # v57/v59 safety net); for non-EP FSDP2 that adds ~2s/layer × 64
+                # layers = ~130s to backward (status.md: corrupted a 4B benchmark to
+                # 274s/step). Native XCCL reduce_scatter is correct AND fast for
+                # non-EP FSDP2, so swap it back around the backward call. With
+                # set_requires_gradient_sync(_is_last_chunk) above, reduce_scatter
+                # fires only on the final chunk; on earlier chunks the swap is inert
+                # (no reduce_scatter is issued) but harmless. We swap per-chunk
+                # (rather than once around the loop) to keep this an exact, local
+                # mirror of the SINGLE_BACKWARD save→swap→backward→finally-restore
+                # pattern and to avoid reindenting the loop body.
+                #
+                # EP SAFETY: when self._expert_parallel_degree > 1 we do NOT swap
+                # (_rsc_bypass_chunk stays False) — the chunked path is then
+                # byte-identical to its pre-fix behavior. EP keeps reduce_grads=False
+                # on ALL FSDPParamGroups (v59), so FSDP2 never fires
+                # reduce_scatter_tensor during backward (grads sync post-backward via
+                # _ep_release_fsdp_unsharded_grads / gloo). The reduce_scatter patch
+                # is only a safety net for EP; if it ever fired it MUST stay on gloo
+                # — native XCCL reduce_scatter on the EP mesh has the op#259 deadlock
+                # and EP replica groups may be at different params when it fires.
+                # FSDP1 note: dist.reduce_scatter_tensor is NOT the FSDP1 grad-sync
+                # op (FSDP1 uses all_reduce, left native by install_xpu_patches), so
+                # the swap is a harmless no-op for FSDP1; we still gate on non-EP.
+                _rsc_bypass_chunk = self._expert_parallel_degree <= 1
+                _rsc_patch_saved_ck = None
+                import torch.distributed as _tdist_ck_fix
+                if _rsc_bypass_chunk:
+                    _rsc_patch_saved_ck = _tdist_ck_fix.reduce_scatter_tensor
+                    _tdist_ck_fix.reduce_scatter_tensor = _orig_reduce_scatter_tensor
+                    if self._is_rank_zero and not getattr(
+                        self, "_chunked_rsc_bypass_logged", False
+                    ):
+                        log.info(
+                            "chunked backward: non-EP reduce_scatter bypass ACTIVE "
+                            "(native XCCL; avoids ~130s gloo CPU-bounce on final chunk)"
+                        )
+                        self._chunked_rsc_bypass_logged = True
                 try:
                     if (_use_fsdp1_no_sync or _use_ddp_no_sync) and not _is_last_chunk:
                         with self._model.no_sync():
@@ -4016,6 +4119,9 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                     log.error("Rank %d: BACKWARD FAILED step=%d chunk[%d:%d] exc=%r",
                               self.rank, self._steps_run, _cs, _ce, _bwd_exc)
                     raise
+                finally:
+                    if _rsc_bypass_chunk:
+                        _tdist_ck_fix.reduce_scatter_tensor = _rsc_patch_saved_ck
                 # MEMPROBE v1: per-rank L0-truth snapshot after backward returns.
                 try:
                     if _dump_mem is not None:
@@ -5109,16 +5215,29 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             _reduce_pg = None  # default world group
             _n_reduce = self.world_size
 
+        # Decide whether to world-reduce the logged metrics. Gate on TRUE HSDP
+        # (dp_replicate > 1), NOT on `_shard_pg is not None`:
+        #   - True HSDP: each replicate group sees DISTINCT data and rank 0's
+        #     local metric is representative of its replica — and a world reduce
+        #     would mix the world PG with FSDP1 sub-PGs on XCCL (deadlock risk).
+        #     Skip the reduce.
+        #   - Flat data-parallel (dp_replicate == 1), whether single-node (1N) or
+        #     multi-node colocate (2N): every rank holds a DISTINCT prompt slice
+        #     (sampler num_replicas == world_size, see _setup_data), so the
+        #     representative metric is the mean ACROSS ranks — reduce it. The 2N
+        #     colocate path now sets `_shard_pg` (the explicit FSDP mesh group, a
+        #     dp_mesh fix for cross-node sharding), so gating on `_shard_pg is
+        #     None` would WRONGLY skip the reduce there and log only rank 0's
+        #     4-sample local mean (coarse 0.25-quantized successes) instead of the
+        #     world-aggregated value the 1N reference logs. Gate on dp_replicate.
+        _reduce_metrics = self._dp_replicate <= 1
         rewards = trajectory.rewards.mean()
-        # HSDP: skip world-level reduce to avoid mixing world PG with FSDP1
-        # sub-PGs on XCCL. Each replicate group processes the same model with
-        # different data, so rank 0's local metrics are representative.
-        if self._shard_pg is None:
+        if _reduce_metrics:
             torch.distributed.reduce(rewards, dst=0, op=torch.distributed.ReduceOp.SUM, group=_reduce_pg)
             rewards /= _n_reduce
 
         successes = trajectory.successes.mean()
-        if self._shard_pg is None:
+        if _reduce_metrics:
             torch.distributed.reduce(successes, dst=0, op=torch.distributed.ReduceOp.SUM, group=_reduce_pg)
             successes /= _n_reduce
 

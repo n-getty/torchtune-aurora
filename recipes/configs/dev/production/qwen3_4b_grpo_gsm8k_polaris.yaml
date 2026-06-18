@@ -1,0 +1,159 @@
+# Qwen3-4B GRPO — Polaris (CUDA / A100) baseline for the Aurora comparison
+#
+# IMPORTANT — what this matches and what it does NOT:
+#   The Aurora target is LoRA-GRPO (recipes/dev/lora_grpo_full_finetune_distributed_xpu.py),
+#   but there is NO CUDA LoRA-GRPO recipe in this tree. The upstream GRPO recipe
+#   recipes/dev/grpo_full_finetune_distributed.py is FULL-FINETUNE only (it has no
+#   LoRA / set_trainable_params path). So this CUDA baseline is FULL-FT GRPO.
+#
+#   Consequence for the comparison: the TASK ENVELOPE is matched (Qwen3-4B, GSM8K,
+#   grpo_samples=24, max_generated_tokens=512, T=1.0, GRPOLoss kl=1e-4, eps=0.2),
+#   but the TRAINABLE SURFACE differs (CUDA = all params; Aurora = LoRA adapter).
+#   This is the single biggest apples-to-apples caveat — see the report.
+#   To make it a true LoRA-vs-LoRA comparison you would need to port the XPU
+#   LoRA-GRPO recipe to CUDA (proposed in the report, not done here).
+#
+# vLLM on CUDA is native and simple (no enforce-eager workaround, no XPU plugin
+#   re-registration). Two ways to run rollouts:
+#     (a) server mode  — set vllm_url to a `vllm serve`'d Qwen3-4B HTTP endpoint;
+#         the recipe POSTs token-ids and gets completions. Matches the Aurora
+#         server-mode topology most closely. (default in the launcher)
+#     (b) native       — leave vllm_url unset; the recipe uses torchtune's
+#         in-process generate(). Simpler 1-node, but slower rollouts.
+#
+# Setup (one-time on Polaris):
+#   module use /soft/modulefiles && module load conda && conda activate
+#   pip install vllm   # CUDA wheel; native, unlike the Aurora XPU story
+#   hf download Qwen/Qwen3-4B --local-dir /eagle/PROJECT/USER/models/Qwen3-4B
+#
+# Launch: see experiments/lora_grpo/polaris/run_qwen3_4b_grpo_polaris.sh
+
+name: grpo_qwen3_4b_gsm8k_polaris
+output_dir: /eagle/PROJECT/USER/torchtune/outputs/${name}
+base_model_path: /eagle/PROJECT/USER/models/Qwen3-4B   # TODO(polaris): real path
+
+# ── Tokenizer ─────────────────────────────────────────────────────────────────
+tokenizer:
+  _component_: torchtune.models.qwen3.qwen3_tokenizer
+  path: ${base_model_path}/vocab.json
+  merges_file: ${base_model_path}/merges.txt
+  max_seq_len: 1024
+
+# ── Dataset (GSM8K, matches Aurora) ───────────────────────────────────────────
+dataset:
+  _component_: torchtune.dev.rl.gsm8k.gsm8k_dataset
+  partition: 1-9/10
+seed: 42
+shuffle: false
+
+# ── Model (FULL-FT — see header caveat) ───────────────────────────────────────
+model:
+  _component_: torchtune.models.qwen3.qwen3_4b_base
+
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [
+    model-00001-of-00003.safetensors,
+    model-00002-of-00003.safetensors,
+    model-00003-of-00003.safetensors,
+  ]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: QWEN3
+
+# Full-FT GRPO carries a separate frozen ref model (unlike the LoRA recipe's
+# disable_adapter() trick). This is required by grpo_full_finetune_distributed.py.
+ref_checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [
+    model-00001-of-00003.safetensors,
+    model-00002-of-00003.safetensors,
+    model-00003-of-00003.safetensors,
+  ]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}/ref
+  model_type: QWEN3
+
+resume_from_checkpoint: false
+save_every_n_epochs: 1
+
+# ── RL hyperparameters (matched to Aurora qwen3_4b_lora_grpo_2node_server_xpu) ──
+grpo_samples: 24                        # paper G=24 (matches Aurora)
+max_generated_tokens: 512               # matches Aurora
+top_k: null
+temperature: 1.0                        # matches Aurora
+
+# batch / chunking
+# NOTE: A100 40GB cannot hold full-FT Qwen3-4B + ref + activations at the Aurora
+#   batch_size=8. Start conservative; the report documents the memory-forced
+#   divergence. Raise batch_size/forward_batch_size if memory allows.
+batch_size: 1                           # TODO(polaris): tune up if A100 mem permits
+forward_batch_size: 1
+ppo_epochs: 1
+num_steps: 20                           # benchmark length (Aurora rung 3 used 20)
+epochs: 20
+clip_grad_norm: 1.0
+gradient_accumulation_steps: 1
+
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 3.0e-5                            # matches Aurora paper lr (NOT the 1e-5 a100 baseline)
+  fused: true
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  num_warmup_steps: 10
+
+# ── Loss (matches Aurora GRPOLoss kl=1e-4 eps=0.2) ────────────────────────────
+# NOTE: the existing A100 baseline configs use GRPOSimpleLoss(kl=0.01). To match
+#   the Aurora LoRA-GRPO config we use GRPOLoss(kl=1e-4, eps=0.2) instead.
+loss:
+  _component_: torchtune.dev.rl.loss.GRPOLoss
+  kl_coeff: 1.0e-4
+  epsilon: 0.2
+
+# ── Reward (matches Aurora) ───────────────────────────────────────────────────
+reward_functions:
+  - _component_: torchtune.dev.rl.rewards.FormattedMathCorrectnessReward
+    answer_tag: answer
+    positive_reward: 10.0
+    negative_reward: 0.0
+  - _component_: torchtune.dev.rl.rewards.ThinkingAnswerFormattingReward
+    think_tag: think
+    answer_tag: answer
+    positive_reward: 1.0
+    negative_reward: 0.0
+
+# ── vLLM rollout ──────────────────────────────────────────────────────────────
+# vllm_url is injected by the launcher (server mode). If unset, the recipe falls
+# back to in-process native generation.
+# vllm_url: http://<vllm_host>:8000
+
+# ── Env ───────────────────────────────────────────────────────────────────────
+device: cuda
+enable_activation_checkpointing: true   # full-FT 4B on A100 40GB needs AC
+compile: false
+dtype: bf16
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+log_every_n_steps: 1
+log_peak_memory_stats: true
+
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: false
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: true
+  cuda: true
+  profile_memory: false
+  with_stack: false
+  record_shapes: true
+  with_flops: false
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1

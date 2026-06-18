@@ -68,9 +68,17 @@ shuffle: true
 resume_from_checkpoint: false
 
 # ── RL Hyperparameters (paper-aligned) ────────────────────────────────────────
-grpo_samples: 24                       # paper G=24
+# ⚠ MEMORY BOUNDARY: grpo_samples=24 + max_generated_tokens=512 is the paper
+# envelope but is the DOCUMENTED banned:1 boundary on 2N Aurora — it OOMs at the
+# step 0->1 vLLM+ref_fwd memory jump (IPC-handle eviction; lora_status.md
+# 2026-05-05, reconfirmed 2026-06-17). VALIDATED-SAFE: G=8/16, max_gen=384
+# (~52-53s/step, 6/6 clean). To run safely, override on the CLI:
+#   grpo_samples=8 max_generated_tokens=384
+# (the launcher run_qwen3_4b_lora_2node.sh now defaults to these). Keep the paper
+# values below as the reference target; only run them with extra memory headroom.
+grpo_samples: 24                       # paper G=24 (see boundary warning above)
 max_seq_len: 1024
-max_generated_tokens: 512
+max_generated_tokens: 512              # paper (see boundary warning above)
 temperature: 1.0                       # paper T=1.0
 top_k: null
 
@@ -115,15 +123,25 @@ reward_functions:
     negative_reward: 0.0
 
 # ── LoRA publish config ────────────────────────────────────────────────────────
-# Default publish path is runtime hot-swap (use_runtime_lora=true):
-# rank 0 writes a PEFT adapter dir to shm_root and POSTs /v1/load_lora_adapter
-# to all vLLM tiles. Requires vLLM launched with --enable-lora and the
-# torch 2.11+xpu venv (memory project_lora_grpo_torch211_unblocks_bgmv.md).
-# Set use_runtime_lora=false to use the merged-weight broadcast path:
-# rank 0 builds W_eff = W_base + (alpha/rank)*(B@A) and POSTs raw bytes to
-# vLLM /collective_rpc load_weights_from_raw (frameworks/2025.3.1, no --enable-lora).
+# publish_mode selects how the trained adapter reaches the vLLM rollout tiles:
+#   merged  — rank 0 builds W_eff = W_base + (alpha/rank)*(B@A) and POSTs the
+#             full ~6.77 GiB raw bytes to /collective_rpc load_weights_from_raw
+#             every step (frameworks/2025.3.1, no --enable-lora). Bit-exact but
+#             bandwidth-bound (~28s/step at 4B/2N).
+#   delta   — rank 0 ships the frozen base ONCE then only the ~66 MB lora_a/b
+#             each step; the vLLM worker re-merges W_eff = base + scale*(B@A)
+#             from a cached CPU base (load_lora_delta_from_raw). Bit-exact to
+#             merged, ~100x less per-step wire, no --enable-lora, any TP. The
+#             optimal path — prefer this once validated.
+#   runtime — vLLM-native hot-swap: rank 0 writes a PEFT adapter dir and POSTs
+#             /v1/load_lora_adapter. Requires vLLM --enable-lora + the
+#             torch 2.11+xpu venv (memory project_lora_grpo_torch211_unblocks_bgmv.md),
+#             TP=1 only, and the cold-DAOS fix in the launcher.
+# Back-compat: if publish_mode is unset, use_runtime_lora=true → "runtime",
+# else "merged". The launcher overrides use_runtime_lora via LORA_USE_RUNTIME.
 lora:
-  use_runtime_lora: true              # runtime hot-swap (default)
+  use_runtime_lora: true              # runtime hot-swap (legacy toggle; see publish_mode)
+  # publish_mode: delta               # uncomment to use the merge-at-receiver path
   publish_every_steps: 1              # sync adapter to vLLM after every optimizer step
   max_loras: 2                        # slot rotation for adapter dirs / raw_bytes path
   shm_root: /lus/flare/projects/ModCon/ngetty/torchtune/outputs/lora_grpo_qwen3_4b_2node_v1/adapters

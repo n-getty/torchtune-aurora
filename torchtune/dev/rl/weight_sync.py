@@ -51,7 +51,9 @@ def _backbone_param_iter(self, policy=None):
         return
     tune_to_hf = getattr(self, '_tune_to_hf_map', {}) or {}
     for tune_name, param in policy.named_parameters():
-        clean = tune_name.replace("_checkpoint_wrapped_module.", "")
+        clean = tune_name.replace(
+            "_checkpoint_wrapped_module.", ""
+        ).replace("_fsdp_wrapped_module.", "")
         hf_name = tune_to_hf.get(clean, tune_to_hf.get(tune_name, clean))
         yield hf_name, param
 
@@ -182,20 +184,40 @@ def _sync_colocated_weights(self) -> None:
     )
 
     n_synced = 0
+
+    # FSDP1 vs FSDP2 full-param materialization:
+    #   - FSDP2 (default colocate, dp_replicate=1): params are DTensors with a
+    #     .full_tensor() collective — handled per-param in the loop below.
+    #   - FSDP1 HYBRID_SHARD (colocate + dp_replicate>1): params are flat shards
+    #     with NO .full_tensor(); `param.data` is only this rank's 1/dp_shard
+    #     slice. Loading that into vLLM asserts on shape (vocab_parallel_embedding
+    #     weight_loader, 2026-06-18). Wrap the whole iteration in
+    #     summon_full_params(rank0_only=False) so EVERY rank sees full params
+    #     (each colocated rank loads its own vLLM). writeback=False: read-only.
+    _use_fsdp1 = bool(getattr(self, "_use_fsdp1", False))
+    if _use_fsdp1 and not hasattr(self._policy, 'vllm_param_iter'):
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        _summon_ctx = FSDP.summon_full_params(
+            self._model, writeback=False, rank0_only=False
+        )
+    else:
+        _summon_ctx = _NullCtx()
+
     # BioReasonModel (and other multimodal wrappers) expose vllm_param_iter()
     # which yields (hf_name, param) for backbone-only params, bypassing the
     # _tune_to_hf_map name translation and skipping frozen encoders/projectors.
     if hasattr(self._policy, 'vllm_param_iter'):
-        param_iter = self._policy.vllm_param_iter()
+        param_iter_factory = self._policy.vllm_param_iter
     else:
-        def _default_iter():
+        def param_iter_factory():
             for tune_name, param in self._model.named_parameters():
-                clean = tune_name.replace("_checkpoint_wrapped_module.", "")
+                clean = tune_name.replace(
+                    "_checkpoint_wrapped_module.", ""
+                ).replace("_fsdp_wrapped_module.", "")
                 hf_name = self._tune_to_hf_map.get(
                     clean, self._tune_to_hf_map.get(tune_name, clean)
                 )
                 yield hf_name, param
-        param_iter = _default_iter()
 
     _unperm_needed = _needs_qk_unpermute(self)
     if _unperm_needed and not getattr(self, "_qk_unperm_engaged_logged", False):
@@ -208,27 +230,29 @@ def _sync_colocated_weights(self) -> None:
             getattr(self, "_model_head_dim", None),
         )
         self._qk_unperm_engaged_logged = True
-    for hf_name, param in param_iter:
-        if hasattr(param, 'full_tensor'):
-            weight_data = param.full_tensor()
-        else:
-            weight_data = param.data
+    with _summon_ctx:
+        for hf_name, param in param_iter_factory():
+            if hasattr(param, 'full_tensor'):
+                weight_data = param.full_tensor()      # FSDP2 DTensor
+            else:
+                # FSDP2 non-DTensor OR FSDP1-under-summon (already full).
+                weight_data = param.data
 
-        if _is_vllm_rank:
-            if _unperm_needed:
-                # Llama-family Q/K were permuted at checkpoint load; un-permute
-                # back to HF layout so vLLM consumes them correctly.
-                weight_data = _maybe_unpermute_qk(self, hf_name, weight_data)
-            llm_model.load_weights([(hf_name, weight_data)])
-        n_synced += 1
-        del weight_data
+            if _is_vllm_rank:
+                if _unperm_needed:
+                    # Llama-family Q/K were permuted at checkpoint load; un-permute
+                    # back to HF layout so vLLM consumes them correctly.
+                    weight_data = _maybe_unpermute_qk(self, hf_name, weight_data)
+                llm_model.load_weights([(hf_name, weight_data)])
+            n_synced += 1
+            del weight_data
 
-        # Sync + gc every 5 params to bound UR handle pressure
-        # (707 full_tensor all-gathers create UR handles that must be
-        # reclaimed before the subsequent FSDP backward pass).
-        if n_synced % 5 == 0 and torch.xpu.is_available():
-            gc.collect()
-            torch.xpu.synchronize(self._device)
+            # Sync + gc every 5 params to bound UR handle pressure
+            # (707 full_tensor all-gathers create UR handles that must be
+            # reclaimed before the subsequent FSDP backward pass).
+            if n_synced % 5 == 0 and torch.xpu.is_available():
+                gc.collect()
+                torch.xpu.synchronize(self._device)
 
     if _is_vllm_rank:
         self._vllm_llm.llm_engine.reset_prefix_cache()
@@ -269,7 +293,9 @@ def _sync_ray_colocate_weights(self) -> None:
     else:
         def _default_iter():
             for tune_name, param in self._model.named_parameters():
-                clean = tune_name.replace("_checkpoint_wrapped_module.", "")
+                clean = tune_name.replace(
+            "_checkpoint_wrapped_module.", ""
+        ).replace("_fsdp_wrapped_module.", "")
                 hf_name = self._tune_to_hf_map.get(
                     clean, self._tune_to_hf_map.get(tune_name, clean)
                 )

@@ -24,12 +24,33 @@ from torchtune.dev.rl.generation import generate
 from torchtune.dev.rl.rewards import batched_rewards
 from torchtune.dev.rl.types import GRPOStats, GRPOTrajectory
 from torchtune.modules import local_kv_cache
+from torchtune.modules.peft import (
+    AdapterModule,
+    get_adapter_params,
+    get_adapter_state_dict,
+    get_lora_module_names,
+    get_merged_lora_ckpt,
+    set_trainable_params,
+    validate_missing_and_unexpected_for_lora,
+)
 from torchtune.recipe_interfaces import FTRecipeInterface
 from torchtune.training import disable_dropout, DummyProfiler, PROFILER_KEY
 from torchtune.training.lr_schedulers import get_lr
 from tqdm import tqdm
 
 log = utils.get_logger("DEBUG")
+
+
+def _model_has_adapter_params(model: nn.Module) -> bool:
+    """Return True iff the instantiated model carries LoRA/DoRA adapter params.
+
+    This is the single switch that selects the OPT-IN LoRA training surface from
+    the existing full-FT path. When the config uses a non-LoRA model builder this
+    returns False and the recipe behaves byte-identically to the tracked full-FT
+    recipe. Factored out as a pure function so the branch can be unit-tested on
+    CPU without FSDP/device setup.
+    """
+    return bool(get_adapter_params(model))
 
 
 class GRPOFullFinetuneRecipeDistributed(FTRecipeInterface):
@@ -250,6 +271,10 @@ class GRPOFullFinetuneRecipeDistributed(FTRecipeInterface):
         self._save_every_n_epochs = cfg.save_every_n_epochs
         self._total_steps = cfg.num_steps
 
+        # LoRA-GRPO checkpoint behavior (no-op for the full-FT path).
+        self._is_lora_policy = _model_has_adapter_params(self._model)
+        self._save_adapter_weights_only = cfg.get("save_adapter_weights_only", False)
+
         # vLLM server mode (optional) — all ranks create their own HTTP client
         self._vllm_url = cfg.get("vllm_url", None)
         self._vllm_client = None
@@ -379,6 +404,51 @@ class GRPOFullFinetuneRecipeDistributed(FTRecipeInterface):
         with training.set_default_dtype(self._dtype), torch.device("meta"):
             model = config.instantiate(cfg_model)
 
+        # OPT-IN LoRA surface: when the config uses a lora_* model builder the
+        # instantiated model carries adapter params. The full-FT path (no adapter
+        # params) below is byte-identical to the tracked recipe — every LoRA-only
+        # action is guarded by ``is_lora``.
+        #
+        # Ref-model semantics: the GRPO recipe builds the policy AND a frozen ref
+        # model (eval_mode=True) via this same method. For LoRA-GRPO the ref must
+        # stay == the FROZEN BASE throughout training. We build the ref as a LoRA
+        # model too, but in eval_mode ALL params (base + adapters) are frozen, and
+        # lora_b initializes to zero (see peft.lora._lora_b_init_params), so a
+        # freshly-initialized LoRA model is numerically identical to the base.
+        # Because the ref's adapters never receive gradients (eval_mode freezes
+        # them and they are excluded from the optimizer, which is built over
+        # self._model.parameters()), they stay at their zero init and ref == base
+        # for the whole run. This reuses the existing two-model machinery with no
+        # structural change. (The XPU LoRA-GRPO fork instead uses a disable_adapter
+        # context on a single model; here we keep the device-agnostic recipe's
+        # separate-ref design and rely on zero-init + frozen adapters.)
+        is_lora = _model_has_adapter_params(model)
+        if is_lora and not eval_mode:
+            # Freeze base, train adapters (must run before sharding/optimizer).
+            set_trainable_params(model, get_adapter_params(model))
+            self._lora_attn_modules = list(cfg_model.lora_attn_modules)
+            self._apply_lora_to_mlp = cfg_model.apply_lora_to_mlp
+            self._apply_lora_to_output = getattr(
+                cfg_model, "apply_lora_to_output", False
+            )
+            self._lora_rank = cfg_model.lora_rank
+            self._lora_alpha = cfg_model.lora_alpha
+            self._adapter_config = {
+                "r": self._lora_rank,
+                "lora_alpha": self._lora_alpha,
+                "target_modules": get_lora_module_names(
+                    self._lora_attn_modules,
+                    self._apply_lora_to_mlp,
+                    self._apply_lora_to_output,
+                ),
+                "peft_type": "LORA",
+            }
+            utils.log_rank_zero(
+                log,
+                f"LoRA-GRPO: {len(get_adapter_params(model))} adapter tensors "
+                "trainable, base frozen.",
+            )
+
         if eval_mode:
             model.eval()
             for p in model.parameters():
@@ -438,21 +508,62 @@ class GRPOFullFinetuneRecipeDistributed(FTRecipeInterface):
             dp_mesh=dp_mesh,
         )
 
-        with training.set_default_dtype(self._dtype), self._device:
-            for m in model.modules():
-                # RoPE is not covered in state dict
-                if hasattr(m, "rope_init"):
-                    m.rope_init()
+        if is_lora:
+            # LoRA path: the checkpoint is a BASE checkpoint (no lora_a/lora_b),
+            # and the model has extra adapter params. strict=True would reject
+            # both the missing adapter keys and the unexpected base format, so we
+            # mirror the validated upstream LoRA load pattern from
+            # recipes/lora_finetune_distributed.py: initialize fresh adapter +
+            # RoPE buffers, do a NON-strict base load, then validate the
+            # missing/unexpected sets are exactly the expected LoRA shape.
+            lora_device = "cpu" if fsdp_cpu_offload else self._device
+            with training.set_default_dtype(self._dtype), self._device:
+                for m in model.modules():
+                    if isinstance(m, AdapterModule):
+                        # Adapters are not in a base checkpoint; init them.
+                        m.to_empty(device=lora_device)
+                        m.initialize_parameters()
+                    if hasattr(m, "rope_init"):
+                        m.rope_init()
 
-        # This method will convert the full model state dict into a sharded state
-        # dict and load into the model
-        training.load_from_full_model_state_dict(
-            model,
-            model_sd,
-            self._device,
-            strict=True,
-            cpu_offload=fsdp_cpu_offload,
-        )
+            base_missing, base_unexpected = training.load_from_full_model_state_dict(
+                model,
+                model_sd,
+                self._device,
+                strict=False,
+                cpu_offload=fsdp_cpu_offload,
+            )
+            # DoRA magnitude (if any) must be initialized after the base load.
+            for m in model.modules():
+                if hasattr(m, "initialize_dora_magnitude"):
+                    m.initialize_dora_magnitude()
+
+            validate_missing_and_unexpected_for_lora(
+                lora_attn_modules=list(cfg_model.lora_attn_modules),
+                apply_lora_to_mlp=cfg_model.apply_lora_to_mlp,
+                apply_lora_to_output=getattr(cfg_model, "apply_lora_to_output", False),
+                state_dict_keys=model.state_dict().keys(),
+                base_missing=base_missing,
+                base_unexpected=base_unexpected,
+                lora_missing=None,
+                lora_unexpected=None,
+            )
+        else:
+            with training.set_default_dtype(self._dtype), self._device:
+                for m in model.modules():
+                    # RoPE is not covered in state dict
+                    if hasattr(m, "rope_init"):
+                        m.rope_init()
+
+            # This method will convert the full model state dict into a sharded
+            # state dict and load into the model
+            training.load_from_full_model_state_dict(
+                model,
+                model_sd,
+                self._device,
+                strict=True,
+                cpu_offload=fsdp_cpu_offload,
+            )
 
         # Ensure no params and buffers are on meta device
         training.validate_no_params_on_meta_device(model)
@@ -596,7 +707,34 @@ class GRPOFullFinetuneRecipeDistributed(FTRecipeInterface):
 
         if self._is_rank_zero:
             start = time.perf_counter()
-            checkpoint_dict.update({training.MODEL_KEY: cpu_state_dict})
+
+            adapter_only = False
+            if getattr(self, "_is_lora_policy", False):
+                # LoRA-GRPO save. cpu_state_dict holds base + lora_a/lora_b keys.
+                # The checkpointer runs tune_to_hf over MODEL_KEY for non-adapter
+                # saves, which would choke on raw lora_* keys — so we either:
+                #   (a) save adapter-only (PEFT dir) when save_adapter_weights_only,
+                #   (b) otherwise MERGE the LoRA delta into the base weights via
+                #       get_merged_lora_ckpt so MODEL_KEY is standard base format,
+                #       and ALSO emit the adapter weights/config alongside.
+                # Always extract the adapter state dict BEFORE merging (merge is
+                # in-place and removes lora_* keys).
+                adapter_state_dict = get_adapter_state_dict(cpu_state_dict)
+                checkpoint_dict[training.ADAPTER_KEY] = adapter_state_dict
+                if getattr(self, "_adapter_config", None) is not None:
+                    checkpoint_dict[training.ADAPTER_CONFIG] = self._adapter_config
+
+                if self._save_adapter_weights_only:
+                    adapter_only = True
+                else:
+                    merged_state_dict = get_merged_lora_ckpt(
+                        cpu_state_dict,
+                        rank=self._lora_rank,
+                        alpha=self._lora_alpha,
+                    )
+                    checkpoint_dict[training.MODEL_KEY] = merged_state_dict
+            else:
+                checkpoint_dict[training.MODEL_KEY] = cpu_state_dict
 
             # if training is in-progress, checkpoint the optimizer state and recipe state
             # as well.
@@ -616,6 +754,7 @@ class GRPOFullFinetuneRecipeDistributed(FTRecipeInterface):
                 checkpoint_dict,
                 epoch=epoch,
                 intermediate_checkpoint=intermediate_checkpoint,
+                adapter_only=adapter_only,
             )
             log.info(f"Saving checkpoint took {time.perf_counter() - start:.2f} secs")
 
