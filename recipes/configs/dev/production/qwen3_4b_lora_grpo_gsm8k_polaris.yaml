@@ -1,0 +1,171 @@
+# Qwen3-4B LoRA-GRPO — Polaris (CUDA / A100) TRUE LoRA-vs-LoRA baseline
+#
+# This is the "Option 1" config from docs/reports/lora_cuda_baseline_plan_20260617.md
+# §6 / docs/reports/lora_grpo_cuda_recipe_option1_20260617.md: it exercises the
+# OPT-IN LoRA training surface added to the device-agnostic GRPO recipe
+# recipes/dev/grpo_full_finetune_distributed.py.
+#
+# Difference vs qwen3_4b_grpo_gsm8k_polaris.yaml (the full-FT sibling):
+#   - model._component_ is a lora_* builder, so the recipe detects adapter params,
+#     freezes the base, and trains ONLY the LoRA adapters (set_trainable_params).
+#   - The TASK ENVELOPE is identical to the full-FT config (Qwen3-4B, GSM8K,
+#     grpo_samples=24, max_generated_tokens=512, T=1.0, GRPOLoss kl=1e-4 eps=0.2,
+#     lr=3e-5), so this is now a TRUE LoRA-vs-LoRA comparison with Aurora's
+#     qwen3_4b_lora_grpo_2node_server_xpu.yaml.
+#   - save_adapter_weights_only: the recipe saves a PEFT adapter dir (small) when
+#     true, or merged base weights + adapter when false.
+#
+# Ref-model semantics (see recipe comment + report): the recipe builds a SEPARATE
+# frozen ref model. For LoRA it is also a LoRA model in eval_mode — base + adapters
+# all frozen — and because lora_b init is ZERO and ref adapters never receive
+# gradients, ref == base for the whole run.
+#
+# Setup (one-time on Polaris):
+#   module use /soft/modulefiles && module load conda && conda activate
+#   pip install vllm   # CUDA wheel; native, unlike the Aurora XPU story
+#   hf download Qwen/Qwen3-4B --local-dir /eagle/PROJECT/USER/models/Qwen3-4B
+#
+# Launch: reuse experiments/lora_grpo/polaris/run_qwen3_4b_grpo_polaris.sh with
+#   CONFIG pointed at this file.
+
+name: lora_grpo_qwen3_4b_gsm8k_polaris
+output_dir: /eagle/PROJECT/USER/torchtune/outputs/${name}
+base_model_path: /eagle/PROJECT/USER/models/Qwen3-4B   # TODO(polaris): real path
+
+# ── Tokenizer ─────────────────────────────────────────────────────────────────
+tokenizer:
+  _component_: torchtune.models.qwen3.qwen3_tokenizer
+  path: ${base_model_path}/vocab.json
+  merges_file: ${base_model_path}/merges.txt
+  max_seq_len: 1024
+
+# ── Dataset (GSM8K, matches Aurora) ───────────────────────────────────────────
+dataset:
+  _component_: torchtune.dev.rl.gsm8k.gsm8k_dataset
+  partition: 1-9/10
+seed: 42
+shuffle: false
+
+# ── Model (LoRA — adapter surface matched to Aurora LoRA-GRPO config) ──────────
+model:
+  _component_: torchtune.models.qwen3.lora_qwen3_4b_base
+  lora_attn_modules: ['q_proj', 'k_proj', 'v_proj', 'output_proj']
+  apply_lora_to_mlp: true
+  apply_lora_to_output: false          # tied embeddings on Qwen3-4B
+  lora_rank: 16                         # matches Aurora (r=16)
+  lora_alpha: 32                        # matches Aurora (alpha=2*rank)
+  lora_dropout: 0.0
+
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [
+    model-00001-of-00003.safetensors,
+    model-00002-of-00003.safetensors,
+    model-00003-of-00003.safetensors,
+  ]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: QWEN3
+
+# The ref model loads the SAME base checkpoint (no adapter keys). Built as a LoRA
+# model in eval_mode (all params frozen, lora_b == 0) so ref == base throughout.
+ref_checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [
+    model-00001-of-00003.safetensors,
+    model-00002-of-00003.safetensors,
+    model-00003-of-00003.safetensors,
+  ]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}/ref
+  model_type: QWEN3
+
+resume_from_checkpoint: false
+save_every_n_epochs: 1
+save_adapter_weights_only: true        # small PEFT adapter dir; set false to also save merged base
+
+# ── RL hyperparameters (matched to Aurora qwen3_4b_lora_grpo_2node_server_xpu) ──
+grpo_samples: 24                        # paper G=24 (matches Aurora)
+max_generated_tokens: 512               # matches Aurora
+top_k: null
+temperature: 1.0                        # matches Aurora
+
+# batch / chunking
+# LoRA frees a lot of A100 40GB headroom vs full-FT (no full-param optimizer state,
+# adapter-only grads), so this can usually run a larger batch than the full-FT
+# sibling. Start conservative and raise if memory permits.
+batch_size: 2                           # TODO(polaris): tune up; LoRA leaves headroom
+forward_batch_size: 2
+ppo_epochs: 1
+num_steps: 20                           # benchmark length (Aurora rung 3 used 20)
+epochs: 20
+clip_grad_norm: 1.0
+gradient_accumulation_steps: 1
+
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 3.0e-5                            # matches Aurora paper lr
+  fused: true
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  num_warmup_steps: 10
+
+# ── Loss (matches Aurora GRPOLoss kl=1e-4 eps=0.2) ────────────────────────────
+loss:
+  _component_: torchtune.dev.rl.loss.GRPOLoss
+  kl_coeff: 1.0e-4
+  epsilon: 0.2
+
+# ── Reward (matches Aurora) ───────────────────────────────────────────────────
+reward_functions:
+  - _component_: torchtune.dev.rl.rewards.FormattedMathCorrectnessReward
+    answer_tag: answer
+    positive_reward: 10.0
+    negative_reward: 0.0
+  - _component_: torchtune.dev.rl.rewards.ThinkingAnswerFormattingReward
+    think_tag: think
+    answer_tag: answer
+    positive_reward: 1.0
+    negative_reward: 0.0
+
+# ── vLLM rollout ──────────────────────────────────────────────────────────────
+# vllm_url is injected by the launcher (server mode). If unset, the recipe falls
+# back to in-process native generation.
+# NOTE: the upstream GRPO recipe's vLLM server mode broadcasts the POLICY weights
+# to vLLM. With LoRA, vLLM serves the BASE model; getting LoRA deltas into vLLM
+# rollouts requires either merged-weight publish or PEFT adapter hot-swap, which
+# this minimal Option-1 path does NOT implement. For a first LoRA-GRPO step-time
+# baseline, prefer in-process native generation (leave vllm_url unset) or accept
+# that server-mode rollouts use base weights until weight-sync is wired. See the
+# report's "still needs CUDA validation" section.
+# vllm_url: http://<vllm_host>:8000
+
+# ── Env ───────────────────────────────────────────────────────────────────────
+device: cuda
+enable_activation_checkpointing: true
+compile: false
+dtype: bf16
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+log_every_n_steps: 1
+log_peak_memory_stats: true
+
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: false
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: true
+  cuda: true
+  profile_memory: false
+  with_stack: false
+  record_shapes: true
+  with_flops: false
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1

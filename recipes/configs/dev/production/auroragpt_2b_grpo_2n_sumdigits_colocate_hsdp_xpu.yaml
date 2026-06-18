@@ -1,0 +1,147 @@
+# AuroraGPT-2B GRPO — 2N COLOCATE HSDP (dp_replicate=2) on sum_digits (topology study)
+#
+# Variant of flat-colocate with dp_replicate=2: instead of one 24-way FSDP shard across
+# both nodes (cross-node AllGather/ReduceScatter every layer), each node is one replica
+# with a 12-way INTRA-NODE shard; gradients all-reduce across the 2 replicas once/step.
+# Hypothesis: keeping the per-layer shard collective on-node (fast intra-node XCCL) beats
+# the cross-node 24-way shard, even with a cross-node grad all-reduce. vLLM still
+# colocated in-process per rank.
+#
+# Compared against colocate-flat (dp1, 24-way x-node shard), 11+1 per-node HSDP server,
+# and dedicated vLLM node. See docs/reports/agpt2b_2n_topology_throughput_*.
+#
+# STATUS: UNVALIDATED combo — colocate has never run at dp_replicate>1. The colocate
+# weight sync (full_tensor() on the 2D dp_mesh) and HSDP generation path are untested
+# together; expect possible bring-up debugging.
+#
+# THROUGHPUT base envelope: sum_digits, G=16, bs=1/rank, max_gen=64, temp=0.7, beta=0
+# (GRPOSimpleLoss). Distinct prompts/step = bs x dp_replicate = 2.
+#
+# Pair with launcher: experiments/auroragpt_2b_bakeoff/2N_sweep.sh (mpiexec pmix, 24
+#   ranks). dp_replicate=2 engages the HSDP FSDP1 HYBRID_SHARD path (model < 50 GiB).
+
+name: grpo_auroragpt_2b_2n_sumdigits_colocate_hsdp
+output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/outputs/grpo_agpt2b_2n_sumdigits_colocate_hsdp
+base_model_path: /flare/AuroraGPT/AuroraGPT-v1/Experiments/AuroraGPT-2B/public/sophiag/hf/global_step138650
+
+# HSDP: 2 replicas (one per node) x 12-way intra-node shard = 24 ranks.
+data_parallel_replicate_dim: 2
+
+# ── vLLM (colocate — resident weights, TP=1 per rank) ────────────────────────
+vllm_mode: colocate
+vllm_enforce_eager: true
+vllm_gpu_memory_utilization: 0.20    # 2B is memory-comfortable on 64 GiB tiles
+vllm_max_model_len: 256
+vllm_max_num_seqs: 32                 # >= bs*G (1*16)
+reshard_after_forward: true
+
+# ── Model ────────────────────────────────────────────────────────────────────
+model:
+  _component_: torchtune.models.llama3.llama3
+  vocab_size: 256000
+  num_layers: 12
+  num_heads: 16
+  num_kv_heads: 4
+  embed_dim: 2048
+  max_seq_len: 1024
+  intermediate_dim: 11008
+  rope_base: 50000
+
+# ── Tokenizer ────────────────────────────────────────────────────────────────
+tokenizer:
+  _component_: torchtune.dev.rl.ezpz_tasks.auroragpt_tokenizer
+  path: ${base_model_path}/tokenizer.model
+  max_seq_len: 1024
+
+# ── Checkpointers (policy + ref share the base model) ────────────────────────
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [pytorch_model.bin]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: LLAMA3
+
+ref_checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [pytorch_model.bin]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}/ref
+  model_type: LLAMA3
+
+resume_from_checkpoint: false
+save_every_n_epochs: 1
+
+# ── Dataset (ezpz sum_digits) ────────────────────────────────────────────────
+dataset:
+  _component_: torchtune.dev.rl.ezpz_tasks.build_ezpz_dataset
+  task: sum_digits
+  num_samples: 0
+  seed: 42
+  max_seq_len: 512
+seed: 42
+shuffle: true
+
+# ── GRPO hparams (throughput-study base envelope; G swept in Phase B) ─────────
+batch_size: 1
+grpo_samples: 16
+forward_batch_size: 8
+ref_forward_batch_size: 8
+max_generated_tokens: 64
+top_k: null
+temperature: 0.7
+gen_batch_size: 1
+
+epochs: 1
+num_steps: 50
+ppo_epochs: 1
+gradient_accumulation_steps: 1
+clip_grad_norm: 1.0
+
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 1.0e-5
+  weight_decay: 0.01
+  fused: false
+
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  num_warmup_steps: 2
+
+loss:
+  _component_: torchtune.dev.rl.loss.GRPOSimpleLoss
+  kl_coeff: 0.0
+  epsilon: 0.2
+
+reward_functions:
+  - _component_: torchtune.dev.rl.ezpz_tasks.SumDigitsReward
+
+# ── Distributed / XPU ────────────────────────────────────────────────────────
+enable_activation_checkpointing: true
+device: xpu
+dtype: bf16
+compile: false
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+log_every_n_steps: 1
+log_peak_memory_stats: true
+
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: false
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: true
+  cuda: false
+  profile_memory: false
+  with_stack: false
+  record_shapes: false
+  with_flops: false
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1

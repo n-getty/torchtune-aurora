@@ -1,0 +1,129 @@
+# Qwen3-4B LoRA SFT — Polaris (CUDA / 4x A100 40GB) baseline
+#
+# Purpose: CUDA cross-platform baseline for the Aurora LoRA SFT step-time / tok/s
+#   comparison. Runs on the UPSTREAM, device-agnostic recipe:
+#       recipes/lora_finetune_distributed.py
+#   (verified device-agnostic: cfg.device drives utils.get_device(); the recipe
+#   has no torch.xpu / torch.cuda hard dependency at the training-loop level.)
+#
+# LoRA hyperparameters are matched to the Aurora LoRA-GRPO config
+#   recipes/configs/dev/production/qwen3_4b_lora_grpo_2node_server_xpu.yaml
+#   (r=16, alpha=32, q/k/v/output_proj + MLP) so the *trainable surface* is
+#   identical across platforms. This is the SFT half of the comparison; the
+#   GRPO half uses qwen3_4b_grpo_gsm8k_polaris.yaml.
+#
+# Setup (one-time on Polaris):
+#   module use /soft/modulefiles && module load conda && conda activate
+#   hf download Qwen/Qwen3-4B --local-dir /path/to/Qwen3-4B
+#
+# Launch (1 node, 4 A100):
+#   tune run --nnodes 1 --nproc_per_node 4 lora_finetune_distributed \
+#     --config dev/production/qwen3_4b_lora_sft_gsm8k_polaris.yaml
+#
+# TODO(polaris): set base_model_path / output_dir to a real eagle or grand path.
+#   Placeholders below use /eagle — confirm your project's allocation path.
+
+output_dir: /eagle/PROJECT/USER/torchtune/outputs/qwen3_4b_lora_sft_gsm8k_polaris
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+# NOTE: matched to the Aurora LoRA-GRPO adapter surface (r=16, alpha=32,
+#   q/k/v/output_proj + MLP, no LoRA on output head — Qwen3-4B has tied embeds).
+#   The Aurora config uses lora_qwen3_4b_base; we use the same builder here so
+#   the parameter count is byte-identical.
+model:
+  _component_: torchtune.models.qwen3.lora_qwen3_4b_base
+  lora_attn_modules: ['q_proj', 'k_proj', 'v_proj', 'output_proj']
+  apply_lora_to_mlp: true
+  apply_lora_to_output: false          # tied embeddings on Qwen3-4B
+  lora_rank: 16
+  lora_alpha: 32
+  lora_dropout: 0.0
+
+tokenizer:
+  _component_: torchtune.models.qwen3.qwen3_tokenizer
+  # TODO(polaris): point at the downloaded Qwen3-4B dir.
+  path: /eagle/PROJECT/USER/models/Qwen3-4B/vocab.json
+  merges_file: /eagle/PROJECT/USER/models/Qwen3-4B/merges.txt
+  max_seq_len: 1024                     # match GRPO max_seq_len for fair token accounting
+
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: /eagle/PROJECT/USER/models/Qwen3-4B
+  checkpoint_files: [
+    model-00001-of-00003.safetensors,
+    model-00002-of-00003.safetensors,
+    model-00003-of-00003.safetensors,
+  ]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  # NOTE: upstream qwen3/4B_lora.yaml uses model_type: QWEN2 for the 4B because
+  #   Qwen3-4B is missing lm_head.weight on HF (tied). Keep QWEN2 for the 4B
+  #   to avoid a checkpoint-load KeyError. (Other Qwen3 sizes use QWEN3.)
+  model_type: QWEN2
+resume_from_checkpoint: false
+save_adapter_weights_only: true
+
+# ── Dataset ───────────────────────────────────────────────────────────────────
+# GSM8K SFT — same task as the GRPO run so the comparison is on one task family.
+# TODO(decision): the Aurora SFT pipeline (agpt2b_sft) uses a mathmix corpus, not
+#   plain GSM8K SFT. For a *matched* baseline pick ONE corpus and use it on both
+#   platforms. gsm8k here keeps the SFT/GRPO pair on the same data; swap to the
+#   mathmix dataset component if you want to mirror the AGPT-2B SFT recipe instead.
+dataset:
+  _component_: torchtune.datasets.alpaca_cleaned_dataset
+  packed: false
+seed: 42
+shuffle: true
+batch_size: 4                           # per-GPU; effective = 4 * 4 GPUs * grad_accum
+
+# ── Optimizer / schedule ──────────────────────────────────────────────────────
+optimizer:
+  _component_: torch.optim.AdamW
+  fused: true                           # CUDA fused AdamW (Aurora uses fused:false)
+  weight_decay: 0.01
+  lr: 3.0e-5                            # match GRPO lr for consistency across the pair
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  num_warmup_steps: 10
+optimizer_in_bwd: false
+loss:
+  _component_: torchtune.modules.loss.LinearCrossEntropyLoss
+
+# ── Training ──────────────────────────────────────────────────────────────────
+epochs: 1
+max_steps_per_epoch: 50                 # bounded for a benchmark; raise for a real run
+gradient_accumulation_steps: 1
+clip_grad_norm: 1.0
+compile: false                          # match Aurora (compile:false on variable-len corpus)
+
+# ── Env ───────────────────────────────────────────────────────────────────────
+device: cuda
+dtype: bf16
+enable_activation_checkpointing: false  # match Aurora LoRA config (adapter-only training)
+enable_activation_offloading: false
+# fsdp_cpu_offload: false               # default; A100 40GB should hold 4B LoRA easily
+# NOTE: upstream recipe uses FULL_SHARD by default (reshard_after_forward=true).
+#   The Aurora config uses FSDP1 SHARD_GRAD_OP (ZeRO-2). This is a forced
+#   divergence (different FSDP version + strategy); footnote in the report.
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+log_every_n_steps: 1
+log_peak_memory_stats: true
+
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: false
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: true
+  cuda: true
+  profile_memory: false
+  with_stack: false
+  record_shapes: true
+  with_flops: false
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1

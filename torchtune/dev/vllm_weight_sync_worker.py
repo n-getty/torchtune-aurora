@@ -161,6 +161,197 @@ class WeightSyncFromFileExtension:
             logger.exception("load_weights_from_raw failed")
             return {"status": "error", "message": str(e)}
 
+    # ------------------------------------------------------------------
+    # LoRA delta path (Path C — merge-at-receiver)
+    # ------------------------------------------------------------------
+    # The trainer ships the frozen base ONCE (load_lora_base_from_raw) then only
+    # the ~66 MB lora_a/lora_b adapter each step (load_lora_delta_from_raw). This
+    # worker caches the base on CPU and re-merges W_eff = base + scale*(B@A) each
+    # step, routing the result through the SAME model.load_weights() the merged
+    # path uses — so the resident weights are bit-identical to Path A. Sidesteps
+    # vLLM --enable-lora entirely; works at any TP.
+
+    @staticmethod
+    def _read_raw_bytes_file(path):
+        """Read a _save_raw_bytes file → {name: cpu_tensor}. Mirrors the read
+        loop in load_weights_from_raw (header + contiguous tensor bytes)."""
+        import struct
+        import json
+        import torch
+
+        out = {}
+        with open(path, "rb") as f:
+            header_len = struct.unpack("<Q", f.read(8))[0]
+            header = json.loads(f.read(header_len))
+            for entry in header:
+                raw = f.read(entry["nbytes"])
+                dtype = getattr(torch, entry["dtype"].split(".")[-1])
+                shape = entry["shape"]
+                if dtype == torch.bfloat16:
+                    t = (
+                        torch.frombuffer(raw, dtype=torch.int16)
+                        .view(torch.bfloat16)
+                        .reshape(shape)
+                        .clone()
+                    )
+                else:
+                    t = torch.frombuffer(raw, dtype=dtype).reshape(shape).clone()
+                out[entry["name"]] = t
+        return out
+
+    @staticmethod
+    def _qk_unpermute_for_vllm(weight, n_heads: int, head_dim: int):
+        """Invert convert_weights.hf_to_tune's Q/K interleave (LLAMA family).
+
+        Identical to torchtune.dev.rl.weight_sync._qk_unpermute_for_vllm, copied
+        here so the worker has no recipe-side import. No-op caller-side for Qwen3
+        (needs_qk_unpermute=False in the shipped meta)."""
+        dim = weight.shape[1]
+        return (
+            weight.view(n_heads, head_dim // 2, 2, dim)
+            .transpose(1, 2)
+            .reshape(n_heads * head_dim, dim)
+            .contiguous()
+        )
+
+    def load_lora_base_from_raw(self, path: str) -> dict:
+        """Cache the frozen LoRA-target base weights (one-time, CPU).
+
+        Called once at the first delta publish. Stores {hf_name: bf16_cpu_tensor}
+        in self._lora_base_cache. The base is already tune->HF renamed and (for
+        LLAMA family) Q/K-unpermuted by the sender, so it is in vLLM HF layout
+        and ready to be added to the per-step delta.
+
+        The base is cached ON THE RESIDENT DEVICE (XPU) so the per-step delta
+        merge (B@A + add) runs on-device — a CPU merge was measured at ~20s/step
+        for 4B (252 fp32 matmuls × 12 contending tiles), which dwarfs the wire
+        win. On-device the matmul is ~ms. Set TORCHTUNE_LORA_DELTA_BASE_CPU=1 to
+        force CPU caching (fallback if a tile lacks ~6.77 GiB free HBM).
+        """
+        import torch
+
+        if not os.path.exists(path):
+            logger.error("LoRA base file not found: %s", path)
+            return {"status": "error", "message": f"Not found: {path}"}
+        try:
+            t0 = time.perf_counter()
+            raw = self._read_raw_bytes_file(path)
+            force_cpu = os.environ.get("TORCHTUNE_LORA_DELTA_BASE_CPU", "0") == "1"
+            try:
+                dev = next(self.model_runner.model.parameters()).device
+            except Exception:
+                dev = torch.device("cpu")
+            if force_cpu:
+                dev = torch.device("cpu")
+            self._lora_base_cache = {k: v.to(dev) for k, v in raw.items()}
+            self._lora_base_device = dev
+            del raw
+            n = len(self._lora_base_cache)
+            gb = sum(t.numel() * t.element_size() for t in self._lora_base_cache.values()) / 1024**3
+            logger.info(
+                "load_lora_base_from_raw: cached %d base tensors %.2f GiB on %s in %.1fs from %s",
+                n, gb, dev, time.perf_counter() - t0, path,
+            )
+            return {"status": "ok", "num_params": n, "device": str(dev)}
+        except Exception as e:
+            logger.exception("load_lora_base_from_raw failed")
+            return {"status": "error", "message": str(e)}
+
+    def load_lora_delta_from_raw(self, path: str, meta_json: str) -> dict:
+        """Re-merge W_eff = base + scale*(B@A) from cached base + shipped adapter.
+
+        Args:
+            path: raw_bytes file with lora_a/lora_b tensors keyed
+                "<hf_name>::lora_A" / "<hf_name>::lora_B".
+            meta_json: JSON with "entries" (list of {hf_name,a_key,b_key,scale}),
+                "needs_qk_unpermute", "num_heads", "num_kv_heads", "head_dim".
+
+        Computes each merged weight in fp32 (matching iter_merged_lora_layers),
+        casts to bf16, and routes all merged tensors through
+        model.load_weights() — the same call the merged path uses.
+        """
+        import json
+        import torch
+
+        if not hasattr(self, "_lora_base_cache") or self._lora_base_cache is None:
+            return {"status": "error",
+                    "message": "load_lora_delta_from_raw called before load_lora_base_from_raw"}
+        if not os.path.exists(path):
+            logger.error("LoRA delta file not found: %s", path)
+            return {"status": "error", "message": f"Not found: {path}"}
+        try:
+            t0 = time.perf_counter()
+            adapter = self._read_raw_bytes_file(path)
+            meta = json.loads(meta_json)
+            entries = meta["entries"]
+            needs_unpermute = bool(meta.get("needs_qk_unpermute", False))
+            n_heads = int(meta.get("num_heads", 0) or 0)
+            n_kv_heads = int(meta.get("num_kv_heads", 0) or 0)
+            head_dim = int(meta.get("head_dim", 0) or 0)
+            t_read = time.perf_counter() - t0
+
+            # Merge on the base's device (XPU by default). A CPU merge was
+            # measured at ~20s/step for 4B (252 fp32 matmuls × 12 tiles); on XPU
+            # the B@A + add is ~ms. Adapter tensors are moved to the base device.
+            merge_dev = getattr(self, "_lora_base_device", None)
+            if merge_dev is None:
+                merge_dev = next(iter(self._lora_base_cache.values())).device
+
+            t_merge0 = time.perf_counter()
+            weights = []
+            for e in entries:
+                hf_name = e["hf_name"]
+                base = self._lora_base_cache.get(hf_name)
+                if base is None:
+                    raise KeyError(
+                        f"load_lora_delta_from_raw: base weight {hf_name!r} not in cache "
+                        f"({len(self._lora_base_cache)} cached)"
+                    )
+                a_w = adapter[e["a_key"]].to(merge_dev)   # [rank, in_dim]
+                b_w = adapter[e["b_key"]].to(merge_dev)   # [out_dim, rank]
+                scale = float(e["scale"])
+                # delta = scale * (B @ A) in fp32 (matches iter_merged_lora_layers).
+                delta = (b_w.to(torch.float32) @ a_w.to(torch.float32)).mul_(scale)
+                # Q/K un-permute on the delta (commutes with the base add because
+                # un-permute is a row permutation on the output dim). The base was
+                # already unpermuted by the sender, so add the unpermuted delta.
+                if needs_unpermute and (".q_proj." in hf_name or ".k_proj." in hf_name):
+                    nh = n_heads if ".q_proj." in hf_name else n_kv_heads
+                    delta = self._qk_unpermute_for_vllm(delta, nh, head_dim)
+                w_eff = (base.to(torch.float32) + delta).to(torch.bfloat16)
+                weights.append((hf_name, w_eff))
+            if merge_dev.type == "xpu":
+                torch.xpu.synchronize(merge_dev)
+            n = len(weights)
+            t_merge = time.perf_counter() - t_merge0
+
+            t_load0 = time.perf_counter()
+            self.model_runner.model.load_weights(weights=weights)
+            t_load = time.perf_counter() - t_load0
+
+            del adapter, weights
+            if hasattr(torch, "xpu"):
+                torch.xpu.empty_cache()
+
+            logger.info(
+                "load_lora_delta_from_raw: %d params in %.1fs (read=%.2fs merge=%.2fs load=%.2fs) from %s",
+                n, time.perf_counter() - t0, t_read, t_merge, t_load, path,
+            )
+            return {"status": "ok", "num_params": n,
+                    "merge_s": round(t_merge, 2), "load_s": round(t_load, 2)}
+        except Exception as e:
+            logger.exception("load_lora_delta_from_raw failed")
+            return {"status": "error", "message": str(e)}
+
+    def debug_param_names(self) -> dict:
+        """Return sorted resident param names (validation §0: fused vs unfused)."""
+        try:
+            names = sorted(dict(self.model_runner.model.named_parameters()).keys())
+            return {"status": "ok", "num_params": len(names), "names": names}
+        except Exception as e:
+            logger.exception("debug_param_names failed")
+            return {"status": "error", "message": str(e)}
+
     def load_weights_from_shm(self, meta: str) -> dict:
         """Load weights from a POSIX shared memory block written by _sync_weights_to_vllm_shm().
 

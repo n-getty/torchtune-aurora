@@ -1,0 +1,154 @@
+# AuroraGPT-2B GRPO — 2N SERVER mode on sum_digits (2N topology throughput study)
+#
+# Topology #3 of the "best 2N AGPT-2B setup" study (docs/reports/agpt2b_2n_topology_
+# throughput_*.md): node 0 = 12 training ranks, node 1 = 12 vLLM HTTP servers (the
+# dedicated-vLLM-node topology). Compared against #1 flat colocate (24 train+gen ranks)
+# and #2 dedicated_rank (11 train + 1 vLLM tile per node).
+#
+# THROUGHPUT STUDY — not learning-matched. Each topology runs at its own production-
+# tuned envelope; we compare seqs/s + gen/train/wsync breakdown + peak mem, NOT a fixed
+# distinct-prompts/step. Base envelope here: sum_digits, G=16, bs=1, max_gen=64,
+# temp=0.7, beta=0 (GRPOSimpleLoss). Phase B sweeps G up to this topology's max-safe
+# ceiling.
+#
+# Pair with launcher: experiments/auroragpt_2b_bakeoff/2N_server_sweep.sh
+#   (drives experiments/lora_grpo/run_qwen3_4b_dense_2node.sh:
+#    node0 = TRAIN_TILES training ranks, node1 = VLLM_DP HTTP servers)
+
+name: grpo_agpt2b_2n_sumdigits_server
+output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/outputs/grpo_agpt2b_2n_sumdigits_server
+base_model_path: /flare/AuroraGPT/AuroraGPT-v1/Experiments/AuroraGPT-2B/public/sophiag/hf/global_step138650
+
+data_parallel_replicate_dim: 1
+
+# ── vLLM (server mode — separate node, HTTP) ─────────────────────────────────
+# vllm_url is overwritten at launch by run_qwen3_4b_dense_2node.sh with the
+# real comma-separated VLLM_NODE_IP:port list (one per HTTP server tile).
+vllm_mode: server
+vllm_url: "http://localhost:8001"
+vllm_group_port: 51216
+vllm_tensor_parallel_size: 1
+vllm_enforce_eager: true
+vllm_max_model_len: 256
+vllm_max_num_seqs: 32          # >= bs*G (1*16); dedicated vLLM node has headroom
+
+vllm_weight_sync: true
+vllm_weight_sync_method: xccl
+vllm_weight_sync_interval: 1
+
+# ── Model ────────────────────────────────────────────────────────────────────
+model:
+  _component_: torchtune.models.llama3.llama3
+  vocab_size: 256000
+  num_layers: 12
+  num_heads: 16
+  num_kv_heads: 4
+  embed_dim: 2048
+  max_seq_len: 1024
+  intermediate_dim: 11008
+  rope_base: 50000
+
+# ── Tokenizer ────────────────────────────────────────────────────────────────
+tokenizer:
+  _component_: torchtune.dev.rl.ezpz_tasks.auroragpt_tokenizer
+  path: ${base_model_path}/tokenizer.model
+  max_seq_len: 1024
+
+# ── Checkpointers (policy + ref share the base model) ────────────────────────
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [pytorch_model.bin]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: LLAMA3
+
+ref_checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [pytorch_model.bin]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}/ref
+  model_type: LLAMA3
+
+resume_from_checkpoint: false
+save_every_n_epochs: 1
+
+# ── Dataset (ezpz sum_digits) ────────────────────────────────────────────────
+dataset:
+  _component_: torchtune.dev.rl.ezpz_tasks.build_ezpz_dataset
+  task: sum_digits
+  num_samples: 0           # 0 → 100k pool, ezpz default
+  seed: 42
+  max_seq_len: 512
+seed: 42
+shuffle: true
+
+# ── GRPO hparams (throughput-study base envelope; G swept in Phase B) ─────────
+batch_size: 1
+grpo_samples: 16             # base G (AGPT-2B production value); Phase B sweeps up
+forward_batch_size: 8        # chunk training over the 16 samples
+ref_forward_batch_size: 8    # explicit — avoids the ref_fwd default trap (G×B)
+max_generated_tokens: 64     # sum_digits (short gen; this task is training-bound)
+top_k: null
+temperature: 0.7
+gen_batch_size: 1
+
+epochs: 1
+num_steps: 50
+ppo_epochs: 1
+gradient_accumulation_steps: 1
+clip_grad_norm: 1.0
+
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 1.0e-5                 # sum_digits productive lr (per the lr sweep)
+  weight_decay: 0.01
+  fused: false
+
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  num_warmup_steps: 2
+
+# beta=0.0 in ezpz → KL coefficient zero. GRPOSimpleLoss (no IS correction),
+# matching the colocate/1N reference cells exactly.
+loss:
+  _component_: torchtune.dev.rl.loss.GRPOSimpleLoss
+  kl_coeff: 0.0
+  epsilon: 0.2
+
+# ── Reward ───────────────────────────────────────────────────────────────────
+reward_functions:
+  - _component_: torchtune.dev.rl.ezpz_tasks.SumDigitsReward
+
+# ── Distributed / FSDP ────────────────────────────────────────────────────────
+reshard_after_forward: true
+enable_activation_checkpointing: true
+
+# ── XPU ───────────────────────────────────────────────────────────────────────
+device: xpu
+dtype: bf16
+compile: false
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+log_every_n_steps: 1
+log_peak_memory_stats: true
+
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: false
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: true
+  cuda: false
+  profile_memory: false
+  with_stack: false
+  record_shapes: false
+  with_flops: false
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1
