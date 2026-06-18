@@ -215,6 +215,12 @@ outputs/
 
 # Development iteration artifacts — launcher history, one-off experiments
 # Anchored to repo root so docs/experiments/ remains tracked.
+# NOTE: this anchored dir-ignore CANNOT be undone with a per-file `!` negation
+# (git won't descend into an excluded dir). Durable infra under experiments/ is
+# kept in git via `git add -f` instead — it stays tracked regardless of this rule.
+# Already force-tracked: the per-topic run_*.sh launchers + their sourced helpers
+# (e.g. experiments/lora_grpo/{run_qwen3_4b_dense_2node,run_qwen3_4b_lora_2node,
+# _vllm_env_setup}.sh). Run-time churn (.out/.err/.log, dated scratch dirs) stays ignored.
 /experiments/
 # Scratch space for repros, drafts, vendored source checkouts — never tracked.
 /scratch/
