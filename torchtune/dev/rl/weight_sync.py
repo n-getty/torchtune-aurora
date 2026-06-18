@@ -2115,20 +2115,71 @@ def _xccl_gather_fsdp1(self, _xccl_accept_and_rename, t0):
         torch.distributed.barrier()
     t_gather = time.perf_counter() - t0
 
+    # Sync-event bookkeeping (mirror the FSDP2 path): the leader clears the
+    # done-event and bumps the pending sync id so _wait_for_sync_complete /
+    # _start_deferred_broadcast track this round. Without this the deferred
+    # broadcast machinery never fires. (Regression fix 2026-06-18: the f60efefc
+    # refactor extracted this gather but dropped the staging+broadcast tail for
+    # the FSDP1 branch, so vLLM was never updated → frozen-generator drift →
+    # ∇logp blowup → NaN on FSDP1+xccl server runs, e.g. 2N 11+1 HSDP.)
+    import json as _json
+    _BATCH_MAX_NUMEL = 512 * 1024 * 1024  # 1 GiB bf16, matches FSDP2 path
     if _is_xccl_leader:
+        self._sync_done_event.clear()
+        self._sync_error = None
+        self._sync_id_counter = getattr(self, "_sync_id_counter", 0) + 1
+        self._pending_sync_id = self._sync_id_counter
+
+    if _is_xccl_leader:
+        # Build the manifest AND the CPU broadcast batches using the SAME greedy
+        # split the receiver mirrors (vllm_weight_sync_worker.receive_weights_xccl
+        # _streaming): walk params in order, flush a batch when adding the next
+        # param would exceed batch_max_numel; a single param larger than the limit
+        # forms its own batch. The sender must emit exactly one broadcast per batch
+        # or the receiver's recv count mismatches → collective_rpc cancelled →
+        # vLLM EngineDeadError (observed 2026-06-18 when the whole model was sent
+        # as one mega-batch).
         tensors_meta = []
         total_elements = 0
+        cpu_batches = []          # list[CPU flat bf16 tensor], one per broadcast
+        _cur_parts = []           # GPU flat chunks accumulating into the current batch
+        _cur_numel = 0
         for hf_name, tensor in hf_state_dict.items():
             numel = tensor.numel()
             tensors_meta.append({"name": hf_name, "shape": list(tensor.shape),
                                  "dtype": str(tensor.dtype), "numel": numel})
             total_elements += numel
-        flat_gpu = torch.empty(total_elements, dtype=torch.bfloat16, device=self._device)
-        offset = 0
-        for tensor in hf_state_dict.values():
-            flat_gpu[offset:offset + tensor.numel()] = tensor.to(torch.bfloat16).flatten()
-            offset += tensor.numel()
-        del hf_state_dict
+            # Flush before adding if this param would overflow the current batch
+            # (but never flush an empty batch — a >limit param goes alone).
+            if _cur_numel > 0 and _cur_numel + numel > _BATCH_MAX_NUMEL:
+                cpu_batches.append(torch.cat(_cur_parts).to("cpu"))
+                _cur_parts = []
+                _cur_numel = 0
+            _cur_parts.append(tensor.to(torch.bfloat16).flatten())
+            _cur_numel += numel
+        if _cur_parts:
+            cpu_batches.append(torch.cat(_cur_parts).to("cpu"))
+        del _cur_parts, hf_state_dict
+
+        meta_json = _json.dumps({
+            "tensors": tensors_meta,
+            "batch_max_numel": _BATCH_MAX_NUMEL,
+            "sender_index": 0,
+        })
+        _cross_pgs = getattr(self, "_xccl_wsync_pgs", None) or [self._xccl_wsync_pg]
+        self._deferred_broadcast_args = (
+            cpu_batches, meta_json,
+            tensors_meta, t0, self._device,
+            _cross_pgs, self._vllm_clients,
+            self._vllm_urls,
+        )
+        log.info(
+            "Rank %d: FSDP1 xccl gather staged %d params (%.2f GiB) in %d batches "
+            "→ deferred broadcast armed (regression fix for f60efefc dropped-broadcast).",
+            self.rank, len(tensors_meta), total_elements * 2 / 1024**3, len(cpu_batches),
+        )
+
+    self._wsync_round = getattr(self, "_wsync_round", 0) + 1
 
 def _xccl_gather_and_stage_fsdp2(self, is_active, pool, _xccl_accept_and_rename, t0):
     """FSDP2/EP XCCL weight-sync gather+stage branch, extracted verbatim

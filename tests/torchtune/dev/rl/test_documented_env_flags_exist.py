@@ -48,6 +48,7 @@ DOC_ROW_FLAG_RE = re.compile(r"^\|\s*`(TORCHTUNE_[A-Z0-9_]+)(?:=[^`]*)?`", re.MU
 UNDOCUMENTED_OK_PREFIXES = ("TORCHTUNE_SKIP_",)
 UNDOCUMENTED_OK_EXACT = {
     "TORCHTUNE_ASYM_MEMPROBE",
+    "TORCHTUNE_COLOCATE_MEM_PROBE",  # diagnostic: per-step free-HBM leak probe in colocate LoRA sync
     "TORCHTUNE_EP_DEBUG",  # documented, but guard anyway
 }
 

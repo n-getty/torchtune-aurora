@@ -1,0 +1,179 @@
+# Qwen3-4B LoRA-GRPO — per-rank COLOCATE (in-process TP=1 vLLM per training rank)
+#
+# Each training rank runs its own in-process vLLM engine (TP=1) on its own tile.
+# The adapter is published by MERGING W_eff = W_base + (alpha/rank)*(B@A) at the
+# trainer and loading it into the rank's OWN engine via load_weights() — NO HTTP,
+# NO --enable-lora, NO torch211. Stays on frameworks/2025.3.1 (vLLM 0.15.0), the
+# same stack the validated AGPT-2B colocate runs use.
+#
+# Why colocate for LoRA: LoRA's tiny train-side footprint (frozen base + adapter,
+# no full-param grad/optimizer) frees the HBM that colocate is starved for, so we
+# can co-resident the rollout engine + trainer on one tile and skip the cross-node
+# weight-publish that dominates server-mode step time.
+#
+# Recipe:   recipes/dev/lora_grpo_full_finetune_distributed_xpu.py (vllm_mode=colocate)
+# Launcher: experiments/lora_grpo/run_qwen3_4b_lora_colocate.sh
+#
+# Bring-up envelope (single node, 12 ranks): G=8, bs=1/rank, max_gen=384. Raise G
+# only after the step 0->1 vLLM+ref_fwd memory jump is confirmed clean.
+
+name: lora_grpo_qwen3_4b_colocate
+output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/outputs/lora_grpo_qwen3_4b_colocate_v1
+base_model_path: /lus/flare/projects/ModCon/ngetty/models/Qwen3-4B
+
+# ── vLLM (colocate — in-process TP=1 per rank) ───────────────────────────────
+vllm_mode: colocate
+vllm_tensor_parallel_size: 1
+vllm_enforce_eager: true              # PIECEWISE is slower on XPU; eager is the validated path
+vllm_gpu_memory_utilization: 0.35     # 4B full bf16 weights (~8 GiB) + KV fit with headroom
+vllm_max_model_len: 1536
+vllm_max_num_seqs: 64                 # >= bs*G (1*8)
+reshard_after_forward: true           # MANDATORY for colocate (ZeRO-2 default OOMs alongside vLLM)
+# No `vllm.enable_lora` block — colocate merges W_eff at the trainer.
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+model:
+  _component_: torchtune.models.qwen3.lora_qwen3_4b_base
+  lora_attn_modules: ['q_proj', 'k_proj', 'v_proj', 'output_proj']
+  apply_lora_to_mlp: true
+  apply_lora_to_output: false         # tied embeddings on Qwen3-4B
+  lora_rank: 16
+  lora_alpha: 32
+  lora_dropout: 0.0
+
+# ── Tokenizer ─────────────────────────────────────────────────────────────────
+tokenizer:
+  _component_: torchtune.models.qwen3.qwen3_tokenizer
+  path: ${base_model_path}/vocab.json
+  merges_file: ${base_model_path}/merges.txt
+  max_seq_len: ${max_seq_len}
+
+# ── Checkpointer (base weights — adapter saved separately) ────────────────────
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [
+    model-00001-of-00003.safetensors,
+    model-00002-of-00003.safetensors,
+    model-00003-of-00003.safetensors,
+  ]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: QWEN3
+
+# No ref_checkpointer — LoRA recipe uses disable_adapter() context for the ref fwd.
+
+# ── Dataset ───────────────────────────────────────────────────────────────────
+# Colocate partitions prompts across ranks (each rank rolls out its own shard),
+# so every rank sees a distinct slice of the dataset.
+dataset:
+  _component_: torchtune.dev.rl.gsm8k.gsm8k_dataset
+  partition: 1-9/10
+
+seed: 42
+shuffle: true
+resume_from_checkpoint: false
+
+# ── RL Hyperparameters (bring-up envelope) ────────────────────────────────────
+grpo_samples: 8
+max_seq_len: 1024
+# max_generated_tokens=128 is REQUIRED for stable colocate at 4B (HW-validated
+# 2026-06-18, 30/30 clean steps, flat 19.3 GiB free). Root cause: in colocate the
+# vLLM KV working set + FSDP activation buffers GROW as rollouts get longer (XPU
+# can't empty_cache to reclaim — UR-handle-leak guard), staircasing HBM down until
+# banned:1. At max_gen=384 the run dies ~step 8-22 (free 21->1.3 GiB staircase);
+# at 128 the peak buffers fit the step-0 budget and plateau immediately.
+# The paper envelope (max_gen=384/512) needs the warmup-at-max fix (front-load the
+# peak vLLM+FSDP buffers at step 0) — TODO, see memory project_overnight_colocate_ur40.
+# Until then, 128 is the validated-safe colocate ceiling. (Server/dedicated modes
+# are unaffected — they don't co-reside vLLM with the trainer.)
+max_generated_tokens: 128
+temperature: 1.0
+top_k: null
+
+# ── Training ──────────────────────────────────────────────────────────────────
+epochs: 1
+num_steps: 50
+ppo_epochs: 1
+batch_size: 1                          # per-rank distinct prompts under colocate sampler
+forward_batch_size: 8
+ref_forward_batch_size: 16             # no-grad ref+rollout fwd chunk
+gen_batch_size: 1                      # one vLLM call/step per rank
+gradient_accumulation_steps: 1
+
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 3.0e-5
+  weight_decay: 0.01
+  fused: false
+
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  num_warmup_steps: 10
+
+clip_grad_norm: 1.0
+
+# ── Loss ──────────────────────────────────────────────────────────────────────
+loss:
+  _component_: torchtune.dev.rl.loss.GRPOLoss
+  kl_coeff: 1.0e-4
+  epsilon: 0.2
+
+# ── Reward (GSM8K math) ───────────────────────────────────────────────────────
+reward_functions:
+  - _component_: torchtune.dev.rl.rewards.FormattedMathCorrectnessReward
+    answer_tag: answer
+    positive_reward: 10.0
+    negative_reward: 0.0
+  - _component_: torchtune.dev.rl.rewards.ThinkingAnswerFormattingReward
+    think_tag: think
+    answer_tag: answer
+    positive_reward: 1.0
+    negative_reward: 0.0
+
+# ── LoRA publish config ───────────────────────────────────────────────────────
+# publish_mode is forced to "colocate" by the recipe when vllm_mode=colocate
+# (in-process merge-and-load; the values below are inert for transport but
+# publish_every_steps still gates how often the adapter is synced).
+lora:
+  publish_every_steps: 1
+  max_loras: 2
+  log_validation_metrics: true
+
+# ── Distributed / FSDP ────────────────────────────────────────────────────────
+# FULL_SHARD (ZeRO-3): minimize the frozen-base residency that sits alongside the
+# resident vLLM weights on each tile. reshard_after_forward (above) frees params
+# after the forward.
+fsdp_shard_strategy: FULL_SHARD
+enable_activation_checkpointing: true
+save_adapter_weights_only: true
+
+# ── XPU ───────────────────────────────────────────────────────────────────────
+device: xpu
+dtype: bf16
+compile: false
+force_math_sdpa: false
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+log_every_n_steps: 1
+log_peak_memory_stats: true
+save_every_n_epochs: 1
+
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: false
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: true
+  cuda: false
+  profile_memory: false
+  with_stack: false
+  record_shapes: false
+  with_flops: false
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1

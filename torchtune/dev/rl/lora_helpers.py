@@ -35,6 +35,65 @@ _TUNE_MODULE_TO_HF: dict[str, str] = {
 _ATTN_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj"]
 _MLP_TARGET_MODULES  = ["gate_proj", "up_proj", "down_proj"]
 
+# vLLM modes the LoRA-GRPO recipe supports. server = HTTP rollout tiles on a
+# separate node; colocate = in-process TP=1 vLLM per training rank (merge-at-
+# trainer, reuses the dense colocate load_weights() path, no --enable-lora).
+# dedicated_rank / colocate_sleep are NOT supported by the LoRA recipe.
+_SUPPORTED_VLLM_MODES = ("server", "colocate")
+
+
+def validate_vllm_mode(mode: str) -> None:
+    """Raise ``ValueError`` unless ``mode`` is a LoRA-recipe-supported vLLM mode.
+
+    The LoRA-GRPO recipe supports ``server`` (HTTP rollout) and ``colocate``
+    (per-rank in-process TP=1 vLLM). ``dedicated_rank`` and ``colocate_sleep``
+    are intentionally rejected — they need code paths the standalone LoRA fork
+    does not implement.
+
+    Args:
+        mode: The ``vllm_mode`` string from config.
+
+    Raises:
+        ValueError: if ``mode`` is not in ``_SUPPORTED_VLLM_MODES``.
+    """
+    if mode not in _SUPPORTED_VLLM_MODES:
+        raise ValueError(
+            f"LoRAGRPODistributedXPU supports vllm_mode in {_SUPPORTED_VLLM_MODES}, "
+            f"got {mode!r}. 'colocate' runs an in-process TP=1 vLLM per rank and "
+            f"merges W_eff at the trainer (no --enable-lora); 'dedicated_rank' / "
+            f"'colocate_sleep' are not implemented in this recipe."
+        )
+
+
+def tune_lora_name_to_hf(tune_name: str) -> Optional[str]:
+    """Map a torchtune LoRA base-weight param name to its HuggingFace name.
+
+    Strips FSDP / activation-checkpointing wrapper prefixes, matches the
+    ``layers.{idx}.{module_path}.weight`` pattern, and translates the module
+    path via ``_TUNE_MODULE_TO_HF``. Used by BOTH the server merged path and
+    the colocate sync path so the two cannot drift.
+
+    Args:
+        tune_name: e.g. ``"layers.0.attn.q_proj.weight"`` (optionally with
+            ``_fsdp_wrapped_module.`` / ``_checkpoint_wrapped_module.`` prefixes).
+
+    Returns:
+        The HF name (e.g. ``"model.layers.0.self_attn.q_proj.weight"``), or
+        ``None`` if the name does not match a known LoRA-target module (caller
+        should skip + log, not crash).
+    """
+    clean = tune_name.replace("_fsdp_wrapped_module.", "").replace(
+        "_checkpoint_wrapped_module.", ""
+    )
+    m = re.match(r"^(?:.*\.)?layers\.(\d+)\.(.+)\.weight$", clean)
+    if m is None:
+        return None
+    layer_idx, module_path = m.group(1), m.group(2)
+    hf_module = _TUNE_MODULE_TO_HF.get(module_path)
+    if hf_module is None:
+        return None
+    return f"model.layers.{layer_idx}.{hf_module}.weight"
+
 
 def build_qwen3_lora_model(cfg) -> nn.Module:
     """Instantiate a LoRA-wrapped Qwen3 model and set adapter-only trainability.
@@ -389,7 +448,16 @@ def iter_merged_lora_layers(model: nn.Module, base_weights: dict | None = None):
         delta = (b_w.to(torch.float32) @ a_w.to(torch.float32)).mul_(scale)
         if delta.device != base_w.device:
             delta = delta.to(base_w.device)
-        merged = (base_w.to(torch.float32) + delta).to(torch.bfloat16)
+        # Low-churn merge: add the (bf16) base in-place into the fp32 delta buffer
+        # instead of allocating a full-size fp32 copy of base AND a separate fp32
+        # sum. add_ upcasts base_w element-wise in the kernel, so this is
+        # bit-identical to ``base_w.to(float32) + delta`` (same fp32(base)+fp32(delta)
+        # elementwise math) but allocates one fewer full-weight fp32 temporary per
+        # layer. At 4B that removes ~12-25 GiB of transient alloc/free churn per
+        # colocate sync step -- relevant to the FSDP-summon + live-vLLM UR-handle
+        # pressure. The server merged/delta paths get the same reduction for free.
+        delta.add_(base_w)
+        merged = delta.to(torch.bfloat16)
         yield (weight_name, merged)
 
 

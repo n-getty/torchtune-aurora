@@ -101,6 +101,8 @@ from torchtune.dev.rl.lora_helpers import (
     unload_lora_adapter_http,
     load_peft_adapter_into_model,
     iter_merged_lora_layers,
+    validate_vllm_mode,
+    tune_lora_name_to_hf,
     _ATTN_TARGET_MODULES,
     _MLP_TARGET_MODULES,
     _TUNE_MODULE_TO_HF,
@@ -150,6 +152,24 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
         self.distributed_backend = get_xpu_distributed_backend(
             self._device.type, offload_ops_to_cpu=self.fsdp_cpu_offload
         )
+
+        # vLLM mode must be resolved BEFORE the process group is created:
+        # colocate inits an in-process vLLM engine per rank, which builds its own
+        # gloo sub-group and must run before init_xpu_process_group() makes CCL
+        # the default backend (mirrors the dense recipe's _init_vllm_early call
+        # site). The full LoRA config parse (publish mode, target modules, etc.)
+        # still happens below — only the colocate-gating bits are hoisted here.
+        self._vllm_mode = cfg.get("vllm_mode", "server")
+        validate_vllm_mode(self._vllm_mode)
+        self._colocate = (self._vllm_mode == "colocate")
+        # LoRA recipe has no asym-optim spare-rank path; vLLM lives on every rank.
+        self._vllm_ranks = None
+        self._vllm_llm = None
+        # Plain colocate only (no colocate_sleep in the LoRA recipe); pin the
+        # sleep flag the shared init/generation helpers read.
+        self._vllm_is_sleeping = False
+        if self._colocate:
+            self._init_vllm_early(cfg)
 
         # MPI pre-init (required for CCL_ATL_TRANSPORT=mpi multi-node)
         if os.environ.get("CCL_ATL_TRANSPORT") == "mpi":
@@ -255,6 +275,11 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
         # Keep use_runtime in sync so the rest of the recipe (PG setup, vLLM
         # client wiring) that branches on it stays correct.
         self._lora_use_runtime = (_publish_mode == "runtime")
+        # Colocate overrides the publish mode: there is no HTTP/raw_bytes wire —
+        # each rank merges W_eff and loads it into its OWN in-process engine.
+        if self._colocate:
+            self._lora_publish_mode = "colocate"
+            self._lora_use_runtime = False
         # One-time base-ship guard for the delta path.
         self._lora_base_shipped = False
 
@@ -273,14 +298,9 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
         self._lora_rank = int(_mc_get("lora_rank", 16))
         self._lora_alpha = float(_mc_get("lora_alpha", 32.0))
 
-        # vLLM server mode (only supported mode for LoRA recipe)
-        self._vllm_mode = cfg.get("vllm_mode", "server")
-        if self._vllm_mode != "server":
-            raise ValueError(
-                f"LoRAGRPODistributedXPU only supports vllm_mode='server', got {self._vllm_mode!r}. "
-                "colocate/dedicated_rank LoRA support requires vLLM in-process add_lora() — "
-                "add those code paths when the HTTP path is validated."
-            )
+        # vLLM mode ('server' | 'colocate') was resolved earlier in __init__
+        # (before the process group) so colocate could init its in-process
+        # engine. self._vllm_mode / self._colocate are already set here.
         self._vllm_url = cfg.get("vllm_url", None)
         if self._vllm_url and "," in self._vllm_url:
             self._vllm_urls = [u.strip() for u in self._vllm_url.split(",")]
@@ -337,6 +357,14 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
 
     # Inject vLLM server mode setup from shared backend module
     _setup_vllm_server_mode = _vllm_backend_module._setup_vllm_server_mode
+
+    # Inject colocate vLLM early-init (TP=1 in-process engine per rank). Reused
+    # verbatim from the dense recipe's backend; the new colocate YAML sets no
+    # vllm.enable_lora, so _lora_engine_kwargs returns {} and the engine boots
+    # exactly like the dense colocate path (frameworks stack, no --enable-lora).
+    _init_vllm_early = _vllm_backend_module._init_vllm_early
+    _init_vllm_tp1 = _vllm_backend_module._init_vllm_tp1
+    _init_vllm_tp = _vllm_backend_module._init_vllm_tp
 
     # Inject the shared Llama-family Q/K un-permute helpers from weight_sync.
     # The merged-weight publish path (_gather_merged_lora_weights) sends weights
@@ -641,13 +669,27 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
 
         collate_fn_obj = _get_component_from_path(collate_fn)
 
-        # Server mode: all ranks must see the same batch (rank 0 generates + broadcasts)
-        sampler = StatefulDistributedSampler(
-            ds,
-            num_replicas=1,
-            rank=0,
-            shuffle=shuffle,
-        )
+        # Server mode: rank 0 generates + broadcasts, so ALL ranks must see the
+        # same batch (num_replicas=1, rank=0).
+        # Colocate: each rank generates locally against its own in-process vLLM,
+        # so each rank must see a DISTINCT prompt shard — partition the data
+        # across the world (num_replicas=world_size, rank=self.rank). Without
+        # this every rank would roll out identical prompts and the group-relative
+        # advantages would be computed on duplicated data.
+        if self._colocate:
+            sampler = StatefulDistributedSampler(
+                ds,
+                num_replicas=self.world_size,
+                rank=self.rank,
+                shuffle=shuffle,
+            )
+        else:
+            sampler = StatefulDistributedSampler(
+                ds,
+                num_replicas=1,
+                rank=0,
+                shuffle=shuffle,
+            )
 
         dataloader = StatefulDataLoader(
             dataset=ds,
@@ -739,8 +781,17 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
         # is the suspected trigger for trainer-side banned:1 PDE on Aurora XPU.
         # Base weights are frozen so the cache is bit-exact for all future steps.
         # Uses the merged-weight publish path; no-op for the legacy PEFT path.
-        if not self._lora_use_runtime:
+        # Colocate skips the rank-0 CPU cache. Instead, if the cached-base colocate
+        # path is enabled (default ON for colocate — it removes the per-step summon
+        # that drives UR:40; set TORCHTUNE_COLOCATE_CACHED_BASE=0 to force the
+        # legacy per-step-summon path for A/B), snapshot the FULL base per-rank once.
+        self._colocate_base_cache = None
+        if not self._lora_use_runtime and not self._colocate:
             self._cache_lora_base_weights()
+        elif self._colocate:
+            _cached_base_on = os.environ.get("TORCHTUNE_COLOCATE_CACHED_BASE", "1") == "1"
+            if _cached_base_on:
+                self._cache_colocate_base()
 
         # Release checkpoint memory
         import gc as _gc
@@ -856,6 +907,19 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
         # used for each generation. Used for the LoRA learning-validation ladder.
         _lora_cfg = cfg.get("lora", {})
         self._log_validation_metrics = bool(_lora_cfg.get("log_validation_metrics", False))
+
+        # vLLM setup. Colocate already built an in-process TP=1 engine per rank
+        # in __init__ (self._vllm_llm); it needs no HTTP clients, no adapter
+        # dirs, no tmpfs/SSH transport — weights are loaded in-process at sync
+        # time. Server mode wires the HTTP clients + transport scaffolding.
+        if self._colocate:
+            log.info(
+                "Rank %d: colocate vLLM ready (in-process TP=1 engine); "
+                "skipping server-mode client + transport setup",
+                self.rank,
+            )
+            torch.distributed.barrier()
+            return
 
         # vLLM server clients
         self._setup_vllm_server_mode()
@@ -1161,6 +1225,169 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
                 len(self._cached_base_weights), _gb, time.perf_counter() - _t0,
             )
 
+    def _sync_colocated_lora_weights(self) -> None:
+        """Merge W_eff per rank and load it into the rank's own in-process vLLM.
+
+        Colocate publish path. Each training rank:
+          1. summons its OWN full frozen base via ``FSDP.summon_full_params``
+             (rank0_only=False) — required because under FSDP1 ``module.weight``
+             is this rank's flat shard, which would shape-assert in vLLM;
+          2. merges ``W_eff = base + (alpha/rank)*(B@A)`` per ``LoRALinear`` via
+             ``iter_merged_lora_layers(model, base_weights=None)`` (the
+             None path reads the now-full ``module.weight``); the adapter
+             tensors are FSDP ``ignored_states`` (replicated) so every rank
+             merges the identical W_eff;
+          3. loads each merged LoRA-target weight into its OWN engine via
+             ``load_weights`` — only LoRA-target weights are pushed; the frozen
+             base for non-LoRA modules was loaded from disk at engine init.
+
+        Bit-identical to the validated server merged path (same
+        ``iter_merged_lora_layers`` + ``tune_lora_name_to_hf`` + Q/K unpermute),
+        but with no HTTP, no rank-0 broadcast, no ``--enable-lora``. COLLECTIVE
+        (summon) — the caller must invoke this on ALL ranks.
+        """
+        import gc
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+        t0 = time.perf_counter()
+        # Opt-in leak diagnostic: log free HBM before the sync each step so a
+        # monotonic decline (UR-handle accumulation under summon+vLLM co-tenancy)
+        # is visible in the log. Off by default (set TORCHTUNE_COLOCATE_MEM_PROBE=1).
+        _mem_probe = os.environ.get("TORCHTUNE_COLOCATE_MEM_PROBE", "0") == "1"
+        if _mem_probe and self._is_rank_zero and self._device.type == "xpu":
+            try:
+                _free, _total = torch.xpu.mem_get_info(self._device)
+                log.info(
+                    "COLOCATE_MEMPROBE step=%d pre-sync free=%.2f GiB reserved=%.2f GiB",
+                    getattr(self, "_steps_run", -1),
+                    _free / 1024**3,
+                    torch.xpu.memory_reserved(self._device) / 1024**3,
+                )
+            except Exception as _mp_exc:
+                log.warning("COLOCATE_MEMPROBE failed: %r", _mp_exc)
+        llm_model = (
+            self._vllm_llm.llm_engine.model_executor.driver_worker.model_runner.model
+        )
+        n_synced = 0
+        skipped = 0
+
+        # Cached-base path (opt-in via TORCHTUNE_COLOCATE_CACHED_BASE=1, or whenever
+        # _colocate_base_cache was populated at setup). The frozen base never
+        # changes and the adapter is replicated (FSDP ignored_states), so there is
+        # NO need to summon_full_params every step — re-all-gathering the full base
+        # each step accumulates L0 IPC/UR handles (the exact mechanism the recipe
+        # avoids for adapter params at setup) and is the suspected UR:40 driver at
+        # ~10 steps. With the base cached full per-rank, merge reads the replicated
+        # adapter directly: no per-step collective, no per-step handle churn.
+        _use_cached_base = getattr(self, "_colocate_base_cache", None) is not None
+        if _use_cached_base:
+            for tune_name, merged in iter_merged_lora_layers(
+                self._model, base_weights=self._colocate_base_cache
+            ):
+                hf_name = tune_lora_name_to_hf(tune_name)
+                if hf_name is None:
+                    skipped += 1
+                    log.warning("colocate LoRA sync: no HF mapping for %s — skipping", tune_name)
+                    continue
+                w = self._maybe_unpermute_qk(hf_name, merged.contiguous())
+                llm_model.load_weights([(hf_name, w)])
+                n_synced += 1
+                del w, merged
+                if n_synced % 5 == 0 and torch.xpu.is_available():
+                    gc.collect()
+                    torch.xpu.synchronize(self._device)
+        else:
+            with torch.no_grad(), FSDP.summon_full_params(
+                self._model, writeback=False, rank0_only=False
+            ):
+                for tune_name, merged in iter_merged_lora_layers(
+                    self._model, base_weights=None
+                ):
+                    hf_name = tune_lora_name_to_hf(tune_name)
+                    if hf_name is None:
+                        skipped += 1
+                        log.warning(
+                            "colocate LoRA sync: no HF mapping for %s — skipping", tune_name
+                        )
+                        continue
+                    # Invert Llama-family Q/K permutation before vLLM (no-op Qwen3).
+                    w = self._maybe_unpermute_qk(hf_name, merged.contiguous())
+                    llm_model.load_weights([(hf_name, w)])
+                    n_synced += 1
+                    del w, merged
+                    # gc + sync every 5 params to bound UR-handle pressure from the
+                    # summon all-gathers before the next FSDP backward.
+                    if n_synced % 5 == 0 and torch.xpu.is_available():
+                        gc.collect()
+                        torch.xpu.synchronize(self._device)
+
+        self._vllm_llm.llm_engine.reset_prefix_cache()
+        gc.collect()
+        if torch.xpu.is_available():
+            torch.xpu.synchronize(self._device)
+
+        if self._is_rank_zero:
+            log.info(
+                "Rank 0: colocate LoRA sync %d merged weights in %.2fs (skipped=%d, path=%s)",
+                n_synced, time.perf_counter() - t0, skipped,
+                "cached_base" if _use_cached_base else "summon",
+            )
+
+    def _cache_colocate_base(self) -> None:
+        """Summon the frozen base ONCE and cache the full per-rank tensors.
+
+        Populates ``self._colocate_base_cache`` = ``{module_name}.weight ->
+        full bf16 base tensor on self._device`` for every LoRALinear. After this,
+        ``_sync_colocated_lora_weights`` merges from the cache with NO per-step
+        ``summon_full_params`` — eliminating the per-step all-gather that
+        accumulates L0 UR/IPC handles (the suspected UR:40 driver at ~10 steps).
+
+        The base is frozen, so a one-time snapshot is bit-exact for all steps. Keys
+        match ``iter_merged_lora_layers``' ``base_weights`` contract
+        (``{module_name}.weight``, FSDP/ckpt prefixes stripped). Cached on-device by
+        default (4B base ~8 GiB bf16; tile has ~56 GiB free alongside vLLM); set
+        ``TORCHTUNE_COLOCATE_BASE_CPU=1`` to cache on CPU if HBM is tight (adds a
+        per-step H2D copy of each base inside the merge).
+        """
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        from torchtune.modules.peft.lora import LoRALinear
+
+        _cpu = os.environ.get("TORCHTUNE_COLOCATE_BASE_CPU", "0") == "1"
+        dst = torch.device("cpu") if _cpu else self._device
+        cache: dict[str, torch.Tensor] = {}
+        t0 = time.perf_counter()
+        with torch.no_grad(), FSDP.summon_full_params(
+            self._model, writeback=False, rank0_only=False
+        ):
+            for module_name, module in self._model.named_modules():
+                if not isinstance(module, LoRALinear):
+                    continue
+                clean = module_name.replace("_fsdp_wrapped_module.", "").replace(
+                    "_checkpoint_wrapped_module.", ""
+                )
+                key = f"{clean}.weight"
+                # .clone() is LOAD-BEARING: under FSDP1 summon_full_params the full
+                # weight lives in a TEMPORARY buffer that is freed when the summon
+                # context exits. For an on-XPU cache (dst==xpu), `.to(xpu)` on an
+                # already-XPU tensor is a no-op returning the SAME storage, so the
+                # cache would alias the summoned buffer → use-after-free → PML4
+                # NotPresent-Read banned:1 at the first post-cache step (validated
+                # 2026-06-18: on-XPU base crashed step 2 at BOTH 4B/0.82-50GiB-free
+                # AND 0.6B — size-independent, so a lifetime bug not an OOM). The CPU
+                # path happened to be safe because cross-device .to() always copies.
+                # .clone() forces fresh storage on either device.
+                cache[key] = (
+                    module.weight.detach().to(torch.bfloat16).to(dst).contiguous().clone()
+                )
+        self._colocate_base_cache = cache
+        if self._is_rank_zero:
+            _gb = sum(t.numel() * t.element_size() for t in cache.values()) / 1024**3
+            log.info(
+                "LoRA-GRPO colocate: cached %d full base weights per-rank (%.2f GiB on %s) "
+                "in %.2fs — per-step summon eliminated",
+                len(cache), _gb, "cpu" if _cpu else "xpu", time.perf_counter() - t0,
+            )
+
     def _gather_merged_lora_weights(self) -> Optional[dict]:
         """Build merged LoRA-target weight dict from cached base + live adapter.
 
@@ -1193,24 +1420,12 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
         for tune_name, w in iter_merged_lora_layers(
             self._model, base_weights=self._cached_base_weights
         ):
-            clean = tune_name.replace("_fsdp_wrapped_module.", "").replace(
-                "_checkpoint_wrapped_module.", ""
-            )
-            import re as _re
-            m = _re.match(r"^(?:.*\.)?layers\.(\d+)\.(.+)\.weight$", clean)
-            if m is None:
+            hf_name = tune_lora_name_to_hf(tune_name)
+            if hf_name is None:
                 log.warning(
-                    "Skipping unexpected merged-LoRA name (no match): %s", tune_name
+                    "Skipping unexpected merged-LoRA name (no HF mapping): %s", tune_name
                 )
                 continue
-            layer_idx, module_path = m.group(1), m.group(2)
-            hf_module = _TUNE_MODULE_TO_HF.get(module_path)
-            if hf_module is None:
-                log.warning(
-                    "Skipping unknown LoRA module path %r in %s", module_path, tune_name
-                )
-                continue
-            hf_name = f"model.layers.{layer_idx}.{hf_module}.weight"
             w = w.cpu().contiguous()
             # Invert the Llama-family Q/K permutation before handing to vLLM.
             # No-op unless this run uses a permuting checkpointer (LLAMA*).
@@ -1631,6 +1846,74 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
     # Generation
     # -------------------------------------------------------------------------
 
+    def _generate_with_colocated_vllm(
+        self,
+        batch_input_ids: torch.Tensor,
+        context_length: int,
+    ) -> torch.Tensor:
+        """Generate using this rank's in-process colocated vLLM engine.
+
+        With a DistributedSampler (num_replicas=world_size), each rank holds its
+        own subset of prompts and generates ALL grpo_samples completions locally
+        — no cross-rank communication. Copied from the dense recipe's colocate
+        path so it closes over THIS module's ``_xpu_device_index``.
+
+        Returns:
+            query_responses: ``[B*G, context_length + max_generated_tokens]``
+        """
+        from vllm import SamplingParams
+
+        bsz = batch_input_ids.shape[0]
+        total_len = context_length + self._max_generated_tokens
+
+        sampling_params = SamplingParams(
+            max_tokens=self._max_generated_tokens,
+            temperature=self._temperature,
+            top_k=self._top_k if self._top_k else -1,
+            detokenize=False,
+        )
+
+        # Strip padding; truncate prompt so prompt_len + gen_len never overflows
+        # the vLLM block table (max_model_len).
+        max_prompt_len = self._vllm_max_model_len - self._max_generated_tokens
+        raw_prompts = []
+        for i in range(bsz):
+            ids = batch_input_ids[i].cpu().tolist()
+            ids = [t for t in ids if t != self._tokenizer.pad_id]
+            raw_prompts.append(ids[-max_prompt_len:] if len(ids) > max_prompt_len else ids)
+        vllm_prompts = [{"prompt_token_ids": p} for p in raw_prompts]
+
+        t0 = time.perf_counter()
+        outputs = self._vllm_llm.generate(
+            prompts=vllm_prompts,
+            sampling_params=sampling_params,
+            use_tqdm=False,
+        )
+        gen_time = time.perf_counter() - t0
+
+        query_responses = batch_input_ids.new_full((bsz, total_len), self._tokenizer.pad_id)
+        query_responses[:, :context_length] = batch_input_ids
+        total_tokens = 0
+        for i, output in enumerate(outputs):
+            comp = output.outputs[0].token_ids
+            total_tokens += len(comp)
+            length = min(len(comp), self._max_generated_tokens)
+            query_responses[i, context_length : context_length + length] = torch.tensor(
+                comp[:length], dtype=batch_input_ids.dtype, device=self._device
+            )
+
+        log.info(
+            "Rank %d: generated %d sequences, %d tokens in %.1fs (%.1f tok/s)",
+            self.rank, bsz, total_tokens, gen_time, total_tokens / max(gen_time, 0.01),
+        )
+
+        # vLLM may have shifted the default XPU device; restore ours.
+        if self._device.type == "xpu":
+            torch.xpu.set_device(_xpu_device_index)
+            torch.xpu.synchronize()
+
+        return query_responses
+
     def _generate_with_vllm(
         self,
         batch_input_ids: torch.Tensor,
@@ -1712,10 +1995,13 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
         input_ids: torch.Tensor,
         answers: list[str],
     ) -> GRPOTrajectory:
-        """Generate one GRPO trajectory (server mode, LoRA adapter)."""
+        """Generate one GRPO trajectory (server or colocate, LoRA adapter)."""
         if self._device.type == "xpu":
             torch.xpu.synchronize()
-        device_empty_cache(self._device)
+        # device_empty_cache leaks UR handles under FSDP + in-process vLLM, so
+        # it must NOT run in colocate (the dense colocate path skips it too).
+        if not self._colocate:
+            device_empty_cache(self._device)
 
         batch_size, context_length = input_ids.shape
         grpo_size = self.grpo_samples
@@ -1724,9 +2010,15 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
         batch_input_ids = batch_input_ids.reshape(batch_size * grpo_size, -1)
         num_seqs = batch_size * grpo_size
 
-        # Step 1: vLLM HTTP generation (adapter-aware: client._model_name = adapter name)
+        # Step 1: vLLM generation. Colocate generates in-process per rank;
+        # server mode calls the HTTP tiles (adapter-aware via client._model_name).
         _vllm_t0 = time.perf_counter()
-        query_responses = self._generate_with_vllm(batch_input_ids, context_length)
+        if self._colocate:
+            query_responses = self._generate_with_colocated_vllm(
+                batch_input_ids, context_length
+            )
+        else:
+            query_responses = self._generate_with_vllm(batch_input_ids, context_length)
         if self._device.type == "xpu":
             torch.xpu.synchronize()
         _vllm_time = time.perf_counter() - _vllm_t0
@@ -2225,11 +2517,29 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
                             self._steps_run, _names, len(_names),
                         )
 
+                    # Sub-phase reserved-memory attribution (opt-in via
+                    # TORCHTUNE_COLOCATE_MEM_PROBE=1). On XPU we never empty_cache
+                    # (UR-handle leak), so any per-step transient inflates `reserved`
+                    # permanently. This logs the reserved DELTA across gen / grpo_step
+                    # / sync to localize the ~5 GiB-per-few-steps staircase that drives
+                    # colocate banned:1. One run pinpoints the source; off by default.
+                    _phase_probe = (
+                        os.environ.get("TORCHTUNE_COLOCATE_MEM_PROBE", "0") == "1"
+                        and self._is_rank_zero and self._device.type == "xpu"
+                    )
+                    def _resv():
+                        return torch.xpu.memory_reserved(self._device) / 1024**3
+                    _r_pre_gen = _resv() if _phase_probe else 0.0
+
                     # Generate trajectory (server mode, may use base or LoRA adapter)
                     _gen_t0 = time.perf_counter()
                     with torch.no_grad():
                         trajectory = self.generate_trajectory_batched(tokens, answers)
                     _gen_time = time.perf_counter() - _gen_t0
+                    if _phase_probe:
+                        _r_post_gen = _resv()
+                        log.info("COLOCATE_PHASEPROBE step=%d gen reserved %.2f->%.2f (+%.2f) GiB",
+                                 self._steps_run, _r_pre_gen, _r_post_gen, _r_post_gen - _r_pre_gen)
 
                     # PPO epochs
                     _grpo_t0 = time.perf_counter()
@@ -2237,6 +2547,10 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
                     for _ppo_epoch in range(self._ppo_epochs):
                         grpo_metrics = self.grpo_step(trajectory)
                     _grpo_time = time.perf_counter() - _grpo_t0
+                    if _phase_probe:
+                        _r_post_grpo = _resv()
+                        log.info("COLOCATE_PHASEPROBE step=%d grpo_step reserved %.2f->%.2f (+%.2f) GiB",
+                                 self._steps_run, _r_post_gen, _r_post_grpo, _r_post_grpo - _r_post_gen)
 
                     # All-reduce adapter param gradients across data-parallel ranks.
                     # Adapter params are in FSDP ignored_states (replicated, not sharded),
@@ -2398,7 +2712,23 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
                     if self._steps_run % self._lora_publish_every == 0:
                         _pub_t0 = time.perf_counter()
                         _mode = self._lora_publish_mode
-                        if _mode == "runtime":
+                        if _mode == "colocate":
+                            # In-process publish: every rank summons its OWN full
+                            # base, merges W_eff, and loads it into its OWN engine.
+                            # This is COLLECTIVE (summon_full_params) — must run on
+                            # ALL ranks, synchronously (no thread, no HTTP).
+                            _r_pre_sync = _resv() if _phase_probe else 0.0
+                            self._sync_colocated_lora_weights()
+                            if self._is_rank_zero:
+                                log.info(
+                                    "Rank 0: colocate LoRA wsync %.2fs",
+                                    time.perf_counter() - _pub_t0,
+                                )
+                            if _phase_probe:
+                                _r_post_sync = _resv()
+                                log.info("COLOCATE_PHASEPROBE step=%d sync reserved %.2f->%.2f (+%.2f) GiB",
+                                         self._steps_run, _r_pre_sync, _r_post_sync, _r_post_sync - _r_pre_sync)
+                        elif _mode == "runtime":
                             publish_state = self._gather_lora_state_dict()  # rank-0 only; non-rank-0 returns None
                             if self._is_rank_zero and publish_state is not None:
                                 _gather_time = time.perf_counter() - _pub_t0

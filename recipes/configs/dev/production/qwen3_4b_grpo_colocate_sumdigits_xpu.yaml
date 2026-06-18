@@ -1,0 +1,142 @@
+# Qwen3-4B DENSE GRPO — 2N COLOCATE HSDP (dp_replicate=2) on sum_digits
+#
+# PURPOSE: isolate the TRUE 2B-vs-4B model-size step-time factor. This mirrors
+# auroragpt_2b_grpo_2n_sumdigits_colocate_hsdp_xpu.yaml EXACTLY (same envelope,
+# topology, loss, dataset, vLLM mode) and swaps only the model 2B -> 4B. Compare
+# tokens/s, gate both logs through scripts/check_run_health.sh (require GREEN).
+# Any step-time delta here is the real model-size cost — NOT the confounded
+# server-mode 4B numbers (different seqs/max_gen/loss/mode/dataset).
+#
+# THROUGHPUT envelope: sum_digits, G=16, bs=1/rank, max_gen=64, temp=0.7, beta=0
+# (GRPOSimpleLoss). dp_replicate=2 (one replica/node, 12-way intra-node shard).
+#
+# Recipe:   recipes/dev/grpo_full_finetune_distributed_xpu.py (base, dense)
+# Launcher: experiments/lora_grpo/run_qwen3_4b_dense_colocate_sumdigits.sh
+#           (or reuse experiments/auroragpt_2b_bakeoff/2N_sweep.sh with CONFIG override)
+
+name: grpo_qwen3_4b_2n_sumdigits_colocate_hsdp
+output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/outputs/grpo_qwen3_4b_2n_sumdigits_colocate_hsdp
+base_model_path: /lus/flare/projects/ModCon/ngetty/models/Qwen3-4B
+
+# HSDP: 2 replicas (one per node) x 12-way intra-node shard = 24 ranks.
+data_parallel_replicate_dim: 2
+
+# ── vLLM (colocate — resident weights, TP=1 per rank) ────────────────────────
+vllm_mode: colocate
+vllm_enforce_eager: true
+vllm_gpu_memory_utilization: 0.30    # 4B full bf16 (~8 GiB) + small KV at max_len=256
+vllm_max_model_len: 256
+vllm_max_num_seqs: 32                 # >= bs*G (1*16)
+reshard_after_forward: true
+
+# ── Model (DENSE Qwen3-4B) ────────────────────────────────────────────────────
+model:
+  _component_: torchtune.models.qwen3.qwen3_4b_base
+
+# ── Tokenizer ─────────────────────────────────────────────────────────────────
+tokenizer:
+  _component_: torchtune.models.qwen3.qwen3_tokenizer
+  path: ${base_model_path}/vocab.json
+  merges_file: ${base_model_path}/merges.txt
+  max_seq_len: 1024
+
+# ── Checkpointers (policy + ref share the base model) ────────────────────────
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [
+    model-00001-of-00003.safetensors,
+    model-00002-of-00003.safetensors,
+    model-00003-of-00003.safetensors,
+  ]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: QWEN3
+
+ref_checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [
+    model-00001-of-00003.safetensors,
+    model-00002-of-00003.safetensors,
+    model-00003-of-00003.safetensors,
+  ]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}/ref
+  model_type: QWEN3
+
+resume_from_checkpoint: false
+save_every_n_epochs: 1
+
+# ── Dataset (ezpz sum_digits — matches 2B run) ───────────────────────────────
+dataset:
+  _component_: torchtune.dev.rl.ezpz_tasks.build_ezpz_dataset
+  task: sum_digits
+  num_samples: 0
+  seed: 42
+  max_seq_len: 512
+seed: 42
+shuffle: true
+
+# ── GRPO hparams (IDENTICAL to the 2B colocate-HSDP envelope) ────────────────
+batch_size: 1
+grpo_samples: 16
+forward_batch_size: 8
+ref_forward_batch_size: 8
+max_generated_tokens: 64
+top_k: null
+temperature: 0.7
+gen_batch_size: 1
+
+epochs: 1
+num_steps: 50
+ppo_epochs: 1
+gradient_accumulation_steps: 1
+clip_grad_norm: 1.0
+
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 1.0e-5
+  weight_decay: 0.01
+  fused: false
+
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  num_warmup_steps: 2
+
+loss:
+  _component_: torchtune.dev.rl.loss.GRPOSimpleLoss
+  kl_coeff: 0.0
+  epsilon: 0.2
+
+reward_functions:
+  - _component_: torchtune.dev.rl.ezpz_tasks.SumDigitsReward
+
+# ── Distributed / XPU ────────────────────────────────────────────────────────
+enable_activation_checkpointing: true
+device: xpu
+dtype: bf16
+compile: false
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+log_every_n_steps: 1
+log_peak_memory_stats: true
+
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: false
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: true
+  cuda: false
+  profile_memory: false
+  with_stack: false
+  record_shapes: false
+  with_flops: false
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1

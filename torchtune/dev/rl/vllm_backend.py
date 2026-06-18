@@ -362,12 +362,18 @@ def _init_vllm_tp1(self, cfg, rank, world_size, local_rank,
     )
     if vllm_mode == "colocate_sleep":
         llm_kwargs["enable_sleep_mode"] = True
-        # Force uniform KV cache sizing across all ranks. Without this,
-        # the L0 mem_get_info bug (returns tile 0 stats for all tiles) creates
-        # bimodal KV cache sizes (e.g. 19 vs 25 GiB at util=0.40). Ranks with
-        # oversized KV get their caching allocator trimmed during FSDP training,
-        # leaking UR handles and corrupting L0 state → banned:1 PDE at step 1.
-        # Fixed block count = uniform reserved memory = no trimming = no crash.
+    # Pin the KV-cache block count for BOTH colocate and colocate_sleep. Without
+    # an override, vLLM profiles KV to fill the gpu_memory_utilization budget and
+    # then GROWS its block pool in discrete ~5 GiB bursts every few steps as it
+    # encounters longer sequences (validated 2026-06-18: free HBM stairsteps
+    # 22.7→17.6→13.2 GiB at steps 5/8 on 4B colocate-LoRA, then banned:1). That
+    # growth co-resident with the FSDP trainer exhausts the tile / trims the
+    # caching allocator, leaking UR handles → banned:1 PDE. A fixed block count
+    # sized to the ACTUAL per-rank workload (batch*grpo_samples seqs ×
+    # max_model_len) caps the pool so it cannot staircase-grow. (The original
+    # colocate_sleep comment: bimodal KV sizing from the L0 mem_get_info bug →
+    # allocator trimming → banned:1 — same failure class.)
+    if vllm_mode in ("colocate", "colocate_sleep"):
         _block_override = cfg.get("vllm_num_gpu_blocks_override", None)
         if _block_override is None:
             _batch = cfg.get("batch_size", 4)
@@ -377,7 +383,8 @@ def _init_vllm_tp1(self, cfg, rank, world_size, local_rank,
             _kv_mult = cfg.get("vllm_kv_cache_multiplier", 1.1)
             _block_override = int(_batch * _grpo_g * _blocks_per_seq * _kv_mult)
         llm_kwargs["num_gpu_blocks_override"] = _block_override
-        log.info("colocate_sleep: num_gpu_blocks_override=%d", _block_override)
+        log.info("%s: num_gpu_blocks_override=%d (KV pool pinned, no staircase growth)",
+                 vllm_mode, _block_override)
     if cfg.get("vllm_enable_prompt_embeds", False):
         llm_kwargs["enable_prompt_embeds"] = True
     llm_kwargs.update(_lora_engine_kwargs(cfg))
