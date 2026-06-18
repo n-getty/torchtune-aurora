@@ -1287,6 +1287,51 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         self._save_every_n_epochs = cfg.save_every_n_epochs
         self._total_steps = cfg.num_steps
 
+        # Run provenance stamp (rank 0, one-shot). Records the code version and
+        # the RESOLVED training envelope so a logged number can always be traced
+        # back to the config/code that produced it. Purely additive + defensive:
+        # wrapped so a missing key or a missing git never affects training.
+        if self._is_rank_zero:
+            try:
+                import subprocess as _subprocess
+
+                _git_hash = (
+                    _subprocess.check_output(
+                        ["git", "rev-parse", "--short", "HEAD"],
+                        cwd=os.path.dirname(os.path.abspath(__file__)),
+                        stderr=_subprocess.DEVNULL,
+                        timeout=5,
+                    )
+                    .decode()
+                    .strip()
+                    or "unknown"
+                )
+            except Exception:
+                _git_hash = "unknown"
+            try:
+                _model_name = str(
+                    cfg.get("model", {}).get("_component_", None) or "unknown"
+                )
+            except Exception:
+                _model_name = "unknown"
+            _publish_mode = cfg.get("lora", {}).get("publish_mode", None)
+            log.info(
+                "RUN PROVENANCE | recipe=grpo_full git=%s | model=%s "
+                "vllm_mode=%s lora.publish_mode=%s | G(grpo_samples)=%s "
+                "forward_batch_size=%s ref_forward_batch_size=%s "
+                "gen_batch_size=%s batch_size=%s | reshard_after_forward=%s",
+                _git_hash,
+                _model_name,
+                getattr(self, "_vllm_mode", "unknown"),
+                _publish_mode if _publish_mode is not None else "n/a",
+                getattr(self, "grpo_samples", "unknown"),
+                getattr(self, "_forward_batch_size", "unknown"),
+                getattr(self, "_ref_forward_batch_size", "unknown"),
+                getattr(self, "_gen_batch_size", "unknown"),
+                getattr(self, "batch_size", "unknown"),
+                cfg.get("reshard_after_forward", True),
+            )
+
         if cfg.get("stop_token_ids", False):
             stop_token_ids = cfg.stop_token_ids
             if self._tokenizer.eos_id not in stop_token_ids:

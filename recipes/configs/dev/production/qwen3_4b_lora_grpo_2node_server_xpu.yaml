@@ -67,18 +67,18 @@ seed: 42
 shuffle: true
 resume_from_checkpoint: false
 
-# ── RL Hyperparameters (paper-aligned) ────────────────────────────────────────
-# ⚠ MEMORY BOUNDARY: grpo_samples=24 + max_generated_tokens=512 is the paper
-# envelope but is the DOCUMENTED banned:1 boundary on 2N Aurora — it OOMs at the
-# step 0->1 vLLM+ref_fwd memory jump (IPC-handle eviction; lora_status.md
-# 2026-05-05, reconfirmed 2026-06-17). VALIDATED-SAFE: G=8/16, max_gen=384
-# (~52-53s/step, 6/6 clean). To run safely, override on the CLI:
-#   grpo_samples=8 max_generated_tokens=384
-# (the launcher run_qwen3_4b_lora_2node.sh now defaults to these). Keep the paper
-# values below as the reference target; only run them with extra memory headroom.
-grpo_samples: 24                       # paper G=24 (see boundary warning above)
+# ── RL Hyperparameters ────────────────────────────────────────────────────────
+# VALIDATED-SAFE envelope (2N 4B). Paper-scale G=24 / max_generated_tokens=512 is
+# the documented banned:1 boundary — it OOMs at the step 0->1 vLLM+ref_fwd memory
+# jump (IPC-handle eviction; lora_status.md 2026-05-05, reconfirmed 2026-06-17).
+# Opt in explicitly via launcher env, do NOT default to it. To chase paper scale
+# (only with extra memory headroom), override on the CLI / via launcher env:
+#   grpo_samples=24 max_generated_tokens=512
+# (run_qwen3_4b_lora_2node.sh exposes these as GRPO_SAMPLES / MAX_GEN_TOKENS).
+# Safe baseline below: ~52-53s/step, 6/6 clean.
+grpo_samples: 8                        # VALIDATED-SAFE (paper G=24 is banned:1 boundary — opt in explicitly)
 max_seq_len: 1024
-max_generated_tokens: 512              # paper (see boundary warning above)
+max_generated_tokens: 384              # VALIDATED-SAFE (paper 512 is banned:1 boundary — opt in explicitly)
 temperature: 1.0                       # paper T=1.0
 top_k: null
 
@@ -88,6 +88,10 @@ num_steps: 200
 ppo_epochs: 1
 batch_size: 8                          # ppo_batch_size = batch_size * grpo_samples = 192 (paper)
 forward_batch_size: 8                  # training fwd+bwd chunk (memory-bound)
+# ref_forward_batch_size SHARP EDGE (CLAUDE.md): defaults to forward_batch_size if
+# absent. If forward_batch_size is later lowered (e.g. to 1 for compile headroom)
+# and this is NOT set explicitly, ref_fwd runs num_seqs sequential FSDP-allgather
+# cycles (validated 500x inflation, 0.2s -> 100s). Keep it pinned explicitly here.
 ref_forward_batch_size: 16             # no-grad ref+rollout fwd chunk; halves FSDP all-gather rounds in ref_fwd
 gen_batch_size: 8                      # outer chunk for trajectory gen → 1 vLLM call/step (decoupled from fwd_bs)
 gradient_accumulation_steps: 1

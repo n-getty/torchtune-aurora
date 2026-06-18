@@ -72,3 +72,47 @@ invalid — re-run both in the same mode.
       is in the log (`varlen=engaged`, not `requested-but-skipped`).
 
 A number that fails any box is **provisional** — do not let it drive a decision.
+
+## Burn → Enforcement loop
+
+The three checks above catch a bad number *after* a run. This loop is about making sure
+each burn we survive can never silently recur. Knowledge that lives only in prose
+(a memory file, a CLAUDE.md table row, a code comment) is one forgetful launch away from
+being re-learned the expensive way. **A retraction or "got-burned" is not closed until it
+has produced all three of:**
+
+1. **(a) a memory entry** — the dated finding in `memory/` (and an index line in
+   `memory/MEMORY.md`), so the next session can *read* what went wrong.
+2. **(b) a CPU-safe pin-down test OR a `check_run_health.sh` rule** — an executable that
+   *fails* on the bad state. A pin-down test (`tests/torchtune/dev/rl/…`, login-node, no
+   XPU) for code-correctness regressions; a `check_run_health.sh` rule for
+   measurement-validity / runtime-mode regressions that CPU tests cannot see.
+3. **(c) a launcher gate** — the check wired into the launcher so it fires *before*
+   node-hours are spent (`--preflight`) or *before a number is trusted* (post-run
+   `check_run_health.sh "$LOG" || exit 1`). Prose nobody runs is not a gate.
+
+If you can only produce (a), the burn is still open: the next launch can repeat it.
+
+### Worked example — the 274s LoRA episode
+
+| Stage | Artifact |
+|-------|----------|
+| **Burn** | A dense-4B run reported 274s/step (silent `CHUNKED_BACKWARD` gloo CPU-bounce); a wrong "LoRA 5× faster" conclusion shipped, then was retracted twice. |
+| **(a) memory** | `memory/project_lora_vs_fullft_4b_parity_20260617.md` — the retraction + the per-component diagnosis. |
+| **(b) rule** | `check_run_health.sh` post-run rule: gloo CPU-bounce `reduce_scatter` ACTIVE on a non-EP `CHUNKED_BACKWARD` run → DEGRADED (exit 1); plus the `--compare` parity check that the original A/B skipped. |
+| **(c) gate** | Launchers wire `check_run_health.sh "$LOG" || exit 1` post-run, and the **pre-launch** `--preflight` mode refuses documented banned envelopes (e.g. LoRA 4B/2N `G=24 × max_gen=512`) and warns on the silent traps (`ref_forward_batch_size` default, ZeRO-3 chunk inflation, missing `--worker-extension-cls`) **before** mpiexec. Reference wiring: `experiments/lora_grpo/run_qwen3_4b_lora_2node.sh`. |
+
+### Extending the gate when a new burn lands
+
+Adding a pre-launch check is one function plus one call — keep doing this:
+
+1. Write the finding to `memory/` (step a).
+2. Add a `pf_check_*` function in `scripts/check_run_health.sh` (data-driven:
+   `pf_add REFUSE|WARN "<message citing the memory file>"`), and call it from
+   `run_preflight()`. Refusals exit 1; warnings exit 0. Add an explicit override env
+   (like `PREFLIGHT_ALLOW_BANNED=1`) only when there is a legitimate reason to force it.
+3. Confirm the launcher already invokes `--preflight` before its launch (the LoRA
+   launcher is the reference example). If you own a launcher that does not, add the gate.
+
+The cost of a `pf_check_*` is a few lines; the cost of re-learning a banned:1 boundary is
+a queued node allocation that OOMs at step 1. Always pay the cheaper one.

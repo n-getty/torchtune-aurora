@@ -15,10 +15,18 @@
 #   scripts/check_run_health.sh <logfile>                 # single-log verdict
 #   scripts/check_run_health.sh --compare <logA> <logB>   # A/B path/transport parity
 #   scripts/check_run_health.sh --baseline <size> <secs> [<logfile>]  # monotonicity check
+#   scripts/check_run_health.sh --preflight <config.yaml>  # PRE-LAUNCH gate (run BEFORE mpiexec)
+#
+# --preflight reads the resolved config YAML AND the launcher's effective env-var
+# overrides (GRPO_SAMPLES, MAX_GEN_TOKENS, FORWARD_BATCH_SIZE, REF_FORWARD_BATCH_SIZE,
+# LORA_USE_RUNTIME, VLLM_WORKER_EXT, ...) and REFUSES known-bad launch points that
+# CLAUDE.md / memory document as banned:1 boundaries or silent-degradation traps —
+# BEFORE a node-hour is spent. It encodes prose knowledge as an executable assertion.
 #
 # EXIT CODES:
-#   0  = GREEN     (safe to trust the runtime number)
+#   0  = GREEN     (safe to trust the runtime number / safe to launch)
 #   1  = DEGRADED  (silent degraded mode detected; do NOT trust the number)
+#                  OR REFUSED (preflight found a documented known-bad launch point)
 #   2  = usage / file error
 #
 # Dependency-free: bash + grep + awk only. Runs on a login node.
@@ -294,6 +302,201 @@ compare_logs() {
 }
 
 # ----------------------------------------------------------------------------
+# PRE-LAUNCH preflight gate.
+#
+# Turns the validated-envelope knowledge that lives in prose (CLAUDE.md tables +
+# memory/*.md) into an executable assertion that fires BEFORE mpiexec/torchrun, so
+# a node-hour is never spent on a launch point already documented as banned:1 or as
+# a silent-degradation trap.
+#
+# Effective-value model: a YAML value is the DEFAULT; the launcher overrides many of
+# them on the CLI from env vars (grpo_samples=${GRPO_SAMPLES}, ...). So preflight reads
+# the YAML for the baseline AND honors the same env vars the launcher uses, evaluating
+# the EFFECTIVE launch point (env override wins, exactly as the recipe sees it).
+#
+# Checks are DATA-DRIVEN: each is a small function appended to PF_FINDINGS as
+# "SEVERITY|message". REFUSE => exit 1 (unless an explicit override env is set);
+# WARN => printed loudly but exit 0. Add a new check by writing one pf_check_* fn
+# and calling it from run_preflight().
+#
+# Dependency-free: bash + grep + awk + sed (login-node python3 is 3.6; we do not
+# rely on it). YAML is parsed with grep/sed for the flat scalar keys we care about.
+# ----------------------------------------------------------------------------
+
+# yaml_scalar <file> <key> : echo the scalar value of a top-level-ish `key: value`
+# line (strips inline `# comments`, surrounding quotes, whitespace). Matches the
+# first non-comment occurrence. Good enough for the flat RL keys in these configs.
+yaml_scalar() {
+    local file="$1" key="$2"
+    grep -E "^[[:space:]]*${key}:[[:space:]]" "$file" 2>/dev/null \
+        | grep -vE "^[[:space:]]*#" \
+        | head -1 \
+        | sed -E "s/^[[:space:]]*${key}:[[:space:]]*//; s/[[:space:]]*#.*\$//; s/^[\"']//; s/[\"']\$//; s/[[:space:]]*\$//"
+}
+
+# eff <env_var_name> <yaml_value> : effective value = env override if set & non-empty,
+# else the YAML default. Mirrors the launcher's `key=${VAR:-default}` precedence.
+eff() {
+    local envname="$1" yamlval="$2" envval
+    envval="$(printf '%s' "${!envname-}")"
+    if [ -n "$envval" ]; then printf '%s' "$envval"; else printf '%s' "$yamlval"; fi
+}
+
+# is_int <s> : true if s is a non-negative integer.
+is_int() { case "$1" in ''|*[!0-9]*) return 1;; *) return 0;; esac; }
+
+PF_FINDINGS=()
+pf_add() { PF_FINDINGS+=("$1|$2"); }   # severity|message
+
+# --- Check 1: G x max_gen banned:1 boundary (LoRA 4B/2N) ---------------------
+# SOURCE: CLAUDE.md "config's paper G=24/max_gen=512 is the documented banned:1
+#   boundary"; YAML header MEMORY BOUNDARY note; memory project_lora_grpo_4b_envelope_20260505
+#   ("G=24 max_gen=512 banned:1 step 1 (IPC eviction ceiling)").
+# Validated-safe: G<=16 with max_gen<=384.
+pf_check_g_maxgen_boundary() {
+    local g="$1" mg="$2"
+    is_int "$g" || return 0
+    is_int "$mg" || return 0
+    if [ "$g" -ge 24 ] && [ "$mg" -ge 512 ]; then
+        if [ "${PREFLIGHT_ALLOW_BANNED:-0}" = "1" ]; then
+            pf_add WARN "G=${g} x max_generated_tokens=${mg} is the DOCUMENTED banned:1 boundary (LoRA 4B/2N, IPC-handle eviction at step 0->1). Proceeding only because PREFLIGHT_ALLOW_BANNED=1. Validated-safe envelope is G<=16, max_gen<=384."
+        else
+            pf_add REFUSE "G=${g} x max_generated_tokens=${mg} is the DOCUMENTED banned:1 boundary for LoRA 4B/2N (OOM at the step 0->1 vLLM+ref_fwd IPC-handle eviction; lora_status.md / project_lora_grpo_4b_envelope_20260505). Use G=8/max_gen=384 (validated-safe ~52-53s/step). To force, set PREFLIGHT_ALLOW_BANNED=1."
+        fi
+    fi
+}
+
+# --- Check 2: fbs lowered without ref_forward_batch_size set ------------------
+# SOURCE: CLAUDE.md "ref_forward_batch_size sharp edge"; memory
+#   feedback_ref_forward_batch_size_default_trap ("0.2s->100s, 500x").
+# If the launcher drops forward_batch_size BELOW the YAML default and does NOT set
+# ref_forward_batch_size explicitly, ref_fwd runs num_seqs sequential FSDP-allgather
+# cycles. We can only see "set explicitly" via the env var the launcher would pass.
+pf_check_ref_fbs_trap() {
+    local fbs="$1" fbs_yaml="$2" ref_set="$3" g="$4" bs="$5"
+    is_int "$fbs" || return 0
+    is_int "$fbs_yaml" || return 0
+    if [ "$fbs" -lt "$fbs_yaml" ] && [ "$ref_set" != "1" ]; then
+        local want="(>= grpo_samples x batch_size)"
+        if is_int "$g" && is_int "$bs"; then want=">= $((g * bs))"; fi
+        pf_add WARN "forward_batch_size lowered to ${fbs} (YAML default ${fbs_yaml}) but ref_forward_batch_size is NOT set explicitly. THE TRAP: ref_forward_batch_size defaults to fbs, so ref-fwd inflates to num_seqs sequential FSDP-allgather cycles (validated 0.2s -> 100s, 500x). Set ref_forward_batch_size ${want} in YAML or pass REF_FORWARD_BATCH_SIZE."
+    fi
+}
+
+# NOTE: the "server mode missing --worker-extension-cls" assertion deliberately does
+# NOT live here. VLLM_WORKER_EXT is set by _vllm_env_setup.sh and is only in scope on
+# the remote vLLM node, AFTER this config-time preflight runs — a config-reading gate
+# cannot observe it without synthesizing a pass (which defeats the check). The guard
+# lives at the single source of truth instead: experiments/lora_grpo/_vllm_env_setup.sh
+# asserts VLLM_WORKER_EXT is non-empty on the merged/delta path, protecting every launch
+# site and every fork that sources it. See feedback_dense_4b_launcher_missing_worker_extension.
+
+# --- Check 4: large fbs/gen_batch with ZeRO-3 => many backward chunks ---------
+# SOURCE: the 274s artifact (RESULTS_DISCIPLINE.md / project_lora_vs_fullft_4b_parity).
+# reshard_after_forward:true (ZeRO-3) + fbs>=2 means num_seqs/fbs backward chunks,
+# each paying an FSDP allgather/reduce-scatter pair; on a non-bypassed chunked path
+# this is exactly how 274s/step appeared. Advisory (depends on transport at runtime).
+pf_check_chunk_inflation() {
+    local fbs="$1" gbs="$2" reshard="$3" g="$4" bs="$5"
+    is_int "$fbs" || return 0
+    local zero3=0
+    case "$reshard" in true|True|TRUE|1) zero3=1;; esac
+    if [ "$zero3" = "1" ] && [ "$fbs" -ge 2 ]; then
+        local nseq="?" nchunks="?"
+        if is_int "$g" && is_int "$bs"; then nseq=$((g * bs)); nchunks=$(( (nseq + fbs - 1) / fbs )); fi
+        pf_add WARN "fbs=${fbs} with reshard_after_forward (ZeRO-3) => ~${nchunks} backward chunks (num_seqs=${nseq}), each an FSDP allgather/reduce-scatter pair. If the chunked path does NOT bypass the gloo reduce_scatter, expect inflated step time (this is the 274s/step artifact, RESULTS_DISCIPLINE.md). Confirm grpo_step path + RS transport post-run with check_run_health.sh <log>."
+    fi
+}
+
+run_preflight() {
+    local CFG="$1"
+    [ -f "$CFG" ] || { echo "ERROR: --preflight needs a config YAML; no such file: $CFG" >&2; exit 2; }
+
+    # YAML baselines (defaults).
+    local y_g y_mg y_fbs y_reffbs y_bs y_mode y_publish y_runtime y_reshard
+    y_g=$(yaml_scalar "$CFG" grpo_samples)
+    y_mg=$(yaml_scalar "$CFG" max_generated_tokens)
+    y_fbs=$(yaml_scalar "$CFG" forward_batch_size)
+    y_reffbs=$(yaml_scalar "$CFG" ref_forward_batch_size)
+    y_bs=$(yaml_scalar "$CFG" batch_size)
+    y_mode=$(yaml_scalar "$CFG" vllm_mode)
+    y_gbs=$(yaml_scalar "$CFG" gen_batch_size)
+    # lora.publish_mode is nested; grep it leniently (commented-out -> empty).
+    y_publish=$(grep -E "^[[:space:]]*publish_mode:[[:space:]]" "$CFG" 2>/dev/null | grep -vE "^[[:space:]]*#" | head -1 | sed -E "s/^[[:space:]]*publish_mode:[[:space:]]*//; s/[[:space:]]*#.*\$//; s/^[\"']//; s/[\"']\$//; s/[[:space:]]*\$//")
+    y_runtime=$(grep -E "^[[:space:]]*use_runtime_lora:[[:space:]]" "$CFG" 2>/dev/null | grep -vE "^[[:space:]]*#" | head -1 | sed -E "s/^[[:space:]]*use_runtime_lora:[[:space:]]*//; s/[[:space:]]*#.*$//; s/[[:space:]]*$//")
+    y_reshard=$(yaml_scalar "$CFG" reshard_after_forward)
+    [ -z "$y_reshard" ] && y_reshard=$(yaml_scalar "$CFG" reshard_after_fwd)
+
+    # Effective values (env override wins, mirroring the launcher).
+    local g mg fbs bs mode publish gbs runtime ref_set
+    g=$(eff GRPO_SAMPLES "$y_g")
+    mg=$(eff MAX_GEN_TOKENS "$y_mg")
+    fbs=$(eff FORWARD_BATCH_SIZE "$y_fbs")
+    bs=$(eff BATCH_SIZE "$y_bs")
+    gbs=$(eff GEN_BATCH_SIZE "$y_gbs")
+    mode=$(eff VLLM_MODE "$y_mode")
+    [ -z "$mode" ] && mode="server"
+
+    # LORA_USE_RUNTIME env drives both publish mode and the vLLM stack (see launcher).
+    runtime="${LORA_USE_RUNTIME:-}"
+    # publish_mode: explicit env wins; else launcher derives from LORA_USE_RUNTIME; else YAML.
+    if [ -n "${LORA_PUBLISH_MODE:-}" ]; then
+        publish="${LORA_PUBLISH_MODE}"
+    elif [ "$runtime" = "1" ]; then
+        publish="runtime"
+    elif [ "$runtime" = "0" ]; then
+        publish="merged"
+    else
+        publish="$y_publish"
+    fi
+    # (worker-extension-cls is verified in _vllm_env_setup.sh, not here — see the note
+    # above pf_check_chunk_inflation. VLLM_WORKER_EXT is not in scope at config time.)
+
+    # ref_forward_batch_size "set explicitly": env REF_FORWARD_BATCH_SIZE present, OR
+    # the YAML carries a non-empty value (the recipe reads it from YAML too).
+    ref_set=0
+    [ -n "${REF_FORWARD_BATCH_SIZE:-}" ] && ref_set=1
+    [ -n "$y_reffbs" ] && ref_set=1
+
+    echo "==================== PREFLIGHT ====================="
+    echo "Config: $CFG"
+    echo "Effective launch point (env override > YAML default):"
+    echo "  grpo_samples=${g:-?}  max_generated_tokens=${mg:-?}  batch_size=${bs:-?}"
+    echo "  forward_batch_size=${fbs:-?} (yaml ${y_fbs:-?})  ref_fwd_set=${ref_set}  gen_batch_size=${gbs:-?}"
+    echo "  vllm_mode=${mode:-?}  publish=${publish:-?}  LORA_USE_RUNTIME=${runtime:-unset}"
+    echo "  reshard_after_forward=${y_reshard:-?}"
+    echo "----------------------------------------------------"
+
+    PF_FINDINGS=()
+    pf_check_g_maxgen_boundary  "$g" "$mg"
+    pf_check_ref_fbs_trap       "$fbs" "$y_fbs" "$ref_set" "$g" "$bs"
+    pf_check_chunk_inflation    "$fbs" "$gbs" "$y_reshard" "$g" "$bs"
+
+    local refuse=0 warn=0 f sev msg
+    if [ "${#PF_FINDINGS[@]}" -eq 0 ]; then
+        echo "${GRN}PREFLIGHT GREEN: no documented known-bad launch points. Safe to launch.${RST}"
+        return 0
+    fi
+    for f in "${PF_FINDINGS[@]}"; do
+        sev="${f%%|*}"; msg="${f#*|}"
+        if [ "$sev" = "REFUSE" ]; then
+            refuse=1
+            echo "${RED}REFUSE: ${msg}${RST}"
+        else
+            warn=1
+            echo "${YEL}WARN:   ${msg}${RST}"
+        fi
+    done
+    echo "----------------------------------------------------"
+    if [ "$refuse" -eq 1 ]; then
+        echo "${RED}PREFLIGHT REFUSED: at least one documented banned/known-bad launch point. NOT launching.${RST}"
+        return 1
+    fi
+    echo "${YEL}PREFLIGHT: warnings only (no refusals). Launch permitted; heed the warnings above.${RST}"
+    return 0
+}
+
+# ----------------------------------------------------------------------------
 # Arg parsing
 # ----------------------------------------------------------------------------
 [ $# -lt 1 ] && { sed -n '5,18p' "$0"; exit 2; }
@@ -312,6 +515,9 @@ case "$1" in
             [ "$VERDICT" = "DEGRADED" ] && exit 1
         fi
         exit 0;;
+    --preflight)
+        [ $# -ge 2 ] || { echo "usage: $0 --preflight <config.yaml>" >&2; exit 2; }
+        run_preflight "$2"; exit $?;;
     -h|--help)
         sed -n '5,18p' "$0"; exit 0;;
     *)
