@@ -280,6 +280,25 @@ class FullFinetuneRecipeDistributedXPU(FTRecipeInterface):
         self._log_every_n_steps = cfg.get("log_every_n_steps", 1)
         self._log_peak_memory_stats = cfg.get("log_peak_memory_stats", False)
         self._logger = utils.get_logger(cfg.log_level)
+
+        # Dataloader async-prefetch knobs (see _setup_data). Default num_workers=2 so the
+        # collate + H2D overlap with compute instead of stalling ~42% of the step
+        # (the dominant SFT throughput win, validated 2026-06-19).
+        self._dataloader_num_workers = cfg.get("dataloader_num_workers", 2)
+        # pin_memory defaults to FALSE: the triple of {torch.compile model +
+        # pinned-memory forked-worker batches + non-reentrant activation
+        # checkpointing} raises `CheckpointError: A different number of tensors
+        # was saved during the original forward and recomputation` at the step-0
+        # backward on XPU. Proven by A/B (experiments/agpt2b_sft/logs/
+        # smoke_dlf2_* + smoke_fix_*): the crash needs compile=True AND
+        # pin_memory=True AND num_workers>0 simultaneously; clearing pin_memory
+        # alone fixes it while keeping the async-collate win (compile_dynamic does
+        # NOT help — dynamic=True still crashes with pin=True). Pinned H2D was
+        # never shown to be part of the 0619 throughput win (that was the async
+        # collate). Set dataloader_pin_memory=true explicitly to opt back in on a
+        # non-compile or non-AC run.
+        self._dataloader_pin_memory = cfg.get("dataloader_pin_memory", False)
+        self._dataloader_prefetch_factor = cfg.get("dataloader_prefetch_factor", 2)
         if (
             self._log_peak_memory_stats
             and self._device.type not in VALID_BACKENDS_FOR_MEMORY_STATS
@@ -935,7 +954,13 @@ class FullFinetuneRecipeDistributedXPU(FTRecipeInterface):
         sampler = StatefulDistributedSampler(
             ds, num_replicas=self.dp_degree, rank=self.dp_rank, shuffle=shuffle, seed=0
         )
-        dataloader = StatefulDataLoader(
+        # Async data loading: num_workers=0 makes the collate (packed block-causal mask
+        # build) + H2D run synchronously and stall the step (~42% of step measured on
+        # Aurora 4B/seq2048/packed via TORCHTUNE_PHASE_TIMER). Default to async prefetch so
+        # the next batch is built during the current step. (Aurora: keep TMPDIR=/tmp for
+        # the worker AF_UNIX socket path.)
+        num_workers = self._dataloader_num_workers
+        dl_kwargs = dict(
             dataset=ds,
             batch_size=batch_size,
             sampler=sampler,
@@ -952,7 +977,13 @@ class FullFinetuneRecipeDistributedXPU(FTRecipeInterface):
             ),
             # dropping last avoids shape issues with compile + flex attention
             drop_last=True,
+            num_workers=num_workers,
+            pin_memory=self._dataloader_pin_memory,
         )
+        if num_workers > 0:
+            dl_kwargs["persistent_workers"] = True
+            dl_kwargs["prefetch_factor"] = self._dataloader_prefetch_factor
+        dataloader = StatefulDataLoader(**dl_kwargs)
         if dataloader_state_dict is not None:
             dataloader.load_state_dict(dataloader_state_dict)
 
@@ -1098,6 +1129,30 @@ class FullFinetuneRecipeDistributedXPU(FTRecipeInterface):
                 except StopIteration:
                     break
 
+                # DIAGNOSTIC ONLY (TORCHTUNE_BATCH_FINGERPRINT=1): fingerprint the
+                # first few batches per rank to detect forked-dataloader-worker data
+                # corruption at multi-node (num_workers>0 + 2N diverged the loss while
+                # num_workers=0 converged; see task #7). Off by default, zero overhead.
+                if (
+                    os.environ.get("TORCHTUNE_BATCH_FINGERPRINT", "0") == "1"
+                    and batch_count < 4
+                ):
+                    _t = batch.get("tokens", batch.get("input_ids"))
+                    _lbl = batch.get("labels")
+                    if _t is not None and _lbl is not None:
+                        _valid = int((_lbl != self._loss_fn.ignore_index).sum().item())
+                        _chk = int(_t.to(torch.int64).sum().item())
+                        self._logger.warning(
+                            "BATCH_FP rank=%d step=%d shape=%s tok_checksum=%d "
+                            "valid_tokens=%d tok0=%s",
+                            self.rank,
+                            batch_count,
+                            tuple(_t.shape),
+                            _chk,
+                            _valid,
+                            _t.reshape(-1)[:8].tolist(),
+                        )
+
                 # Start tracking CUDA memory for active steps for just the first epoch
                 if (
                     self._is_rank_zero
@@ -1131,7 +1186,60 @@ class FullFinetuneRecipeDistributedXPU(FTRecipeInterface):
                         torch.distributed.all_reduce(num_tokens)
                         torch.distributed.all_reduce(running_loss)
                         current_loss = current_loss * (self.dp_degree / num_tokens)
-                    current_loss.backward()
+                        current_loss.backward()
+                    else:
+                        # Gradient accumulation: suppress the FSDP/DDP gradient
+                        # all-reduce/reduce-scatter on every micro-batch except the
+                        # last of each accumulation window. With ga>1 this collapses
+                        # `ga` cross-rank grad reductions per optimizer step down to
+                        # one, the dominant comm cost at multi-node scale. The result
+                        # is mathematically equivalent to syncing every micro-batch
+                        # (grad reduction is linear), but not bit-identical (different
+                        # summation order). Mirrors the GRPO recipe's accumulation
+                        # path (grpo_full_finetune_distributed_xpu.py).
+                        #   - FSDP2 (fully_shard): set_requires_gradient_sync(is_last)
+                        #     — must be re-enabled explicitly on the last micro-batch.
+                        #   - FSDP1 / DDP: no_sync() context manager on non-last.
+                        # ga==1 takes the plain backward (no-op gating, identical to
+                        # prior behavior).
+                        is_last_microbatch = (
+                            (batch_count + 1) % self._gradient_accumulation_steps == 0
+                        )
+                        # DIAGNOSTIC ONLY (not a supported/production flag):
+                        # TORCHTUNE_SFT_DISABLE_NO_SYNC=1 forces grad sync on every
+                        # micro-batch (the pre-optimization behavior) so an A/B can
+                        # measure the no_sync win on the same binary. Default unset →
+                        # optimization on. Do NOT promote to the CLAUDE.md flag table.
+                        _no_sync_disabled = (
+                            os.environ.get("TORCHTUNE_SFT_DISABLE_NO_SYNC", "0") == "1"
+                        )
+                        if (
+                            self._gradient_accumulation_steps > 1
+                            and not _no_sync_disabled
+                            and hasattr(self._model, "set_requires_gradient_sync")
+                        ):
+                            # FSDP2 path
+                            self._model.set_requires_gradient_sync(is_last_microbatch)
+                            current_loss.backward()
+                        elif (
+                            self._gradient_accumulation_steps > 1
+                            and not _no_sync_disabled
+                            and not is_last_microbatch
+                            and hasattr(self._model, "no_sync")
+                        ):
+                            # FSDP1 / DDP path
+                            with self._model.no_sync():
+                                current_loss.backward()
+                        else:
+                            # ga==1, diagnostic disable, or no FSDP hooks: plain
+                            # backward (grad sync on every micro-batch).
+                            if (
+                                _no_sync_disabled
+                                and hasattr(self._model, "set_requires_gradient_sync")
+                            ):
+                                # Ensure FSDP2 sync is explicitly ON for the baseline.
+                                self._model.set_requires_gradient_sync(True)
+                            current_loss.backward()
 
                 # Optimizer step (if not fused in backward call)
                 if (batch_count + 1) % self._gradient_accumulation_steps == 0:
@@ -1197,6 +1305,10 @@ class FullFinetuneRecipeDistributedXPU(FTRecipeInterface):
                                     else self._optim_ckpt_wrapper
                                 ),
                             ),
+                            # Raw per-step wall time: the one engine-agnostic throughput
+                            # metric (no token-masking / normalization assumptions), used
+                            # by the SFT throughput benchmark for cross-engine A/B.
+                            "time_per_step_s": time_per_step,
                             "tokens_per_second_per_gpu": (
                                 num_tokens / self.parallel_dims.non_data_parallel_size
                             )

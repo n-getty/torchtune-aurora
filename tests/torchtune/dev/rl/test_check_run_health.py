@@ -233,3 +233,50 @@ def test_real_incident_logs_if_present():
         rc, out = _run(str(grn))
         assert rc == 0, out
         assert "GREEN" in out
+
+
+# --- SFT log-format support (full_finetune / lora_finetune_distributed_xpu) ---
+# SFT recipes emit "Step N | ... time_per_step_s:..." via the DiskLogger instead
+# of the GRPO "TIMING step=...total=...s" stdout line. The gate must classify
+# these GREEN and read the step time from time_per_step_s, not false-DEGRADE for
+# lacking GRPO TIMING lines (see memory project_sft_no_sync_zero2_2n_validated).
+
+# DiskLogger metric file content (what the SFT recipe writes to run_out/logs).
+SFT_METRIC = """\
+Step 1 | loss:6.40 lr:5e-07 time_per_step_s:70.2 tokens_per_second_per_gpu:27 grad_norm:97.5
+Step 2 | loss:1.58 lr:1e-06 time_per_step_s:21.6 tokens_per_second_per_gpu:91 grad_norm:131.0
+Step 3 | loss:0.94 lr:1.5e-06 time_per_step_s:21.5 tokens_per_second_per_gpu:107 grad_norm:19.9
+Step 4 | loss:1.11 lr:2e-06 time_per_step_s:21.5 tokens_per_second_per_gpu:194 grad_norm:13.2
+"""
+
+
+def test_sft_metric_log_is_green(tmp_path):
+    """A run pointed directly at the SFT DiskLogger metric file is GREEN."""
+    log = _write(tmp_path, "log_123.txt", SFT_METRIC)
+    rc, out = _run(log)
+    assert rc == 0, out
+    assert "GREEN" in out
+    assert "time_per_step_s" in out  # used the SFT timing extractor
+
+
+def test_sft_cell_log_folds_in_sibling_metric(tmp_path):
+    """A cell.log lacking timing must auto-discover the sibling run_out metric."""
+    # Stdout-style log with no timing lines (the usual gate target for SFT).
+    cell = tmp_path / "cell.log"
+    cell.write_text("=== AGPT-2B SFT ===\nvarlen=no-grad-only\n0|0: 1/19\n")
+    # Sibling DiskLogger metric file at run_out/logs/log_*.txt.
+    mdir = tmp_path / "run_out" / "logs"
+    mdir.mkdir(parents=True)
+    (mdir / "log_123.txt").write_text(SFT_METRIC)
+    rc, out = _run(str(cell))
+    assert rc == 0, out
+    assert "GREEN" in out
+    assert "folded in" in out
+
+
+def test_sft_no_timing_anywhere_is_degraded(tmp_path):
+    """An SFT log with no timing and no sibling metric is still DEGRADED."""
+    cell = _write(tmp_path, "empty_cell.log", "=== SFT ===\nvarlen=no-grad-only\n")
+    rc, out = _run(cell)
+    assert rc == 1, out
+    assert "DEGRADED" in out

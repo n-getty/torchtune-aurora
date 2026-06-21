@@ -98,7 +98,11 @@ loss:
 enable_activation_checkpointing: true   # KEEP for 2N memory safety
 enable_activation_offloading: false
 fsdp_cpu_offload: false
-fsdp_reshard_after_forward: true        # ZeRO-3 (safer on 2N)
+fsdp_reshard_after_forward: false       # ZeRO-2 (shard_grad_op): +16% step time at +4.9 GiB
+                                        # vs ZeRO-3 at 2B/2N. HW-validated 2026-06-21 (57 steps,
+                                        # 18.9 GiB peak, bit-identical training). See memory
+                                        # project_sft_no_sync_zero2_2n_validated_20260621. Revert
+                                        # to true if a larger model/seq OOMs.
 data_parallel_replicate_dim: 1
 data_parallel_shard_dim: -1
 tensor_parallel_dim: 1

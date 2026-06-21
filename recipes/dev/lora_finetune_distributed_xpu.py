@@ -261,6 +261,24 @@ class LoRAFinetuneRecipeDistributedXPU(FTRecipeInterface):
         self._log_peak_memory_stats = cfg.get("log_peak_memory_stats", False)
         self._logger = utils.get_logger(cfg.log_level)
 
+        # Dataloader async-prefetch knobs. Default num_workers=2 so the collate (packed
+        # block-causal mask build) + H2D overlap with compute instead of stalling the step
+        # (~42% of step wasted at num_workers=0). Override via config. On Aurora keep
+        # TMPDIR=/tmp (AF_UNIX worker-socket path length) when workers>0.
+        self._dataloader_num_workers = cfg.get("dataloader_num_workers", 2)
+        # pin_memory defaults to FALSE: the triple of {torch.compile model +
+        # pinned-memory forked-worker batches + non-reentrant activation
+        # checkpointing} raises `CheckpointError: A different number of tensors
+        # was saved during the original forward and recomputation` at the step-0
+        # backward on XPU (A/B-proven on the full-FT recipe: needs compile=True
+        # AND pin_memory=True AND num_workers>0 together; clearing pin_memory
+        # alone fixes it while keeping the async-collate throughput win;
+        # compile_dynamic does NOT help). See
+        # memory/project_sft_pinmem_compile_ac_checkpoint_error_20260621. Set
+        # dataloader_pin_memory=true explicitly on a non-compile or non-AC run.
+        self._dataloader_pin_memory = cfg.get("dataloader_pin_memory", False)
+        self._dataloader_prefetch_factor = cfg.get("dataloader_prefetch_factor", 2)
+
         self.save_every_n_steps = cfg.get("save_every_n_steps")
 
         if (
@@ -774,7 +792,15 @@ class LoRAFinetuneRecipeDistributedXPU(FTRecipeInterface):
             rank=self.dp_rank,
             shuffle=shuffle,
         )
-        dataloader = StatefulDataLoader(
+        # Async data loading: with num_workers=0 (the historical default) the collate
+        # (block-causal mask build for packed data) + H2D run synchronously on the main
+        # process and DO NOT overlap with compute -> measured ~3.4s/step (~42%) of pure
+        # dataloader wait on Aurora 4B/seq2048/packed. Make workers/pin/prefetch
+        # configurable and default to async prefetch so the next batch is prepared during
+        # the current step's backward. (Aurora: long node TMPDIR overflows the AF_UNIX
+        # 108-char worker socket path -> launcher sets TMPDIR=/tmp.)
+        num_workers = self._dataloader_num_workers
+        dl_kwargs = dict(
             dataset=ds,
             batch_size=batch_size,
             sampler=sampler,
@@ -791,7 +817,13 @@ class LoRAFinetuneRecipeDistributedXPU(FTRecipeInterface):
             ),
             # dropping last avoids shape issues with compile + flex attention
             drop_last=True,
+            num_workers=num_workers,
+            pin_memory=self._dataloader_pin_memory,
         )
+        if num_workers > 0:
+            dl_kwargs["persistent_workers"] = True
+            dl_kwargs["prefetch_factor"] = self._dataloader_prefetch_factor
+        dataloader = StatefulDataLoader(**dl_kwargs)
 
         return dataloader
 
@@ -832,12 +864,29 @@ class LoRAFinetuneRecipeDistributedXPU(FTRecipeInterface):
         running_loss = 0
         num_tokens = 0
 
+        # Optional per-phase step profiler (env-gated, off by default). Splits each
+        # step into fwd+loss / backward / optimizer with device syncs so a slow step
+        # can be attributed. Adds sync overhead -> diagnostic use only.
+        self._phase_timer = os.environ.get("TORCHTUNE_PHASE_TIMER", "0") == "1"
+        self._phase_acc = {
+            "fwd_loss": 0.0, "fwd_only": 0.0, "loss_only": 0.0, "bwd": 0.0, "opt": 0.0,
+            "data": 0.0,
+        }
+
         self._profiler.start()
         # self.epochs_run should be non-zero when we're resuming from a checkpoint
         for curr_epoch in range(self.epochs_run, self.total_epochs):
             pbar = tqdm(total=self._steps_per_epoch, disable=not (self.rank == 0))
             self._dataloader.sampler.set_epoch(curr_epoch)
+            if self._phase_timer:
+                self._device_sync()
+                _data_t = time.perf_counter()
             for idx, batch in enumerate(self._dataloader):
+                if self._phase_timer:
+                    # time spent waiting for this batch (dataloader/getitem/collate)
+                    self._phase_acc["data"] = (
+                        self._phase_acc.get("data", 0.0) + time.perf_counter() - _data_t
+                    )
                 # Start tracking device memory for active steps for just the first epoch
                 if (
                     self._is_rank_zero
@@ -860,12 +909,71 @@ class LoRAFinetuneRecipeDistributedXPU(FTRecipeInterface):
 
                     # Loss is normalized by default so we multiply by the number of tokens
                     # This way we can normalize by the total number of tokens if we're accumulating gradients
+                    if self._phase_timer:
+                        self._device_sync()
+                        _tp = time.perf_counter()
                     current_loss = self._loss_step(batch) * current_num_tokens
                     running_loss += current_loss
-                    current_loss.backward()
+                    if self._phase_timer:
+                        self._device_sync()
+                        self._phase_acc["fwd_loss"] += time.perf_counter() - _tp
+                        _tp = time.perf_counter()
+                    # Gradient accumulation: suppress the FSDP/DDP gradient
+                    # all-reduce/reduce-scatter on every micro-batch except the
+                    # last of each accumulation window. With ga>1 this collapses
+                    # `ga` cross-rank grad reductions per optimizer step down to
+                    # one, the dominant comm cost at multi-node scale. The result
+                    # is mathematically equivalent to syncing every micro-batch
+                    # (grad reduction is linear), but not bit-identical (different
+                    # summation order). HW-validated on the full-FT recipe
+                    # (2.15x faster at 2N; see memory project_sft_no_sync_zero2_2n
+                    # _validated_20260621). This loop has no inner micro-batch
+                    # sub-loop, so the last-micro-batch predicate reuses the same
+                    # (idx+1) % ga == 0 expression that gates the optimizer step.
+                    #   - FSDP2 (fully_shard): set_requires_gradient_sync(is_last)
+                    #   - FSDP1 / DDP: no_sync() context manager on non-last.
+                    # ga==1 takes the plain backward (no-op gating). Opt-out via
+                    # TORCHTUNE_SFT_DISABLE_NO_SYNC=1 (diagnostic, A/B only).
+                    is_last_microbatch = (
+                        (idx + 1) % self._gradient_accumulation_steps == 0
+                    )
+                    _no_sync_disabled = (
+                        os.environ.get("TORCHTUNE_SFT_DISABLE_NO_SYNC", "0") == "1"
+                    )
+                    if (
+                        self._gradient_accumulation_steps > 1
+                        and not _no_sync_disabled
+                        and hasattr(self._model, "set_requires_gradient_sync")
+                    ):
+                        # FSDP2 path
+                        self._model.set_requires_gradient_sync(is_last_microbatch)
+                        current_loss.backward()
+                    elif (
+                        self._gradient_accumulation_steps > 1
+                        and not _no_sync_disabled
+                        and not is_last_microbatch
+                        and hasattr(self._model, "no_sync")
+                    ):
+                        # FSDP1 / DDP path
+                        with self._model.no_sync():
+                            current_loss.backward()
+                    else:
+                        # ga==1, diagnostic disable, or no FSDP hooks: plain backward.
+                        if (
+                            _no_sync_disabled
+                            and hasattr(self._model, "set_requires_gradient_sync")
+                        ):
+                            self._model.set_requires_gradient_sync(True)
+                        current_loss.backward()
+                    if self._phase_timer:
+                        self._device_sync()
+                        self._phase_acc["bwd"] += time.perf_counter() - _tp
 
                 # Step with optimizer
                 if (idx + 1) % self._gradient_accumulation_steps == 0:
+                    if self._phase_timer:
+                        self._device_sync()
+                        _tp = time.perf_counter()
                     # Get total number of tokens across all ranks to normalize gradients
                     torch.distributed.all_reduce(num_tokens)
                     # This will ensure that the logged loss matches what we're optimizing
@@ -881,6 +989,9 @@ class LoRAFinetuneRecipeDistributedXPU(FTRecipeInterface):
                     self._optimizer.step()
                     self._optimizer.zero_grad(set_to_none=True)
                     self._lr_scheduler.step()
+                    if self._phase_timer:
+                        self._device_sync()
+                        self._phase_acc["opt"] += time.perf_counter() - _tp
 
                     # Update the number of steps when the weights are updated
                     self.global_step += 1
@@ -900,6 +1011,10 @@ class LoRAFinetuneRecipeDistributedXPU(FTRecipeInterface):
                         log_dict = {
                             "loss": loss_to_log,
                             "lr": self._optimizer.param_groups[0]["lr"],
+                            # Raw per-step wall time: the one engine-agnostic throughput
+                            # metric (no token-masking / normalization assumptions), used
+                            # by the SFT throughput benchmark for cross-engine A/B.
+                            "time_per_step_s": time_per_step,
                             "tokens_per_second_per_gpu": num_tokens
                             / (time_per_step * self.world_size),
                         }
@@ -910,6 +1025,17 @@ class LoRAFinetuneRecipeDistributedXPU(FTRecipeInterface):
 
                         if self._clip_grad_norm is not None:
                             log_dict.update({"grad_norm": grad_norm})
+                        if self._phase_timer:
+                            log_dict.update(
+                                {
+                                    "phase_fwd_loss_s": self._phase_acc["fwd_loss"],
+                                    "phase_fwd_only_s": self._phase_acc.get("fwd_only", 0.0),
+                                    "phase_loss_only_s": self._phase_acc.get("loss_only", 0.0),
+                                    "phase_bwd_s": self._phase_acc["bwd"],
+                                    "phase_opt_s": self._phase_acc["opt"],
+                                    "phase_data_s": self._phase_acc.get("data", 0.0),
+                                }
+                            )
                         self._metric_logger.log_dict(
                             log_dict,
                             step=self.global_step,
@@ -918,6 +1044,11 @@ class LoRAFinetuneRecipeDistributedXPU(FTRecipeInterface):
                     # Reset running stats for the next step
                     running_loss = 0
                     num_tokens = 0
+                    if self._phase_timer:
+                        self._phase_acc = {
+                            "fwd_loss": 0.0, "fwd_only": 0.0, "loss_only": 0.0,
+                            "bwd": 0.0, "opt": 0.0, "data": 0.0,
+                        }
                     t0 = time.perf_counter()
 
                     # Stop tracking device memory now that active steps are complete
@@ -958,6 +1089,10 @@ class LoRAFinetuneRecipeDistributedXPU(FTRecipeInterface):
                 ) == self.max_steps_per_epoch:
                     break
 
+                if self._phase_timer:
+                    self._device_sync()
+                    _data_t = time.perf_counter()
+
             self.epochs_run += 1
 
         self._profiler.stop()
@@ -965,10 +1100,21 @@ class LoRAFinetuneRecipeDistributedXPU(FTRecipeInterface):
         # Save final non-distributed ckpt
         self.save_checkpoint(epoch=curr_epoch, full_tensors=True)
 
+    def _device_sync(self) -> None:
+        """Block until queued device work completes (for accurate phase timing)."""
+        if self._device.type == "xpu":
+            torch.xpu.synchronize()
+        elif self._device.type == "cuda":
+            torch.cuda.synchronize()
+
     def _loss_step(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
         # Shape [b, s], needed for the loss not the model
         labels = batch.pop("labels")
 
+        _pt = getattr(self, "_phase_timer", False)
+        if _pt:
+            self._device_sync()
+            _t = time.perf_counter()
         with self.activations_handling_ctx:
             outputs = self._model(**batch)
 
@@ -979,8 +1125,19 @@ class LoRAFinetuneRecipeDistributedXPU(FTRecipeInterface):
             if isinstance(outputs, DTensor):
                 outputs = outputs.full_tensor()
 
+        if _pt:
+            self._device_sync()
+            self._phase_acc["fwd_only"] = (
+                self._phase_acc.get("fwd_only", 0.0) + time.perf_counter() - _t
+            )
+            _t = time.perf_counter()
         # Compute loss
         loss = self._loss_fn(outputs, labels)
+        if _pt:
+            self._device_sync()
+            self._phase_acc["loss_only"] = (
+                self._phase_acc.get("loss_only", 0.0) + time.perf_counter() - _t
+            )
 
         # free logits otherwise it peaks backward memory
         del outputs

@@ -83,6 +83,28 @@ analyze_log() {
     local norm
     norm=$(normalize "$LOG")
 
+    # SFT recipes emit per-step timing ("Step N | ... time_per_step_s:...") only
+    # to the DiskLogger file, NOT to the stdout/cell log this gate is usually
+    # pointed at. If the given log has no timing of either format, fold in a
+    # sibling DiskLogger metric file so SFT runs get a real verdict instead of a
+    # false DEGRADED. Search common locations relative to the given log.
+    if ! printf '%s\n' "$norm" | grep -qE "TIMING step=|time_per_step_s:[0-9.]+"; then
+        local logdir metricf
+        logdir=$(dirname "$LOG")
+        for cand in \
+            "$logdir"/run_out/logs/log_*.txt \
+            "$logdir"/logs/log_*.txt \
+            "$logdir"/*/run_out/logs/log_*.txt; do
+            for metricf in $cand; do
+                if [ -f "$metricf" ] && grep -qE "time_per_step_s:[0-9.]+" "$metricf"; then
+                    norm="$norm"$'\n'"$(normalize "$metricf")"
+                    notes+=("SFT metric log folded in: $metricf")
+                    break 2
+                fi
+            done
+        done
+    fi
+
     # --- grpo_step path (one-shot rank-0 line) -------------------------------
     # SOURCE: grpo_full_finetune_distributed_xpu.py ~3675 "grpo_step path: %s ..."
     local pathline
@@ -179,22 +201,33 @@ analyze_log() {
     fi
 
     # --- TIMING completeness -------------------------------------------------
-    # SOURCE: recipe:4644/4771/4951 "TIMING step=%d ..."
-    local ntiming
+    # GRPO recipes: recipe:4644/4771/4951 "TIMING step=%d ... total=%.1fs"
+    # SFT recipes (full_finetune/lora_finetune_distributed_xpu): the DiskLogger
+    # emits "Step %d | loss:... time_per_step_s:%f ..." instead. Support both so
+    # an SFT run is not falsely flagged DEGRADED for lacking GRPO TIMING lines.
+    local ntiming nsft
     ntiming=$(printf '%s\n' "$norm" | grep "TIMING step=" | sort -u | wc -l)
-    if [ "$ntiming" -eq 0 ]; then
-        degraded=1
-        findings+=("NO 'TIMING step=' lines -- the run never completed a step. Any step-time number is fabricated/partial.")
-    else
-        # Report the steady-state step time (median-ish: drop step 0 if >1).
+    nsft=$(printf '%s\n' "$norm" | grep -E "time_per_step_s:[0-9.]+" | sort -u | wc -l)
+    if [ "$ntiming" -gt 0 ]; then
+        # GRPO format: step time is the `total=...s` field.
         local steptimes
         steptimes=$(printf '%s\n' "$norm" | grep "TIMING step=" | grep -oE 'total=[0-9.]+s' | grep -oE '[0-9.]+' | sort -n)
-        local nsteps
-        nsteps=$(printf '%s\n' "$steptimes" | grep -c .)
         local typ
         typ=$(printf '%s\n' "$steptimes" | awk '{a[NR]=$1} END{if(NR==0)exit; print a[int((NR+1)/2)]}')
         notes+=("TIMING: $ntiming distinct step lines; typical total=${typ}s.")
         LAST_TYP_STEP="$typ"
+    elif [ "$nsft" -gt 0 ]; then
+        # SFT format: step time is the `time_per_step_s:` field. Median over all
+        # steps (the first 1-3 carry torch.compile warmup; median is robust to
+        # those when enough steps exist).
+        local steptimes typ
+        steptimes=$(printf '%s\n' "$norm" | grep -oE 'time_per_step_s:[0-9.]+' | grep -oE '[0-9.]+' | sort -n)
+        typ=$(printf '%s\n' "$steptimes" | awk '{a[NR]=$1} END{if(NR==0)exit; print a[int((NR+1)/2)]}')
+        notes+=("TIMING (SFT): $nsft distinct step lines; median time_per_step_s=${typ}s.")
+        LAST_TYP_STEP="$typ"
+    else
+        degraded=1
+        findings+=("NO 'TIMING step=' or 'time_per_step_s:' lines -- the run never completed a step. Any step-time number is fabricated/partial.")
     fi
 
     # --- emit ----------------------------------------------------------------
