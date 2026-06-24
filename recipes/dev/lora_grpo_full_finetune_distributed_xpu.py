@@ -71,6 +71,7 @@ from torchtune.dev.rl.rewards import batched_rewards
 from torchtune.dev.rl.types import GRPOStats, GRPOTrajectory
 from torchtune.modules import local_kv_cache
 from torchtune.modules.attention_utils import _compute_maskfree_causal
+from torchtune.modules.loss import RLLoss
 from torchtune.modules.peft import (
     disable_adapter,
     get_adapter_params,
@@ -846,6 +847,16 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
 
         self._loss_fn = config.instantiate(cfg.loss)
         self._use_chunked_loss = hasattr(self._loss_fn, "num_output_chunks")
+        # Memory-efficient chunked-vocab loss opt-in. LinearGRPOLoss (and any RLLoss
+        # exposing set_model_output) takes the model's HIDDEN states and applies the
+        # vocab projection per sequence-chunk inside the loss, so the full
+        # [B, S, vocab] FP32 logit tensor (~2.7 GiB/seq at S~1900 for Qwen3-4B) is
+        # never materialized. Detected here; wired after the model + RL params exist.
+        # Default loss (GRPOLoss) lacks set_model_output -> _linear_loss=False ->
+        # the existing full-logit path runs byte-for-byte unchanged.
+        self._linear_loss = isinstance(self._loss_fn, RLLoss) and hasattr(
+            self._loss_fn, "set_model_output"
+        )
 
         collate_name = cfg.get("collate_fn", "torchtune.dev.rl.data.padded_collate_rl")
         self._dataloader = self._setup_data(
@@ -873,6 +884,45 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
         self._temperature = cfg.temperature
         self._top_k = cfg.top_k
         self._max_generated_tokens = cfg.max_generated_tokens
+
+        # Wire the chunked-vocab loss to the model (after model + temperature exist).
+        # set_model_output captures self._loss_fn.linear_projection = model.output and
+        # sets model.skip_output_layer=True; we immediately reset it to False so ONLY
+        # the training forward (which toggles it per-call in grpo_step) returns hidden
+        # states — the ref/rollout forwards keep returning logits unchanged.
+        if self._linear_loss:
+            # The loss applies model.output OUTSIDE model.forward. Under FSDP
+            # FULL_SHARD the projection weight is resharded after forward, so
+            # projecting it in the loss would multiply by a shard (wrong numerics).
+            # Only the no-FSDP colocate path keeps params resident -> safe. Fail
+            # fast otherwise (override at your own risk for SHARD_GRAD_OP).
+            if not self._no_fsdp and os.environ.get(
+                "TORCHTUNE_LINEAR_LOSS_ALLOW_FSDP", "0"
+            ) != "1":
+                raise RuntimeError(
+                    "LinearGRPOLoss (chunked-vocab) requires TORCHTUNE_COLOCATE_NO_FSDP=1 "
+                    "(projection runs outside model.forward; FSDP FULL_SHARD reshards the "
+                    "weight -> wrong numerics). Set TORCHTUNE_LINEAR_LOSS_ALLOW_FSDP=1 to "
+                    "override (only safe under SHARD_GRAD_OP, untested)."
+                )
+            # LinearGRPOLoss computes logprobs via CE with NO temperature scaling.
+            # The recipe's standard path divides logits by self._temperature; at
+            # temperature==1.0 these match. Guard against silent corruption at !=1.0.
+            if self._temperature != 1.0:
+                raise RuntimeError(
+                    f"LinearGRPOLoss path requires temperature==1.0 (got "
+                    f"{self._temperature}); its CE has no temperature term. "
+                    "Use the full-logit GRPOLoss path for non-unit temperature."
+                )
+            self._loss_fn.set_model_output(self._model)
+            self._model.skip_output_layer = False  # re-enabled per-call in grpo_step
+            utils.log_rank_zero(
+                log,
+                "LoRA-GRPO: LinearGRPOLoss wired (chunked-vocab, "
+                f"num_output_chunks={getattr(self._loss_fn, 'num_output_chunks', '?')}); "
+                "training forward returns hidden states, projection runs per seq-chunk "
+                "in the loss. Ref/rollout forwards unchanged.",
+            )
         self.batch_size = cfg.batch_size
         self._forward_batch_size = cfg.forward_batch_size
         # Separate chunk size for no-grad forwards (ref_fwd inside disable_adapter,
@@ -2426,31 +2476,58 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
             for cs in range(0, num_seqs, fwd_bs):
                 ce = min(cs + fwd_bs, num_seqs)
                 _is_last_chunk = (ce >= num_seqs)
-                chunk_logits = self._model(
-                    trajectory.query_responses[cs:ce],
-                    input_pos=trajectory.position_ids[cs:ce],
-                    mask=trajectory.masks[cs:ce] if trajectory.masks is not None else None,
-                )
-                chunk_logits = rlhf.truncate_sequence_for_logprobs(chunk_logits, context_length)
-                chunk_pi_lp = rlhf.batched_logits_to_logprobs(
-                    chunk_logits, responses[cs:ce], self._temperature
-                )
-                del chunk_logits
-                chunk_old_lp = (
-                    trajectory.logprobs[cs:ce]
-                    if trajectory.logprobs is not None
-                    else chunk_pi_lp.detach()
-                )
-                # NOTE: padding_masks=True means "include this token in loss" (base recipe
-                # convention). response_padding_masks is True for PAD/truncated tokens, so
-                # invert it here. Bug in the original: was passing without ~.
-                chunk_loss, _, chunk_kl, *_ = self._loss_fn(
-                    chunk_old_lp,
-                    chunk_pi_lp,
-                    trajectory.ref_logprobs[cs:ce],
-                    trajectory.advantages[cs:ce],
-                    padding_masks=~trajectory.response_padding_masks[cs:ce],
-                )
+                if getattr(self, "_linear_loss", False):
+                    # Chunked-vocab path: model returns HIDDEN states (skip_output_layer
+                    # toggled True ONLY around this training forward); LinearGRPOLoss
+                    # applies the vocab projection per seq-chunk, so no full [B,S,vocab]
+                    # FP32 logit tensor is ever held. The loss reads pi_old from the
+                    # hidden it re-projects (ratios collapse to 1, simple formulation).
+                    try:
+                        self._model.skip_output_layer = True
+                        chunk_hidden = self._model(
+                            trajectory.query_responses[cs:ce],
+                            input_pos=trajectory.position_ids[cs:ce],
+                            mask=trajectory.masks[cs:ce] if trajectory.masks is not None else None,
+                        )
+                    finally:
+                        self._model.skip_output_layer = False
+                    chunk_hidden = rlhf.truncate_sequence_for_logprobs(
+                        chunk_hidden, context_length
+                    )
+                    chunk_loss, _, chunk_kl, *_ = self._loss_fn(
+                        chunk_hidden,                       # pi_old_outputs = HIDDEN
+                        responses[cs:ce],                   # pi_outputs = target token ids
+                        trajectory.ref_logprobs[cs:ce],     # ref_outputs = ref logprobs
+                        trajectory.advantages[cs:ce],
+                        padding_masks=~trajectory.response_padding_masks[cs:ce],
+                    )
+                    del chunk_hidden
+                else:
+                    chunk_logits = self._model(
+                        trajectory.query_responses[cs:ce],
+                        input_pos=trajectory.position_ids[cs:ce],
+                        mask=trajectory.masks[cs:ce] if trajectory.masks is not None else None,
+                    )
+                    chunk_logits = rlhf.truncate_sequence_for_logprobs(chunk_logits, context_length)
+                    chunk_pi_lp = rlhf.batched_logits_to_logprobs(
+                        chunk_logits, responses[cs:ce], self._temperature
+                    )
+                    del chunk_logits
+                    chunk_old_lp = (
+                        trajectory.logprobs[cs:ce]
+                        if trajectory.logprobs is not None
+                        else chunk_pi_lp.detach()
+                    )
+                    # NOTE: padding_masks=True means "include this token in loss" (base recipe
+                    # convention). response_padding_masks is True for PAD/truncated tokens, so
+                    # invert it here. Bug in the original: was passing without ~.
+                    chunk_loss, _, chunk_kl, *_ = self._loss_fn(
+                        chunk_old_lp,
+                        chunk_pi_lp,
+                        trajectory.ref_logprobs[cs:ce],
+                        trajectory.advantages[cs:ce],
+                        padding_masks=~trajectory.response_padding_masks[cs:ce],
+                    )
                 if self._is_rank_zero and cs == 0 and self._device.type == "xpu":
                     try:
                         ms = torch.xpu.memory_stats(self._device)
@@ -2471,27 +2548,49 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
         else:
             # Single forward + backward
             grad_scale = max(1, self._gradient_accumulation_steps)
-            logits = self._model(
-                trajectory.query_responses,
-                input_pos=trajectory.position_ids,
-                mask=trajectory.masks,
-            )
-            logits = rlhf.truncate_sequence_for_logprobs(logits, context_length)
-            pi_logprobs = rlhf.batched_logits_to_logprobs(logits, responses, self._temperature)
-            del logits
-            old_logprobs = (
-                trajectory.logprobs if trajectory.logprobs is not None else pi_logprobs.detach()
-            )
-            # NOTE: padding_masks=True means "include this token in loss" (base recipe
-            # convention). response_padding_masks is True for PAD/truncated tokens, so
-            # invert it here. Bug in the original: was passing without ~.
-            loss, _, kl_loss, *_ = self._loss_fn(
-                old_logprobs,
-                pi_logprobs,
-                trajectory.ref_logprobs,
-                trajectory.advantages,
-                padding_masks=~trajectory.response_padding_masks,
-            )
+            if getattr(self, "_linear_loss", False):
+                # Chunked-vocab path (see chunked branch above): hidden states +
+                # per-seq-chunk projection inside LinearGRPOLoss.
+                try:
+                    self._model.skip_output_layer = True
+                    hidden = self._model(
+                        trajectory.query_responses,
+                        input_pos=trajectory.position_ids,
+                        mask=trajectory.masks,
+                    )
+                finally:
+                    self._model.skip_output_layer = False
+                hidden = rlhf.truncate_sequence_for_logprobs(hidden, context_length)
+                loss, _, kl_loss, *_ = self._loss_fn(
+                    hidden,
+                    responses,
+                    trajectory.ref_logprobs,
+                    trajectory.advantages,
+                    padding_masks=~trajectory.response_padding_masks,
+                )
+                del hidden
+            else:
+                logits = self._model(
+                    trajectory.query_responses,
+                    input_pos=trajectory.position_ids,
+                    mask=trajectory.masks,
+                )
+                logits = rlhf.truncate_sequence_for_logprobs(logits, context_length)
+                pi_logprobs = rlhf.batched_logits_to_logprobs(logits, responses, self._temperature)
+                del logits
+                old_logprobs = (
+                    trajectory.logprobs if trajectory.logprobs is not None else pi_logprobs.detach()
+                )
+                # NOTE: padding_masks=True means "include this token in loss" (base recipe
+                # convention). response_padding_masks is True for PAD/truncated tokens, so
+                # invert it here. Bug in the original: was passing without ~.
+                loss, _, kl_loss, *_ = self._loss_fn(
+                    old_logprobs,
+                    pi_logprobs,
+                    trajectory.ref_logprobs,
+                    trajectory.advantages,
+                    padding_masks=~trajectory.response_padding_masks,
+                )
             (loss / grad_scale).backward()
             total_loss = loss.detach()
             total_kl = kl_loss.detach()

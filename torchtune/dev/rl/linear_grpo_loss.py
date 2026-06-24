@@ -82,12 +82,16 @@ class LinearGRPOLoss(nn.Module, RLLoss):
         pi_logprobs_detached = pi_logprobs_chunk.detach()
         ref_logprobs_detached = ref_logprobs_chunk.detach()
 
-        # KL term
-        per_token_kl = (
-            torch.exp(ref_logprobs_detached - pi_logprobs_chunk)
-            - (ref_logprobs_detached - pi_logprobs_chunk)
-            - 1
-        )
+        # KL term — k3 estimator exp(d) - d - 1, d = ref - pi. Clamp to [-10, 10]
+        # (exp(10)=22026) and scrub NaN: on long generations a rare token gets a
+        # very negative pi logprob -> d ~ +80 -> exp(d) overflows to Inf -> the
+        # reduction NaNs and poisons the whole step (mirrors GRPOSimpleLoss /
+        # GRPOLoss hardening in loss.py:291-294; hit on BioReason 2048-gen step 4).
+        # nan_to_num runs first because clamp alone does not filter inf-inf=nan.
+        _kl_diff = ref_logprobs_detached - pi_logprobs_chunk
+        _kl_diff = torch.nan_to_num(_kl_diff, nan=0.0, posinf=10.0, neginf=-10.0)
+        _kl_diff = _kl_diff.clamp(min=-10.0, max=10.0)
+        per_token_kl = torch.exp(_kl_diff) - _kl_diff - 1
 
         # Policy term
         per_token_policy_loss = (
