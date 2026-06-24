@@ -519,14 +519,39 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
                 f"from rank 0 (cross-rank init divergence fix)",
             )
 
-        model = FSDP(
-            model,
-            sharding_strategy=_sharding_strategy,
-            mixed_precision=mp_policy,
-            use_orig_params=True,
-            limit_all_gathers=True,
-            ignored_states=_lora_adapter_params,
+        # A100-equivalent plain-resident colocate path (TORCHTUNE_COLOCATE_NO_FSDP=1):
+        # SKIP FSDP entirely. Rationale: for LoRA the only thing FSDP usefully shards
+        # is the ~8 GiB frozen base, which fits resident on a 64 GiB tile alongside
+        # vLLM (~24 GiB). FSDP is what BANS empty_cache on XPU (empty_cache + FSDP
+        # leaks UR handles "proportional to FSDP units per call") — the single reason
+        # reserved memory only grows on XPU where CUDA reclaims cleanly. Removing FSDP
+        # in colocate lets us re-enable empty_cache between gen/train (see
+        # generate_trajectory + grpo_step), matching the TRL/A100 plain colocate loop.
+        # Model stays full-precision-replicated per tile; tiny adapter grads are
+        # all-reduced manually in train() (already the case — adapters are FSDP-ignored
+        # anyway). Only valid in colocate (server/dedicated still shard for cross-node).
+        self._no_fsdp = (
+            self._colocate
+            and os.environ.get("TORCHTUNE_COLOCATE_NO_FSDP", "0") == "1"
         )
+        if self._no_fsdp:
+            utils.log_rank_zero(
+                log,
+                "LoRA-GRPO: TORCHTUNE_COLOCATE_NO_FSDP=1 — model NOT FSDP-wrapped "
+                "(full base replicated per tile); empty_cache re-enabled in colocate. "
+                "A100-equivalent plain-resident path.",
+            )
+            # Model already lives on self._device from _setup_model_lora; ensure it.
+            model = model.to(self._device)
+        else:
+            model = FSDP(
+                model,
+                sharding_strategy=_sharding_strategy,
+                mixed_precision=mp_policy,
+                use_orig_params=True,
+                limit_all_gathers=True,
+                ignored_states=_lora_adapter_params,
+            )
 
         if self._enable_activation_checkpointing:
             training.set_activation_checkpointing(
@@ -1342,9 +1367,15 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
                     gc.collect()
                     torch.xpu.synchronize(self._device)
         else:
-            with torch.no_grad(), FSDP.summon_full_params(
-                self._model, writeback=False, rank0_only=False
-            ):
+            import contextlib as _ctxlib
+            # No-FSDP: weights are full+resident, read module.weight directly (no
+            # summon). FSDP: summon the full sharded param for the merge.
+            _summon_ctx = (
+                _ctxlib.nullcontext()
+                if getattr(self, "_no_fsdp", False)
+                else FSDP.summon_full_params(self._model, writeback=False, rank0_only=False)
+            )
+            with torch.no_grad(), _summon_ctx:
                 for tune_name, merged in iter_merged_lora_layers(
                     self._model, base_weights=None
                 ):
@@ -1394,6 +1425,7 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
         ``TORCHTUNE_COLOCATE_BASE_CPU=1`` to cache on CPU if HBM is tight (adds a
         per-step H2D copy of each base inside the merge).
         """
+        import contextlib
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
         from torchtune.modules.peft.lora import LoRALinear
 
@@ -1401,9 +1433,14 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
         dst = torch.device("cpu") if _cpu else self._device
         cache: dict[str, torch.Tensor] = {}
         t0 = time.perf_counter()
-        with torch.no_grad(), FSDP.summon_full_params(
-            self._model, writeback=False, rank0_only=False
-        ):
+        # No-FSDP path: weights are full+resident already, no summon needed (and the
+        # _fsdp_wrapped_module. prefix is absent). FSDP path: summon the full param.
+        _summon = (
+            contextlib.nullcontext()
+            if getattr(self, "_no_fsdp", False)
+            else FSDP.summon_full_params(self._model, writeback=False, rank0_only=False)
+        )
+        with torch.no_grad(), _summon:
             for module_name, module in self._model.named_modules():
                 if not isinstance(module, LoRALinear):
                     continue
@@ -2044,9 +2081,13 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
         if self._device.type == "xpu":
             torch.xpu.synchronize()
         # device_empty_cache leaks UR handles under FSDP + in-process vLLM, so
-        # it must NOT run in colocate (the dense colocate path skips it too).
+        # it must NOT run in FSDP colocate (the dense colocate path skips it too).
+        # The no-FSDP colocate path DOES reclaim (the whole hypothesis) via
+        # _colocate_reclaim; off-colocate uses the standard helper.
         if not self._colocate:
             device_empty_cache(self._device)
+        else:
+            self._colocate_reclaim()
 
         batch_size, context_length = input_ids.shape
         grpo_size = self.grpo_samples
@@ -2057,6 +2098,17 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
 
         # Step 1: vLLM generation. Colocate generates in-process per rank;
         # server mode calls the HTTP tiles (adapter-aware via client._model_name).
+        # Sub-phase creep probe (MEM_PROBE=1): reserved before/after JUST the vLLM
+        # generate call, to localize the ~0.5 GiB/step gen-phase floor creep to
+        # vLLM-internal growth vs the torch ref/policy forwards that follow.
+        _subprobe = (
+            os.environ.get("TORCHTUNE_COLOCATE_MEM_PROBE", "0") == "1"
+            and self._is_rank_zero and self._device.type == "xpu"
+        )
+        if _subprobe and self._device.type == "xpu":
+            torch.xpu.synchronize()
+        _r_pre_vllm = torch.xpu.memory_reserved(self._device) / 1024**3 if _subprobe else 0.0
+        _a_pre_vllm = torch.xpu.memory_allocated(self._device) / 1024**3 if _subprobe else 0.0
         _vllm_t0 = time.perf_counter()
         if self._colocate:
             query_responses = self._generate_with_colocated_vllm(
@@ -2067,6 +2119,19 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
         if self._device.type == "xpu":
             torch.xpu.synchronize()
         _vllm_time = time.perf_counter() - _vllm_t0
+        if _subprobe:
+            # ACTIVE (live) is the discriminator — the gen-phase +0.44/step creep
+            # (job 8558618) is in ACTIVE; reserved was blind. Pins whether the leak
+            # is the vLLM generate call itself or the torch forwards after it.
+            _r_post_vllm = torch.xpu.memory_reserved(self._device) / 1024**3
+            _a_post_vllm = torch.xpu.memory_allocated(self._device) / 1024**3
+            log.info(
+                "COLOCATE_SUBPROBE step=%d vllm_generate reserved %.2f->%.2f (%+.2f) "
+                "| ACTIVE %.2f->%.2f (%+.3f) GiB",
+                getattr(self, "_steps_run", -1), _r_pre_vllm, _r_post_vllm,
+                _r_post_vllm - _r_pre_vllm,
+                _a_pre_vllm, _a_post_vllm, _a_post_vllm - _a_pre_vllm,
+            )
 
         responses = query_responses[:, context_length:].clone()
 
@@ -2146,6 +2211,10 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
         _policy_fwd_time = time.perf_counter() - _policy_fwd_t0
 
         # Step 3: ref logprobs via disable_adapter (no separate ref model)
+        if _subprobe and self._device.type == "xpu":
+            torch.xpu.synchronize()
+        _r_pre_ref = torch.xpu.memory_reserved(self._device) / 1024**3 if _subprobe else 0.0
+        _a_pre_ref = torch.xpu.memory_allocated(self._device) / 1024**3 if _subprobe else 0.0
         _ref_fwd_t0 = time.perf_counter()
         with disable_adapter(self._model):
             with torch.no_grad():
@@ -2171,6 +2240,16 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
                     ref_logprobs = torch.cat(ref_chunks, dim=0)
         if self._device.type == "xpu":
             torch.xpu.synchronize()
+        if _subprobe:
+            _r_post_ref = torch.xpu.memory_reserved(self._device) / 1024**3
+            _a_post_ref = torch.xpu.memory_allocated(self._device) / 1024**3
+            log.info(
+                "COLOCATE_SUBPROBE step=%d ref_fwd reserved %.2f->%.2f (%+.2f) "
+                "| ACTIVE %.2f->%.2f (%+.3f) GiB",
+                getattr(self, "_steps_run", -1), _r_pre_ref, _r_post_ref,
+                _r_post_ref - _r_pre_ref,
+                _a_pre_ref, _a_post_ref, _a_post_ref - _a_pre_ref,
+            )
         _ref_fwd_time = time.perf_counter() - _ref_fwd_t0
 
         log.info(
@@ -2251,6 +2330,7 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
             advantages = advantages.reshape(batch_size * grpo_size)
         del responses
         device_empty_cache(self._device)
+        self._colocate_reclaim()
 
         # Mask padding (logprobs is None when rollout-time policy fwd was skipped).
         if logprobs is not None:
@@ -2288,8 +2368,10 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
                 batch_input_ids = input_ids[batch_start: batch_start + self._gen_batch_size]
                 batch_answers = answers[batch_start: batch_start + self._gen_batch_size]
                 device_empty_cache(self._device)
+                self._colocate_reclaim()
                 trajectories.append(self.generate_trajectory(batch_input_ids, batch_answers))
                 device_empty_cache(self._device)
+                self._colocate_reclaim()
 
         concatenated_fields = {}
         for field_name in trajectories[0]._fields:
@@ -2421,17 +2503,25 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
 
     def save_checkpoint(self, epoch: int) -> None:
         """Save adapter weights (base weights excluded by default)."""
+        import contextlib
         from torch.distributed.fsdp import (
             FullyShardedDataParallel as FSDP,
             StateDictType,
             FullStateDictConfig,
         )
 
-        with FSDP.state_dict_type(
-            self._model,
-            StateDictType.FULL_STATE_DICT,
-            FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
-        ):
+        # No-FSDP colocate: the model is a plain replicated module, so state_dict()
+        # is already the full dict (no gather needed). FSDP: use FULL_STATE_DICT.
+        _sd_ctx = (
+            contextlib.nullcontext()
+            if getattr(self, "_no_fsdp", False)
+            else FSDP.state_dict_type(
+                self._model,
+                StateDictType.FULL_STATE_DICT,
+                FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
+            )
+        )
+        with _sd_ctx:
             full_sd = self._model.state_dict()
 
         if self._is_rank_zero:
@@ -2492,6 +2582,277 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
                 f"vLLM EngineCore failed warm-up (node may have stale L0 state): {_e}"
             ) from _e
 
+    def _colocate_reclaim(self, final: bool = False) -> None:
+        """Real empty_cache for the no-FSDP colocate path (A100-equivalent).
+
+        The standard ``device_empty_cache`` is a hard no-op on XPU because
+        ``empty_cache`` + FSDP leaks UR handles.  The no-FSDP colocate hypothesis
+        is that, WITHOUT FSDP units, ``torch.xpu.empty_cache()`` reclaims cleanly
+        like CUDA — letting reserved memory drop between gen and train instead of
+        accumulating to ``banned:1``.  This is the load-bearing call that tests it.
+        Only fires on the ``_no_fsdp`` colocate path; everywhere else it is a no-op
+        (the FSDP-ban still holds).
+
+        ``final`` marks the end-of-train-step reclamation site (the one
+        A100-equivalent point that, on its own, reclaims the big per-step grpo_step
+        transient).  ``TORCHTUNE_COLOCATE_RECLAIM_MODE`` controls how many of the
+        ~5 per-step sites actually call ``empty_cache``:
+          - ``all`` (default): fire at every site (~5 empty_cache/step).
+          - ``once``: fire ONLY at ``final`` (1 empty_cache/step) — still reclaims
+            the big transient each step, but 5x fewer calls.  DECISIVE TEST: if the
+            ~0.44 GiB/step creep is driven by ``empty_cache``/L0 reclamation residue
+            it should fall ~5x in ``once`` mode; if it is vLLM-internal/per-step it
+            stays the same.  See memory project_nofsdp_colocate_creep_diagnosis.
+        ``TORCHTUNE_COLOCATE_RECLAIM_STRIDE`` (int, default 1): fire only every Nth
+        eligible call (mitigation knob once the cause is known).
+        """
+        if not getattr(self, "_no_fsdp", False):
+            return
+        _mode = os.environ.get("TORCHTUNE_COLOCATE_RECLAIM_MODE", "all")
+        if _mode == "once" and not final:
+            return
+        # stride gate: count eligible calls, fire only every Nth
+        _stride = int(os.environ.get("TORCHTUNE_COLOCATE_RECLAIM_STRIDE", "1"))
+        if _stride > 1:
+            self._reclaim_eligible = getattr(self, "_reclaim_eligible", 0) + 1
+            if (self._reclaim_eligible % _stride) != 0:
+                return
+        _probe = (
+            os.environ.get("TORCHTUNE_COLOCATE_MEM_PROBE", "0") == "1"
+            and self._is_rank_zero
+        )
+        if self._device.type == "xpu":
+            torch.xpu.synchronize(self._device)
+            if _probe:
+                _r0 = torch.xpu.memory_reserved(self._device) / 1024**3
+                _f0, _ = torch.xpu.mem_get_info(self._device)
+            torch.xpu.empty_cache()
+            # cumulative count of REAL empty_cache calls (causation test: plot
+            # ALLOC creep against this, not against step number).
+            self._ec_calls = getattr(self, "_ec_calls", 0) + 1
+            if _probe:
+                _r1 = torch.xpu.memory_reserved(self._device) / 1024**3
+                _f1, _ = torch.xpu.mem_get_info(self._device)
+                # CRITICAL SPLIT: allocated = live tensors PyTorch TRACKS; reserved =
+                # torch pool; L0 free = whole device. If allocated CREEPS, the leak is
+                # a torch-tracked tensor (our code / a torch module retaining refs). If
+                # allocated is FLAT but L0 free DROPS, the growth is OUTSIDE torch's
+                # allocator entirely → vLLM-internal (its own device buffers) or driver.
+                # This is the measurement that ends the bisect.
+                _alloc = torch.xpu.memory_allocated(self._device) / 1024**3
+                try:
+                    _ms = torch.xpu.memory_stats(self._device)
+                    _active = _ms.get("active_bytes.all.current", 0) / 1024**3
+                    _nalloc = _ms.get("allocation.all.current", 0)  # count of live blocks
+                    # allocation-class attribution (the only stack-free signal XPU
+                    # gives us — no memory_snapshot on XPU). If the creep is in
+                    # `reserved-but-not-active` it is allocator frag; if in `active`
+                    # it is genuinely live; `num_alloc_retries` rising == pool churn.
+                    _seg = _ms.get("reserved_bytes.all.current", 0) / 1024**3
+                    _inact = _ms.get("inactive_split_bytes.all.current", 0) / 1024**3
+                    _retries = _ms.get("num_alloc_retries", 0)
+                except Exception:
+                    _active, _nalloc, _seg, _inact, _retries = -1.0, -1, -1.0, -1.0, -1
+                log.info(
+                    "COLOCATE_RECLAIM reserved %.2f->%.2f (%+.2f) | L0 free %.2f->%.2f (%+.2f) "
+                    "| ALLOC=%.2f active=%.2f n_blocks=%d seg=%.2f inact=%.2f retries=%d "
+                    "ec_calls=%d step=%d final=%d GiB",
+                    _r0, _r1, _r1 - _r0,
+                    _f0 / 1024**3, _f1 / 1024**3, (_f1 - _f0) / 1024**3,
+                    _alloc, _active, _nalloc, _seg, _inact, _retries,
+                    getattr(self, "_ec_calls", -1), getattr(self, "_steps_run", -1),
+                    int(final),
+                )
+                # Live-tensor census (TORCHTUNE_COLOCATE_TENSOR_CENSUS=1): walk every
+                # live torch.Tensor via gc, bucket by (shape,dtype) on-device. The
+                # bucket whose COUNT grows ~N/step IS the leak — its shape names it.
+                # Ends the bisect: inspection found no growing Python container, so
+                # enumerate the actual live tensors instead of guessing.
+                if os.environ.get("TORCHTUNE_COLOCATE_TENSOR_CENSUS", "0") == "1":
+                    try:
+                        import gc as _gc
+                        from collections import Counter as _Counter
+                        _c = _Counter()
+                        _bytes = _Counter()
+                        for _o in _gc.get_objects():
+                            try:
+                                if isinstance(_o, torch.Tensor) and _o.is_xpu:
+                                    _k = (tuple(_o.shape), str(_o.dtype))
+                                    _c[_k] += 1
+                                    _bytes[_k] += _o.numel() * _o.element_size()
+                            except Exception:
+                                continue
+                        _top = sorted(_bytes.items(), key=lambda kv: -kv[1])[:8]
+                        for _k, _b in _top:
+                            log.info(
+                                "TENSOR_CENSUS step=%d shape=%s dtype=%s count=%d tot=%.3fGiB",
+                                getattr(self, "_steps_run", -1), _k[0], _k[1],
+                                _c[_k], _b / 1024**3,
+                            )
+                    except Exception as _ce:
+                        log.warning("TENSOR_CENSUS failed: %r", _ce)
+        elif self._device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    def _warmup_at_max(self) -> None:
+        """Front-load peak vLLM + FSDP buffers at step 0 (colocate only).
+
+        Root cause this addresses (see ``docs/reports/lora_colocate_4b_20260618.md``
+        and ``memory/project_overnight_colocate_ur40_plan_20260618``): in colocate
+        the vLLM KV working set and the FSDP activation/all-gather buffers GROW the
+        first time a rollout exceeds all prior sequence lengths.  XPU cannot
+        ``empty_cache`` (the FSDP UR-handle-leak guard makes it a no-op), so the
+        caching allocator's ``reserved`` only climbs — a discrete ~5 GiB staircase
+        every few steps until ``banned:1``.  This caps colocate at
+        ``max_generated_tokens=128`` (the validated-safe ceiling).
+
+        The fix: BEFORE the train loop, run one throwaway generation at the maximum
+        prompt+completion length AND one no-grad ref forward + one training fwd/bwd
+        at ``vllm_max_model_len``, so BOTH engines allocate their peak buffers up
+        front, inside the step-0 budget.  The mid-run jump then never happens — every
+        subsequent (shorter or equal) step reuses already-reserved memory and the
+        curve is flat from step 0.
+
+        Runs on ALL ranks: the FSDP forward/backward are collective, so every rank
+        must participate or the warmup deadlocks.  Gated to colocate (server /
+        dedicated modes do not co-resident vLLM with the trainer, so they never hit
+        the staircase).  Disable for A/B with ``TORCHTUNE_COLOCATE_WARMUP_AT_MAX=0``.
+        """
+        if not self._colocate:
+            return
+        if os.environ.get("TORCHTUNE_COLOCATE_WARMUP_AT_MAX", "1") != "1":
+            log.info("colocate warmup-at-max DISABLED (TORCHTUNE_COLOCATE_WARMUP_AT_MAX=0)")
+            return
+
+        dev = self._device
+        S = int(self._vllm_max_model_len)
+        gen_len = int(self._max_generated_tokens)
+        context_length = max(1, S - gen_len)
+        # Full per-step training batch grpo_step sees (all gen micro-batches concat).
+        num_seqs = max(1, int(self.batch_size) * int(self.grpo_samples))
+        vocab = int(getattr(self, "_vocab_size", 0)) or 32000
+        pad_id = self._tokenizer.pad_id
+
+        def _resv() -> float:
+            if dev.type == "xpu":
+                return torch.xpu.memory_reserved(dev) / 1024**3
+            if dev.type == "cuda":
+                return torch.cuda.memory_reserved(dev) / 1024**3
+            return 0.0
+
+        _r0 = _resv()
+        log.info(
+            "Rank %d: colocate warmup-at-max START num_seqs=%d seq_len=%d "
+            "(ctx=%d gen=%d) reserved=%.2f GiB",
+            self.rank, num_seqs, S, context_length, gen_len, _r0,
+        )
+
+        # --- 1. vLLM KV peak: submit num_seqs max-length prompts concurrently with
+        #     ignore_eos so each runs the full max_generated_tokens.  The real step
+        #     generates batch_size*grpo_samples concurrent sequences, so the KV block
+        #     pool's working max is for num_seqs full-length seqs — warming with one
+        #     prompt would under-allocate it.  detokenize=False keeps it cheap. ---
+        if self._vllm_llm is not None:
+            from vllm import SamplingParams
+
+            max_prompt_len = max(1, S - gen_len)
+            warm_prompt = [int(self._tokenizer.bos_id or 1)] * max_prompt_len
+            try:
+                self._vllm_llm.generate(
+                    prompts=[{"prompt_token_ids": warm_prompt}] * num_seqs,
+                    sampling_params=SamplingParams(
+                        max_tokens=gen_len,
+                        temperature=self._temperature,
+                        top_k=self._top_k if self._top_k else -1,
+                        ignore_eos=True,        # run the full length — peak KV
+                        detokenize=False,
+                    ),
+                    use_tqdm=False,
+                )
+            except Exception as _e:  # pragma: no cover - HW path
+                log.warning("Rank %d: warmup vLLM generate failed: %s", self.rank, _e)
+            if dev.type == "xpu":
+                torch.xpu.set_device(_xpu_device_index)
+                torch.xpu.synchronize()
+
+        # --- Synthetic worst-case batch at [num_seqs, S] (random valid tokens). ---
+        query_responses = torch.randint(
+            0, vocab, (num_seqs, S), dtype=torch.long, device=dev
+        )
+        responses = query_responses[:, context_length:]
+        qr_pad_mask = query_responses != pad_id
+        # Mirror generate_trajectory's mask decision so the warmup allocates the
+        # SAME mask buffer the real step will (None under maskfree/varlen, else the
+        # full [num_seqs, S, S] causal mask — itself a large transient to front-load).
+        _maskfree, _ = _compute_maskfree_causal(
+            env_set=os.environ.get("TORCHTUNE_MASKFREE_CAUSAL") == "1",
+            device_type=dev.type,
+            packing_enabled=False,
+            query_responses=query_responses,
+            context_length=context_length,
+            pad_id=pad_id,
+        )
+        if _maskfree:
+            masks = None
+        else:
+            masks = generation.get_causal_mask_from_padding_mask(
+                qr_pad_mask, target_seq_len=S
+            )
+        position_ids = generation.get_position_ids_from_padding_mask(qr_pad_mask)
+        response_padding_masks = torch.zeros_like(responses, dtype=torch.bool)
+        ref_logprobs = torch.zeros_like(responses, dtype=torch.float32)
+        advantages = torch.zeros(num_seqs, dtype=torch.float32, device=dev)
+
+        # --- 2. No-grad ref forward peak (disable_adapter, chunked at ref_fbs). ---
+        ref_fbs = self._ref_forward_batch_size
+        with disable_adapter(self._model):
+            with torch.no_grad():
+                for cs in range(0, num_seqs, ref_fbs):
+                    ce = min(cs + ref_fbs, num_seqs)
+                    _ = self._model(
+                        query_responses[cs:ce],
+                        input_pos=position_ids[cs:ce],
+                        mask=None if masks is None else masks[cs:ce],
+                    )
+                    del _
+        if dev.type == "xpu":
+            torch.xpu.synchronize()
+
+        # --- 3. Training fwd+bwd peak: run the REAL grpo_step on the synthetic
+        #     trajectory so activation + all-gather + reduce-scatter buffers all
+        #     allocate at max.  Discard the resulting (garbage) grads. ---
+        warm_traj = GRPOTrajectory(
+            query_responses=query_responses,
+            logprobs=None,
+            ref_logprobs=ref_logprobs,
+            advantages=advantages,
+            rewards=torch.zeros(num_seqs, device=dev),
+            successes=torch.zeros(num_seqs, device=dev),
+            masks=masks,
+            position_ids=position_ids,
+            response_padding_masks=response_padding_masks,
+            seq_lens=training.get_unmasked_sequence_lengths(response_padding_masks),
+            answers=[""] * num_seqs,
+        )
+        try:
+            self.grpo_step(warm_traj)
+        except Exception as _e:  # pragma: no cover - HW path
+            log.warning("Rank %d: warmup grpo_step failed: %s", self.rank, _e)
+        finally:
+            self._optimizer.zero_grad(set_to_none=True)
+
+        del query_responses, responses, masks, position_ids
+        del response_padding_masks, ref_logprobs, advantages, warm_traj
+        if dev.type == "xpu":
+            torch.xpu.synchronize()
+
+        _r1 = _resv()
+        log.info(
+            "Rank %d: colocate warmup-at-max DONE reserved %.2f->%.2f (+%.2f) GiB "
+            "(this peak is now front-loaded; mid-run staircase should not occur)",
+            self.rank, _r0, _r1, _r1 - _r0,
+        )
+
     def train(self) -> None:
         """Main training loop."""
         # Verify vLLM EngineCore is functional before entering the training loop.
@@ -2500,6 +2861,12 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
         # Rank 0 retries up to 3× with 60s waits; all ranks barrier after.
         if self._is_rank_zero:
             self._warmup_vllm()
+        torch.distributed.barrier()
+
+        # Colocate only: front-load peak vLLM + FSDP buffers at max sequence length
+        # so the per-step memory curve is flat from step 0 (no seq-length staircase
+        # to banned:1).  Runs on ALL ranks (FSDP collectives).  No-op off colocate.
+        self._warmup_at_max()
         torch.distributed.barrier()
 
         # Initialize LoRA adapter publish before training (step 0)
@@ -2574,7 +2941,16 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
                     )
                     def _resv():
                         return torch.xpu.memory_reserved(self._device) / 1024**3
+                    # ACTIVE (live) tracker — the A/B (job 8558600) proved the
+                    # ~0.44 GiB/step creep is in ACTIVE memory (active==alloc,
+                    # inact=0, empty_cache-count-independent), so reserved-based
+                    # phase probes are blind to it. Track active too, with a sync
+                    # so the counter is settled before reading.
+                    def _act():
+                        torch.xpu.synchronize(self._device)
+                        return torch.xpu.memory_allocated(self._device) / 1024**3
                     _r_pre_gen = _resv() if _phase_probe else 0.0
+                    _a_pre_gen = _act() if _phase_probe else 0.0
 
                     # Generate trajectory (server mode, may use base or LoRA adapter)
                     _gen_t0 = time.perf_counter()
@@ -2583,8 +2959,11 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
                     _gen_time = time.perf_counter() - _gen_t0
                     if _phase_probe:
                         _r_post_gen = _resv()
-                        log.info("COLOCATE_PHASEPROBE step=%d gen reserved %.2f->%.2f (+%.2f) GiB",
-                                 self._steps_run, _r_pre_gen, _r_post_gen, _r_post_gen - _r_pre_gen)
+                        _a_post_gen = _act()
+                        log.info("COLOCATE_PHASEPROBE step=%d gen reserved %.2f->%.2f (+%.2f) "
+                                 "| ACTIVE %.2f->%.2f (%+.3f) GiB",
+                                 self._steps_run, _r_pre_gen, _r_post_gen, _r_post_gen - _r_pre_gen,
+                                 _a_pre_gen, _a_post_gen, _a_post_gen - _a_pre_gen)
 
                     # PPO epochs
                     _grpo_t0 = time.perf_counter()
@@ -2594,8 +2973,11 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
                     _grpo_time = time.perf_counter() - _grpo_t0
                     if _phase_probe:
                         _r_post_grpo = _resv()
-                        log.info("COLOCATE_PHASEPROBE step=%d grpo_step reserved %.2f->%.2f (+%.2f) GiB",
-                                 self._steps_run, _r_post_gen, _r_post_grpo, _r_post_grpo - _r_post_gen)
+                        _a_post_grpo = _act()
+                        log.info("COLOCATE_PHASEPROBE step=%d grpo_step reserved %.2f->%.2f (+%.2f) "
+                                 "| ACTIVE %.2f->%.2f (%+.3f) GiB",
+                                 self._steps_run, _r_post_gen, _r_post_grpo, _r_post_grpo - _r_post_gen,
+                                 _a_post_gen, _a_post_grpo, _a_post_grpo - _a_post_gen)
 
                     # All-reduce adapter param gradients across data-parallel ranks.
                     # Adapter params are in FSDP ignored_states (replicated, not sharded),
@@ -2763,6 +3145,7 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
                             # This is COLLECTIVE (summon_full_params) — must run on
                             # ALL ranks, synchronously (no thread, no HTTP).
                             _r_pre_sync = _resv() if _phase_probe else 0.0
+                            _a_pre_sync = _act() if _phase_probe else 0.0
                             self._sync_colocated_lora_weights()
                             if self._is_rank_zero:
                                 log.info(
@@ -2771,8 +3154,11 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
                                 )
                             if _phase_probe:
                                 _r_post_sync = _resv()
-                                log.info("COLOCATE_PHASEPROBE step=%d sync reserved %.2f->%.2f (+%.2f) GiB",
-                                         self._steps_run, _r_pre_sync, _r_post_sync, _r_post_sync - _r_pre_sync)
+                                _a_post_sync = _act()
+                                log.info("COLOCATE_PHASEPROBE step=%d sync reserved %.2f->%.2f (+%.2f) "
+                                         "| ACTIVE %.2f->%.2f (%+.3f) GiB",
+                                         self._steps_run, _r_pre_sync, _r_post_sync, _r_post_sync - _r_pre_sync,
+                                         _a_pre_sync, _a_post_sync, _a_post_sync - _a_pre_sync)
                         elif _mode == "runtime":
                             publish_state = self._gather_lora_state_dict()  # rank-0 only; non-rank-0 returns None
                             if self._is_rank_zero and publish_state is not None:
@@ -2854,6 +3240,12 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
                         )
 
                     self._steps_run += 1
+
+                    # No-FSDP colocate: reclaim transients at the end of the step
+                    # (the A100-equivalent reclamation point — between this step's
+                    # training and the next step's generation). No-op otherwise.
+                    # final=True: the one site that fires even in RECLAIM_MODE=once.
+                    self._colocate_reclaim(final=True)
 
                     # Logging
                     if self._steps_run % self._log_every_n_steps == 0 and self._is_rank_zero:

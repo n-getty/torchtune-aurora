@@ -120,6 +120,68 @@ class TestVarlenBufferCache(unittest.TestCase):
             f"No-grad shape change should reallocate (got {m.call_count} empty_like calls)"
         )
 
+    def _get_caches(self, varlen_call):
+        """Pull the three cache dicts out of _ipex_varlen_call's closure."""
+        names = ("_varlen_out_cache", "_varlen_alibi_cache", "_varlen_seqlens_cache")
+        out = {}
+        fv = varlen_call.__code__.co_freevars
+        for n in names:
+            self.assertIn(n, fv, f"{n} not a free var of _ipex_varlen_call")
+            out[n] = varlen_call.__closure__[fv.index(n)].cell_contents
+        return out
+
+    def test_nograd_cache_is_bounded(self):
+        """
+        THE regression test for the no-FSDP colocate creep root cause.
+
+        Variable-seqlen RL produces a new (b,h,s,d) key nearly every step. The old
+        unbounded dict cached one ~14.7 MiB output buffer per distinct shape FOREVER
+        (~0.44 GiB/step live-memory leak in the ref forward). The bounded cache must
+        cap the number of retained entries regardless of how many distinct shapes
+        are seen — while still reusing within a step.
+        """
+        varlen_call = self._get_varlen_call()
+        caches = self._get_caches(varlen_call)
+        # cap is read from env at closure-creation; default 8. Feed many MORE
+        # distinct seqlens than the cap and assert the cache never exceeds it.
+        cap = au_cache_max = None
+        # derive the active cap the same way the module does
+        import os as _os
+        cap = max(1, int(_os.environ.get("TORCHTUNE_VARLEN_CACHE_MAX", "8")))
+        n_shapes = cap + 20
+        with mock.patch.object(au, '_ipex_varlen_attention', _noop_varlen):
+            with torch.no_grad():
+                for i in range(n_shapes):
+                    s = 8 + i  # distinct seq len each iteration → distinct cache key
+                    q, k, v = self._make_qkv(2, 4, s, 16)
+                    varlen_call(q, k, v)
+        for name, c in caches.items():
+            self.assertLessEqual(
+                len(c), cap,
+                f"{name} grew to {len(c)} entries with cap={cap} — cache is UNBOUNDED "
+                f"(the variable-seqlen RL leak is back)."
+            )
+        # all three caches must stay key-aligned (evicted together)
+        self.assertEqual(
+            set(caches["_varlen_out_cache"].keys()),
+            set(caches["_varlen_alibi_cache"].keys()),
+            "out/alibi caches drifted — eviction is not joint",
+        )
+
+    def test_nograd_repeated_same_shape_stays_single_entry(self):
+        """Same shape many times → exactly ONE cached entry (within-step reuse intact)."""
+        varlen_call = self._get_varlen_call()
+        caches = self._get_caches(varlen_call)
+        q, k, v = self._make_qkv(2, 4, 8, 16)
+        with mock.patch.object(au, '_ipex_varlen_attention', _noop_varlen):
+            with torch.no_grad():
+                for _ in range(50):
+                    varlen_call(q, k, v)
+        self.assertEqual(
+            len(caches["_varlen_out_cache"]), 1,
+            "Repeated identical shape must collapse to one cache entry (the speedup).",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -6,6 +6,7 @@
 
 import logging
 import os
+from collections import OrderedDict
 from typing import Callable, Optional, Union
 
 import torch
@@ -285,9 +286,35 @@ def _sdpa_or_flex_attention() -> Callable:
     # Persistent per-shape output buffer cache for IPEX varlen path.
     # Reusing the output tensor across calls means 0 allocator delta per attention
     # call (validated 2026-04-30 micro-bench), which is the goal of this path.
-    _varlen_out_cache: dict = {}
+    #
+    # BOUNDED (2026-06-24): the caches are keyed by (b, h, s, d, dtype, device).
+    # On a FIXED-seqlen workload (the original microbench / SFT) only one key ever
+    # appears, so the original unbounded dict was fine.  On VARIABLE-seqlen RL
+    # (GSM8K rollouts: prompt+completion length differs nearly every step) `s`
+    # changes per step, so a brand-new ~14.7 MiB output buffer (shape [b*s, h, d],
+    # bf16) was cached EVERY step and NEVER evicted — a ~0.44 GiB/step live-memory
+    # leak in the no-grad ref forward (root-caused via the no-FSDP colocate creep
+    # bisect, jobs 8558600/8558618/8558640).  empty_cache cannot reclaim it (the
+    # buffers are live, referenced by these module-level dicts).
+    #
+    # Fix: cap each cache with simple FIFO eviction.  Within a step all 36 layers
+    # reuse the SAME key (same b,h,s,d) — sequential, consumed before reuse — so a
+    # small cap preserves the within-step and consecutive-same-shape reuse (the
+    # real speedup) while bounding memory to MAX_ENTRIES * per-buffer bytes.
+    # Override the cap with TORCHTUNE_VARLEN_CACHE_MAX (default 8).
+    _varlen_out_cache: "OrderedDict" = OrderedDict()
     _varlen_alibi_cache: dict = {}
     _varlen_seqlens_cache: dict = {}
+    _varlen_cache_max = max(1, int(os.environ.get("TORCHTUNE_VARLEN_CACHE_MAX", "8")))
+
+    def _varlen_cache_evict(key: tuple) -> None:
+        # FIFO: keep the cap most-recently-INSERTED keys. Evict the same key from
+        # all three caches together (they share the cache_key) so they never drift.
+        _varlen_out_cache.move_to_end(key)
+        while len(_varlen_out_cache) > _varlen_cache_max:
+            old, _ = _varlen_out_cache.popitem(last=False)
+            _varlen_alibi_cache.pop(old, None)
+            _varlen_seqlens_cache.pop(old, None)
 
     def _ipex_varlen_call(
         q: torch.Tensor,
@@ -306,21 +333,29 @@ def _sdpa_or_flex_attention() -> Callable:
         # Under autograd (training fwd), allocate fresh to avoid version-counter
         # conflicts across chunks in the chunked grpo_step backward loop.
         # No-grad paths (ref fwd, rollout logprobs) reuse the persistent buffer.
+        # NOTE: this call is only reached on no-grad paths (the SDPA caller gates it
+        # with `not torch.is_grad_enabled()`), but keep the grad-enabled fresh-alloc
+        # branch as defensive code in case the call site changes.
         if torch.is_grad_enabled():
             out = torch.empty_like(q_packed)
+            alibi = torch.zeros(h, dtype=torch.float32, device=q.device)
+            seqlens = torch.arange(0, b * s + 1, s, dtype=torch.int32, device=q.device)
         else:
             out = _varlen_out_cache.get(cache_key)
             if out is None or out.shape != q_packed.shape:
                 out = torch.empty_like(q_packed)
                 _varlen_out_cache[cache_key] = out
-        alibi = _varlen_alibi_cache.get(cache_key)
-        if alibi is None:
-            alibi = torch.zeros(h, dtype=torch.float32, device=q.device)
-            _varlen_alibi_cache[cache_key] = alibi
-        seqlens = _varlen_seqlens_cache.get(cache_key)
-        if seqlens is None:
-            seqlens = torch.arange(0, b * s + 1, s, dtype=torch.int32, device=q.device)
-            _varlen_seqlens_cache[cache_key] = seqlens
+            alibi = _varlen_alibi_cache.get(cache_key)
+            if alibi is None:
+                alibi = torch.zeros(h, dtype=torch.float32, device=q.device)
+                _varlen_alibi_cache[cache_key] = alibi
+            seqlens = _varlen_seqlens_cache.get(cache_key)
+            if seqlens is None:
+                seqlens = torch.arange(0, b * s + 1, s, dtype=torch.int32, device=q.device)
+                _varlen_seqlens_cache[cache_key] = seqlens
+            # Bound all three caches together (FIFO) so variable-seqlen RL does not
+            # accumulate one ~14.7 MiB buffer per distinct (b,s) forever.
+            _varlen_cache_evict(cache_key)
 
         softmax_scale = 1.0 / (d ** 0.5)
         _ipex_varlen_attention(
