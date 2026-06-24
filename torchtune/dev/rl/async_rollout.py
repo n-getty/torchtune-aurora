@@ -183,9 +183,27 @@ class RolloutProducer:
                         pass
                     return
                 t0 = time.perf_counter()
-                # Snapshot weight version BEFORE producing so the rollout
-                # is tagged with the version it actually generated under.
-                weight_version_at_start = self._weight_versions.version
+                # Weight-version tag. By default the producer snapshots the
+                # tracker at pickup time. That is correct for the token-only
+                # path, but it lets the tag drift by the queue depth (the
+                # producer can pull work item i and snapshot AFTER one or more
+                # consumer-side weight syncs have already landed — observed as
+                # a staleness=2 plateau on HW under the embeds-mailbox path).
+                #
+                # STALENESS PIN (staleness=1): a caller that owns a
+                # deterministic main-thread post point may pre-tag the work
+                # item with the version that was live when the rollout was
+                # ENQUEUED (before the consumer trained/bumped for any
+                # intervening batch). When the work item is a dict carrying
+                # ``_weight_version``, we honour it verbatim instead of
+                # re-snapshotting, so the tag is ordered w.r.t. the bumps on
+                # the main thread and the lag is exactly 1. The token-only
+                # path (batch is a plain dataloader dict without that key)
+                # keeps the snapshot-at-pickup behaviour — byte-identical.
+                if isinstance(batch, dict) and "_weight_version" in batch:
+                    weight_version_at_start = int(batch["_weight_version"])
+                else:
+                    weight_version_at_start = self._weight_versions.version
                 rollout_payload, telem = self._produce_fn(batch)
                 latency = time.perf_counter() - t0
                 item = RolloutItem(

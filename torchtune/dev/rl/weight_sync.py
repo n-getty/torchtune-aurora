@@ -1277,6 +1277,18 @@ def _sync_weights_to_vllm(self) -> None:
     t0 = time.perf_counter()
     hf_state_dict = {}
 
+    # HSDP-safe publisher gate: the FULL_STATE_DICT gather is COLLECTIVE (all shard
+    # ranks must call state_dict()), but only ONE rank may save to _weight_sync_path +
+    # POST to the shared vLLM pool. With dp_replicate>1 there are multiple shard
+    # leaders (one per replica) — if each saved/POSTed they would clobber the same
+    # file and race the same vLLM servers. All replicas are weight-identical (HYBRID_
+    # SHARD all-reduces grads across the replicate dim), so global rank 0 publishes for
+    # everyone. Single-replica: _is_shard_leader == rank 0, so this is unchanged.
+    _is_publisher = (
+        (self.rank == 0) if getattr(self, "_dp_replicate", 1) > 1
+        else getattr(self, "_is_shard_leader", self._is_rank_zero)
+    )
+
     # BioReason: vLLM only loads the backbone (Qwen3-4B). Strip the
     # 'backbone.' prefix and skip everything else (ESM3, GO encoder,
     # projectors). Without this filter, vLLM's load_weights() would
@@ -1300,8 +1312,8 @@ def _sync_weights_to_vllm(self) -> None:
     if getattr(self, '_use_fsdp1', False):
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, StateDictType
         with FSDP.state_dict_type(self._model, StateDictType.FULL_STATE_DICT):
-            full_sd = self._model.state_dict()
-        if self._is_shard_leader:
+            full_sd = self._model.state_dict()  # COLLECTIVE — all shard ranks call it
+        if _is_publisher:
             for param_name, param in full_sd.items():
                 hf_name = _accept_and_rename(param_name)
                 if hf_name is None:
@@ -1325,7 +1337,7 @@ def _sync_weights_to_vllm(self) -> None:
 
     t_gather = time.perf_counter() - t0
 
-    if self._is_shard_leader:
+    if _is_publisher:
         save_path = self._weight_sync_path
         n_params = len(hf_state_dict)
 
@@ -2076,10 +2088,7 @@ def _xccl_gather_fsdp1(self, _xccl_accept_and_rename, t0):
     _sync_weights_to_vllm_xccl (no behavior change). Builds flat_gpu /
     tensors_meta on the XCCL leader. _xccl_accept_and_rename is the
     per-call rename closure; t0 is the wsync-start perf_counter stamp."""
-    # FSDP1: state_dict() handles gathering; result is on CPU already
     from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, StateDictType
-    with FSDP.state_dict_type(self._model, StateDictType.FULL_STATE_DICT):
-        full_sd = self._model.state_dict()
     hf_state_dict = {}
     # WS3.5: only the XCCL leader (global rank 0) keeps and broadcasts.
     _is_xccl_leader = getattr(self, "_is_xccl_leader", self._is_shard_leader)
@@ -2100,16 +2109,52 @@ def _xccl_gather_fsdp1(self, _xccl_accept_and_rename, t0):
             getattr(self, "_model_head_dim", None),
         )
         self._qk_unperm_xccl_fsdp1_engaged_logged = True
-    if _is_xccl_leader:
-        for param_name, param in full_sd.items():
-            hf_name = _xccl_accept_and_rename(param_name)
-            if hf_name is None:
-                continue
-            weight = param.to(self._device)
-            if _unperm_needed_x:
-                weight = _maybe_unpermute_qk(self, hf_name, weight)
-            hf_state_dict[hf_name] = weight
-    del full_sd
+
+    # BioReason PEFT-LoRA: vLLM runs a vanilla (adapter-less) Qwen3, so it must
+    # receive the merged W_eff = base + sum_a scale_a*(B_a@A_a). We summon full
+    # params on every rank, then on the leader form W_eff WITHOUT mutating the
+    # frozen base: read base_layer.weight via the PEFT-aware vllm_param_iter
+    # (clean HF names; lora_A/lora_B skipped) and add the non-mutating
+    # get_delta_weight (fp32) from lora_delta_map(). This avoids the bf16
+    # round-trip drift that in-place merge_adapter()/unmerge_adapter() would
+    # accumulate INTO the frozen base across many steps (~5e-3/20 cycles,
+    # compounding). The .clone()/contiguous() is load-bearing: summon_full_params
+    # frees its gather buffer on context exit, so the leader's kept tensors must
+    # own their storage. No vLLM co-tenancy here (server mode, vLLM on a separate
+    # node) → no summon/colocate wedge.
+    _lora_merge = (
+        getattr(self, "_is_bioreason", False)
+        and getattr(self._model, "_has_lora", False)
+    )
+    if _lora_merge:
+        with torch.no_grad(), FSDP.summon_full_params(
+            self._model, writeback=False, rank0_only=False
+        ):
+            if _is_xccl_leader:
+                delta_map = self._model.lora_delta_map()  # {hf_name: fp32 delta}
+                for hf_name, param in self._model.vllm_param_iter():
+                    weight = param.detach().to(self._device)
+                    delta = delta_map.get(hf_name)
+                    if delta is not None:
+                        # fp32 accumulate, recast to the base dtype (bf16) once.
+                        weight = (weight.float() + delta.to(self._device).float()).to(param.dtype)
+                    if _unperm_needed_x:
+                        weight = _maybe_unpermute_qk(self, hf_name, weight)
+                    hf_state_dict[hf_name] = weight.contiguous().clone()
+    else:
+        # FSDP1: state_dict() handles gathering; result is on CPU already
+        with FSDP.state_dict_type(self._model, StateDictType.FULL_STATE_DICT):
+            full_sd = self._model.state_dict()
+        if _is_xccl_leader:
+            for param_name, param in full_sd.items():
+                hf_name = _xccl_accept_and_rename(param_name)
+                if hf_name is None:
+                    continue
+                weight = param.to(self._device)
+                if _unperm_needed_x:
+                    weight = _maybe_unpermute_qk(self, hf_name, weight)
+                hf_state_dict[hf_name] = weight
+        del full_sd
 
     if not self._production_mode:
         torch.distributed.barrier()
@@ -3675,24 +3720,45 @@ def _wait_for_sync_complete(self) -> None:
             self.rank, self._sync_error,
         )
         self._sync_error = None  # reset so training continues
-    if self._is_rank_zero and getattr(self, "_weight_versions", None) is not None:
+    # Version-bump rank set. The async RolloutProducer runs on every replica's
+    # SHARD LEADER (global ranks 0, dp_shard, 2*dp_shard, ... under HSDP), so each
+    # of those leaders must advance ITS OWN _weight_versions tracker in lockstep —
+    # otherwise the staleness telemetry on the non-rank-0 leaders would stay pinned
+    # at 0 (the per-replica producers tag against their local tracker). All replicas
+    # are weight-identical (HYBRID_SHARD all-reduces grads), so each leader bumps
+    # for its own replica. Only rank 0 actually PUBLISHES to vLLM (_is_publisher),
+    # but every shard leader completes the FULL_STATE_DICT gather collective every
+    # step. Single-replica: _is_shard_leader == rank 0, so this is unchanged.
+    _is_leader = getattr(self, "_is_shard_leader", self._is_rank_zero)
+    if _is_leader and getattr(self, "_weight_versions", None) is not None:
+        # Non-publisher shard leaders (HSDP ranks 12, 24, ...) never run the
+        # publisher block that sets _pending_sync_id, but they DO sync every step
+        # (their replica's producer consumes a fresh rollout each step). Synthesize
+        # a pending id for them so the bump fires in lockstep with rank 0.
+        _is_publisher = (
+            (self.rank == 0) if getattr(self, "_dp_replicate", 1) > 1
+            else getattr(self, "_is_shard_leader", self._is_rank_zero)
+        )
+        if (not _is_publisher) and getattr(self, "_pending_sync_id", None) is None and not sync_failed:
+            self._sync_id_counter = getattr(self, "_sync_id_counter", 0) + 1
+            self._pending_sync_id = self._sync_id_counter
         if getattr(self, "_pending_sync_id", None) is None:
             log.warning(
-                "Rank 0: _wait_for_sync_complete called with no pending sync — "
-                "skipping version bump (telemetry guard)"
+                "Rank %d: _wait_for_sync_complete called with no pending sync — "
+                "skipping version bump (telemetry guard)", self.rank,
             )
         elif sync_failed:
             # Keep _pending_sync_id set so the next successful retry can bump.
             log.warning(
-                "Rank 0: sync_id=%d failed — version stays at %d, pending sync retained",
-                self._pending_sync_id,
+                "Rank %d: sync_id=%d failed — version stays at %d, pending sync retained",
+                self.rank, self._pending_sync_id,
                 self._weight_versions.version,
             )
         else:
             new_v = self._weight_versions.bump()
             log.info(
-                "Rank 0: weight version bumped → %d (sync_id=%d)",
-                new_v, self._pending_sync_id,
+                "Rank %d: weight version bumped → %d (sync_id=%d)",
+                self.rank, new_v, self._pending_sync_id,
             )
             self._pending_sync_id = None
 

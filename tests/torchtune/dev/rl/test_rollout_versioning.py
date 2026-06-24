@@ -143,3 +143,87 @@ def test_noop_when_vllm_weight_sync_disabled():
     # Early return — no bump, pending state untouched.
     assert recipe._weight_versions.version == 0
     assert recipe._pending_sync_id == 1
+
+
+# ---------------------------------------------------------------------------
+# Staleness pin (=1): the BioReason async lookahead tags each rollout with the
+# weight version live at the MAIN-THREAD post point (the _weight_version key on
+# the mailbox dict), NOT a producer-pickup snapshot. This bounds the consume-time
+# lag to exactly 1 (the HW bug plateaued at 2 because the pickup snapshot drifted
+# by the queue depth). These tests pin the RolloutProducer honouring that tag.
+# ---------------------------------------------------------------------------
+def test_producer_honours_pretagged_weight_version():
+    from queue import Queue
+
+    from torchtune.dev.rl.async_rollout import RolloutProducer
+
+    versions = WeightVersionTracker()
+    inbox: Queue = Queue(maxsize=1)
+
+    def batch_iter_fn():
+        return inbox.get()
+
+    p = RolloutProducer(
+        produce_fn=lambda w: ({"qr": w["id"]}, {}),
+        batch_iter_fn=batch_iter_fn,
+        weight_versions=versions,
+        max_staleness=1,
+        warmup=False,
+    )
+    p.start()
+    try:
+        # Bump the tracker AFTER posting work tagged with the CURRENT (pre-bump)
+        # version. If the producer re-snapshotted at pickup it could read the
+        # bumped value; with the pin it must use the posted tag.
+        inbox.put({"id": 0, "_weight_version": versions.version})  # tag = 0
+        versions.bump()  # tracker -> 1 (simulate a wsync racing the pickup)
+        item0 = p.get(timeout=5.0)
+        assert item0.weight_version == 0, (
+            "producer must honour the pre-tagged _weight_version (post-time), "
+            f"not re-snapshot at pickup; got {item0.weight_version}"
+        )
+        inbox.put(None)
+        assert p.get(timeout=5.0) is None
+    finally:
+        p.stop()
+
+
+def test_pinned_lag_never_exceeds_one_under_simulated_loop():
+    """Simulate the recipe's main-loop ordering (post i, consume i-1, bump) and
+    assert the consume-time lag is bounded to 1 for every rollout when the tag is
+    taken at post time (the staleness pin). Mirrors _async_lookahead_iter_impl."""
+    from queue import Queue
+
+    from torchtune.dev.rl.async_rollout import RolloutProducer
+
+    versions = WeightVersionTracker()
+    inbox: Queue = Queue(maxsize=1)
+
+    p = RolloutProducer(
+        produce_fn=lambda w: ({"id": w["id"]}, {}),
+        batch_iter_fn=lambda: inbox.get(),
+        weight_versions=versions,
+        max_staleness=1,
+        warmup=False,
+    )
+    p.start()
+    try:
+        pending = None
+        lags = []
+        for i in range(6):
+            # post i tagged with the version live NOW (before training i-1).
+            inbox.put({"id": i, "_weight_version": versions.version})
+            if pending is not None:
+                item = p.get(timeout=5.0)
+                lag = max(0, versions.version - item.weight_version)
+                lags.append(lag)
+                versions.bump()  # end-of-step wsync for the consumed batch
+            pending = i
+        # drain last
+        item = p.get(timeout=5.0)
+        lags.append(max(0, versions.version - item.weight_version))
+        inbox.put(None)
+        assert p.get(timeout=5.0) is None
+        assert all(l <= 1 for l in lags), f"lag must be pinned to <=1, got {lags}"
+    finally:
+        p.stop()

@@ -281,6 +281,7 @@ class VLLMClient:
         temperature: float = 1.0,
         top_k: int = 0,
         top_p: float = 1.0,
+        stop_token_ids: Optional[list[int]] = None,
     ) -> list[list[int]]:
         """Send pre-computed prompt embeddings to vLLM and return completion token IDs.
 
@@ -327,6 +328,13 @@ class VLLMClient:
         }
         if top_k and top_k > 0:
             payload["top_k"] = top_k
+        # stop_token_ids: tell vLLM to STOP decoding at EOS/stop tokens server-side.
+        # Without this every sequence runs to max_tokens (the recipe only truncated
+        # post-hoc on the train side) — measured stop_rate=0.000, trunc_rate~0.5 on
+        # BioReason 4N, i.e. ~half the rollouts decoded the full 1024-token cap
+        # needlessly. This is the dominant generation cost (NOT engine dispatch).
+        if stop_token_ids:
+            payload["stop_token_ids"] = list(stop_token_ids)
 
         r = self.session.post(comp_url, json=payload, timeout=600)
         if r.status_code != 200:

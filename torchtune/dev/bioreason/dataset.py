@@ -44,11 +44,18 @@ class BioReasonRLDataset(Dataset):
         max_seq_len: int = 2048,
         max_protein_len: int = 512,
         num_go_tokens: int = 200,
+        answer_column: str = "go_ids",
     ):
         self.tokenizer = tokenizer
         self.max_seq_len = max_seq_len
         self.max_protein_len = max_protein_len
         self.num_go_tokens = num_go_tokens
+        # RL reward target column. MUST be the experimental ground truth (`go_ids`,
+        # == go_bp∪go_mf∪go_cc == the eval F_max target). The old default `go_pred`
+        # was a BUG: it's the GO-GPT submodel's noisy PREDICTIONS (~50% recall of GT),
+        # so RL optimized toward another model's guesses, not truth — flat reward +
+        # can degrade eval F_max. Kept configurable only for A/B against the old runs.
+        self.answer_column = answer_column
 
         self.examples = self._load(data_files)
         logger.info(f"Loaded {len(self.examples)} BioReason RL examples from {data_files}")
@@ -110,7 +117,16 @@ class BioReasonRLDataset(Dataset):
         #   ppi_formatted, interpro_formatted, go_bp, go_mf, go_cc, go_ids
         protein_seq = ex.get("sequence", "")
         go_aspect = ex.get("go_aspect", "all") or "all"
-        answer = ex.get("go_pred", "")  # comma-separated target GO terms
+        # Reward target: the experimental ground-truth GO terms (self.answer_column,
+        # default "go_ids" == eval F_max target). go_ids is stored as a list/ndarray;
+        # join to a comma-separated string (the reward fn regex-extracts GO:####### so
+        # the exact separator is cosmetic, but a clean string keeps logs readable).
+        _ans = ex.get(self.answer_column, "")
+        if _ans is None:
+            _ans = ""
+        if not isinstance(_ans, str):  # list / ndarray of GO terms
+            _ans = ", ".join(str(t) for t in _ans)
+        answer = _ans
 
         # Build the context text from available fields
         name = ex.get("protein_names", "")
@@ -221,6 +237,7 @@ def bioreason_rl_dataset(
     max_seq_len: int = 2048,
     max_protein_len: int = 512,
     num_go_tokens: int = 200,
+    answer_column: str = "go_ids",
 ) -> BioReasonRLDataset:
     """TorchTune component factory for use in YAML configs."""
     return BioReasonRLDataset(
@@ -229,6 +246,7 @@ def bioreason_rl_dataset(
         max_seq_len=max_seq_len,
         max_protein_len=max_protein_len,
         num_go_tokens=num_go_tokens,
+        answer_column=answer_column,
     )
 
 

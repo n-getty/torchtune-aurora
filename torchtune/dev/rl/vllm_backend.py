@@ -387,6 +387,25 @@ def _init_vllm_tp1(self, cfg, rank, world_size, local_rank,
                  vllm_mode, _block_override)
     if cfg.get("vllm_enable_prompt_embeds", False):
         llm_kwargs["enable_prompt_embeds"] = True
+    # Prefix caching: default OFF for colocate. In the colocate GRPO loop the policy
+    # weights are re-published into the engine EVERY step, so cross-step prefix reuse
+    # is not just useless but semantically wrong (cached blocks were computed under
+    # stale weights). On XPU, prefix caching is also a suspected per-step active-memory
+    # CREEP: `reset_prefix_cache()` clears the logical block table but the hashed
+    # prefix-block tensors stay referenced, growing the PyTorch caching-allocator floor
+    # ~0.5 GiB/step (job 8557588: gen-phase reserved floor 30.95→44.12 over 25 steps,
+    # tracked L0 free in lockstep → torch active growth, not vLLM-opaque). Disable to
+    # flatten the floor; override with `vllm_enable_prefix_caching: true` if a workload
+    # genuinely benefits and tolerates the creep. Env `TORCHTUNE_COLOCATE_PREFIX_CACHE=1`
+    # forces it back on for A/B.
+    if vllm_mode in ("colocate", "colocate_sleep"):
+        _pc_env = os.environ.get("TORCHTUNE_COLOCATE_PREFIX_CACHE")
+        if _pc_env is not None:
+            _prefix_cache = _pc_env == "1"
+        else:
+            _prefix_cache = bool(cfg.get("vllm_enable_prefix_caching", False))
+        llm_kwargs["enable_prefix_caching"] = _prefix_cache
+        log.info("%s: enable_prefix_caching=%s", vllm_mode, _prefix_cache)
     llm_kwargs.update(_lora_engine_kwargs(cfg))
 
     self._vllm_llm = LLM(**llm_kwargs)

@@ -90,7 +90,21 @@ class GRPOLoss(nn.Module):
         )  # [B x G, L]
         policy_loss = rlhf.masked_mean(policy_loss, padding_masks)
 
-        _kl_diff = (ref_logprobs - pi_logprobs).clamp(max=20.0)  # prevent exp() overflow → Inf → NaN
+        # k3 KL estimator: exp(d) - d - 1, d = ref - pi. Harden against NaN/Inf.
+        # The upper clamp prevents exp() overflow. But d can be NaN when BOTH
+        # logprobs underflow to -inf at the same token (-inf - -inf = nan) — common
+        # on long generations (2048 tokens) at rare/EOS positions — and clamp does
+        # NOT filter NaN. nan_to_num scrubs those positions to a finite 0 KL
+        # contribution before the exp (normal d in ~[-10,10] is untouched).
+        _kl_diff = (ref_logprobs - pi_logprobs)
+        # Clamp to [-10, 10] (exp(10)=22026, a sane ceiling) and scrub NaN. A KL
+        # diff beyond ~10 nats is already a pathological single-token outlier
+        # (common on long 2048-tok generations at rare/EOS positions); without
+        # this, exp(d) at d~80 overflows the masked_mean reduction → Inf → NaN
+        # that poisons the whole step. nan_to_num catches the inf-inf=nan case
+        # that clamp alone does not. Normal d (~[-5,5]) is untouched.
+        _kl_diff = torch.nan_to_num(_kl_diff, nan=0.0, posinf=10.0, neginf=-10.0)
+        _kl_diff = _kl_diff.clamp(min=-10.0, max=10.0)
         kl_loss = (
             torch.exp(_kl_diff) - _kl_diff - 1
         )  # [B x G]
@@ -182,7 +196,21 @@ class GRPOCompletionLoss(nn.Module):
         )  # [B x G]
         policy_loss = policy_loss.mean()  # scalar
 
-        _kl_diff = (ref_logprobs - pi_logprobs).clamp(max=20.0)  # prevent exp() overflow → Inf → NaN
+        # k3 KL estimator: exp(d) - d - 1, d = ref - pi. Harden against NaN/Inf.
+        # The upper clamp prevents exp() overflow. But d can be NaN when BOTH
+        # logprobs underflow to -inf at the same token (-inf - -inf = nan) — common
+        # on long generations (2048 tokens) at rare/EOS positions — and clamp does
+        # NOT filter NaN. nan_to_num scrubs those positions to a finite 0 KL
+        # contribution before the exp (normal d in ~[-10,10] is untouched).
+        _kl_diff = (ref_logprobs - pi_logprobs)
+        # Clamp to [-10, 10] (exp(10)=22026, a sane ceiling) and scrub NaN. A KL
+        # diff beyond ~10 nats is already a pathological single-token outlier
+        # (common on long 2048-tok generations at rare/EOS positions); without
+        # this, exp(d) at d~80 overflows the masked_mean reduction → Inf → NaN
+        # that poisons the whole step. nan_to_num catches the inf-inf=nan case
+        # that clamp alone does not. Normal d (~[-5,5]) is untouched.
+        _kl_diff = torch.nan_to_num(_kl_diff, nan=0.0, posinf=10.0, neginf=-10.0)
+        _kl_diff = _kl_diff.clamp(min=-10.0, max=10.0)
         kl_loss = (
             torch.exp(_kl_diff) - _kl_diff - 1
         )  # [B x G]
@@ -254,12 +282,16 @@ class GRPOSimpleLoss(nn.Module):
                 - clipfrac: Fraction of clipped policy ratios
         """
 
-        # [B x G, L]
-        per_token_kl = (
-            torch.exp(ref_logprobs.detach() - pi_logprobs)
-            - (ref_logprobs.detach() - pi_logprobs)
-            - 1
-        )
+        # [B x G, L] — k3 KL estimator exp(d) - d - 1, d = ref - pi. Clamp to
+        # [-10, 10] (exp(10)=22026) and scrub NaN: on long 2048-tok generations a
+        # rare token gets a very negative pi logprob → d ~ +80 → exp(d) overflows
+        # to Inf → masked_mean NaN that poisons the whole step (hit on BioReason
+        # 2048-gen, 2026-06-18 step 4). clamp alone does not filter the inf-inf=nan
+        # case, so nan_to_num runs first. Normal d (~[-5,5]) is untouched.
+        _kl_diff = ref_logprobs.detach() - pi_logprobs
+        _kl_diff = torch.nan_to_num(_kl_diff, nan=0.0, posinf=10.0, neginf=-10.0)
+        _kl_diff = _kl_diff.clamp(min=-10.0, max=10.0)
+        per_token_kl = torch.exp(_kl_diff) - _kl_diff - 1
 
         advantages = advantages[:, None]  # [B x G, 1]
 
@@ -331,12 +363,12 @@ class GRPOWithChunkedOutputLoss(nn.Module):
         pi_logprobs_detached = pi_logprobs_chunk.detach()
         ref_logprobs_detached = ref_logprobs_chunk.detach()
 
-        # KL term
-        per_token_kl = (
-            torch.exp(ref_logprobs_detached - pi_logprobs_chunk)
-            - (ref_logprobs_detached - pi_logprobs_chunk)
-            - 1
-        )
+        # KL term — clamp d=[-10,10] + scrub NaN to prevent exp() overflow on long
+        # generations (see GRPOSimpleLoss note; same k3 estimator NaN class).
+        _kl_diff = ref_logprobs_detached - pi_logprobs_chunk
+        _kl_diff = torch.nan_to_num(_kl_diff, nan=0.0, posinf=10.0, neginf=-10.0)
+        _kl_diff = _kl_diff.clamp(min=-10.0, max=10.0)
+        per_token_kl = torch.exp(_kl_diff) - _kl_diff - 1
 
         # Policy term
         per_token_policy_loss = (

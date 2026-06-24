@@ -1,0 +1,167 @@
+# BioReason-Pro 4B GRPO RL — ASYNC generation/training overlap variant (server mode)
+#
+# This is the ASYNC variant of bioreason_4b_lora_grpo_2node_server_xpu.yaml. It is
+# IDENTICAL to that validated config EXCEPT for the async block below. The sync
+# config is left untouched (production-validated); this one opts into the Phase-1
+# rollout-producer overlap. See:
+#   recipes/dev/grpo_bioreason_distributed_xpu.py :: _async_lookahead_iter_impl
+#   torchtune/dev/rl/async_rollout.py             :: RolloutProducer
+#
+# Async boundary (BioReason-specific): the prompt_embeds build (ESM3 cache + GO +
+# trainable projectors under summon_full_params) is an XPU forward AND a world
+# collective, so it stays on the MAIN thread on every rank. ONLY the pure vLLM
+# HTTP generate_from_embeds round-trip is overlapped on the rank-0 producer thread.
+# The producer runs batch i's HTTP while the trainer trains on batch i-1.
+#
+# CONTRACT (enforced by tests/torchtune/dev/rl/test_async_loss_combo.py):
+#   async_generation.enabled=true  =>  loss=GRPOLoss
+#                                  AND  always_compute_rollout_logprobs=true.
+# At staleness=1 the rollout is sampled under the previous weight version; the
+# GRPOLoss IS ratio (recomputed pi_old on the current policy) carries a small bias.
+# EXPERIMENTAL — see CLAUDE.md async guards. HW smoke must confirm ratios ~= 1.0.
+#
+# Launch (after a 2-node hold is R; same launcher as the sync variant, just point
+# CONFIG at this file):
+#   ENABLE_LORA=1 bash experiments/bioreason/run_bioreason_2node_server.sh
+
+name: grpo_bioreason_4b_2node_server_lora_async
+output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/outputs/bioreason_2node_server_lora_async_v1
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+model_type: bioreason
+base_model_path: /tmp/torchtune/bioreason-pro-sft
+
+# ── PEFT-LoRA (published BioReason-Pro RL config) ──────────────────────────────
+enable_lora: true
+lora_rank: 16
+lora_alpha: 32
+lora_dropout: 0.05
+
+# ── ESM3 pre-encode cache ──────────────────────────────────────────────────────
+esm3_cache_path: /lus/flare/projects/ModCon/ngetty/datasets/bioreason_rl/esm3_cache_2048.pt
+
+# ── Tokenizer ─────────────────────────────────────────────────────────────────
+tokenizer:
+  _component_: torchtune.dev.bioreason.bioreason_tokenizer
+  ckpt_dir: ${base_model_path}
+
+# ── Dataset ───────────────────────────────────────────────────────────────────
+dataset:
+  _component_: torchtune.dev.bioreason.bioreason_rl_dataset
+  data_files: /lus/flare/projects/ModCon/ngetty/datasets/bioreason_rl
+  max_seq_len: ${max_seq_len}
+  max_protein_len: 2048
+  num_go_tokens: 200
+
+collate_fn: torchtune.dev.bioreason.dataset.bioreason_collate_fn
+
+seed: 42
+shuffle: True
+resume_from_checkpoint: False
+
+# ── RL Hyperparameters ────────────────────────────────────────────────────────
+grpo_samples: 8
+max_seq_len: 4096
+max_generated_tokens: 1024
+temperature: 0.8
+top_k: null
+
+# ── Async generation / training overlap (Phase 1, staleness=1 ONLY) ────────────
+# Invariant enforced by tests/torchtune/dev/rl/test_async_loss_combo.py:
+#   async_generation.enabled=true  => loss=GRPOLoss AND
+#                                     always_compute_rollout_logprobs=true.
+# always_compute_rollout_logprobs forces the rollout-time policy fwd every step so
+# GRPOLoss has pi_old for the IS ratio. The recipe ALSO sets this implicitly when
+# async is on, but we set it explicitly here so the static config test passes.
+always_compute_rollout_logprobs: true
+
+async_generation:
+  enabled: true
+  # staleness>1 raises ValueError at recipe init (rollout logprobs are recomputed
+  # on current weights -> biased IS ratios). Phase 1 is k=1 only.
+  max_staleness: 1
+
+# ── Training ──────────────────────────────────────────────────────────────────
+epochs: 1
+num_steps: 1200
+ppo_epochs: 1
+batch_size: 2
+forward_batch_size: 1
+ref_forward_batch_size: 16
+gradient_accumulation_steps: 1
+
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 3e-6
+  weight_decay: 0.01
+  fused: false
+
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  num_warmup_steps: 50
+
+clip_grad_norm: 1.0
+
+skip_zero_advantage_step: true
+
+# ── Loss ──────────────────────────────────────────────────────────────────────
+# GRPOLoss (token-wise IS ratios) — REQUIRED for async: GRPOSimpleLoss collapses
+# the ratio to 1.0 unconditionally, discarding the behavior-policy correction.
+# kl_coeff/epsilon carried over from the sync LoRA config's tuning levers.
+loss:
+  _component_: torchtune.dev.rl.loss.GRPOLoss
+  kl_coeff: 1e-3
+  epsilon: 0.2
+
+# ── Reward ────────────────────────────────────────────────────────────────────
+reward_mode: bioreason
+
+# ── Distributed ───────────────────────────────────────────────────────────────
+enable_activation_checkpointing: true
+
+# data_parallel_replicate_dim is passed by the launcher (run_bioreason_2node_server.sh
+# /  the 4N HSDP launcher). Async is HSDP-AWARE: when dp_replicate>1 each replica's
+# shard-leader (global ranks 0, dp_shard, 2*dp_shard, ...) runs its own rollout
+# producer and the consume-time broadcast is node-local over _gloo_dp_shard_pg. At
+# dp_replicate=1 it collapses to the validated single-generator (rank 0 + world
+# broadcast) path. No YAML change is needed to move between 2N single-replica and
+# 4N HSDP — the recipe reads _dp_replicate from data_parallel_replicate_dim.
+# data_parallel_replicate_dim: 1   # set by the launcher; uncomment to pin here.
+
+# ── XPU ───────────────────────────────────────────────────────────────────────
+device: xpu
+dtype: bf16
+compile: false
+force_math_sdpa: false
+
+# ── vLLM rollout (server mode, multi-URL DP=12) ───────────────────────────────
+vllm_mode: server
+vllm_weight_sync: true
+vllm_weight_sync_method: xccl
+vllm_weight_sync_interval: 1
+vllm_max_model_len: 4096
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+log_every_n_steps: 1
+log_peak_memory_stats: true
+save_every_n_epochs: 1
+
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+
+# ── Profiler ──────────────────────────────────────────────────────────────────
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: false
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: true
+  cuda: false
+  profile_memory: false
+  with_stack: false
+  record_shapes: false
+  with_flops: false
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1

@@ -199,6 +199,71 @@ def test_standalone_recipe_sets_shared_server_mode_attrs(recipe):
     )
 
 
+def test_bioreason_hsdp_wrap_and_shard_leader_generate():
+    """When data_parallel_replicate_dim>1, BioReason must (a) wrap with FSDP1
+    HYBRID_SHARD over the 2D dp_mesh (not the flat single-replica process_group),
+    and (b) generate from the shard LEADER (each replica's leader), not global rank 0.
+
+    HSDP is the throughput lever for distinct prompts in PARALLEL across replicas
+    (batch_size only adds SEQUENTIAL prompts). The wrap + generate paths are wired
+    into the base machinery (_dp_mesh, _is_shard_leader, _gloo_dp_shard_pg from base
+    __init__). Single-replica (dp_replicate==1) must stay byte-identical: base sets
+    _is_shard_leader == _is_rank_zero, and the wrap falls to SHARD_GRAD_OP.
+    """
+    src = (RECIPES_DIR / "grpo_bioreason_distributed_xpu.py").read_text()
+    # (a) HSDP wrap: HYBRID_SHARD + device_mesh routing gated on dp_replicate>1.
+    assert "_HYBRID_SHARD_ZERO2" in src or "HYBRID_SHARD" in src, \
+        "BioReason must offer an FSDP1 HYBRID_SHARD wrap for HSDP"
+    assert "device_mesh=self._dp_mesh" in src, \
+        "HSDP wrap must use the 2D dp_mesh (device_mesh=self._dp_mesh)"
+    assert "enable_fsdp1_hsdp_inter_node_gloo" in src, \
+        "HSDP must route inter-node grad all-reduce over gloo (CXI-leak mitigation)"
+    # (b) generation must be shard-leader-aware, not hard rank-0.
+    tree = ast.parse(src)
+    fn = next(
+        (n for n in ast.walk(tree)
+         if isinstance(n, ast.FunctionDef)
+         and n.name == "_generate_with_vllm_server_embeds"),
+        None,
+    )
+    assert fn is not None, "_generate_with_vllm_server_embeds not found"
+    fn_src = ast.get_source_segment(src, fn)
+    assert "_is_shard_leader" in fn_src, (
+        "server-mode generation must gate on _is_shard_leader (HSDP: each replica's "
+        "leader generates its slice), not hard self._is_rank_zero"
+    )
+
+
+def test_bioreason_batched_gen_chunks_by_gen_batch_size():
+    """generate_trajectory_batched must chunk the vLLM-generation loop by
+    gen_batch_size, NOT forward_batch_size.
+
+    Regression (2026-06-22): the loop chunked by forward_batch_size. With fbs=1 +
+    batch_size=8 that made 8 SEQUENTIAL vLLM generation calls per step, and ~half
+    returned EMPTY completions (vLLM server state across rapid repeated calls) —
+    silently zeroing the reward for those prompts. gen_batch_size (defaults to
+    batch_size) keeps generation in ONE call, matching the validated batch_size=1
+    path. forward_batch_size is for the ref/policy micro-batch only.
+    """
+    src = (RECIPES_DIR / "grpo_bioreason_distributed_xpu.py").read_text()
+    tree = ast.parse(src)
+    fn = next(
+        (n for n in ast.walk(tree)
+         if isinstance(n, ast.FunctionDef) and n.name == "generate_trajectory_batched"),
+        None,
+    )
+    assert fn is not None, "generate_trajectory_batched not found"
+    fn_src = ast.get_source_segment(src, fn)
+    # The generation chunk loop must range over gen_batch_size, not forward_batch_size.
+    assert "_gen_batch_size" in fn_src or "_gen_bs" in fn_src, (
+        "generate_trajectory_batched must chunk by gen_batch_size"
+    )
+    assert "range(0, self.batch_size, self._forward_batch_size)" not in fn_src, (
+        "generation loop must NOT chunk by forward_batch_size (causes empty vLLM "
+        "completions at batch_size>1 with fbs=1) — chunk by gen_batch_size"
+    )
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))

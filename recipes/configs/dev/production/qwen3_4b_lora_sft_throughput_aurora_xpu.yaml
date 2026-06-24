@@ -1,0 +1,117 @@
+# Qwen3-4B LoRA SFT throughput benchmark — Aurora (XPU, 1 node = 12 PVC tiles)
+#
+# LoRA twin of qwen3_4b_sft_throughput_aurora_xpu.yaml. Same envelope as the TRL
+# LoRA parity run (seqlen 2048, bf16, activation checkpointing ON, micro-batch 2,
+# grad-accum 1) and the SAME adapter surface TRL used (r=16, alpha=32, on
+# q/k/v/output_proj + all MLP, no output head) so the trainable parameter count
+# matches and the Aurora engine delta (torchtune vs TRL LoRA) is clean.
+#
+# Recipe:   recipes/dev/lora_finetune_distributed_xpu.py
+# Launcher: benchmarks/sft_throughput_aurora_vs_polaris/run_aurora_torchtune.sh (LORA=1)
+
+name: qwen3_4b_lora_sft_throughput_aurora
+output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/benchmarks/sft_throughput_aurora_vs_polaris/runs/${name}
+base_model_path: /lus/flare/projects/ModCon/ngetty/models/Qwen3-4B
+
+# ── Model (adapter surface matched to the TRL LoRA leg) ──────────────────────
+model:
+  _component_: torchtune.models.qwen3.lora_qwen3_4b_base
+  lora_attn_modules: ['q_proj', 'k_proj', 'v_proj', 'output_proj']
+  apply_lora_to_mlp: true
+  apply_lora_to_output: false          # tied embeddings on Qwen3-4B
+  lora_rank: 16
+  lora_alpha: 32
+  lora_dropout: 0.0
+
+# ── Tokenizer ────────────────────────────────────────────────────────────────
+tokenizer:
+  _component_: torchtune.models.qwen3.qwen3_tokenizer
+  path: ${base_model_path}/vocab.json
+  merges_file: ${base_model_path}/merges.txt
+  max_seq_len: 2048
+
+# ── Checkpointer ─────────────────────────────────────────────────────────────
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [
+    model-00001-of-00003.safetensors,
+    model-00002-of-00003.safetensors,
+    model-00003-of-00003.safetensors,
+  ]
+  recipe_checkpoint: null
+  adapter_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: QWEN2
+resume_from_checkpoint: false
+save_adapter_weights_only: true
+
+# ── Dataset (packed alpaca @ seq2048 → constant token volume per step) ────────
+dataset:
+  _component_: torchtune.datasets.alpaca_dataset
+  source: tatsu-lab/alpaca
+  train_on_input: true     # all positions unmasked → token accounting matches TRL (labels=input_ids)
+  packed: true
+seed: 1234
+shuffle: true
+# Async dataloader: collate (packed block-causal mask) + H2D overlap with compute.
+# num_workers=0 stalls ~42% of the step on Aurora 4B/seq2048 (validated 2026-06-19).
+dataloader_num_workers: 4
+
+# ── Training envelope (matched to TRL LoRA parity run) ───────────────────────
+epochs: 1
+max_steps_per_epoch: 55      # ~10 warmup + ~45 measured (launcher trims warmup)
+batch_size: 2
+gradient_accumulation_steps: 1
+clip_grad_norm: null
+
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 1.0e-5
+  weight_decay: 0.0
+  fused: true
+optimizer_in_bwd: false
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  num_warmup_steps: 5
+
+loss:
+  _component_: torchtune.modules.loss.LinearCrossEntropyLoss
+
+# ── Distributed / FSDP ───────────────────────────────────────────────────────
+enable_activation_checkpointing: true   # match TRL LoRA leg (grad ckpt ON)
+enable_activation_offloading: false
+fsdp_cpu_offload: false
+fsdp_reshard_after_forward: true
+data_parallel_replicate_dim: 1
+data_parallel_shard_dim: -1
+tensor_parallel_dim: 1
+
+# ── XPU ──────────────────────────────────────────────────────────────────────
+device: xpu
+dtype: bf16
+compile: false
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+log_level: INFO
+log_every_n_steps: 1
+log_peak_memory_stats: true
+
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: false
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: true
+  cuda: false
+  profile_memory: false
+  with_stack: false
+  record_shapes: false
+  with_flops: false
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1

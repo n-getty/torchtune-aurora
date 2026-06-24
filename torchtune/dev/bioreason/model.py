@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import os
 import sys
+import json
 import fnmatch
+import hashlib
 import logging
 from typing import Optional
 
@@ -91,7 +93,9 @@ class BioReasonModel(nn.Module):
       - GO graph encoder (frozen — output cached from go_embedding.pt at load time)
       - protein_projection MLP  (trainable)
       - go_projection MLP       (trainable)
-      - Qwen3-4B LLM backbone   (trainable via DDP, no LoRA for simplicity)
+      - Qwen3-4B LLM backbone   (full-FT by default; frozen base + PEFT-LoRA
+        adapters when ``enable_lora=True`` — matches the published BioReason-Pro
+        RL recipe, which trains GO encoder + projections + LoRA adapters only)
 
     The forward() method accepts inputs_embeds (pre-computed by build_prompt_embeds)
     and returns logits, matching the interface expected by the GRPO recipe.
@@ -110,6 +114,13 @@ class BioReasonModel(nn.Module):
         attn_implementation: str = "sdpa",
         go_obo_path: Optional[str] = None,
         precomputed_go_path: Optional[str] = None,
+        enable_lora: bool = False,
+        lora_rank: int = 16,
+        lora_alpha: int = 32,
+        lora_dropout: float = 0.05,
+        esm3_cache_path: Optional[str] = None,
+        adapter_path: Optional[str] = None,
+        proj_resume_dir: Optional[str] = None,
     ):
         super().__init__()
         _ensure_paths()
@@ -117,6 +128,13 @@ class BioReasonModel(nn.Module):
         self.device = device
         self.dtype = dtype
         self._ckpt_dir = ckpt_dir
+        self._has_lora = bool(enable_lora)
+        # When an ESM3 pre-encode cache is provided, the (frozen) ESM3 encoder is
+        # NOT built — its ~5.5 GiB fp32 footprint never enters the process and the
+        # per-step encode is replaced by a dict lookup. Loaded below after tokenizer.
+        self._esm3_cache_path = esm3_cache_path
+        self._esm3_cache = None
+        self._esm3_cache_meta = None
 
         from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
         from bioreason2.models.special_tokens import get_all_special_tokens, get_token
@@ -134,6 +152,68 @@ class BioReasonModel(nn.Module):
             trust_remote_code=True,
         ).to(device)
 
+        # ── PEFT-LoRA on the HF backbone (published BioReason-Pro RL recipe) ───
+        # The backbone is an HF AutoModelForCausalLM, so we wrap it with PEFT
+        # (NOT torchtune's LoRALinear, which only builds from scratch and cannot
+        # retrofit an HF module). get_peft_model freezes the base and marks only
+        # the adapters trainable; the projectors (built below) stay trainable.
+        # Config matches bioreason2/utils/save_grpo_ckpt.py.
+        if self._has_lora:
+            from peft import LoraConfig, get_peft_model
+
+            lora_config = LoraConfig(
+                r=lora_rank,
+                lora_alpha=lora_alpha,
+                lora_dropout=lora_dropout,
+                target_modules=[
+                    "q_proj", "k_proj", "v_proj", "o_proj",
+                    "gate_proj", "up_proj", "down_proj",
+                ],
+                init_lora_weights="gaussian",
+                bias="none",
+                task_type="CAUSAL_LM",
+            )
+            # autocast_adapter_dtype=False keeps adapters in the base dtype (bf16).
+            # PEFT defaults to True (fp32 adapters), but FSDP1's flat-param requires
+            # UNIFORM dtype across a wrapped module — fp32 adapters + bf16 base/
+            # projectors crash with "Must flatten tensors with uniform dtype but got
+            # torch.bfloat16 and torch.float32". bf16 adapters + bf16 AdamW is the
+            # same regime the full-FT BioReason path already trains in successfully.
+            self.backbone = get_peft_model(
+                self.backbone, lora_config, autocast_adapter_dtype=False
+            )
+            # RESUME: load trained adapter weights into the fresh PEFT adapter (e.g.
+            # to continue a 4N run at 8N). adapter_path is a dir holding
+            # adapter_model.safetensors (what save_checkpoint writes). We load the
+            # tensors into the EXISTING adapter (set_peft_model_state_dict) rather than
+            # PeftModel.from_pretrained so the LoraConfig/dtype/FSDP-readiness already
+            # set above is preserved. Without this, an 8N "resume" would silently
+            # restart from the gaussian init (zero learning carried over).
+            if adapter_path is not None:
+                import os as _os
+                from safetensors.torch import load_file as _load_sft
+                from peft import set_peft_model_state_dict as _set_peft_sd
+                _af = _os.path.join(adapter_path, "adapter_model.safetensors")
+                if not _os.path.isfile(_af):
+                    raise FileNotFoundError(
+                        f"adapter_path set but {_af} not found — cannot resume LoRA."
+                    )
+                _sd = _load_sft(_af)
+                _res = _set_peft_sd(self.backbone, _sd)
+                _missing = getattr(_res, "unexpected_keys", None) or []
+                logger.info(
+                    "PEFT-LoRA adapter RESUMED from %s (%d tensors, unexpected=%d)",
+                    _af, len(_sd), len(_missing),
+                )
+            # LOAD-BEARING with gradient checkpointing: the frozen base produces
+            # no input grads, so without this hook the adapter grads are dropped
+            # (silent zero-learning). See model risks in the plan.
+            self.backbone.enable_input_require_grads()
+            logger.info(
+                "PEFT-LoRA applied to backbone (r=%d, alpha=%d, dropout=%.3f)",
+                lora_rank, lora_alpha, lora_dropout,
+            )
+
         # ── Tokenizer + special token IDs ─────────────────────────────────────
         self.tokenizer = AutoTokenizer.from_pretrained(ckpt_dir, trust_remote_code=True)
         self.tokenizer.add_special_tokens(
@@ -148,17 +228,33 @@ class BioReasonModel(nn.Module):
         # Loaded from checkpoint safetensors — same weights as backbone.embed_tokens.
         self._embed = self._load_embed_layer(ckpt_dir, cfg)
 
-        # ── Projectors (trainable) ────────────────────────────────────────────
-        from bioreason2.models.protein_encoder import create_protein_encoder
+        # ── Protein encoder (ESM3) OR its pre-encoded cache ───────────────────
+        if self._esm3_cache_path is not None:
+            # Cached path: skip building ESM3 entirely (frees ~5.5 GiB fp32/tile
+            # and removes the per-step encoder forward). build_prompt_embeds()
+            # looks up raw per-residue features from the cache and applies the
+            # (live, trainable) protein_projection. embedding_dim comes from the
+            # cache sidecar since there is no encoder to query.
+            self.protein_encoder = None
+            self._esm3_cache, self._esm3_cache_meta = self._load_esm3_cache(
+                self._esm3_cache_path, protein_model_name
+            )
+            protein_hidden = int(self._esm3_cache_meta["embedding_dim"])
+            logger.info(
+                "ESM3 pre-encode cache loaded (%d seqs, dim=%d) — ESM3 encoder NOT built",
+                self._esm3_cache_meta.get("n_seqs", -1), protein_hidden,
+            )
+        else:
+            from bioreason2.models.protein_encoder import create_protein_encoder
 
-        self.protein_encoder = create_protein_encoder(
-            protein_model_name, inference_mode=True
-        )
-        # ESM3 stays in float32: it has fp32_autocast_context internally for
-        # numerical stability in structure ops. Output embeddings are cast to
-        # self.dtype in build_prompt_embeds() before the projection layer.
-        self.protein_encoder.model.to(device=device)
-        protein_hidden = self.protein_encoder.embedding_dim
+            self.protein_encoder = create_protein_encoder(
+                protein_model_name, inference_mode=True
+            )
+            # ESM3 stays in float32: it has fp32_autocast_context internally for
+            # numerical stability in structure ops. Output embeddings are cast to
+            # self.dtype in build_prompt_embeds() before the projection layer.
+            self.protein_encoder.model.to(device=device)
+            protein_hidden = self.protein_encoder.embedding_dim
 
         self.protein_projection = nn.Sequential(
             nn.Linear(protein_hidden, self.hidden_size),
@@ -186,9 +282,63 @@ class BioReasonModel(nn.Module):
 
         # ── Load checkpoint weights for projectors / GO ───────────────────────
         self._load_custom_weights(ckpt_dir)
+        # RESUME the TRAINED projections (protein_projection.pt / go_projection.pt) from
+        # a prior run's epoch dir, overlaying the SFT-base projections just loaded from
+        # ckpt_dir. Without this, resuming a run (adapter_path set) would restart the
+        # TRAINABLE projectors from the SFT base — silently discarding their RL training
+        # (the LoRA adapter would resume but the projectors would not). proj_resume_dir
+        # is normally the same epoch dir that holds adapter_path's adapter/.
+        if proj_resume_dir is not None:
+            self._load_custom_weights(proj_resume_dir)
+            logger.info("Resumed trained projections from %s", proj_resume_dir)
 
         # Freeze ESM3 and GO encoder during RL
         self._freeze_encoders()
+
+    # ── ESM3 pre-encode cache helpers ─────────────────────────────────────────
+
+    @staticmethod
+    def esm3_cache_key(sequence: str) -> str:
+        """Stable key for a (already-truncated) amino-acid sequence.
+
+        The caller MUST pass the same truncation the dataset applies
+        (``sequence[:max_protein_len]``) so the key matches what the precompute
+        script wrote. SHA1 keeps the on-disk dict compact and avoids storing long
+        AA strings as keys.
+        """
+        return hashlib.sha1(sequence.encode("ascii", "ignore")).hexdigest()
+
+    def _load_esm3_cache(self, cache_path: str, protein_model_name: str):
+        """Load the pre-encoded ESM3 cache + sidecar; assert config-match.
+
+        Returns (cache_dict, meta_dict). cache_dict maps esm3_cache_key(seq) ->
+        per-residue feature tensor [L+2, embedding_dim]. The sidecar JSON
+        (``<cache>.json``) records max_protein_len / embedding_dim /
+        esm3_model_name / n_seqs so a stale cache is rejected loudly rather than
+        producing silently-wrong embeddings.
+        """
+        if not os.path.exists(cache_path):
+            raise FileNotFoundError(
+                f"ESM3 cache not found at {cache_path}. Run "
+                f"experiments/bioreason/precompute_esm3_cache.py first."
+            )
+        sidecar = cache_path + ".json"
+        if not os.path.exists(sidecar):
+            raise FileNotFoundError(
+                f"ESM3 cache sidecar not found at {sidecar} (written by the "
+                f"precompute script alongside the .pt)."
+            )
+        with open(sidecar) as f:
+            meta = json.load(f)
+        if meta.get("esm3_model_name") != protein_model_name:
+            raise ValueError(
+                f"ESM3 cache model mismatch: sidecar='{meta.get('esm3_model_name')}' "
+                f"vs requested='{protein_model_name}'. Re-run precompute."
+            )
+        cache = torch.load(cache_path, map_location="cpu")
+        if not isinstance(cache, dict) or not cache:
+            raise ValueError(f"ESM3 cache at {cache_path} is empty or not a dict.")
+        return cache, meta
 
     # ── Weight loading helpers ────────────────────────────────────────────────
 
@@ -215,7 +365,11 @@ class BioReasonModel(nn.Module):
                 continue
             with safe_open(path, framework="pt", device="cpu") as f:
                 if key in f.keys():
-                    emb.weight.data = f.get_tensor(key)
+                    # Cast to self.dtype: some checkpoints store embed_tokens as fp32
+                    # (e.g. bioreason-pro-rl) and assigning the raw tensor would make
+                    # `embeds` fp32 while protein/GO features are bf16 — `embeds[mask]
+                    # = flat` then fails with a dtype mismatch in build_prompt_embeds.
+                    emb.weight.data = f.get_tensor(key).to(self.dtype)
                     logger.info(f"Loaded embed_tokens from {path}")
                     break
         return emb.to(self.device)
@@ -246,13 +400,17 @@ class BioReasonModel(nn.Module):
             logger.info(f"Loaded cached GO embedding from {go_emb_path}")
 
     def _freeze_encoders(self):
-        for p in self.protein_encoder.model.parameters():
-            p.requires_grad = False
+        # protein_encoder is None when the ESM3 pre-encode cache is used (encoder
+        # not built) — nothing to freeze on the protein side then.
+        if self.protein_encoder is not None:
+            for p in self.protein_encoder.model.parameters():
+                p.requires_grad = False
         if self.go_encoder is not None:
             for p in self.go_encoder.parameters():
                 p.requires_grad = False
         # GO projection is trainable; protein projection is trainable.
-        logger.info("ESM3 and GO encoder frozen (RL trains projectors + backbone)")
+        _bk = "LoRA adapters" if getattr(self, "_has_lora", False) else "full backbone"
+        logger.info("ESM3 and GO encoder frozen (RL trains projectors + %s)", _bk)
 
     # ── Embedding computation ─────────────────────────────────────────────────
 
@@ -279,9 +437,33 @@ class BioReasonModel(nn.Module):
         if protein_sequences:
             if batch_idx_map is None:
                 batch_idx_map = list(range(B))
-            raw = self.protein_encoder.encode_sequences(
-                protein_sequences, batch_idx_map, B
-            )
+            if self._esm3_cache is not None:
+                # Cache lookup replaces the live ESM3 forward. Build the SAME
+                # per-batch-item `raw` list encode_sequences would return: for each
+                # batch item, concatenate the cached features of its sequence(s)
+                # (in batch_idx_map order). Sequences are keyed by the SAME
+                # truncation the dataset applied. A miss is a hard error (the cache
+                # must be complete) — never silently zero-fill.
+                _per_item: list[list[torch.Tensor]] = [[] for _ in range(B)]
+                for _seq_idx, _seq in enumerate(protein_sequences):
+                    _k = self.esm3_cache_key(_seq)
+                    _t = self._esm3_cache.get(_k)
+                    if _t is None:
+                        raise KeyError(
+                            f"ESM3 cache miss for sequence (len={len(_seq)}, "
+                            f"key={_k[:12]}…). Cache is incomplete — re-run "
+                            f"precompute_esm3_cache.py over the full dataset."
+                        )
+                    _per_item[batch_idx_map[_seq_idx]].append(_t)
+                raw = [
+                    torch.cat(_per_item[i], dim=0) if _per_item[i]
+                    else torch.zeros((0, int(self._esm3_cache_meta["embedding_dim"])))
+                    for i in range(B)
+                ]
+            else:
+                raw = self.protein_encoder.encode_sequences(
+                    protein_sequences, batch_idx_map, B
+                )
             # ESM3 per_residue_embedding includes BOS and EOS tokens (+2 per sequence).
             # SFT was trained with placeholders for the BOS/EOS too — see upstream
             # PLProcessor (processing_pl.py:184-185, num_protein_tokens = seq_len + 2).
@@ -384,12 +566,87 @@ class BioReasonModel(nn.Module):
             "go_projection": self.go_projection.state_dict(),
         }
 
+    @staticmethod
+    def _peft_name_to_hf(name: str) -> Optional[str]:
+        """Translate a PEFT backbone param name to the clean HF name vLLM expects.
+
+        PEFT renames a wrapped linear's weight to e.g.
+        ``base_model.model.model.layers.0.self_attn.q_proj.base_layer.weight``
+        and adds adapter params ``...q_proj.lora_A.default.weight`` /
+        ``...lora_B.default.weight``. vLLM's ``load_weights`` expects the original
+        HF name ``model.layers.0.self_attn.q_proj.weight``.
+
+        Returns the clean HF name for base/non-target params, or ``None`` for
+        adapter-only params (which are never shipped to vLLM — the merged delta
+        rides on ``base_layer.weight`` after ``merge_adapter()``).
+        """
+        if ".lora_A." in name or ".lora_B." in name or ".lora_embedding_" in name:
+            return None
+        # Strip the PEFT wrapper prefix: PeftModel.base_model.model -> original root.
+        if name.startswith("base_model.model."):
+            name = name[len("base_model.model."):]
+        # Remove the ``.base_layer`` infix inserted around wrapped linears.
+        name = name.replace(".base_layer.", ".")
+        return name
+
+    def lora_delta_map(self) -> dict:
+        """Return {clean_hf_name: delta_weight} for every LoRA-target backbone module.
+
+        Eager dict form — materializes ALL ~398 fp32 deltas at once. Prefer
+        ``lora_delta_iter()`` in the colocate merge: holding the full dict for the
+        whole load_weights loop is a large per-step fp32 transient that, with no
+        empty_cache under colocate, fragments the allocator → reserved staircase →
+        banned:1 (observed +11 GiB/step, 2026-06-18). Kept for the server path /
+        tests where the dict is convenient.
+        """
+        return dict(self.lora_delta_iter())
+
+    def lora_delta_iter(self):
+        """Yield (clean_hf_name, delta_weight) one LoRA-target at a time.
+
+        ``delta = sum_a scale_a * (B_a @ A_a)`` via PEFT's non-mutating
+        ``get_delta_weight`` (fp32). Streaming so the caller can add it to the base,
+        load it into vLLM, and free it before computing the next — bounding the
+        per-step transient to one layer's delta instead of all 398. The frozen base
+        is never mutated (avoids the bf16 merge/unmerge drift). Must be called with
+        full (summoned) params under FSDP; in colocate the model is unsharded so
+        it's a plain read.
+        """
+        if not self._has_lora:
+            return
+        for mod_name, module in self.backbone.named_modules():
+            if not (hasattr(module, "base_layer") and hasattr(module, "get_delta_weight")):
+                continue
+            active = getattr(module, "active_adapters", [])
+            if not active:
+                continue
+            hf_name = self._peft_name_to_hf(f"{mod_name}.base_layer.weight")
+            if hf_name is None:
+                continue
+            delta = None
+            for a in active:
+                d = module.get_delta_weight(a)
+                delta = d if delta is None else delta + d
+            yield hf_name, delta
+
     def vllm_param_iter(self):
         """Yield (hf_name, param) for LLM backbone params only — used for vLLM weight sync.
 
         ESM3, GO encoder, protein_projection, and go_projection are excluded because
         vLLM receives pre-computed prompt_embeds and never runs the encoders/projectors.
         The backbone uses native HF parameter names (no 'backbone.' prefix).
+
+        When LoRA is active, PEFT-renamed params are translated back to clean HF
+        names and adapter params (lora_A/lora_B) are skipped — callers merge the
+        adapter into ``base_layer.weight`` (``merge_adapter()``) before iterating
+        so the yielded base weight already carries W_eff.
         """
-        for name, param in self.backbone.named_parameters():
-            yield name, param
+        if self._has_lora:
+            for name, param in self.backbone.named_parameters():
+                hf_name = self._peft_name_to_hf(name)
+                if hf_name is None:
+                    continue
+                yield hf_name, param
+        else:
+            for name, param in self.backbone.named_parameters():
+                yield name, param

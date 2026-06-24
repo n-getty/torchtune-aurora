@@ -1,0 +1,117 @@
+# Qwen3-4B FULL SFT throughput benchmark — Aurora (XPU, 1 node = 12 PVC tiles)
+#
+# Purpose: the torchtune-NATIVE half of the Aurora-vs-Polaris SFT throughput
+#   comparison. This is "our most optimal/stable recipe" (the XPU full-FT recipe),
+#   measured at the SAME envelope as the TRL harness (Qwen3-4B, seqlen 2048, bf16,
+#   activation checkpointing, micro-batch 2, grad-accum 1) so the Aurora engine
+#   delta (torchtune vs TRL) is quantifiable on one platform, and the cross-cluster
+#   number reflects the recipe we actually ship.
+#
+# Recipe:   recipes/dev/full_finetune_distributed_xpu.py
+# Launcher: benchmarks/sft_throughput_aurora_vs_polaris/run_aurora_torchtune.sh
+#
+# Token volume is held constant via packed alpaca at max_seq_len=2048: every packed
+# row is exactly 2048 tokens, so tokens/optimizer-step = world_size * batch_size *
+# 2048 is a known constant and dataloader luck is removed from the timing. Throughput
+# at fixed seqlen is insensitive to token identity (parity with TRL synthetic data).
+#
+# Measurement: the recipe logs rank-0 `tokens_per_second_per_gpu` every step
+# (full_finetune_distributed_xpu.py:~1200). The launcher discards the first 10 steps
+# (warmup) and takes the median of the next ~40. No extra instrumentation.
+
+name: qwen3_4b_sft_throughput_aurora
+output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/benchmarks/sft_throughput_aurora_vs_polaris/runs/${name}
+base_model_path: /lus/flare/projects/ModCon/ngetty/models/Qwen3-4B
+
+# ── Model ────────────────────────────────────────────────────────────────────
+model:
+  _component_: torchtune.models.qwen3.qwen3_4b_instruct
+
+# ── Tokenizer ────────────────────────────────────────────────────────────────
+tokenizer:
+  _component_: torchtune.models.qwen3.qwen3_tokenizer
+  path: ${base_model_path}/vocab.json
+  merges_file: ${base_model_path}/merges.txt
+  max_seq_len: 2048
+
+# ── Checkpointer ─────────────────────────────────────────────────────────────
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [
+    model-00001-of-00003.safetensors,
+    model-00002-of-00003.safetensors,
+    model-00003-of-00003.safetensors,
+  ]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  # Qwen3-4B is missing lm_head.weight on HF (tied embeds); QWEN2 type handles it.
+  model_type: QWEN2
+
+resume_from_checkpoint: false
+
+# ── Dataset (packed alpaca @ seq2048 → constant token volume per step) ────────
+dataset:
+  _component_: torchtune.datasets.alpaca_dataset
+  source: tatsu-lab/alpaca
+  train_on_input: true     # all positions unmasked → token accounting matches TRL (labels=input_ids)
+  packed: true
+seed: 1234
+shuffle: true
+# Async dataloader: collate (packed block-causal mask) + H2D overlap with compute.
+# num_workers=0 stalls ~42% of the step on Aurora 4B/seq2048 (validated 2026-06-19).
+dataloader_num_workers: 4
+
+# ── Training envelope (matched to TRL parity run) ────────────────────────────
+epochs: 1
+max_steps_per_epoch: 55      # ~10 warmup + ~45 measured (launcher trims warmup)
+batch_size: 2                # per-device micro-batch (= TRL micro_bsz=2)
+gradient_accumulation_steps: 1
+clip_grad_norm: null         # off: keep the step on the compute/comm path, no extra allreduce
+
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 1.0e-5
+  weight_decay: 0.0
+  fused: true                # XPU fused AdamW (validated, see project_adamw_xpu_probe)
+
+loss:
+  _component_: torchtune.modules.loss.LinearCrossEntropyLoss
+
+# ── Distributed / FSDP (top-level wrap, reshard-after-forward) ────────────────
+enable_activation_checkpointing: true
+enable_activation_offloading: false
+fsdp_cpu_offload: false
+fsdp_reshard_after_forward: true
+data_parallel_replicate_dim: 1
+data_parallel_shard_dim: -1   # full shard across all 12 tiles
+tensor_parallel_dim: 1
+
+# ── XPU ──────────────────────────────────────────────────────────────────────
+device: xpu
+dtype: bf16
+compile: false
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+log_level: INFO
+log_every_n_steps: 1
+log_peak_memory_stats: true
+
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: false
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: true
+  cuda: false
+  profile_memory: false
+  with_stack: false
+  record_shapes: false
+  with_flops: false
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1

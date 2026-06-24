@@ -1,0 +1,179 @@
+# BioReason-Pro 4B GRPO RL — 2-node asymmetric (HTTP vLLM + prompt_embeds), PEFT-LoRA
+#
+# This is the LoRA variant of bioreason_4b_grpo_2node_server_xpu.yaml. It trains
+# the published BioReason-Pro RL surface: FROZEN Qwen3-4B backbone + PEFT-LoRA
+# adapters + trainable projectors (ESM3 / GO encoder stay frozen). The full-FT
+# baseline was 200/200 steps stable but reward-FLAT; LoRA + the tuning levers
+# below target the FIRST real reward climb. See:
+#   docs/reports/bioreason_4b_200step_stability_20260501.md (flat-reward baseline)
+#   memory/project_bioreason_200step_baseline.md            (tuning-lever analysis)
+#
+# vLLM runs a vanilla (adapter-less) Qwen3 — the recipe merges W_eff = base +
+# (alpha/r)*B@A under summon_full_params and ships it via the existing XCCL
+# node_fanout weight-sync path each step (merge_adapter -> gather -> unmerge).
+#
+# NEW RUNTIME DEP: peft==0.17.1 must be on the training PYTHONPATH (provisioned in
+# $BIOREASON_DEPS). See memory/feedback_bioreason_peft_dep_provisioning.md.
+#
+# Launch (after a 2-node hold is R; mirrors the full-FT launcher):
+#   ENABLE_LORA=1 bash experiments/bioreason/run_bioreason_2node_server.sh
+
+name: grpo_bioreason_4b_2node_server_lora
+output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/outputs/bioreason_2node_server_lora_v1
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+model_type: bioreason
+base_model_path: /tmp/torchtune/bioreason-pro-sft
+
+# ── PEFT-LoRA (published BioReason-Pro RL config) ──────────────────────────────
+enable_lora: true
+lora_rank: 16
+lora_alpha: 32
+lora_dropout: 0.05
+
+# ── ESM3 pre-encode cache ──────────────────────────────────────────────────────
+# When set, neither policy/ref/embed builds the ~1.4B fp32 ESM3 encoder (~5.5 GiB
+# /tile freed) — per-residue features come from this cache (built offline by
+# experiments/bioreason/precompute_esm3_cache.py). The trainable protein_projection
+# is still applied live. Remove this line to fall back to the live encoder.
+# Must be the 2048-encoded cache to match max_protein_len: 2048 below — the keys are
+# sha1(sequence[:max_protein_len]), so the old 128 cache (esm3_cache.pt) would KeyError
+# at lookup. Built by precompute_esm3_cache.py --max_protein_len 2048 --out ...2048.pt.
+esm3_cache_path: /lus/flare/projects/ModCon/ngetty/datasets/bioreason_rl/esm3_cache_2048.pt
+
+# ── Tokenizer ─────────────────────────────────────────────────────────────────
+tokenizer:
+  _component_: torchtune.dev.bioreason.bioreason_tokenizer
+  ckpt_dir: ${base_model_path}
+
+# ── Dataset ───────────────────────────────────────────────────────────────────
+dataset:
+  _component_: torchtune.dev.bioreason.bioreason_rl_dataset
+  data_files: /lus/flare/projects/ModCon/ngetty/datasets/bioreason_rl
+  max_seq_len: ${max_seq_len}
+  # FAITHFUL INPUTS (match the published SFT checkpoint, 2026-06-19):
+  #   - max_protein_len 128 -> 2048: SFT learned from <=2048-residue ESM3 features;
+  #     128 truncated 93.7% of proteins (median 422). REQUIRES re-encoding the ESM3
+  #     cache at 2048 (precompute_esm3_cache.py --max_protein_len 2048).
+  #   - num_go_tokens 50 -> 200: the SFT ckpt ships go_embedding.pt of shape
+  #     (200,2560); 50 sliced off 75% of the GO graph context the model expects.
+  max_protein_len: 2048
+  num_go_tokens: 200
+
+collate_fn: torchtune.dev.bioreason.dataset.bioreason_collate_fn
+
+seed: 42
+shuffle: True
+resume_from_checkpoint: False
+
+# ── RL Hyperparameters ────────────────────────────────────────────────────────
+# max_seq_len 4096 (paper max_length_text): the faithful prompt carries ~2050
+# protein_pad + 200 go_graph_pad + text tokens — keep at 4096 for the PROMPT side.
+# max_generated_tokens 2048 -> 1024 (2026-06-22, throughput): generation dominated
+# step time (~150s of ~250s at 4N) and was straggler-bound by the 2048 cap, making
+# 4N ~4-5x slower than the 45-53s 1N baseline (which used 1024). Responses run
+# 780-1530 tok so 1024 truncates the longest ~few % of reasoning traces — accepted
+# for the ~2x generation speedup (user decision). The published BioReason baseline
+# also used 1024 (hit the cap ~80% of the time). Bump back up only if eval shows the
+# truncation hurts F_max.
+grpo_samples: 8
+max_seq_len: 4096
+max_generated_tokens: 1024
+temperature: 0.8
+top_k: null
+
+# ── Training ──────────────────────────────────────────────────────────────────
+epochs: 1
+num_steps: 1200
+ppo_epochs: 1
+# batch_size = DISTINCT prompts per step, processed SEQUENTIALLY within a replica
+# (one vLLM generation call per gen_batch_size chunk). Measured: batch_size scales
+# step wall-time ~LINEARLY (bs=8 ≈ 8× bs=1 step time). So batch_size is only a modest
+# within-replica variance smoother — for THROUGHPUT/distinct-prompt diversity use HSDP
+# replicas (data_parallel_replicate_dim, parallel across nodes), NOT big batch_size.
+# Keep this small; the launcher's BATCH_SIZE env overrides.
+batch_size: 2
+# forward_batch_size=1 + TORCHTUNE_USE_CHUNKED_LOSS=0 (per-chunk backward) is the validated
+# memory envelope at faithful inputs (2048 protein / 200 GO / max_gen 2048) — bounds the
+# activation peak (~56 GiB/rollout) so it fits the 64 GiB tile.
+forward_batch_size: 1
+# ref_forward_batch_size MUST be >= batch_size*grpo_samples (=16 at batch_size=2) so the
+# no-grad ref forward does ONE FSDP allgather, not num_seqs sequential ones (documented
+# ~500x slowdown trap). The launcher auto-derives REF_FORWARD_BATCH_SIZE=BATCH_SIZE*GRPO_SAMPLES.
+ref_forward_batch_size: 16
+gradient_accumulation_steps: 1
+
+# Reward-tuning lever #2: LoRA tolerates a higher LR than full-FT (frozen base +
+# fp32 adapters). 1e-6 was too small to move reward on the sparse GO-term signal;
+# 3e-6 is the run-1 setting (try 5e-6 as a one-line A/B).
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 3e-6
+  weight_decay: 0.01
+  fused: false
+
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  num_warmup_steps: 50
+
+clip_grad_norm: 1.0
+
+# Reward-tuning lever #1: skip the optimizer step when advantages are globally
+# zero across all training ranks (group_std=0 → no GRPO signal). Removes ~17% of
+# wasted updates + most grad spikes seen in the 200-step baseline.
+skip_zero_advantage_step: true
+
+# ── Loss ──────────────────────────────────────────────────────────────────────
+# Reward-tuning lever #3: lower kl_coeff 0.01 -> 1e-3 so a single KL spike no
+# longer dominates the loss (a 1e3 KL at 0.01 -> 1e1 loss; at 1e-3 -> 1.0).
+loss:
+  _component_: torchtune.dev.rl.loss.GRPOSimpleLoss
+  kl_coeff: 1e-3
+  epsilon: 0.2
+
+# ── Reward ────────────────────────────────────────────────────────────────────
+reward_mode: bioreason
+
+# ── Distributed ───────────────────────────────────────────────────────────────
+enable_activation_checkpointing: true
+
+# ── XPU ───────────────────────────────────────────────────────────────────────
+device: xpu
+dtype: bf16
+compile: false
+force_math_sdpa: false
+
+# ── vLLM rollout (server mode, multi-URL DP=12) ───────────────────────────────
+# vllm_url is filled in at runtime by the launcher (depends on which node PBS gave us).
+vllm_mode: server
+vllm_weight_sync: true
+vllm_weight_sync_method: xccl
+vllm_weight_sync_interval: 1
+# Must hold prompt ctx (<=max_seq_len=4096) + max_generated_tokens (2048) -> 6144.
+vllm_max_model_len: 4096   # prompt ctx (<=~3072) + max_generated_tokens (1024); was
+                           # 6144 for the old 2048-gen. Launcher passes its own value.
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+log_every_n_steps: 1
+log_peak_memory_stats: true
+save_every_n_epochs: 1
+
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+
+# ── Profiler ──────────────────────────────────────────────────────────────────
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: false
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: true
+  cuda: false
+  profile_memory: false
+  with_stack: false
+  record_shapes: false
+  with_flops: false
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1

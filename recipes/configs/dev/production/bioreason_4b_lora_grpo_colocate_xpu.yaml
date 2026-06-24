@@ -1,0 +1,153 @@
+# BioReason-Pro 4B GRPO RL — SINGLE-NODE per-rank COLOCATE (in-process TP=1 vLLM), PEFT-LoRA
+#
+# Colocate variant of bioreason_4b_lora_grpo_2node_server_xpu.yaml. Each training
+# rank runs its OWN in-process TP=1 vLLM engine on the same tile — no dedicated
+# vLLM node, no cross-node generation round-trip. 1 node instead of 2.
+#
+# FIT STRATEGY = colocate_sleep: vLLM (~24 GiB: 4B weights + KV) SLEEPS during the
+# grpo backward (~60 GiB train peak) and wakes only for generation, so the two
+# peaks are temporally disjoint and the tile needs max(~40, ~60)≈60 GiB < 64 — this
+# is what lets max_generated_tokens=2048 fit colocate. Plain `colocate` (vLLM
+# resident during training) would need 60+24=84 GiB and does NOT fit.
+#
+# With PEFT-LoRA, vLLM runs a vanilla adapter-less Qwen3; the recipe merges
+# W_eff = base + (alpha/r)*B@A per-rank in `_sync_colocated_lora_weights` (called
+# in the wake path) and load_weights() into each rank's own engine.
+#
+# NEW RUNTIME DEP: peft==0.17.1 on the training PYTHONPATH ($BIOREASON_DEPS).
+# See memory/feedback_bioreason_peft_dep_provisioning.md.
+#
+# Launch (after a 1-node hold is R):
+#   bash experiments/bioreason/run_bioreason_colocate_1node.sh
+
+name: grpo_bioreason_4b_colocate_lora
+output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/outputs/bioreason_colocate_lora_v1
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+model_type: bioreason
+base_model_path: /tmp/torchtune/bioreason-pro-sft
+
+# ── PEFT-LoRA (published BioReason-Pro RL config) ──────────────────────────────
+enable_lora: true
+lora_rank: 16
+lora_alpha: 32
+lora_dropout: 0.05
+
+# ── ESM3 pre-encode cache (frees ~10 GiB/tile — critical for colocate fit) ─────
+esm3_cache_path: /lus/flare/projects/ModCon/ngetty/datasets/bioreason_rl/esm3_cache.pt
+
+# ── Tokenizer ─────────────────────────────────────────────────────────────────
+tokenizer:
+  _component_: torchtune.dev.bioreason.bioreason_tokenizer
+  ckpt_dir: ${base_model_path}
+
+# ── Dataset ───────────────────────────────────────────────────────────────────
+dataset:
+  _component_: torchtune.dev.bioreason.bioreason_rl_dataset
+  data_files: /lus/flare/projects/ModCon/ngetty/datasets/bioreason_rl
+  max_seq_len: ${max_seq_len}
+  max_protein_len: 128
+  num_go_tokens: 50
+
+collate_fn: torchtune.dev.bioreason.dataset.bioreason_collate_fn
+
+seed: 42
+shuffle: True
+resume_from_checkpoint: False
+
+# ── RL Hyperparameters ────────────────────────────────────────────────────────
+grpo_samples: 8
+max_seq_len: 1024
+# max_gen=512 for the plain-colocate isolation run: vLLM stays resident (~24 GiB)
+# alongside the train model, so the full max_gen=2048 envelope (~84 GiB) doesn't
+# fit. 512 keeps the tile <64 and isolates "is the per-rank LoRA merge correct"
+# from the colocate_sleep wake/restore path. Raise after colocate_sleep is fixed.
+max_generated_tokens: 512
+temperature: 0.8
+top_k: null
+
+# ── Training ──────────────────────────────────────────────────────────────────
+epochs: 1
+num_steps: 1200
+ppo_epochs: 1
+batch_size: 1
+# forward_batch_size REDUCED 8 -> 2 to trim the grpo activation peak (secondary
+# memory knob; colocate_sleep is the primary fit lever). Raise toward 4 after the
+# mem-probe smoke confirms headroom. ref_forward_batch_size matches.
+forward_batch_size: 2
+ref_forward_batch_size: 2
+gradient_accumulation_steps: 1
+
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 3e-6
+  weight_decay: 0.01
+  fused: false
+
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  num_warmup_steps: 50
+
+clip_grad_norm: 1.0
+skip_zero_advantage_step: true
+
+# ── Loss ──────────────────────────────────────────────────────────────────────
+loss:
+  _component_: torchtune.dev.rl.loss.GRPOSimpleLoss
+  kl_coeff: 1e-3
+  epsilon: 0.2
+
+# ── Reward ────────────────────────────────────────────────────────────────────
+reward_mode: bioreason
+
+# ── Distributed ───────────────────────────────────────────────────────────────
+enable_activation_checkpointing: true
+
+# ── XPU ───────────────────────────────────────────────────────────────────────
+device: xpu
+dtype: bf16
+compile: false
+force_math_sdpa: false
+
+# ── vLLM rollout (per-rank in-process colocate) ────────────────────────────────
+# Plain `colocate` (vLLM resident, NO sleep) — the dense-validated path. The
+# colocate_sleep wake/weight-restore on XPU is unvalidated (first smoke crashed
+# with zero-storage weights from a skipped wake); use plain colocate to isolate
+# the per-rank LoRA merge first, then revisit sleep for the max_gen=2048 envelope.
+vllm_mode: colocate
+vllm_enable_prompt_embeds: true       # REQUIRED for BioReason multimodal prompt_embeds
+vllm_tensor_parallel_size: 1
+vllm_enforce_eager: true
+vllm_gpu_memory_utilization: 0.55     # co-tenancy headroom; probe-tune
+vllm_max_model_len: 1536              # prompt ctx (<=1024) + max_gen (512)
+vllm_max_num_seqs: 16                 # >= batch_size * grpo_samples
+vllm_kv_cache_multiplier: 1.1
+# vllm_num_gpu_blocks_override left UNSET → auto = batch*G*ceil(3072/16)*1.1
+# (pins the KV pool against staircase growth → banned:1)
+vllm_weight_sync: true
+vllm_weight_sync_interval: 1
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+log_every_n_steps: 1
+log_peak_memory_stats: true
+save_every_n_epochs: 1
+
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+
+# ── Profiler ──────────────────────────────────────────────────────────────────
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: false
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: true
+  cuda: false
+  profile_memory: false
+  with_stack: false
+  record_shapes: false
+  with_flops: false
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1
