@@ -47,11 +47,11 @@ def _make_inputs(seed: int = 0):
     return hidden, targets, ref_logprobs, advantages, padding_masks
 
 
-def _reference(proj, hidden, targets, ref_logprobs, advantages, padding_masks):
-    """Full-logit reference: proj(hidden) -> logprobs -> GRPOSimpleLoss."""
+def _reference(proj, hidden, targets, ref_logprobs, advantages, padding_masks, temperature=1.0):
+    """Full-logit reference: proj(hidden) -> logprobs(/T) -> GRPOSimpleLoss."""
     logits = proj(hidden)  # [B, S, vocab] FP32 — the tensor we want to AVOID at scale
-    # batched_logits_to_logprobs == log_softmax + gather (temperature 1.0)
-    pi_logprobs = rlhf.batched_logits_to_logprobs(logits, targets, 1.0)
+    # batched_logits_to_logprobs == log_softmax(logits / T) + gather
+    pi_logprobs = rlhf.batched_logits_to_logprobs(logits, targets, temperature)
     loss_fn = GRPOSimpleLoss(kl_coeff=KL_COEFF)
     loss, policy_loss, kl_loss, _, _ = loss_fn(
         pi_logprobs.detach(),   # pi_old (unused by GRPOSimpleLoss)
@@ -90,6 +90,34 @@ class TestLinearGRPOLossEquivalence(unittest.TestCase):
                 torch.testing.assert_close(lin_pol, ref_pol, atol=1e-5, rtol=1e-4)
                 torch.testing.assert_close(lin_kl, ref_kl, atol=1e-5, rtol=1e-4)
                 torch.testing.assert_close(lin_pi, ref_pi, atol=1e-5, rtol=1e-4)
+
+    def test_temperature_equivalence(self):
+        """With matched temperature, LinearGRPOLoss matches the /T reference (T in {0.7, 0.8, 1.3})."""
+        for temp in (0.7, 0.8, 1.3):
+            with self.subTest(temperature=temp):
+                proj = self._proj()
+                hidden, targets, ref_lp, adv, pmask = _make_inputs()
+
+                ref_loss, ref_pol, ref_kl, ref_pi = _reference(
+                    proj, hidden, targets, ref_lp, adv, pmask, temperature=temp
+                )
+
+                loss_fn = LinearGRPOLoss(
+                    num_output_chunks=4, kl_coeff=KL_COEFF, temperature=temp
+                )
+                loss_fn.linear_projection = proj
+                lin_loss, _, lin_kl, _, _, lin_pi = loss_fn(
+                    hidden, targets, ref_lp, adv, padding_masks=pmask
+                )
+
+                torch.testing.assert_close(lin_pi, ref_pi, atol=1e-5, rtol=1e-4)
+                torch.testing.assert_close(lin_loss, ref_loss, atol=1e-5, rtol=1e-4)
+                torch.testing.assert_close(lin_kl, ref_kl, atol=1e-5, rtol=1e-4)
+
+    def test_temperature_default_is_one(self):
+        """Default temperature is 1.0 (no scaling) so existing behavior is unchanged."""
+        loss_fn = LinearGRPOLoss(num_output_chunks=4, kl_coeff=KL_COEFF)
+        self.assertEqual(loss_fn.temperature, 1.0)
 
     def test_gradient_equivalence(self):
         """Backward through hidden: hidden.grad matches the reference (grad path preserved)."""

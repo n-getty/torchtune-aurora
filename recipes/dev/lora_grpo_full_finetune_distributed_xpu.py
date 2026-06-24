@@ -905,15 +905,18 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
                     "weight -> wrong numerics). Set TORCHTUNE_LINEAR_LOSS_ALLOW_FSDP=1 to "
                     "override (only safe under SHARD_GRAD_OP, untested)."
                 )
-            # LinearGRPOLoss computes logprobs via CE with NO temperature scaling.
-            # The recipe's standard path divides logits by self._temperature; at
-            # temperature==1.0 these match. Guard against silent corruption at !=1.0.
-            if self._temperature != 1.0:
-                raise RuntimeError(
-                    f"LinearGRPOLoss path requires temperature==1.0 (got "
-                    f"{self._temperature}); its CE has no temperature term. "
-                    "Use the full-logit GRPOLoss path for non-unit temperature."
-                )
+            # LinearGRPOLoss computes logprobs via CE. Thread the recipe temperature
+            # into it so its CE divides logits by T exactly like the standard
+            # rlhf.logits_to_logprobs path (log_softmax(logits / T)). Without this the
+            # policy logprobs would come from the wrong (T=1) distribution on any
+            # sampling-temperature run. Inject onto the instance (the config loss block
+            # does not carry temperature; it lives at the recipe top level).
+            self._loss_fn.temperature = self._temperature
+            utils.log_rank_zero(
+                log,
+                f"LoRA-GRPO: LinearGRPOLoss temperature set to {self._temperature} "
+                "(matched to recipe temperature for correct policy logprobs).",
+            )
             # LinearGRPOLoss uses the GRPOSimpleLoss formulation (ratios==1, NO
             # importance-sampling clip). At ppo_epochs==1 and on-policy rollouts
             # (always_compute_rollout_logprobs==False) the policy is the behavior

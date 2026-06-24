@@ -27,6 +27,7 @@ class LinearGRPOLoss(nn.Module, RLLoss):
         kl_coeff: float = 0.1,
         ignore_index: int = -100,
         mask_pre_projection: bool = True,
+        temperature: float = 1.0,
     ):
         super().__init__()
         """
@@ -35,6 +36,12 @@ class LinearGRPOLoss(nn.Module, RLLoss):
             ignore_index (int): Index to ignore in the target tensor. Default is -100.
             mask_pre_projection (bool): Whether to mask the output tensor before projection, avoiding
                 computing it for tokens that will be ignored during CE anyway. Default is True.
+            temperature (float): Softmax temperature applied to logits before computing logprobs,
+                matching the rollout/recipe temperature (rlhf.logits_to_logprobs divides logits by
+                it). The logprob of token t is ``log_softmax(logits / temperature)[t]``, equal to
+                ``-cross_entropy(logits / temperature, t)``. Default 1.0 (no scaling). MUST match
+                the recipe's ``temperature`` or the policy logprobs are computed under the wrong
+                distribution.
         """
         self.linear_projection = None
         self.num_output_chunks = num_output_chunks
@@ -42,6 +49,7 @@ class LinearGRPOLoss(nn.Module, RLLoss):
         self.kl_coeff = kl_coeff
         self.ignore_index = ignore_index
         self.mask_pre_projection = mask_pre_projection
+        self.temperature = temperature
 
     def apply_compile_strategy(self, *args, **kwargs):
         """Applies compile only to the compute_grpo_loss function.
@@ -70,11 +78,16 @@ class LinearGRPOLoss(nn.Module, RLLoss):
         if isinstance(ref_logprobs_chunk, DTensor):
             ref_logprobs_chunk = ref_logprobs_chunk.full_tensor()
 
-        # CE
+        # CE -> token logprob = log_softmax(logits / T)[t] = -cross_entropy(logits / T, t).
+        # Temperature must match the recipe/rollout temperature so policy logprobs come
+        # from the same distribution the standard rlhf.logits_to_logprobs path uses.
         pi_logits_flat = pi_logits_chunk.reshape(-1, pi_logits_chunk.size(-1))
         targets_flat = targets_chunk.reshape(-1)
+        pi_logits_flat = pi_logits_flat.float()
+        if self.temperature != 1.0:
+            pi_logits_flat = pi_logits_flat / self.temperature
         pi_logprobs_chunk = -F.cross_entropy(
-            pi_logits_flat.float(), targets_flat, reduction="none"
+            pi_logits_flat, targets_flat, reduction="none"
         )
         pi_logprobs_chunk = pi_logprobs_chunk.view_as(targets_chunk)
 
