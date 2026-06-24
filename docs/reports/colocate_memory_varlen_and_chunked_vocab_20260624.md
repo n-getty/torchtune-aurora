@@ -9,13 +9,30 @@ Qwen3-4B LoRA, `max_generated_tokens=1024`, 64 GiB tile (the BioReason/paper goa
 | Lever | Status | Effect |
 |-------|--------|--------|
 | `_varlen_out_cache` unbounded retention | **FIXED** (`attention_utils.py`) | killed a ~0.44 GiB/step LIVE-memory leak in the ref forward |
-| Chunked-vocab `LinearGRPOLoss` (training fwd) | **HW-validated** (LoRA colocate) | training backward peak 57.75 → 41 GiB (−16.7) at mg1024; also absorbs per-rank seqlen variance |
+| Chunked-vocab `LinearGRPOLoss` (training fwd) | **memory win real; mg1024 NOT validated** | training backward peak 57.75 → 41 GiB (−16.7); but the mg1024 colocate run does NOT survive — see CORRECTION below |
 | Explicit-mask attention S² | **already handled** | `TORCHTUNE_MASKFREE_CAUSAL=1` engages the fused bf16 FlashAttentionXPU kernel at bs=1 |
 | Base / BioReason ports | **fail-fast guarded** | not portable as-is (FSDP FULL_SHARD / HF backbone); guarded against silent mis-wiring |
 
-Net for LoRA colocate: the colocate `banned:1` wall is no longer a memory-capacity problem.
-mg1024 now fits with ~24 GiB headroom; the residual is a separate vLLM/trainer L0
-co-tenancy fault (W17/W19 mitigation, orthogonal).
+> ## CORRECTION (2026-06-24, post-diagnosis) — mg1024 colocate does NOT work
+> An earlier version of this report claimed LinearGRPOLoss was "HW-validated at mg1024" and
+> that "mg1024 now fits with ~24 GiB headroom; the residual is a separate L0 co-tenancy fault."
+> **Both claims were wrong.** The mg1024 LoRA colocate run crashes (~step 7-8) with a
+> `CCS NotPresent / PDE banned:1` GPU page fault. Follow-up diagnosis (sweep job 8559141 +
+> A/B job 8559162) established the fault is **NON-DETERMINISTIC** (same `max_gen=512` config
+> crashed once and survived 9 steps back-to-back) — NOT memory, NOT the co-tenancy fault
+> (that's the two-process Ray TP=8 path), NOT our loss code. It is a probabilistic
+> vLLM-on-XPU KV-paging fault whose probability rises with generation volume. See
+> `docs/bugs/xpu_colocate_generation_pde_nondeterministic.md`.
+>
+> **Honest status:** the two memory fixes below are real and on main (opt-in, default path
+> unchanged). The `max_gen=256` colocate envelope is the low-risk practical ceiling.
+> `max_gen ≥ 384` colocate is flaky and `max_gen=1024` is **blocked** by the driver-level
+> fault — independent of these fixes. LinearGRPOLoss is a validated *memory optimization*, not
+> a validated mg1024 production path.
+
+Net for LoRA colocate: the two memory fixes remove real memory walls, but mg1024 colocate
+remains blocked by the non-deterministic generation page fault (a vLLM/XPU driver issue, not
+a memory-capacity problem).
 
 ## 1. The `_varlen_out_cache` leak (root cause of the "0.44 GiB/step creep")
 
@@ -85,16 +102,17 @@ loss component (`loss._component_=torchtune.dev.rl.linear_grpo_loss.LinearGRPOLo
 faster, within noise); total step 29.1 vs 29.7s. Chunking the projection into 8 GEMMs adds no
 measurable overhead (same FLOPs, smaller working set, avoids the giant FP32 alloc/free).
 
-**HW validation (job 8558962, mg1024, LoRA colocate):**
-- training backward peak **57.75 → 41.05 GiB** (−16.7); **24 GiB free** at the crash (vs ~2 GiB
-  for GRPOLoss) — no longer capacity-bound.
-- **per-rank seqlen variance absorbed:** a rank generated 4957 tokens (vs the 2472 that OOM'd
-  GRPOLoss) and peak stayed ~38 GiB, because the chunked projection no longer scales the logit
-  tensor with the longest sequence.
-- residual: faulted step ~8 **during generation** (`level 0 PTE banned:1`, 24 GiB free) — a
-  colocate vLLM/trainer **L0 co-tenancy** fault (see `docs/bugs/xpu_l0_event_pool_co_tenancy.md`),
-  NOT an OOM and NOT in the changed training backward. Long mg1024 colocate needs the separate
-  W17/W19 kill-after-gen+respawn mitigation.
+**HW run (job 8558962, mg1024, LoRA colocate) — memory measurement valid, run did NOT survive:**
+- training backward peak **57.75 → 41.05 GiB** (−16.7) — the memory win is real and measured.
+- the run nonetheless **crashed ~step 7-8 during generation** (`banned:1` page fault, 24 GiB
+  free — NOT OOM, NOT the changed backward). This was initially mislabeled an "L0 co-tenancy"
+  fault; that was WRONG (co-tenancy is the two-process Ray TP=8 path). Follow-up diagnosis
+  (jobs 8559141, 8559162) established it is the **non-deterministic vLLM-XPU generation page
+  fault** documented in `docs/bugs/xpu_colocate_generation_pde_nondeterministic.md` — same
+  fault hits the GRPOLoss baseline and predates these changes. The "per-rank seqlen variance
+  absorbed" observation was also an artifact of fitting a stochastic fault; disregard it.
+- **Conclusion: LinearGRPOLoss reduces colocate training memory as designed, but does NOT make
+  mg1024 colocate survive — that path is blocked by the driver-level fault, not memory.**
 
 Tests: `test_linear_grpo_loss_equivalence.py` (forward+gradient bit-equivalence vs
 GRPOSimpleLoss for chunks {1,2,4,8} incl uneven split; temperature {0.7,0.8,1.3};
