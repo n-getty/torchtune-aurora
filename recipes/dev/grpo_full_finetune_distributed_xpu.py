@@ -163,12 +163,31 @@ def _async_lookahead_iter(recipe, dataloader):
     Step 2 of the Phase 2 plan: this used to be an inline thread; now
     delegates to :class:`torchtune.dev.rl.async_rollout.RolloutProducer` so
     server-mode and (future) dedicated-rank async share one abstraction.
+
+    Subclass hook: a recipe whose generation needs an XPU/collective step
+    BEFORE the overlappable HTTP call (e.g. BioReason's prompt_embeds build
+    under ``summon_full_params``) cannot run its full produce path in the
+    rank-0 producer thread. Such a recipe defines
+    ``_async_lookahead_iter_impl(dataloader)`` (a generator) and this
+    function delegates to it. The collective parts run on the main thread on
+    every rank inside that generator's body (all ranks resume ``next()``
+    together), while only the pure HTTP round-trip is handed to the producer.
+    The default token-only path below stays byte-identical for recipes that
+    do not define the hook.
     """
     is_async = (
         recipe._async_generation_enabled
         and recipe._vllm_mode == "server"
         and recipe._is_rank_zero
     )
+    # Subclass-provided async pipeline (e.g. BioReason embeds lookahead). The
+    # hook decides for itself whether to engage (it sees the same gates) and
+    # must fall back to a transparent passthrough when not async. Engaged on
+    # ALL ranks (not just rank 0) because the embeds build is a collective.
+    _impl = getattr(recipe, "_async_lookahead_iter_impl", None)
+    if _impl is not None and recipe._async_generation_enabled and recipe._vllm_mode == "server":
+        yield from _impl(dataloader)
+        return
     if not is_async:
         yield from dataloader
         return
@@ -264,12 +283,31 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             )
             self._log_peak_memory_stats = False
 
+        # Dataloader async-prefetch knobs (see _setup_data). Ported from the AGPT-2B
+        # SFT recipe (full_finetune_distributed_xpu.py) where async collate + H2D
+        # overlap cut a ~42% per-step data stall (validated 2026-06-19). DEFAULT OFF
+        # for GRPO (num_workers=0) so this is a byte-for-byte no-op on every existing
+        # run — GRPO is normally rollout/collective-bound, not data-bound. Opt in via
+        # config (dataloader_num_workers>0) only if a data stall is observed. pin_memory
+        # stays FALSE by default: {torch.compile + pinned forked-worker batches +
+        # non-reentrant activation checkpointing} crashes step-0 backward on XPU
+        # (CheckpointError) — see the AGPT-2B note. Set dataloader_pin_memory=true only
+        # on a non-compile / non-AC run.
+        self._dataloader_num_workers = cfg.get("dataloader_num_workers", 0)
+        self._dataloader_pin_memory = cfg.get("dataloader_pin_memory", False)
+        self._dataloader_prefetch_factor = cfg.get("dataloader_prefetch_factor", 2)
+
         # Initialize the distributed environment
         self.fsdp_cpu_offload = cfg.get("fsdp_cpu_offload", False)
         # ref_cpu_offload: keep ref model on CPU, policy on GPU (needed for inline gen).
         # Frees ~12 GiB XPU HBM by offloading ref model params to CPU; FSDP2 moves
         # them to GPU on demand during ref forward passes only.
         self._ref_cpu_offload = cfg.get("ref_cpu_offload", False)
+        # Opt-in (default off): skip optimizer.step() on steps whose advantages
+        # are globally zero across all training ranks. The decision is computed
+        # collectively (see generate_trajectory) and stored on _skip_optimizer_step.
+        self._skip_zero_advantage_step = cfg.get("skip_zero_advantage_step", False)
+        self._skip_optimizer_step = False
         self._disable_prefetch = cfg.get("disable_prefetch", False)
         self._fsdp_diagnostics = cfg.get("fsdp_diagnostics", False)
         self._empty_cache_before_backward = cfg.get("empty_cache_before_backward", False)
@@ -807,12 +845,13 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         _async_cfg = cfg.get("async_generation", {}) or {}
         self._async_generation_enabled = bool(_async_cfg.get("enabled", False))
         self._async_generation_max_staleness = int(_async_cfg.get("max_staleness", 1))
-        # HSDP guard: the async lookahead path (_async_lookahead_iter /
-        # _pending_async_query_responses) assumes a SINGLE generator (global rank 0)
-        # and a world broadcast. Under HSDP (dp_replicate>1) generation is per-replica
-        # via each shard-leader with a node-local broadcast, which the async producer
-        # thread does not yet implement. Force async OFF rather than silently mixing
-        # the two handshakes. Per-replica async is a planned follow-up.
+        # HSDP guard (BASE token-only path only): the DEFAULT _async_lookahead_iter
+        # producer below is rank-0-only with a world broadcast — it does NOT
+        # implement per-replica shard-leader generation. Force async OFF under HSDP
+        # for the base recipe. A SUBCLASS that provides an HSDP-aware
+        # _async_lookahead_iter_impl (e.g. BioReason: per-shard-leader producer +
+        # node-local _gloo_dp_shard_pg broadcast) overrides setup() and does NOT
+        # reach this guard, so it keeps async enabled under dp_replicate>1.
         if self._async_generation_enabled and self._dp_replicate > 1:
             log.warning(
                 "async_generation requested but disabled: not supported with HSDP "
@@ -1165,6 +1204,24 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
 
         # initialize loss
         self._loss_fn = config.instantiate(cfg.loss)
+        # The chunked-vocab LinearGRPOLoss (set_model_output / skip_output_layer)
+        # projects model.output OUTSIDE model.forward. That is correct ONLY when the
+        # output weight stays resident (the LoRA no-FSDP colocate recipe). This base
+        # recipe is full-FT with a TRAINED tied output projection AND always runs
+        # FSDP FULL_SHARD (reshard_after_forward=True) — so the weight is resharded
+        # after forward, giving WRONG numerics and broken gradient accumulation.
+        # Fail fast rather than silently corrupt training. A FULL_SHARD-safe port
+        # (summon_full_params around the projection) is deferred to Phase 3; until
+        # then use the LoRA colocate recipe for the chunked-vocab memory path.
+        if hasattr(self._loss_fn, "set_model_output"):
+            raise RuntimeError(
+                "LinearGRPOLoss (chunked-vocab) is not supported in the base full-FT "
+                "GRPO recipe: it projects model.output outside model.forward, which is "
+                "incorrect under FSDP FULL_SHARD with a trained output projection "
+                "(wrong numerics + broken grads). Use the LoRA colocate recipe "
+                "(lora_grpo_full_finetune_distributed_xpu.py, NO_FSDP) for this path, "
+                "or wait for the Phase-3 summon-based projection."
+            )
         # Detect chunked output loss (takes raw logits instead of logprobs)
         self._use_chunked_loss = hasattr(self._loss_fn, "num_output_chunks")
         if self._use_chunked_loss:
@@ -2485,7 +2542,14 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             shuffle=shuffle,
             seed=self.seed,
         )
-        dataloader = StatefulDataLoader(
+        # Async data loading (default OFF — num_workers=0): with workers>0 the collate
+        # + H2D overlap with compute instead of stalling the step. Ported from the
+        # AGPT-2B SFT recipe; opt in via cfg.dataloader_num_workers only if a data
+        # stall is observed (GRPO is normally rollout/collective-bound). pin_memory
+        # default FALSE (compile+AC+pinned-fork crash on XPU — see __init__ note).
+        # Keep TMPDIR=/tmp on Aurora for the worker AF_UNIX socket path.
+        num_workers = getattr(self, "_dataloader_num_workers", 0)
+        dl_kwargs = dict(
             dataset=ds,
             batch_size=batch_size,
             sampler=sampler,
@@ -2497,7 +2561,15 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             ),
             # dropping last avoids shape issues with compile + flex attention
             drop_last=True,
+            num_workers=num_workers,
+            pin_memory=getattr(self, "_dataloader_pin_memory", False),
         )
+        if num_workers > 0:
+            dl_kwargs["persistent_workers"] = True
+            dl_kwargs["prefetch_factor"] = getattr(
+                self, "_dataloader_prefetch_factor", 2
+            )
+        dataloader = StatefulDataLoader(**dl_kwargs)
         if dataloader_state_dict is not None:
             dataloader.load_state_dict(dataloader_state_dict)
             list(dataloader)
@@ -4982,9 +5054,30 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                         torch.xpu.synchronize()
 
                     _opt_t0 = time.perf_counter()
-                    log.info("Rank %d: optimizer.step()", self.rank)
-                    self._optimizer.step()
-                    self._optimizer.zero_grad(set_to_none=True)
+                    # Zero-signal skip lever (default off; opt-in via
+                    # skip_zero_advantage_step). When a step's advantages are
+                    # globally zero across ALL training ranks (every rollout in
+                    # every rank's batch got identical reward → group_std=0), the
+                    # policy gradient is structurally zero and the optimizer would
+                    # only move on KL/degenerate noise (the source of ~17% wasted
+                    # updates + most grad spikes in the BioReason 200-step
+                    # baseline). The flag is set collectively in generate_trajectory
+                    # (all-reduced), so every rank takes this branch together — no
+                    # FSDP collective desync. grad buffers are still cleared.
+                    _skip_zero_adv = (
+                        getattr(self, "_skip_zero_advantage_step", False)
+                        and getattr(self, "_skip_optimizer_step", False)
+                    )
+                    if _skip_zero_adv:
+                        log.info(
+                            "Rank %d: optimizer.step() SKIPPED (zero global advantage)",
+                            self.rank,
+                        )
+                        self._optimizer.zero_grad(set_to_none=True)
+                    else:
+                        log.info("Rank %d: optimizer.step()", self.rank)
+                        self._optimizer.step()
+                        self._optimizer.zero_grad(set_to_none=True)
                     # v9: defensive sweep — release any FSDP2 unsharded grad residue
                     # the per-chunk hook missed. On a clean step this is a no-op
                     # (logs a WARN if it finds residue, indicating a chunk-loop leak).
