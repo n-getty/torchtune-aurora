@@ -914,6 +914,34 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
                     f"{self._temperature}); its CE has no temperature term. "
                     "Use the full-logit GRPOLoss path for non-unit temperature."
                 )
+            # LinearGRPOLoss uses the GRPOSimpleLoss formulation (ratios==1, NO
+            # importance-sampling clip). At ppo_epochs==1 and on-policy rollouts
+            # (always_compute_rollout_logprobs==False) the policy is the behavior
+            # policy, so pi_old==pi.detach() and even GRPOLoss's clip is inert ->
+            # bit-equivalent (CPU test). But with ppo_epochs>1 or off-policy/async
+            # rollouts, pi diverges from pi_old and the IS clip MATTERS for stable
+            # learning; LinearGRPOLoss would silently drop it. Fail fast so the
+            # capability difference is never silent.
+            _ppo_epochs_cfg = cfg.get("ppo_epochs", 1)
+            _async_lp = cfg.get("always_compute_rollout_logprobs", False)
+            if _ppo_epochs_cfg > 1 or _async_lp:
+                raise RuntimeError(
+                    "LinearGRPOLoss uses the simple (no IS-clip) GRPO formulation; it is "
+                    f"only equivalent to GRPOLoss when ppo_epochs==1 AND "
+                    f"always_compute_rollout_logprobs==False (got ppo_epochs={_ppo_epochs_cfg}, "
+                    f"always_compute_rollout_logprobs={_async_lp}). In off-policy/multi-epoch "
+                    "regimes the IS clip affects learning stability — use the full-logit "
+                    "GRPOLoss path there."
+                )
+            # The per-call skip_output_layer toggle flips the model forward's return
+            # type (logits<->hidden); under torch.compile that changes a guard every
+            # step and forces recompiles (or guard failures). Not supported in Phase 1.
+            if getattr(self, "_compile", False):
+                raise RuntimeError(
+                    "LinearGRPOLoss is incompatible with compile=True: the per-call "
+                    "skip_output_layer toggle changes the forward return type and breaks "
+                    "torch.compile guards. Disable compile or use the GRPOLoss path."
+                )
             self._loss_fn.set_model_output(self._model)
             self._model.skip_output_layer = False  # re-enabled per-call in grpo_step
             utils.log_rank_zero(
