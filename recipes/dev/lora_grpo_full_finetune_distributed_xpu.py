@@ -3179,10 +3179,22 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
                             import gc as _gc_census
                             torch.xpu.synchronize(self._device)
                             _by_key: dict = {}
+                            _seen_storage: set = set()  # dedupe by storage data_ptr (REAL bytes)
                             for _o in _gc_census.get_objects():
                                 if isinstance(_o, torch.Tensor) and _o.is_xpu:
-                                    _k = (tuple(_o.shape), str(_o.dtype))
-                                    _b = _o.numel() * _o.element_size()
+                                    # Count grad-tracking tensors separately — a growing
+                                    # grad_fn group is the retained-autograd-graph signature.
+                                    _grad = "+grad" if (_o.requires_grad or _o.grad_fn is not None) else ""
+                                    _k = (tuple(_o.shape), str(_o.dtype) + _grad)
+                                    # REAL bytes: count each underlying storage ONCE (views
+                                    # of one buffer must not inflate the total).
+                                    try:
+                                        _ptr = _o.untyped_storage().data_ptr()
+                                        _nbytes = _o.untyped_storage().nbytes()
+                                    except Exception:
+                                        _ptr, _nbytes = id(_o), _o.numel() * _o.element_size()
+                                    _b = 0 if _ptr in _seen_storage else _nbytes
+                                    _seen_storage.add(_ptr)
                                     _agg = _by_key.get(_k)
                                     if _agg is None:
                                         _by_key[_k] = [1, _b]
@@ -3191,7 +3203,7 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
                                         _agg[1] += _b
                             _top = sorted(
                                 _by_key.items(), key=lambda kv: kv[1][1], reverse=True
-                            )[:12]
+                            )[:14]
                             _tot = sum(v[1] for v in _by_key.values()) / 1024**3
                             # Reconcile gc-visible total vs the allocator's live total.
                             # If they track step-over-step, the leak is a Python-referenced
