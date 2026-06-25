@@ -44,6 +44,13 @@ class LinearGRPOLoss(nn.Module, RLLoss):
                 distribution.
         """
         self.linear_projection = None
+        # FSDP2 tied-embedding support. For a TiedLinear output (qwen2_5 / qwen3 with
+        # tie_word_embeddings) the projection weight lives in model.tok_embeddings,
+        # owned by the ROOT FSDP2 unit. set_model_output captures that root here so
+        # forward() can unshard() it before the per-chunk projection (a no-op under
+        # default AllGather prefetch where the root stays resident; the fix when the
+        # root reshards, e.g. disable_prefetch=True). None for untied / no-FSDP.
+        self._fsdp_root = None
         self.num_output_chunks = num_output_chunks
         self.epsilon = epsilon
         self.kl_coeff = kl_coeff
@@ -58,10 +65,51 @@ class LinearGRPOLoss(nn.Module, RLLoss):
         return self
 
     def set_model_output(self, model: nn.Module) -> None:
-        """Modify model output to match the expected input for the loss function."""
+        """Modify model output to match the expected input for the loss function.
+
+        Two residency mechanisms, selected by whether the output projection is tied.
+        HW-validated 2026-06-24 on 2-rank FSDP2 (Aurora XPU): the chunked-vocab
+        projection + tied-grad are bit-exact to a single-process full-weight
+        reference (``probe_tied_grad.py``: max_abs_diff=0.0).
+
+        - TIED (``model.output`` is a ``TiedLinear``, not an ``nn.Module``): the
+          projection weight physically lives in ``model.tok_embeddings``. Under
+          torchtune's FSDP2 sharding, ``tok_embeddings`` is NOT its own unit — it
+          stays in the **root** FSDP2 unit, which (with default AllGather prefetch,
+          ``reshard_after_forward=None``) keeps its own params RESIDENT through the
+          forward. So ``F.linear(hidden, tok_embeddings.weight)`` post-forward sees
+          the FULL weight, and FSDP2's autograd accumulates the grad from BOTH the
+          input-embedding use and this unembed use into the one tied param. We
+          capture the root unit (``_fsdp_root``) and ``unshard()`` it once in
+          ``forward`` — a no-op under default prefetch, and the correct fix if the
+          root ever reshards (e.g. ``disable_prefetch=True``). We do NOT make
+          ``tok_embeddings`` a separate ``custom_sharded_layers`` unit: that would
+          reshard it mid-forward and break the in-forward tied unembed used by
+          generation/ref forwards.
+
+        - UNTIED (``model.output`` is a real ``nn.Linear``): capture it directly.
+          Under FSDP it is its own ``fully_shard`` unit (via
+          ``custom_sharded_layers=['output']``); because ``skip_output_layer=True``
+          makes ``unembed`` skip it in forward, calling it post-forward fires FSDP2's
+          pre-forward all-gather hook -> projects -> reshards. No root unshard needed.
+        """
         # The loss may handle the output projection. If true, the model should skip it.
         model.skip_output_layer = True
-        self.linear_projection = model.output
+        from torch.distributed.fsdp import FSDPModule
+        from torchtune.modules.tied_linear import TiedLinear
+
+        if isinstance(model.output, TiedLinear):
+            tied_module = model.tok_embeddings
+            # Closure reads tied_module.weight at call time (full weight post-forward).
+            self.linear_projection = lambda x: F.linear(x, tied_module.weight)
+            # Root FSDP2 unit owns tok_embeddings.weight; unshard() it in forward so
+            # the projection sees the full weight even if the root resharded.
+            self._fsdp_root = model if isinstance(model, FSDPModule) else None
+        else:
+            self.linear_projection = model.output
+            # Untied: model.output is its own FSDP2 unit; calling it fires the
+            # all-gather hook. No root unshard needed.
+            self._fsdp_root = None
 
     def chunked_grpo_loss(
         self,
@@ -135,6 +183,19 @@ class LinearGRPOLoss(nn.Module, RLLoss):
         Returns:
             tuple[torch.Tensor, ...]: loss, policy_loss, kl_loss, ratios, clipfrac, pi_logprobs
         """
+        # TIED-EMBEDDING FSDP2 residency: ensure the root unit (which owns the tied
+        # tok_embeddings.weight) is unsharded before the chunk loop, so the closure
+        # linear_projection reads the FULL weight per chunk. Under default AllGather
+        # prefetch the root stays resident through forward, so this is a no-op
+        # (HW-validated bit-exact); it is the correctness fix only if the root
+        # resharded (disable_prefetch=True). We do NOT reshard() before backward —
+        # FSDP2 auto-reshards in the post-backward hook, and the weight must stay
+        # unsharded across all chunks' graphs until the single backward(). hasattr-
+        # guarded so CPU / no-FSDP / untied (the equivalence tests set
+        # linear_projection directly, bypassing set_model_output) is unaffected.
+        if self._fsdp_root is not None and hasattr(self._fsdp_root, "unshard"):
+            self._fsdp_root.unshard()
+
         # Chunk along sequence dimension
         hidden_chunks = pi_old_outputs.tensor_split(self.num_output_chunks, dim=1)
         target_chunks = pi_outputs.tensor_split(self.num_output_chunks, dim=1)

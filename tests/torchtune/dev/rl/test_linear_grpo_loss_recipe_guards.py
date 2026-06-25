@@ -8,18 +8,24 @@ Source-level guard tests for the chunked-vocab LinearGRPOLoss across the GRPO re
 family.
 
 LinearGRPOLoss projects ``model.output`` OUTSIDE ``model.forward`` (per sequence
-chunk). That is only correct when the output weight stays resident and the model
-exposes torchtune's ``skip_output_layer`` hidden-state path. Two recipes cannot
-satisfy that today and MUST fail fast rather than silently corrupt training:
+chunk). That is only correct when the output weight is materialized at projection
+time and the model exposes torchtune's ``skip_output_layer`` hidden-state path.
 
-- base full-FT (``grpo_full_finetune_distributed_xpu.py``): FSDP FULL_SHARD reshards
-  the trained tied output weight after forward -> wrong numerics + broken grads.
-- BioReason (``grpo_bioreason_distributed_xpu.py``): HF ``AutoModelForCausalLM``
-  backbone has no ``skip_output_layer`` hidden path, and runs FSDP FULL_SHARD.
+- base full-FT (``grpo_full_finetune_distributed_xpu.py``): SUPPORTED (Phase 1).
+  The tied output weight (== tok_embeddings.weight) stays resident in the ROOT FSDP2
+  unit through the forward (default AllGather prefetch), so the loss reads the full
+  weight post-forward (closure over tok_embeddings.weight; root unshard() as a
+  defensive no-op). The recipe WIRES the loss (set_model_output) inside a scope
+  fence: FSDP2 FULL_SHARD, non-EP, non-HSDP, non-packing, no compile, ppo_epochs==1,
+  and a residency fence that FORBIDS 'tok_embeddings' in custom_sharded_layers for
+  tied models (making it its own unit reshards it mid-forward and breaks generation).
+- BioReason (``grpo_bioreason_distributed_xpu.py``): still UNSUPPORTED — HF
+  ``AutoModelForCausalLM`` backbone has no ``skip_output_layer`` hidden path. It MUST
+  keep its fail-fast.
 
-Only the LoRA colocate recipe (no-FSDP, frozen tied output) supports it. These tests
-pin the fail-fast guards so a future edit cannot drop them and re-enable a
-silently-wrong path. Pure source inspection — no XPU/distributed/model load.
+These tests pin the base recipe's wiring + scope fences (so a future edit cannot drop
+a fence and re-enable a silently-wrong path) and the BioReason fail-fast. Pure source
+inspection — no XPU/distributed/model load.
 """
 import unittest
 from pathlib import Path
@@ -33,10 +39,33 @@ def _src(name: str) -> str:
 
 
 class TestLinearGRPOLossRecipeGuards(unittest.TestCase):
-    def test_base_recipe_failfast_present(self):
+    def test_base_recipe_wires_linear_loss_with_fences(self):
+        """The base recipe must WIRE LinearGRPOLoss (Phase 1) and keep every scope fence.
+
+        The old fail-fast ('not supported in the base full-FT') is gone; in its place
+        the recipe detects the loss and wires it under fail-fast fences. If any fence
+        text is dropped a silently-wrong path could be re-enabled, so pin them all.
+        """
         src = _src("grpo_full_finetune_distributed_xpu.py")
-        self.assertIn('hasattr(self._loss_fn, "set_model_output")', src)
-        self.assertIn("not supported in the base full-FT", src)
+        # Detection + wiring (not a fail-fast anymore).
+        self.assertIn('"set_model_output"', src)
+        self.assertIn("set_model_output(self._model)", src)
+        self.assertNotIn("not supported in the base full-FT", src)
+        # Scope fences (Phase 1).
+        self.assertIn("not supported with expert", src)          # EP
+        self.assertIn("not supported with HSDP", src)            # HSDP / dp_replicate
+        self.assertIn("requires FSDP2", src)                     # FSDP1
+        self.assertIn("not supported with enable_packing", src)  # packing
+        self.assertIn("incompatible with compile=True", src)     # compile
+        self.assertIn("simple (no IS-clip) GRPO formulation", src)  # ppo_epochs / async
+        # Tied-embedding residency fence: tok_embeddings must be FORBIDDEN from
+        # custom_sharded_layers for tied models (root-resident weight), and 'output'
+        # required for untied models.
+        self.assertIn("tok_embeddings", src)
+        self.assertIn("custom_sharded_layers", src)
+        self.assertIn("NOT be in custom_sharded_layers", src)
+        # Temperature threaded into the loss.
+        self.assertIn("self._loss_fn.temperature = cfg.temperature", src)
 
     def test_bioreason_recipe_failfast_present(self):
         src = _src("grpo_bioreason_distributed_xpu.py")
