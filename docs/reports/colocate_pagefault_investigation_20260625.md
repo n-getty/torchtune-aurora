@@ -146,6 +146,42 @@ single process (R-LW proves the XCCL co-residence factor is required).
    colocate at mg≥384 is therefore **driver-blocked**; the supported performant path is
    server/dedicated mode (recommended: `+ delta` publish).
 
+## NEW separate issue — server-mode 4B-LoRA-2N step-6 trainer fault is a MEMORY LEAK, not L0 co-residence
+
+A multi-step soak of **Qwen3-4B LoRA 2-node *server* mode** faults trainer-side at **step ~6**
+with `banned:1` (jobs 8559836/8559857/8559882; both `delta` and `merged`). It was initially
+filed alongside the colocate fault; **diagnosis 2026-06-25 from
+`experiments/lora_grpo/run_lora_grpo_2node_20260625_051455.log` shows it is a DIFFERENT bug —
+a trainer-side per-step memory creep → OOM at the tile ceiling.**
+
+Evidence it is **not** the 2-factor L0 co-residence fault:
+- **vLLM is on a separate node** — trainer `x4412c6s2b0n0`, vLLM `x4412c6s4b0n0`. No co-resident
+  L0 engine client on the trainer tiles, so the 2-factor mechanism cannot apply.
+- The publish **succeeds** (`publish join 13.18s`) and vLLM generation **succeeds** (64 seqs in
+  9.0s); the fault fires afterward in **`ref_fwd`** on trainer ranks 0 & 2.
+- Fault is `access: 1 (Write)`; the colocate fault is `access: 0 (Read)`.
+
+Evidence it is a **live memory leak** (not allocator caching, not the bounded varlen cache):
+
+| step | active GiB | reserved GiB |
+|------|-----------|--------------|
+| 1    | 39.17     | 45.59        |
+| 2    | 44.10     | 55.75        |
+| 4    | 49.07     | 56.74        |
+| 5    | 50.59     | 59.47        |
+| 6    | 52.86     | **60.34** → fault in ref_fwd |
+
+- ~2.7 GiB/step; `active` and `reserved` rise together → genuine reference retention, not caching.
+- Larger than the known `_varlen_out_cache` variable-seqlen leak (capped at
+  `TORCHTUNE_VARLEN_CACHE_MAX=8` ≈ bounded; `varlen=engaged` confirmed in this run), so it is a
+  **separate** retention.
+- Suspects (under bisection): per-step merged-publish staging buffers, master-fp32 copies, or
+  ungated gather buffers in the server publish path.
+
+**Action:** hold-node bisect with a per-step component memory probe + A/B
+(`TORCHTUNE_USE_CHUNKED_LOSS`, varlen off, publish-path probes). Until the leak is fixed,
+4B-LoRA-2N server is **not** production-ready; the known-good server envelope is AGPT-2B full-FT.
+
 ## Artifacts
 
 - `scratch/repro_colocate_pagefault.py` (single-tile ladder), `..._multitile.py` (12-rank).

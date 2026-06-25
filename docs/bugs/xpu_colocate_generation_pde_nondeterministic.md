@@ -72,14 +72,24 @@ caveat below.
 1. **Server / dedicated vLLM mode** — `vllm_mode=server`/`dedicated` moves vLLM to its own
    process/tiles, eliminating factor (1)'s shared L0 context, so the **colocate** fault does not
    occur. The AGPT-2B GSM8K server production envelope (full-FT, 2B) runs clean for hours.
-   **CAVEAT (2026-06-25):** server mode is NOT a blanket clean path. A first-ever multi-step soak
-   of **Qwen3-4B LoRA 2-node server** faults **trainer-side** (node-0 grpo_step) at **step ~5-6**
-   with the same `banned:1` — reproduced 4× across nodes, **both `delta` and `merged`** publish
-   (jobs 8559836/8559857/8559882). That is a **separate** fault (vLLM is on another node; the
-   publish succeeds), still under diagnosis — see [the investigation report](../reports/colocate_pagefault_investigation_20260625.md)
-   §"NEW separate issue". So: server mode dodges the *colocate* bug, but the 4B-LoRA-2N server
-   config has its own step-6 trainer-side stability fault — **do not assume server+LoRA at 4B/2N is
-   production-ready until that soak clears.** The 2B full-FT server envelope is the known-good one.
+   **CAVEAT (2026-06-25):** server mode is NOT a blanket clean path at 4B-LoRA-2N — but the
+   blocker there is a **different bug** from the colocate L0 co-residence fault. A multi-step soak
+   of **Qwen3-4B LoRA 2-node server** faults **trainer-side** at **step ~6** with `banned:1`
+   (jobs 8559836/8559857/8559882, both `delta` and `merged`). **Diagnosed 2026-06-25 from the log
+   (`run_lora_grpo_2node_20260625_051455.log`): this is a trainer-side MEMORY CREEP → OOM, NOT L0
+   co-residence.** vLLM runs on a *separate node* (trainer `x4412c6s2b0n0` vs vLLM
+   `x4412c6s4b0n0`), so the 2-factor mechanism cannot apply; the publish + generation both succeed,
+   then the fault fires in **`ref_fwd`** with `access: 1 (Write)` (colocate fault is
+   `access: 0 (Read)`). Trainer `active` grows monotonically ~2.7 GiB/step
+   (39.2→44.1→49.1→50.6→52.9 GiB, `reserved` 45.6→60.3) and step-6's ref_fwd allocation crosses
+   the 64 GiB tile ceiling. `active` and `reserved` track together → a genuine reference leak, not
+   allocator caching; larger than the bounded `_varlen_out_cache` leak (capped at
+   `TORCHTUNE_VARLEN_CACHE_MAX=8`, varlen *did* engage here). Suspects: per-step merged-publish
+   staging, master-fp32 copies, or ungated gather buffers in the server publish path — under
+   bisection. See [the investigation report](../reports/colocate_pagefault_investigation_20260625.md)
+   §"NEW separate issue". So: server mode dodges the *colocate* bug; the 4B-LoRA-2N server config
+   has a **separate per-step memory leak** — **do not assume server+LoRA at 4B/2N is
+   production-ready until that leak is fixed.** The 2B full-FT server envelope is the known-good one.
 2. **Quiesce-wsync** (`TORCHTUNE_COLOCATE_QUIESCE_WSYNC=1`) — barrier+sync around the publish.
    **REFUTED** (job 8559693: 6/6 crash, barrier confirmed engaged). A barrier only syncs rank
    *arrival*; it does not remove the resident co-tenant L0 context. Any *serialization*-based fix
