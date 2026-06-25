@@ -4513,17 +4513,24 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                 "torch.compile guards. Disable compile or use the GRPOLoss path."
             )
         # IS-clip semantics: LinearGRPOLoss uses the simple (no IS-clip) formulation,
-        # only equivalent to GRPOLoss at ppo_epochs==1 AND on-policy rollouts.
+        # only equivalent to GRPOLoss at ppo_epochs==1 AND on-policy rollouts. Fence on
+        # the derived _compute_rollout_logprobs_required (== _always_compute_rollout_logprobs
+        # OR _async_generation_enabled), not the raw flag: the linear grpo_step branches
+        # drop the rollout-logprob assertion the full-logit path keeps, so async (which
+        # implies off-policy behavior-policy logprobs) must be blocked here too. This is
+        # strictly stronger and does not rely on the async⇒always_compute invariant.
         _ppo_epochs_cfg = cfg.get("ppo_epochs", 1)
-        if _ppo_epochs_cfg > 1 or self._always_compute_rollout_logprobs:
+        if _ppo_epochs_cfg > 1 or self._compute_rollout_logprobs_required:
             raise RuntimeError(
                 "LinearGRPOLoss uses the simple (no IS-clip) GRPO formulation; it is "
-                "only equivalent to GRPOLoss when ppo_epochs==1 AND "
-                "always_compute_rollout_logprobs==False (got "
-                f"ppo_epochs={_ppo_epochs_cfg}, always_compute_rollout_logprobs="
-                f"{self._always_compute_rollout_logprobs}). In off-policy/multi-epoch "
-                "regimes the IS clip affects learning stability — use the full-logit "
-                "GRPOLoss path there."
+                "only equivalent to GRPOLoss when ppo_epochs==1 AND on-policy "
+                "(always_compute_rollout_logprobs==False AND async_generation disabled). "
+                f"Got ppo_epochs={_ppo_epochs_cfg}, "
+                f"compute_rollout_logprobs_required={self._compute_rollout_logprobs_required} "
+                f"(always_compute_rollout_logprobs={self._always_compute_rollout_logprobs}, "
+                f"async_generation_enabled={self._async_generation_enabled}). In "
+                "off-policy/multi-epoch regimes the IS clip affects learning stability — "
+                "use the full-logit GRPOLoss path there."
             )
 
         # --- Residency requirements -----------------------------------------
@@ -4539,6 +4546,14 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         #   - UNTIED: model.output is a real nn.Linear -> must be its own unit so the
         #     post-forward call fires the all-gather hook -> 'output' required.
         _csl = cfg.get("custom_sharded_layers", None) or []
+        if not hasattr(self._model, "output"):
+            raise RuntimeError(
+                "LinearGRPOLoss requires the model to expose a `.output` projection "
+                "(tied TiedLinear or untied nn.Linear) so the loss can route the "
+                f"per-chunk vocab projection. Model {type(self._model).__name__} has no "
+                "`.output` — this model family is outside the Phase 1 scope "
+                "(qwen2_5 / qwen3). Use the full-logit GRPOLoss path."
+            )
         _is_tied = isinstance(self._model.output, TiedLinear)
         if _is_tied:
             if "tok_embeddings" in _csl:
@@ -4561,6 +4576,10 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
         # --- Wire ------------------------------------------------------------
         # Thread the recipe temperature so the loss CE divides logits by T exactly
         # like the standard rlhf.logits_to_logprobs path (log_softmax(logits / T)).
+        # The recipe-level `temperature` is authoritative and OVERRIDES any
+        # `loss.temperature` set in the loss config block (the rollout/ref paths use
+        # the recipe temperature, so the training CE must match it, not a divergent
+        # per-loss value).
         self._loss_fn.temperature = cfg.temperature
         # set_model_output sets model.skip_output_layer=True and captures the
         # projection (closure over tok_embeddings.weight for tied; model.output for

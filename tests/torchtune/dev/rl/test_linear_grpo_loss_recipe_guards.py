@@ -58,6 +58,13 @@ class TestLinearGRPOLossRecipeGuards(unittest.TestCase):
         self.assertIn("not supported with enable_packing", src)  # packing
         self.assertIn("incompatible with compile=True", src)     # compile
         self.assertIn("simple (no IS-clip) GRPO formulation", src)  # ppo_epochs / async
+        # The IS-clip fence must gate on the DERIVED _compute_rollout_logprobs_required
+        # (covers async_generation too), not just the raw _always_compute flag — the
+        # linear grpo_step branch drops the rollout-logprob assertion the full path keeps.
+        self.assertIn("self._compute_rollout_logprobs_required", src)
+        # `.output` must be hasattr-guarded before the TiedLinear isinstance check so an
+        # out-of-scope model fails with a clear message, not a raw AttributeError.
+        self.assertIn('hasattr(self._model, "output")', src)
         # Tied-embedding residency fence: tok_embeddings must be FORBIDDEN from
         # custom_sharded_layers for tied models (root-resident weight), and 'output'
         # required for untied models.
