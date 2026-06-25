@@ -147,7 +147,7 @@ class TestVarlenBufferCache(unittest.TestCase):
         cap = au_cache_max = None
         # derive the active cap the same way the module does
         import os as _os
-        cap = max(1, int(_os.environ.get("TORCHTUNE_VARLEN_CACHE_MAX", "8")))
+        cap = max(1, int(_os.environ.get("TORCHTUNE_VARLEN_CACHE_MAX", "1")))
         n_shapes = cap + 20
         with mock.patch.object(au, '_ipex_varlen_attention', _noop_varlen):
             with torch.no_grad():
@@ -167,6 +167,32 @@ class TestVarlenBufferCache(unittest.TestCase):
             set(caches["_varlen_alibi_cache"].keys()),
             "out/alibi caches drifted — eviction is not joint",
         )
+
+    def test_default_cap_is_one(self):
+        """The fix: with TORCHTUNE_VARLEN_CACHE_MAX UNSET the default cap is 1.
+
+        This is THE behavior the PR turns on (8->1 fixed the server step-6 leak:
+        cap=8 held ~20 GiB of seqlen-keyed generations -> banned:1 at step ~6).
+        Pin it so the default cannot silently regress back to 8. The closure reads
+        the cap from env at creation time, so build it with the var removed and
+        feed many distinct shapes; exactly one entry must survive.
+        """
+        import os as _os
+        with mock.patch.dict(_os.environ, {}, clear=False):
+            _os.environ.pop("TORCHTUNE_VARLEN_CACHE_MAX", None)
+            varlen_call = self._get_varlen_call()
+            caches = self._get_caches(varlen_call)
+            with mock.patch.object(au, '_ipex_varlen_attention', _noop_varlen):
+                with torch.no_grad():
+                    for i in range(10):  # 10 distinct seqlens >> default cap
+                        q, k, v = self._make_qkv(2, 4, 8 + i, 16)
+                        varlen_call(q, k, v)
+        for name, c in caches.items():
+            self.assertLessEqual(
+                len(c), 1,
+                f"{name} held {len(c)} entries with the env var unset — default cap "
+                f"is no longer 1 (regressed toward the cap=8 step-6 leak).",
+            )
 
     def test_nograd_repeated_same_shape_stays_single_entry(self):
         """Same shape many times → exactly ONE cached entry (within-step reuse intact)."""

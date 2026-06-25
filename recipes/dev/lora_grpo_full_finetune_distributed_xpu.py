@@ -1532,6 +1532,12 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
             # later paged-attention kernel references). TORCHTUNE_COLOCATE_SKIP_RESET_PREFIX=1
             # lets the page-fault A/B (experiments/colocate/run_colocate_ab.sh, cell=noreset)
             # isolate it. Default unchanged: the call still fires.
+            # ORDERING NOTE (SLEEP_WSYNC path): under TORCHTUNE_COLOCATE_SLEEP_WSYNC=1 the
+            # engine is KV-slept (level=10) here and woken in the `finally` below, so this
+            # reset runs while KV is discarded. That is intentional/harmless — reset only
+            # clears the block table (no KV pages to free under sleep), and the wake re-
+            # allocates KV fresh afterward. If a future A/B shows reset-under-sleep matters,
+            # move this call after wake_up() rather than reordering the sleep/wake.
             if os.environ.get("TORCHTUNE_COLOCATE_SKIP_RESET_PREFIX", "0") != "1":
                 self._vllm_llm.llm_engine.reset_prefix_cache()
             gc.collect()
