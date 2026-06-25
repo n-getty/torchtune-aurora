@@ -49,6 +49,7 @@ UNDOCUMENTED_OK_PREFIXES = ("TORCHTUNE_SKIP_",)
 UNDOCUMENTED_OK_EXACT = {
     "TORCHTUNE_ASYM_MEMPROBE",
     "TORCHTUNE_COLOCATE_MEM_PROBE",  # diagnostic: per-step free-HBM leak probe in colocate LoRA sync
+    "TORCHTUNE_LEAK_CENSUS",  # diagnostic: per-step live-XPU-tensor census (names the server step-6 leak)
     "TORCHTUNE_EP_DEBUG",  # documented, but guard anyway
 }
 

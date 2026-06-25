@@ -3164,6 +3164,47 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
                     _r_pre_gen = _resv() if _phase_probe else 0.0
                     _a_pre_gen = _act() if _phase_probe else 0.0
 
+                    # Leak census (TORCHTUNE_LEAK_CENSUS=1, default off): at each
+                    # step boundary, aggregate ALL live XPU tensors by (shape,dtype)
+                    # and log the top groups by total bytes. Diffing consecutive
+                    # steps names the object behind the ~2.5 GiB/step server-mode
+                    # ref_fwd floor creep (docs/bugs/xpu_colocate_generation_pde_*).
+                    # gc.get_objects() is slow (~0.1-0.5s) so it is opt-in and rank-0.
+                    if (
+                        os.environ.get("TORCHTUNE_LEAK_CENSUS", "0") == "1"
+                        and self._is_rank_zero
+                        and self._device.type == "xpu"
+                    ):
+                        try:
+                            import gc as _gc_census
+                            torch.xpu.synchronize(self._device)
+                            _by_key: dict = {}
+                            for _o in _gc_census.get_objects():
+                                if isinstance(_o, torch.Tensor) and _o.is_xpu:
+                                    _k = (tuple(_o.shape), str(_o.dtype))
+                                    _b = _o.numel() * _o.element_size()
+                                    _agg = _by_key.get(_k)
+                                    if _agg is None:
+                                        _by_key[_k] = [1, _b]
+                                    else:
+                                        _agg[0] += 1
+                                        _agg[1] += _b
+                            _top = sorted(
+                                _by_key.items(), key=lambda kv: kv[1][1], reverse=True
+                            )[:12]
+                            _tot = sum(v[1] for v in _by_key.values()) / 1024**3
+                            log.info(
+                                "LEAK_CENSUS step=%d live_xpu_tensors total=%.2f GiB groups=%d",
+                                self._steps_run, _tot, len(_by_key),
+                            )
+                            for _k, (_n, _bytes) in _top:
+                                log.info(
+                                    "LEAK_CENSUS step=%d   %6.3f GiB x%d  shape=%s %s",
+                                    self._steps_run, _bytes / 1024**3, _n, _k[0], _k[1],
+                                )
+                        except Exception as _ce:
+                            log.warning("LEAK_CENSUS failed: %r", _ce)
+
                     # Generate trajectory (server mode, may use base or LoRA adapter)
                     _gen_t0 = time.perf_counter()
                     with torch.no_grad():
