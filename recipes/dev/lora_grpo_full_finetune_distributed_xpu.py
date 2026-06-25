@@ -3193,9 +3193,16 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
                                 _by_key.items(), key=lambda kv: kv[1][1], reverse=True
                             )[:12]
                             _tot = sum(v[1] for v in _by_key.values()) / 1024**3
+                            # Reconcile gc-visible total vs the allocator's live total.
+                            # If they track step-over-step, the leak is a Python-referenced
+                            # tensor (a top group below will grow). If gc_total stays flat
+                            # while alloc climbs, the retention is C++/autograd-side and
+                            # INVISIBLE to gc.get_objects() — pivot to a different tool.
+                            _alloc = torch.xpu.memory_allocated(self._device) / 1024**3
                             log.info(
-                                "LEAK_CENSUS step=%d live_xpu_tensors total=%.2f GiB groups=%d",
-                                self._steps_run, _tot, len(_by_key),
+                                "LEAK_CENSUS step=%d live_xpu_tensors gc_total=%.2f GiB "
+                                "alloc=%.2f GiB gc_unseen=%.2f GiB groups=%d",
+                                self._steps_run, _tot, _alloc, _alloc - _tot, len(_by_key),
                             )
                             for _k, (_n, _bytes) in _top:
                                 log.info(
