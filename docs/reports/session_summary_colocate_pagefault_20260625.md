@@ -75,16 +75,25 @@ XCCL PG), so in-process colocate at mg≥384 is driver-blocked.
   `QUIESCE_WSYNC` (refuted), `SLEEP_WSYNC` (refuted) — all default-off, byte-identical off-path;
   CLAUDE.md table rows + `tests/torchtune/dev/rl/test_colocate_skip_reset_prefix.py` (green).
 
-## Open issue uncovered by the soak (must resolve before recommending server+delta)
+## NEW separate issue uncovered by the soak (server-mode 4B-LoRA-2N step-6 trainer fault)
 
-The 4B-LoRA 2-node server run faults **trainer-side** (node 0, `[default0]`) at **step ~6**,
-entering `grpo_step` after generation — `CCS NotPresent PDE banned:1 access=Write`. Reproduced on
-**two different nodes** (8559836, 8559857) → not node variance. This is a **distinct** fault from
-the colocate 2-factor bug (vLLM is on a separate node here; the publish succeeds each step). It is
-a trainer-side FSDP/XCCL `banned:1` — possibly a known class (e.g. CCL IPC-handle accumulation, the
-`CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD` issue) surfacing at this envelope. Diagnosis in flight:
-- `merged` soak (8559877) — is the fault delta-specific or general to 4B-LoRA-2N?
-- If general: check CCL env (the 2-node launcher vs the AGPT-2B known-good env), lower G/mg.
+The 4B-LoRA **2-node server** run faults **trainer-side** (node 0 ranks) at **step ~5-6**, entering
+`grpo_step` after generation — `CCS NotPresent PDE banned:1 access=Write`. **Reproduced 4×** across
+multiple nodes, **both `delta` AND `merged`** publish (8559836, 8559857, 8559882). Pattern: steps
+0-4 clean, step 5 `grpo_step` spikes (45-181s), step 6 faults. Findings:
+- **Not delta-specific** (merged faults too), **not vLLM co-residence** (vLLM is on node 1),
+  **not node variance** (3+ nodes), **not the publish call** (it succeeds each step).
+- **Not the CCL IPC-handle threshold**: the known-good AGPT-2B 2N GSM8K *server* run uses the same
+  `CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD=65536` and runs clean for hours. Ruled out.
+- The discriminator vs known-good is **model size (4B vs 2B) / LoRA + adapter-publish / FSDP-at-2N**.
+  Suspect: the LoRA adapter-publish path or 4B FSDP at 2N. **Not chased further overnight** — it is
+  a second, separate investigation beyond the colocate scope; flagged here for a daytime follow-up.
+- **Possible connection:** the step-6 `grpo_step`-slowdown→`banned:1` precursor *resembles* the
+  colocate precursor. It is worth checking whether the colocate "factor 2" (resident trainer
+  XCCL/L0) and this 2N-server trainer fault share a root cause — i.e. whether the trainer-side
+  FSDP/XCCL path itself has an L0-accumulation fault that colocate co-residence merely accelerates.
+  (The standalone isolation — XCCL+FSDP without load_weights ran clean at step 0 single-node —
+  argues they may differ, but this was not tested at 2-node/step-6.)
 
 ## Recommendation (interim — pending the diagnosis above)
 
