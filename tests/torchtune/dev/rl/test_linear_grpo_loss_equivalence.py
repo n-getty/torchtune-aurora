@@ -137,6 +137,42 @@ class TestLinearGRPOLossEquivalence(unittest.TestCase):
         self.assertIsNotNone(h_lin.grad)
         torch.testing.assert_close(h_lin.grad, h_ref.grad, atol=1e-5, rtol=1e-4)
 
+    def test_bf16_path_noise_is_bounded(self):
+        """fp32: the chunked-vocab path is bit-exact to the full-logit reference.
+        bf16: the two paths differ only by arithmetic-ordering noise (full log_softmax
+        over vocab vs per-seq-chunk cross_entropy), NOT a bug.
+
+        Pins the 2026-06-24 HW finding: the base-recipe A/B (GRPOSimpleLoss vs
+        LinearGRPOLoss) showed ~1.6% step-1 grad_norm delta in bf16. This reproduces
+        the mechanism on identical inputs (no FSDP / rollout) and bounds it: fp32 grad
+        is bit-exact; bf16 grad_norm relative delta is small (a few %), and grows with
+        vocab size / seq len (real model >> these toy dims). If fp32 ever stops being
+        bit-exact, that IS a bug — this test catches it.
+        """
+        for dtype, rtol in ((torch.float32, 1e-4), (torch.bfloat16, 5e-2)):
+            with self.subTest(dtype=dtype):
+                torch.manual_seed(1)
+                proj = nn.Linear(EMB, VOCAB, bias=False).to(dtype)
+                hidden, targets, ref_lp, adv, pmask = _make_inputs()
+
+                h_ref = hidden.clone().to(dtype).requires_grad_(True)
+                ref_loss, *_ = _reference(proj, h_ref, targets, ref_lp, adv, pmask)
+                ref_loss.backward()
+
+                h_lin = hidden.clone().to(dtype).requires_grad_(True)
+                loss_fn = LinearGRPOLoss(num_output_chunks=4, kl_coeff=KL_COEFF)
+                loss_fn.linear_projection = proj
+                lin_loss, *_ = loss_fn(h_lin, targets, ref_lp, adv, padding_masks=pmask)
+                lin_loss.backward()
+
+                gr = h_ref.grad.float().norm().item()
+                gl = h_lin.grad.float().norm().item()
+                rel = abs(gr - gl) / (gr + 1e-12)
+                if dtype == torch.float32:
+                    self.assertLess(rel, 1e-5, f"fp32 must be ~bit-exact, got rel={rel:.2e}")
+                else:
+                    self.assertLess(rel, rtol, f"bf16 grad noise too large: rel={rel:.2e}")
+
     def test_never_materializes_full_seq_vocab(self):
         """The per-chunk projection input seq-dim must be <= ceil(S/k), never full S."""
         k = 4
@@ -179,6 +215,79 @@ class TestLinearGRPOLossEquivalence(unittest.TestCase):
         )
         self.assertTrue(torch.isfinite(lin_loss).all(), "loss not finite under inf KL diff")
         self.assertTrue(torch.isfinite(lin_kl).all(), "kl not finite under inf KL diff")
+
+
+class TestSetModelOutputTiedAware(unittest.TestCase):
+    """set_model_output must build a closure over tok_embeddings.weight for TiedLinear
+    models and capture model.output directly for untied models.
+
+    Pins the FSDP2 tied-embedding residency mechanism for the base recipe. HW-validated
+    2026-06-24 (probe_tied_grad.py, bit-exact): a tied model's output weight lives in
+    tok_embeddings, owned by the ROOT FSDP2 unit, which stays resident through the
+    forward — so the loss reads the full weight via a closure, with NO separate
+    tok_embeddings FSDP unit. _fsdp_root is captured only when the model is an
+    FSDPModule (so unshard() can run defensively); on a plain CPU module it is None.
+    No FSDP / XPU needed here.
+    """
+
+    class _FakeModel(nn.Module):
+        """Minimal stand-in exposing tok_embeddings + output + skip_output_layer.
+        NOT an FSDPModule, so _fsdp_root stays None (the CPU/no-FSDP case)."""
+
+        def __init__(self, output):
+            super().__init__()
+            self.tok_embeddings = nn.Embedding(VOCAB, EMB)
+            self.output = output
+            self.skip_output_layer = False
+
+    def test_tied_builds_weight_closure(self):
+        from torchtune.modules.tied_linear import TiedLinear
+
+        model = self._FakeModel(output=None)
+        model.output = TiedLinear(model.tok_embeddings)
+
+        loss_fn = LinearGRPOLoss(num_output_chunks=4, kl_coeff=KL_COEFF)
+        loss_fn.set_model_output(model)
+
+        # skip_output_layer toggled on; plain module -> no FSDP root captured.
+        self.assertTrue(model.skip_output_layer)
+        self.assertIsNone(loss_fn._fsdp_root)
+
+        # The closure projects exactly == F.linear(h, tok_embeddings.weight),
+        # reading the CURRENT weight (so a post-unshard full weight is honored).
+        h = torch.randn(B, S, EMB)
+        torch.testing.assert_close(
+            loss_fn.linear_projection(h),
+            F.linear(h, model.tok_embeddings.weight),
+        )
+
+    def test_untied_captures_model_output(self):
+        out = nn.Linear(EMB, VOCAB, bias=False)
+        model = self._FakeModel(output=out)
+
+        loss_fn = LinearGRPOLoss(num_output_chunks=4, kl_coeff=KL_COEFF)
+        loss_fn.set_model_output(model)
+
+        self.assertTrue(model.skip_output_layer)
+        self.assertIsNone(loss_fn._fsdp_root)
+        # Untied: linear_projection IS model.output (the real nn.Linear).
+        self.assertIs(loss_fn.linear_projection, out)
+
+    def test_forward_no_unshard_when_no_fsdp_root(self):
+        """forward() must not crash when _fsdp_root is None (CPU / no-FSDP) — the
+        unshard call is guarded on _fsdp_root being a real FSDPModule."""
+        from torchtune.modules.tied_linear import TiedLinear
+
+        model = self._FakeModel(output=None)
+        model.output = TiedLinear(model.tok_embeddings)
+        loss_fn = LinearGRPOLoss(num_output_chunks=4, kl_coeff=KL_COEFF)
+        loss_fn.set_model_output(model)
+        self.assertIsNone(loss_fn._fsdp_root)
+
+        hidden, targets, ref_lp, adv, pmask = _make_inputs()
+        # Should run end-to-end and produce a finite loss (no AttributeError).
+        out = loss_fn(hidden, targets, ref_lp, adv, padding_masks=pmask)
+        self.assertTrue(torch.isfinite(out[0]).all())
 
 
 if __name__ == "__main__":

@@ -112,6 +112,7 @@ from torchtune.dev.rl.rewards import batched_rewards, gene_recall_batched_reward
 from torchtune.dev.rl.types import GRPOStats, GRPOTrajectory
 from torchtune.modules import local_kv_cache
 from torchtune.modules.attention_utils import _compute_maskfree_causal
+from torchtune.modules.loss import RLLoss
 from torchtune.recipe_interfaces import FTRecipeInterface
 from torchtune.training import (
     device_record_memory_history,
@@ -1204,24 +1205,23 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
 
         # initialize loss
         self._loss_fn = config.instantiate(cfg.loss)
-        # The chunked-vocab LinearGRPOLoss (set_model_output / skip_output_layer)
-        # projects model.output OUTSIDE model.forward. That is correct ONLY when the
-        # output weight stays resident (the LoRA no-FSDP colocate recipe). This base
-        # recipe is full-FT with a TRAINED tied output projection AND always runs
-        # FSDP FULL_SHARD (reshard_after_forward=True) — so the weight is resharded
-        # after forward, giving WRONG numerics and broken gradient accumulation.
-        # Fail fast rather than silently corrupt training. A FULL_SHARD-safe port
-        # (summon_full_params around the projection) is deferred to Phase 3; until
-        # then use the LoRA colocate recipe for the chunked-vocab memory path.
-        if hasattr(self._loss_fn, "set_model_output"):
-            raise RuntimeError(
-                "LinearGRPOLoss (chunked-vocab) is not supported in the base full-FT "
-                "GRPO recipe: it projects model.output outside model.forward, which is "
-                "incorrect under FSDP FULL_SHARD with a trained output projection "
-                "(wrong numerics + broken grads). Use the LoRA colocate recipe "
-                "(lora_grpo_full_finetune_distributed_xpu.py, NO_FSDP) for this path, "
-                "or wait for the Phase-3 summon-based projection."
-            )
+        # Memory-efficient chunked-vocab loss opt-in (Phase 1: FSDP2 FULL_SHARD,
+        # non-EP, non-HSDP, non-packing, tied-embedding models). LinearGRPOLoss takes
+        # the model's HIDDEN states and applies the vocab projection per sequence-chunk
+        # inside the loss, so the full [B, S, vocab] FP32 logit tensor (~2.7 GiB/seq at
+        # S~1900 for Qwen3-4B) is never materialized — the dominant training-forward
+        # memory cost in GRPO. It projects model.output OUTSIDE model.forward; under
+        # FSDP FULL_SHARD the tied output weight (== tok_embeddings.weight) is resharded
+        # after forward, so the loss must unshard() the embedding FSDP2 unit before the
+        # projection (handled in LinearGRPOLoss.forward via the _tied_unit captured by
+        # set_model_output below). Default loss (GRPOLoss/GRPOSimpleLoss) lacks
+        # set_model_output -> _linear_loss=False -> the existing full-logit path runs
+        # byte-for-byte unchanged.
+        self._linear_loss = isinstance(self._loss_fn, RLLoss) and hasattr(
+            self._loss_fn, "set_model_output"
+        )
+        if self._linear_loss:
+            self._wire_linear_grpo_loss(cfg)
         # Detect chunked output loss (takes raw logits instead of logprobs)
         self._use_chunked_loss = hasattr(self._loss_fn, "num_output_chunks")
         if self._use_chunked_loss:
@@ -3896,39 +3896,74 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
 
             log.info("Rank %d: single-backward forward start (total=%d seqs)", self.rank, total_seqs)
             _fwd_t0_sb = time.perf_counter()
-            pi_logits = self._model(
-                trajectory.query_responses,
-                input_pos=trajectory.position_ids,
-                mask=trajectory.masks,
-            )
-            pi_logits = rlhf.truncate_sequence_for_logprobs(pi_logits, context_length)
-            pi_logprobs = rlhf.batched_logits_to_logprobs(
-                pi_logits,
-                trajectory.query_responses[:, context_length:],
-                self._temperature,
-                chunk_size=1,
-            )
-            pi_logprobs.masked_fill_(trajectory.response_padding_masks, 1.0)
-            del pi_logits
-            if self._device.type == "xpu":
-                torch.xpu.synchronize()
-            _fwd_time_sb = time.perf_counter() - _fwd_t0_sb
-            log.info("Rank %d: single-backward forward=%.1fs", self.rank, _fwd_time_sb)
-
-            if self._compute_rollout_logprobs_required:
-                assert trajectory.logprobs is not None, (
-                    "async_generation / always_compute_rollout_logprobs is set but "
-                    "trajectory.logprobs is None — rollout-time policy fwd was not "
-                    "run; cannot fall back to .detach() without breaking IS ratios"
+            if self._linear_loss:
+                # Chunked-vocab path: model returns HIDDEN states (skip_output_layer
+                # toggled True ONLY around this training forward); LinearGRPOLoss
+                # applies the vocab projection per seq-chunk, so no full [B,S,vocab]
+                # FP32 logit tensor is ever materialized. It returns pi_logprobs as the
+                # 6th element. The tied output weight is unshard()'d inside the loss
+                # (must stay unsharded across all chunks until the single backward()).
+                responses_sb = trajectory.query_responses[:, context_length:]
+                try:
+                    self._model.skip_output_layer = True
+                    pi_hidden = self._model(
+                        trajectory.query_responses,
+                        input_pos=trajectory.position_ids,
+                        mask=trajectory.masks,
+                    )
+                finally:
+                    self._model.skip_output_layer = False
+                pi_hidden = rlhf.truncate_sequence_for_logprobs(pi_hidden, context_length)
+                if self._device.type == "xpu":
+                    torch.xpu.synchronize()
+                _fwd_time_sb = time.perf_counter() - _fwd_t0_sb
+                log.info("Rank %d: single-backward forward=%.1fs", self.rank, _fwd_time_sb)
+                loss, policy_loss, kl_loss, ratios, clipfrac, pi_logprobs = self._loss_fn(
+                    pi_hidden,                       # pi_old_outputs = HIDDEN
+                    responses_sb,                    # pi_outputs = target token ids
+                    trajectory.ref_logprobs,         # ref_outputs = ref logprobs
+                    trajectory.advantages,
+                    padding_masks=~trajectory.response_padding_masks,
                 )
-            old_logprobs = trajectory.logprobs if trajectory.logprobs is not None else pi_logprobs.detach()
-            loss, policy_loss, kl_loss, ratios, clipfrac = self._loss_fn(
-                old_logprobs,
-                pi_logprobs,
-                trajectory.ref_logprobs,
-                trajectory.advantages,
-                padding_masks=~trajectory.response_padding_masks,
-            )
+                pi_logprobs = pi_logprobs.detach()
+                old_logprobs = (
+                    trajectory.logprobs if trajectory.logprobs is not None else pi_logprobs
+                )
+                del pi_hidden
+            else:
+                pi_logits = self._model(
+                    trajectory.query_responses,
+                    input_pos=trajectory.position_ids,
+                    mask=trajectory.masks,
+                )
+                pi_logits = rlhf.truncate_sequence_for_logprobs(pi_logits, context_length)
+                pi_logprobs = rlhf.batched_logits_to_logprobs(
+                    pi_logits,
+                    trajectory.query_responses[:, context_length:],
+                    self._temperature,
+                    chunk_size=1,
+                )
+                pi_logprobs.masked_fill_(trajectory.response_padding_masks, 1.0)
+                del pi_logits
+                if self._device.type == "xpu":
+                    torch.xpu.synchronize()
+                _fwd_time_sb = time.perf_counter() - _fwd_t0_sb
+                log.info("Rank %d: single-backward forward=%.1fs", self.rank, _fwd_time_sb)
+
+                if self._compute_rollout_logprobs_required:
+                    assert trajectory.logprobs is not None, (
+                        "async_generation / always_compute_rollout_logprobs is set but "
+                        "trajectory.logprobs is None — rollout-time policy fwd was not "
+                        "run; cannot fall back to .detach() without breaking IS ratios"
+                    )
+                old_logprobs = trajectory.logprobs if trajectory.logprobs is not None else pi_logprobs.detach()
+                loss, policy_loss, kl_loss, ratios, clipfrac = self._loss_fn(
+                    old_logprobs,
+                    pi_logprobs,
+                    trajectory.ref_logprobs,
+                    trajectory.advantages,
+                    padding_masks=~trajectory.response_padding_masks,
+                )
 
             if os.environ.get("TORCHTUNE_SKIP_GRPO_BACKWARD", "0") == "1":
                 log.warning(
@@ -4046,47 +4081,84 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                         _cs, _ce, _pre_fwd_alloc, _pre_fwd_resv,
                     )
                 log.info("Rank %d: grpo_step chunk[%d:%d] fwd", self.rank, _cs, _ce)
-                _c_logits = self._model(
-                    trajectory.query_responses[_cs:_ce],
-                    input_pos=trajectory.position_ids[_cs:_ce],
-                    mask=None if trajectory.masks is None else trajectory.masks[_cs:_ce],
-                )
-                _c_logits = rlhf.truncate_sequence_for_logprobs(_c_logits, context_length)
-                _c_pi_lp = rlhf.batched_logits_to_logprobs(
-                    _c_logits,
-                    trajectory.query_responses[_cs:_ce, context_length:],
-                    self._temperature,
-                    chunk_size=1,
-                )
-                # Use masked_fill_ instead of boolean index assignment.
-                # Boolean indexing triggers L0 sub-allocation (gather/scatter)
-                # while FSDP storage is live, causing UR:40 handle exhaustion.
-                _c_pi_lp.masked_fill_(trajectory.response_padding_masks[_cs:_ce], 1.0)
-                del _c_logits
-                if self._device.type == "xpu":
-                    torch.xpu.synchronize()
-                if self._device.type == "xpu" and self._is_rank_zero:
-                    _post_fwd_alloc = torch.xpu.memory_allocated() / 1024**3
-                    _post_fwd_resv = torch.xpu.memory_reserved() / 1024**3
-                    log.info(
-                        "Rank 0: POST-train-fwd[%d:%d] alloc=%.2f GiB, resv=%.2f GiB",
-                        _cs, _ce, _post_fwd_alloc, _post_fwd_resv,
+                if self._linear_loss:
+                    # Chunked-vocab path: model returns HIDDEN states (skip_output_layer
+                    # toggled True ONLY around this training forward); LinearGRPOLoss
+                    # applies the vocab projection per seq-chunk, so no full [B,S,vocab]
+                    # FP32 logit tensor is held. The loss returns pi_logprobs as its 6th
+                    # element. The tied output weight is unshard()'d inside the loss and
+                    # stays unsharded until this chunk's backward() (FSDP2 auto-reshards
+                    # in the post-backward hook).
+                    try:
+                        self._model.skip_output_layer = True
+                        _c_hidden = self._model(
+                            trajectory.query_responses[_cs:_ce],
+                            input_pos=trajectory.position_ids[_cs:_ce],
+                            mask=None if trajectory.masks is None else trajectory.masks[_cs:_ce],
+                        )
+                    finally:
+                        self._model.skip_output_layer = False
+                    _c_hidden = rlhf.truncate_sequence_for_logprobs(_c_hidden, context_length)
+                    if self._device.type == "xpu":
+                        torch.xpu.synchronize()
+                    if self._device.type == "xpu" and self._is_rank_zero:
+                        _post_fwd_alloc = torch.xpu.memory_allocated() / 1024**3
+                        _post_fwd_resv = torch.xpu.memory_reserved() / 1024**3
+                        log.info(
+                            "Rank 0: POST-train-fwd[%d:%d] alloc=%.2f GiB, resv=%.2f GiB",
+                            _cs, _ce, _post_fwd_alloc, _post_fwd_resv,
+                        )
+                    _c_loss, _c_pol, _c_kl, _c_rat, _c_clip, _c_pi_lp = self._loss_fn(
+                        _c_hidden,                              # pi_old_outputs = HIDDEN
+                        trajectory.query_responses[_cs:_ce, context_length:],  # targets
+                        trajectory.ref_logprobs[_cs:_ce],       # ref_outputs = ref logprobs
+                        trajectory.advantages[_cs:_ce],
+                        padding_masks=~trajectory.response_padding_masks[_cs:_ce],
                     )
+                    _c_pi_lp = _c_pi_lp.detach()
+                    del _c_hidden
+                else:
+                    _c_logits = self._model(
+                        trajectory.query_responses[_cs:_ce],
+                        input_pos=trajectory.position_ids[_cs:_ce],
+                        mask=None if trajectory.masks is None else trajectory.masks[_cs:_ce],
+                    )
+                    _c_logits = rlhf.truncate_sequence_for_logprobs(_c_logits, context_length)
+                    _c_pi_lp = rlhf.batched_logits_to_logprobs(
+                        _c_logits,
+                        trajectory.query_responses[_cs:_ce, context_length:],
+                        self._temperature,
+                        chunk_size=1,
+                    )
+                    # Use masked_fill_ instead of boolean index assignment.
+                    # Boolean indexing triggers L0 sub-allocation (gather/scatter)
+                    # while FSDP storage is live, causing UR:40 handle exhaustion.
+                    _c_pi_lp.masked_fill_(trajectory.response_padding_masks[_cs:_ce], 1.0)
+                    del _c_logits
+                    if self._device.type == "xpu":
+                        torch.xpu.synchronize()
+                    if self._device.type == "xpu" and self._is_rank_zero:
+                        _post_fwd_alloc = torch.xpu.memory_allocated() / 1024**3
+                        _post_fwd_resv = torch.xpu.memory_reserved() / 1024**3
+                        log.info(
+                            "Rank 0: POST-train-fwd[%d:%d] alloc=%.2f GiB, resv=%.2f GiB",
+                            _cs, _ce, _post_fwd_alloc, _post_fwd_resv,
+                        )
 
-                if self._compute_rollout_logprobs_required:
-                    assert trajectory.logprobs is not None, (
-                        "async_generation / always_compute_rollout_logprobs is set but "
-                        "trajectory.logprobs is None — rollout-time policy fwd was not "
-                        "run; cannot fall back to .detach() without breaking IS ratios"
+                    if self._compute_rollout_logprobs_required:
+                        assert trajectory.logprobs is not None, (
+                            "async_generation / always_compute_rollout_logprobs is set but "
+                            "trajectory.logprobs is None — rollout-time policy fwd was not "
+                            "run; cannot fall back to .detach() without breaking IS ratios"
+                        )
+                    _c_old_lp = trajectory.logprobs[_cs:_ce] if trajectory.logprobs is not None else _c_pi_lp.detach()
+                    _c_loss, _c_pol, _c_kl, _c_rat, _c_clip = self._loss_fn(
+                        _c_old_lp,
+                        _c_pi_lp,
+                        trajectory.ref_logprobs[_cs:_ce],
+                        trajectory.advantages[_cs:_ce],
+                        padding_masks=~trajectory.response_padding_masks[_cs:_ce],
                     )
-                _c_old_lp = trajectory.logprobs[_cs:_ce] if trajectory.logprobs is not None else _c_pi_lp.detach()
-                _c_loss, _c_pol, _c_kl, _c_rat, _c_clip = self._loss_fn(
-                    _c_old_lp,
-                    _c_pi_lp,
-                    trajectory.ref_logprobs[_cs:_ce],
-                    trajectory.advantages[_cs:_ce],
-                    padding_masks=~trajectory.response_padding_masks[_cs:_ce],
-                )
 
                 if os.environ.get("TORCHTUNE_SKIP_GRPO_BACKWARD", "0") == "1":
                     log.warning(
@@ -4385,6 +4457,126 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
             None,  # metadata
         )
 
+
+    def _wire_linear_grpo_loss(self, cfg) -> None:
+        """Validate scope + wire the chunked-vocab LinearGRPOLoss into the model.
+
+        Phase 1 scope: FSDP2 FULL_SHARD, non-EP, non-HSDP, non-packing,
+        tied-embedding models (qwen2_5_3b / qwen3_4b). Everything outside that
+        fail-fasts here rather than silently corrupting training. Called from
+        setup() when ``self._linear_loss`` is True (the loss exposes
+        ``set_model_output``); the default GRPOLoss/GRPOSimpleLoss path never
+        reaches this method, so it is byte-for-byte unchanged.
+
+        Must run AFTER ``_setup_model`` (reads ``self._model`` / ``self._use_fsdp1``)
+        but it is invoked before the RL-param block, so config-derived values
+        (temperature, ppo_epochs, packing) are read from ``cfg`` directly.
+        """
+        from torchtune.modules.tied_linear import TiedLinear
+
+        # --- Scope fences (Phase 1) -----------------------------------------
+        # EP: expert-parallel grad release / chunked path assumes [B,S,vocab].
+        if self._expert_parallel_degree > 1:
+            raise RuntimeError(
+                "LinearGRPOLoss (chunked-vocab) is not supported with expert "
+                f"parallelism (expert_parallel_degree={self._expert_parallel_degree}). "
+                "Phase 1 covers non-EP FSDP2 only. Use GRPOLoss/GRPOSimpleLoss for EP."
+            )
+        # HSDP / FSDP1: the tied-embedding residency uses FSDPModule.unshard(),
+        # which only exists on FSDP2 units. _setup_model routes dp_replicate>1 &
+        # model<50GiB & non-EP to FSDP1 (no .unshard()).
+        if self._dp_replicate > 1:
+            raise RuntimeError(
+                "LinearGRPOLoss (chunked-vocab) is not supported with HSDP "
+                f"(data_parallel_replicate_dim={self._dp_replicate}). Phase 1 covers "
+                "pure FSDP2 FULL_SHARD (dp_replicate=1) only; the tied-embedding "
+                "residency relies on FSDP2 unshard(), absent on the FSDP1 HSDP path."
+            )
+        if getattr(self, "_use_fsdp1", False):
+            raise RuntimeError(
+                "LinearGRPOLoss (chunked-vocab) requires FSDP2 (FSDPModule.unshard()); "
+                "this run resolved to FSDP1. Phase 1 supports FSDP2 FULL_SHARD only."
+            )
+        # Packing: the PACKED grpo_step branch unpacks a [B,S,vocab] logit tensor.
+        if cfg.get("enable_packing", False):
+            raise RuntimeError(
+                "LinearGRPOLoss (chunked-vocab) is not supported with enable_packing "
+                "(the packed grpo_step path materializes [B,S,vocab] logits). Phase 1 "
+                "covers the non-packed path only."
+            )
+        # compile: the per-call skip_output_layer toggle flips the forward return
+        # type (logits<->hidden), changing a torch.compile guard every step.
+        if getattr(self, "_compile", False):
+            raise RuntimeError(
+                "LinearGRPOLoss is incompatible with compile=True: the per-call "
+                "skip_output_layer toggle changes the forward return type and breaks "
+                "torch.compile guards. Disable compile or use the GRPOLoss path."
+            )
+        # IS-clip semantics: LinearGRPOLoss uses the simple (no IS-clip) formulation,
+        # only equivalent to GRPOLoss at ppo_epochs==1 AND on-policy rollouts.
+        _ppo_epochs_cfg = cfg.get("ppo_epochs", 1)
+        if _ppo_epochs_cfg > 1 or self._always_compute_rollout_logprobs:
+            raise RuntimeError(
+                "LinearGRPOLoss uses the simple (no IS-clip) GRPO formulation; it is "
+                "only equivalent to GRPOLoss when ppo_epochs==1 AND "
+                "always_compute_rollout_logprobs==False (got "
+                f"ppo_epochs={_ppo_epochs_cfg}, always_compute_rollout_logprobs="
+                f"{self._always_compute_rollout_logprobs}). In off-policy/multi-epoch "
+                "regimes the IS clip affects learning stability — use the full-logit "
+                "GRPOLoss path there."
+            )
+
+        # --- Residency requirements -----------------------------------------
+        # The projection runs outside model.forward. For it to see the FULL output
+        # weight (HW-validated 2026-06-24, bit-exact tied-grad):
+        #   - TIED: the weight lives in tok_embeddings, owned by the ROOT FSDP2 unit,
+        #     which stays resident through forward under default AllGather prefetch.
+        #     tok_embeddings must NOT be its own custom_sharded_layers unit — that
+        #     would reshard it mid-forward and break the in-forward tied unembed used
+        #     by generation/ref forwards (observed: "mixed Tensor and DTensor" in
+        #     generate()). The loss unshards the root defensively (no-op under
+        #     prefetch). So forbid 'tok_embeddings' in custom_sharded_layers here.
+        #   - UNTIED: model.output is a real nn.Linear -> must be its own unit so the
+        #     post-forward call fires the all-gather hook -> 'output' required.
+        _csl = cfg.get("custom_sharded_layers", None) or []
+        _is_tied = isinstance(self._model.output, TiedLinear)
+        if _is_tied:
+            if "tok_embeddings" in _csl:
+                raise RuntimeError(
+                    "LinearGRPOLoss with a tied-embedding model requires "
+                    "'tok_embeddings' NOT be in custom_sharded_layers: making it its "
+                    "own FSDP2 unit reshards it mid-forward and breaks the in-forward "
+                    "tied unembed used by generation (mixed Tensor/DTensor in mm). The "
+                    "tied weight stays resident in the root unit; the loss reads it "
+                    f"there. Got custom_sharded_layers={_csl!r} — remove 'tok_embeddings'."
+                )
+        else:
+            if "output" not in _csl:
+                raise RuntimeError(
+                    "LinearGRPOLoss with an untied model requires custom_sharded_layers "
+                    "to include 'output' (so the output projection is its own FSDP2 unit "
+                    f"with .unshard()). Got custom_sharded_layers={_csl!r}."
+                )
+
+        # --- Wire ------------------------------------------------------------
+        # Thread the recipe temperature so the loss CE divides logits by T exactly
+        # like the standard rlhf.logits_to_logprobs path (log_softmax(logits / T)).
+        self._loss_fn.temperature = cfg.temperature
+        # set_model_output sets model.skip_output_layer=True and captures the
+        # projection (closure over tok_embeddings.weight for tied; model.output for
+        # untied). Immediately reset to False so ONLY the training forward (which
+        # toggles it per-call in grpo_step) returns hidden states — ref/rollout
+        # forwards keep returning logits unchanged.
+        self._loss_fn.set_model_output(self._model)
+        self._model.skip_output_layer = False
+        utils.log_rank_zero(
+            log,
+            "Base GRPO: LinearGRPOLoss wired (chunked-vocab, "
+            f"num_output_chunks={getattr(self._loss_fn, 'num_output_chunks', '?')}, "
+            f"temperature={cfg.temperature}, tied={_is_tied}); training forward "
+            "returns hidden states, projection runs per seq-chunk in the loss "
+            "(unshard before chunk loop). Ref/rollout forwards unchanged.",
+        )
 
     def _prewarm_fsdp1_allgather_buffer(self) -> None:
         """Pre-warm the FSDP1 summon_full_params AllGather buffer before training.

@@ -1,0 +1,157 @@
+# Chunked-vocab LinearGRPOLoss config for GRPO on Intel XPU (Aurora HPC)
+# Uses Qwen2.5-3B (tied embeddings) on shared filesystem.
+#
+# Purpose: memory-efficient GRPO training forward. LinearGRPOLoss takes the
+# model's HIDDEN states (model.skip_output_layer=True on the training forward
+# only) and applies the vocab projection PER sequence-chunk inside the loss, so
+# the full [B, S, vocab] FP32 logit tensor is never materialized.
+#
+# Phase 1 scope (enforced by recipe fail-fasts): FSDP2 FULL_SHARD, non-EP,
+# non-HSDP (dp_replicate=1), non-packing, no compile, ppo_epochs==1,
+# always_compute_rollout_logprobs=False, tied-embedding model.
+#
+# Tied-embedding NOTE: the shared output weight lives in tok_embeddings, owned by
+# the ROOT FSDP2 unit, which stays resident through the forward (default AllGather
+# prefetch). The loss reads the full weight there post-forward — NO
+# custom_sharded_layers needed. Do NOT add 'tok_embeddings' to custom_sharded_layers
+# (it would reshard mid-forward and break the in-forward tied unembed used by
+# generation). HW-validated bit-exact 2026-06-24.
+#
+# Launch (interactive, 2 tiles for quick test):
+#   cd /lus/flare/projects/ModCon/ngetty/torchtune
+#   PYTHONPATH=$PWD:$PYTHONPATH ZE_FLAT_DEVICE_HIERARCHY=FLAT \
+#   torchrun --standalone --nproc_per_node=2 \
+#     -m recipes.dev.grpo_full_finetune_distributed_xpu \
+#     --config dev/baseline/qwen3B_grpo_xpu_linearloss
+
+name: grpo_linearloss_qwen3b_xpu
+
+output_dir: /tmp/torchtune/grpo_linearloss
+base_model_path: /lus/flare/projects/ModCon/ngetty/models/Qwen2.5-3B
+
+# Tokenizer
+tokenizer:
+  _component_: torchtune.models.qwen2_5.qwen2_5_tokenizer
+  path: ${base_model_path}/vocab.json
+  merges_file: ${base_model_path}/merges.txt
+  max_seq_len: 1024
+
+# Dataset
+dataset:
+  _component_: torchtune.dev.rl.gsm8k.gsm8k_dataset
+  partition: 1-9/10
+seed: 42
+shuffle: False
+
+# Model
+model:
+  _component_: torchtune.models.qwen2_5.qwen2_5_3b
+
+# NOTE: do NOT set custom_sharded_layers for this tied-embedding model. The tied
+# output weight (== tok_embeddings.weight) stays resident in the ROOT FSDP2 unit
+# through the forward (default AllGather prefetch), so the loss reads the full
+# weight post-forward without any extra unit. Making tok_embeddings its own unit
+# reshards it mid-forward and breaks the in-forward tied unembed used by
+# generation (HW-validated 2026-06-24). The recipe fail-fasts if 'tok_embeddings'
+# appears in custom_sharded_layers for a tied model.
+
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [
+    model-00001-of-00002.safetensors,
+    model-00002-of-00002.safetensors,
+  ]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: QWEN2
+
+ref_checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [
+    model-00001-of-00002.safetensors,
+    model-00002-of-00002.safetensors,
+  ]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}/ref
+  model_type: QWEN2
+
+resume_from_checkpoint: False
+save_every_n_epochs: 1
+
+# Fine-tuning arguments — baseline: small batch, short runs
+batch_size: 1
+grpo_samples: 4
+forward_batch_size: 1
+max_generated_tokens: 256
+top_k: null
+temperature: 1.0
+
+ppo_epochs: 1
+gradient_accumulation_steps: 1
+
+# Run 10 steps for baseline measurement
+num_steps: 10
+
+clip_grad_norm: 1.0
+
+epochs: 1
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 1e-5
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  num_warmup_steps: 2
+# Chunked-vocab LinearGRPOLoss. Simple (no IS-clip) GRPO formulation — equivalent
+# to GRPOSimpleLoss at ppo_epochs==1 + on-policy rollouts. temperature is threaded
+# from the recipe-level `temperature` above (the loss CE divides logits by T).
+loss:
+  _component_: torchtune.dev.rl.linear_grpo_loss.LinearGRPOLoss
+  num_output_chunks: 8
+  kl_coeff: 0.01
+  epsilon: 0.2
+
+# XPU device
+device: xpu
+
+# Memory management
+enable_activation_checkpointing: True
+compile: False
+
+# Precision
+dtype: bf16
+
+reward_functions:
+    - _component_: torchtune.dev.rl.rewards.FormattedMathCorrectnessReward
+      answer_tag: answer
+      positive_reward: 10.0
+      negative_reward: 0.0
+    - _component_: torchtune.dev.rl.rewards.ThinkingAnswerFormattingReward
+      think_tag: think
+      answer_tag: answer
+      positive_reward: 1.0
+      negative_reward: 0.0
+
+# Logging
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+log_every_n_steps: 1
+log_peak_memory_stats: True
+
+# Profiler disabled
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: False
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: True
+  cuda: False
+  profile_memory: False
+  with_stack: False
+  record_shapes: False
+  with_flops: False
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1
