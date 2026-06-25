@@ -297,15 +297,26 @@ def _sdpa_or_flex_attention() -> Callable:
     # bisect, jobs 8558600/8558618/8558640).  empty_cache cannot reclaim it (the
     # buffers are live, referenced by these module-level dicts).
     #
-    # Fix: cap each cache with simple FIFO eviction.  Within a step all 36 layers
-    # reuse the SAME key (same b,h,s,d) — sequential, consumed before reuse — so a
-    # small cap preserves the within-step and consecutive-same-shape reuse (the
-    # real speedup) while bounding memory to MAX_ENTRIES * per-buffer bytes.
-    # Override the cap with TORCHTUNE_VARLEN_CACHE_MAX (default 8).
+    # Fix: cap each cache with simple FIFO eviction.
+    #
+    # DEFAULT CAP = 1 (corrected 2026-06-25). The original cap=8 was set against a
+    # mistaken ~14.7 MiB-per-shape / ~0.44 GiB/step estimate. A leak census on the
+    # 4B-LoRA-2N server soak (job 8561648) measured the TRUE per-generation
+    # footprint at ~2.5 GiB: each ref-forward generation retains ~36 distinct
+    # (total_tokens, n_heads, head_dim) bf16 buffers (≈69 MiB each), NOT one
+    # 14.7 MiB buffer. At cap=8 that is up to ~20 GiB of seqlen-keyed generations
+    # held on the tile — which OOMs (banned:1 PDE) around step 6 on a 64 GiB tile.
+    # cap=1 keeps only the CURRENT generation (flat ~2.5 GiB working set, validated
+    # bit-flat 1.43→4.28→4.46→4.25→4.45→4.35→4.33 GiB across steps 0-6 vs the
+    # baseline staircase 3.97→7.01→9.46→12.11→14.67→CRASH). On variable-seqlen RL
+    # (GSM8K) `s` changes every step so cross-step reuse is ~nil anyway; on
+    # FIXED-seqlen workloads raise the cap via TORCHTUNE_VARLEN_CACHE_MAX to recover
+    # consecutive-same-shape reuse. See docs/reports/colocate_pagefault_investigation_20260625.md.
     _varlen_out_cache: "OrderedDict" = OrderedDict()
     _varlen_alibi_cache: dict = {}
     _varlen_seqlens_cache: dict = {}
-    _varlen_cache_max = max(1, int(os.environ.get("TORCHTUNE_VARLEN_CACHE_MAX", "8")))
+    _varlen_census_seen: set = set()  # diag: keys already logged (TORCHTUNE_LEAK_CENSUS)
+    _varlen_cache_max = max(1, int(os.environ.get("TORCHTUNE_VARLEN_CACHE_MAX", "1")))
 
     def _varlen_cache_evict(key: tuple) -> None:
         # FIFO: keep the cap most-recently-INSERTED keys. Evict the same key from
@@ -356,6 +367,19 @@ def _sdpa_or_flex_attention() -> Callable:
             # Bound all three caches together (FIFO) so variable-seqlen RL does not
             # accumulate one ~14.7 MiB buffer per distinct (b,s) forever.
             _varlen_cache_evict(cache_key)
+            # Diagnostic (TORCHTUNE_LEAK_CENSUS=1): expose the true cache occupancy
+            # + per-buffer bytes so the (b,h,s,d)-keyed dict size is unambiguous —
+            # resolves whether the per-step (N,32,128)x36 retention is IN this cache
+            # (1 buffer/key) or aliased downstream. One log per distinct key.
+            if os.environ.get("TORCHTUNE_LEAK_CENSUS", "0") == "1":
+                _nb = out.numel() * out.element_size()
+                if cache_key not in _varlen_census_seen:
+                    _varlen_census_seen.add(cache_key)
+                    _log.info(
+                        "VARLEN_CACHE diag: entries=%d cap=%d this_key=%s buf=%.1f MiB",
+                        len(_varlen_out_cache), _varlen_cache_max,
+                        (b, h, s, d), _nb / 1024**2,
+                    )
 
         softmax_scale = 1.0 / (d ** 0.5)
         _ipex_varlen_attention(

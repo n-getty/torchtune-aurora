@@ -1401,6 +1401,24 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
         t0 = time.perf_counter()
+        # Quiesce-wsync (TORCHTUNE_COLOCATE_QUIESCE_WSYNC=1, default off): the colocate
+        # generation page fault is a 2-factor interaction — a real vLLM load_weights()
+        # weight-publish into the live in-process engine CONCURRENT with cross-rank XCCL
+        # collectives on the same tile corrupts the per-tile L0 page tables (CCS NotPresent
+        # PDE banned:1). Neither factor alone faults (HW-isolated 2026-06-25, jobs 8559640/
+        # 8559650/8559661; see docs/reports/colocate_pagefault_investigation_20260625.md).
+        # This barrier forces every rank to a common point with NO XCCL collective in flight,
+        # then syncs the device, BEFORE any load_weights mutation begins — removing the
+        # overlap. A matching barrier runs after the publish. The barrier completes before the
+        # mutation, so it does not itself overlap. Cheap; only the 2 barriers + 1 sync.
+        _quiesce = os.environ.get("TORCHTUNE_COLOCATE_QUIESCE_WSYNC", "0") == "1"
+        if _quiesce:
+            if torch.xpu.is_available():
+                torch.xpu.synchronize(self._device)
+            if torch.distributed.is_initialized():
+                torch.distributed.barrier()
+            if torch.xpu.is_available():
+                torch.xpu.synchronize(self._device)
         # Opt-in leak diagnostic: log free HBM before the sync each step so a
         # monotonic decline (UR-handle accumulation under summon+vLLM co-tenancy)
         # is visible in the log. Off by default (set TORCHTUNE_COLOCATE_MEM_PROBE=1).
@@ -1422,66 +1440,136 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
         n_synced = 0
         skipped = 0
 
-        # Cached-base path (opt-in via TORCHTUNE_COLOCATE_CACHED_BASE=1, or whenever
-        # _colocate_base_cache was populated at setup). The frozen base never
-        # changes and the adapter is replicated (FSDP ignored_states), so there is
-        # NO need to summon_full_params every step — re-all-gathering the full base
-        # each step accumulates L0 IPC/UR handles (the exact mechanism the recipe
-        # avoids for adapter params at setup) and is the suspected UR:40 driver at
-        # ~10 steps. With the base cached full per-rank, merge reads the replicated
-        # adapter directly: no per-step collective, no per-step handle churn.
-        _use_cached_base = getattr(self, "_colocate_base_cache", None) is not None
-        if _use_cached_base:
-            for tune_name, merged in iter_merged_lora_layers(
-                self._model, base_weights=self._colocate_base_cache
-            ):
-                hf_name = tune_lora_name_to_hf(tune_name)
-                if hf_name is None:
-                    skipped += 1
-                    log.warning("colocate LoRA sync: no HF mapping for %s — skipping", tune_name)
-                    continue
-                w = self._maybe_unpermute_qk(hf_name, merged.contiguous())
-                llm_model.load_weights([(hf_name, w)])
-                n_synced += 1
-                del w, merged
-                if n_synced % 5 == 0 and torch.xpu.is_available():
-                    gc.collect()
+        # Sleep-wsync (TORCHTUNE_COLOCATE_SLEEP_WSYNC=1, default off): the colocate page fault is
+        # load_weights mutating vLLM's resident weights while the trainer's XCCL/L0 context is
+        # co-resident — a barrier does NOT help (quiesce A/B refuted), so instead clear vLLM's own
+        # KV/L0 paging state around the mutation via a KV-only sleep. NOTE: level=10 is the
+        # XPU-patched KV-only-discard variant (torchtune.dev.xpu_sleep), NOT an upstream vLLM
+        # sleep level (upstream is 1/2) — it keeps weights on GPU so load_weights can still write
+        # them; wakes after. Requires enable_sleep_mode at init (gated by the same env in
+        # vllm_backend). See docs/reports/colocate_pagefault_investigation_20260625.md.
+        _sleep_wsync = os.environ.get("TORCHTUNE_COLOCATE_SLEEP_WSYNC", "0") == "1"
+        # Tracks whether the engine is currently KV-slept so the wake in the
+        # `finally` below ALWAYS runs once a sleep succeeded — even if the merge
+        # or reset_prefix_cache raises. Otherwise an exception between sleep and
+        # wake would strand the in-process engine asleep with KV discarded (and
+        # the publish exception is fatal: fail_on_publish_error propagates it).
+        _engine_asleep = False
+        if _sleep_wsync:
+            try:
+                if torch.xpu.is_available():
                     torch.xpu.synchronize(self._device)
-        else:
-            import contextlib as _ctxlib
-            # No-FSDP: weights are full+resident, read module.weight directly (no
-            # summon). FSDP: summon the full sharded param for the merge.
-            _summon_ctx = (
-                _ctxlib.nullcontext()
-                if getattr(self, "_no_fsdp", False)
-                else FSDP.summon_full_params(self._model, writeback=False, rank0_only=False)
-            )
-            with torch.no_grad(), _summon_ctx:
+                self._vllm_llm.sleep(level=10)  # KV-only discard; weights stay resident
+                _engine_asleep = True
+                if torch.xpu.is_available():
+                    torch.xpu.synchronize(self._device)
+                if self._is_rank_zero:
+                    log.info("COLOCATE_SLEEP_WSYNC step=%d: KV-sleep before publish",
+                             getattr(self, "_steps_run", -1))
+            except Exception as _sl_exc:
+                log.warning("COLOCATE_SLEEP_WSYNC sleep failed: %r", _sl_exc)
+
+        try:
+            # Cached-base path (opt-in via TORCHTUNE_COLOCATE_CACHED_BASE=1, or whenever
+            # _colocate_base_cache was populated at setup). The frozen base never
+            # changes and the adapter is replicated (FSDP ignored_states), so there is
+            # NO need to summon_full_params every step — re-all-gathering the full base
+            # each step accumulates L0 IPC/UR handles (the exact mechanism the recipe
+            # avoids for adapter params at setup) and is the suspected UR:40 driver at
+            # ~10 steps. With the base cached full per-rank, merge reads the replicated
+            # adapter directly: no per-step collective, no per-step handle churn.
+            _use_cached_base = getattr(self, "_colocate_base_cache", None) is not None
+            if _use_cached_base:
                 for tune_name, merged in iter_merged_lora_layers(
-                    self._model, base_weights=None
+                    self._model, base_weights=self._colocate_base_cache
                 ):
                     hf_name = tune_lora_name_to_hf(tune_name)
                     if hf_name is None:
                         skipped += 1
-                        log.warning(
-                            "colocate LoRA sync: no HF mapping for %s — skipping", tune_name
-                        )
+                        log.warning("colocate LoRA sync: no HF mapping for %s — skipping", tune_name)
                         continue
-                    # Invert Llama-family Q/K permutation before vLLM (no-op Qwen3).
                     w = self._maybe_unpermute_qk(hf_name, merged.contiguous())
                     llm_model.load_weights([(hf_name, w)])
                     n_synced += 1
                     del w, merged
-                    # gc + sync every 5 params to bound UR-handle pressure from the
-                    # summon all-gathers before the next FSDP backward.
                     if n_synced % 5 == 0 and torch.xpu.is_available():
                         gc.collect()
                         torch.xpu.synchronize(self._device)
+            else:
+                import contextlib as _ctxlib
+                # No-FSDP: weights are full+resident, read module.weight directly (no
+                # summon). FSDP: summon the full sharded param for the merge.
+                _summon_ctx = (
+                    _ctxlib.nullcontext()
+                    if getattr(self, "_no_fsdp", False)
+                    else FSDP.summon_full_params(self._model, writeback=False, rank0_only=False)
+                )
+                with torch.no_grad(), _summon_ctx:
+                    for tune_name, merged in iter_merged_lora_layers(
+                        self._model, base_weights=None
+                    ):
+                        hf_name = tune_lora_name_to_hf(tune_name)
+                        if hf_name is None:
+                            skipped += 1
+                            log.warning(
+                                "colocate LoRA sync: no HF mapping for %s — skipping", tune_name
+                            )
+                            continue
+                        # Invert Llama-family Q/K permutation before vLLM (no-op Qwen3).
+                        w = self._maybe_unpermute_qk(hf_name, merged.contiguous())
+                        llm_model.load_weights([(hf_name, w)])
+                        n_synced += 1
+                        del w, merged
+                        # gc + sync every 5 params to bound UR-handle pressure from the
+                        # summon all-gathers before the next FSDP backward.
+                        if n_synced % 5 == 0 and torch.xpu.is_available():
+                            gc.collect()
+                            torch.xpu.synchronize(self._device)
 
-        self._vllm_llm.llm_engine.reset_prefix_cache()
-        gc.collect()
-        if torch.xpu.is_available():
-            torch.xpu.synchronize(self._device)
+            # reset_prefix_cache() mutates the vLLM KV block table. It is a no-op when
+            # prefix caching is disabled (the colocate default), but it is on the suspect
+            # list for the colocate generation page fault (a freed/remapped KV page that a
+            # later paged-attention kernel references). TORCHTUNE_COLOCATE_SKIP_RESET_PREFIX=1
+            # lets the page-fault A/B (experiments/colocate/run_colocate_ab.sh, cell=noreset)
+            # isolate it. Default unchanged: the call still fires.
+            # ORDERING NOTE (SLEEP_WSYNC path): under TORCHTUNE_COLOCATE_SLEEP_WSYNC=1 the
+            # engine is KV-slept (level=10) here and woken in the `finally` below, so this
+            # reset runs while KV is discarded. That is intentional/harmless — reset only
+            # clears the block table (no KV pages to free under sleep), and the wake re-
+            # allocates KV fresh afterward. If a future A/B shows reset-under-sleep matters,
+            # move this call after wake_up() rather than reordering the sleep/wake.
+            if os.environ.get("TORCHTUNE_COLOCATE_SKIP_RESET_PREFIX", "0") != "1":
+                self._vllm_llm.llm_engine.reset_prefix_cache()
+            gc.collect()
+            if torch.xpu.is_available():
+                torch.xpu.synchronize(self._device)
+        finally:
+            # Sleep-wsync: wake the engine (re-alloc KV) after the weight publish so the
+            # next generation runs normally. Pairs with the level-10 sleep above. In a
+            # `finally` so a raising merge/reset_prefix can never leave the engine asleep.
+            if _engine_asleep:
+                try:
+                    self._vllm_llm.wake_up()
+                    _engine_asleep = False
+                    if torch.xpu.is_available():
+                        torch.xpu.synchronize(self._device)
+                    if self._is_rank_zero:
+                        log.info("COLOCATE_SLEEP_WSYNC step=%d: woke engine after publish",
+                                 getattr(self, "_steps_run", -1))
+                except Exception as _wk_exc:
+                    log.warning("COLOCATE_SLEEP_WSYNC wake failed: %r", _wk_exc)
+
+        # Quiesce-wsync trailing barrier: ensure the weight publish (+ reset_prefix) on every
+        # rank has fully completed and the device is idle before any rank resumes XCCL work,
+        # so the next collective cannot overlap a still-in-flight load_weights mutation.
+        if _quiesce:
+            if torch.distributed.is_initialized():
+                torch.distributed.barrier()
+            if torch.xpu.is_available():
+                torch.xpu.synchronize(self._device)
+            if self._is_rank_zero:
+                log.info("COLOCATE_QUIESCE_WSYNC step=%d: barriered publish (no XCCL overlap)",
+                         getattr(self, "_steps_run", -1))
 
         if self._is_rank_zero:
             log.info(
@@ -3081,6 +3169,66 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
                         return torch.xpu.memory_allocated(self._device) / 1024**3
                     _r_pre_gen = _resv() if _phase_probe else 0.0
                     _a_pre_gen = _act() if _phase_probe else 0.0
+
+                    # Leak census (TORCHTUNE_LEAK_CENSUS=1, default off): at each
+                    # step boundary, aggregate ALL live XPU tensors by (shape,dtype)
+                    # and log the top groups by total bytes. Diffing consecutive
+                    # steps names the object behind the ~2.5 GiB/step server-mode
+                    # ref_fwd floor creep (docs/bugs/xpu_colocate_generation_pde_*).
+                    # gc.get_objects() is slow (~0.1-0.5s) so it is opt-in and rank-0.
+                    if (
+                        os.environ.get("TORCHTUNE_LEAK_CENSUS", "0") == "1"
+                        and self._is_rank_zero
+                        and self._device.type == "xpu"
+                    ):
+                        try:
+                            import gc as _gc_census
+                            torch.xpu.synchronize(self._device)
+                            _by_key: dict = {}
+                            _seen_storage: set = set()  # dedupe by storage data_ptr (REAL bytes)
+                            for _o in _gc_census.get_objects():
+                                if isinstance(_o, torch.Tensor) and _o.is_xpu:
+                                    # Count grad-tracking tensors separately — a growing
+                                    # grad_fn group is the retained-autograd-graph signature.
+                                    _grad = "+grad" if (_o.requires_grad or _o.grad_fn is not None) else ""
+                                    _k = (tuple(_o.shape), str(_o.dtype) + _grad)
+                                    # REAL bytes: count each underlying storage ONCE (views
+                                    # of one buffer must not inflate the total).
+                                    try:
+                                        _ptr = _o.untyped_storage().data_ptr()
+                                        _nbytes = _o.untyped_storage().nbytes()
+                                    except Exception:
+                                        _ptr, _nbytes = id(_o), _o.numel() * _o.element_size()
+                                    _b = 0 if _ptr in _seen_storage else _nbytes
+                                    _seen_storage.add(_ptr)
+                                    _agg = _by_key.get(_k)
+                                    if _agg is None:
+                                        _by_key[_k] = [1, _b]
+                                    else:
+                                        _agg[0] += 1
+                                        _agg[1] += _b
+                            _top = sorted(
+                                _by_key.items(), key=lambda kv: kv[1][1], reverse=True
+                            )[:14]
+                            _tot = sum(v[1] for v in _by_key.values()) / 1024**3
+                            # Reconcile gc-visible total vs the allocator's live total.
+                            # If they track step-over-step, the leak is a Python-referenced
+                            # tensor (a top group below will grow). If gc_total stays flat
+                            # while alloc climbs, the retention is C++/autograd-side and
+                            # INVISIBLE to gc.get_objects() — pivot to a different tool.
+                            _alloc = torch.xpu.memory_allocated(self._device) / 1024**3
+                            log.info(
+                                "LEAK_CENSUS step=%d live_xpu_tensors gc_total=%.2f GiB "
+                                "alloc=%.2f GiB gc_unseen=%.2f GiB groups=%d",
+                                self._steps_run, _tot, _alloc, _alloc - _tot, len(_by_key),
+                            )
+                            for _k, (_n, _bytes) in _top:
+                                log.info(
+                                    "LEAK_CENSUS step=%d   %6.3f GiB x%d  shape=%s %s",
+                                    self._steps_run, _bytes / 1024**3, _n, _k[0], _k[1],
+                                )
+                        except Exception as _ce:
+                            log.warning("LEAK_CENSUS failed: %r", _ce)
 
                     # Generate trajectory (server mode, may use base or LoRA adapter)
                     _gen_t0 = time.perf_counter()

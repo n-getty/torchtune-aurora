@@ -1,10 +1,16 @@
-# Non-deterministic CCS/PDE GPU page fault in per-tile in-process colocate generation (max_gen > ~256)
+# CCS/PDE GPU page fault in per-tile in-process colocate — vLLM weight-publish × XCCL co-residence
 
-**Status**: ROOT-CAUSE CHARACTERIZED as **non-deterministic** (2026-06-24). NOT fixable by a
-recipe config change. Distinct from the Ray TP=8 co-tenancy fault
-([`xpu_l0_event_pool_co_tenancy.md`](xpu_l0_event_pool_co_tenancy.md)) — this is the
-**single-process, per-tile TP=1 in-process** colocate path (AGPT-2B / Qwen3-4B LoRA colocate),
-and it fires during **vLLM generation**, not at the first backward.
+**Status**: ROOT CAUSE ISOLATED (2026-06-25) as a **2-factor L0 co-residence interaction**, NOT
+fixable by any recipe-config value or any in-process mitigation (quiesce / PG-teardown / vLLM
+sleep all REFUTED — see Mitigations). Reproduced byte-identically in a **torchtune-free,
+frameworks-module-only** script. Supersedes the earlier "non-deterministic, unanalyzable" reading
+(that was the low-probability mg512 regime; at mg768 the in-framework recipe faults 8/8). Full
+methodology + crash-rate tables: [`docs/reports/colocate_pagefault_investigation_20260625.md`](../reports/colocate_pagefault_investigation_20260625.md).
+Same broad family as the Ray TP=8 co-tenancy fault
+([`xpu_l0_event_pool_co_tenancy.md`](xpu_l0_event_pool_co_tenancy.md)) — this is its
+**single-OS-process, in-process TP=1** analogue, firing during/around the colocate weight publish.
+**Server mode avoids THIS fault (separate process), but is not a blanket escape** — a separate
+trainer-side step-6 `banned:1` was found in the Qwen3-4B LoRA 2-node *server* config (Mitigations §1).
 
 ## Symptom
 
@@ -12,51 +18,40 @@ and it fires during **vLLM generation**, not at the first backward.
 Segmentation fault from GPU at 0xff00ffff........, ctx_id: 1 (CCS) type: 0 (NotPresent),
 level: 1 (PDE) [or level: 0 (PTE)], access: 0 (Read), banned: 1, aborting.
 ```
+followed by a NEO `drm_neo.cpp:288` abort (SIGABRT). **~24-55 GiB HBM free at the crash — NOT an
+OOM.** Single OS process per tile (in-process vLLM + trainer).
 
-- Fires during the **vLLM generation phase** of a training step (not warmup-gen, not the
-  trainer backward).
-- `ctx_id 1 (CCS)` = compute command streamer; `NotPresent` at page-directory (PDE) or
-  page-table (PTE) level = the GPU referenced an **unmapped page** — a freed/remapped KV/page
-  region inside vLLM's paged-attention allocator.
-- **~24-28 GiB HBM free at the crash** — NOT an OOM.
-- Single OS process per tile (in-process vLLM + trainer) — NOT the two-process Ray co-tenancy
-  trigger.
+## ROOT CAUSE — a 2-factor interaction (HW-isolated, the key finding)
 
-## It is NON-DETERMINISTIC (the key finding)
+The fault requires **BOTH** of the following to be true at once; **neither alone triggers it**:
 
-Decisive A/B, job 8559162, same `max_gen=512`, same node, back-to-back:
+1. a real vLLM **`load_weights()`** weight-publish into the **live in-process engine** (the
+   colocate adapter publish — `copy_` into the engine's resident device tensors), AND
+2. concurrent **cross-rank XCCL collectives** on the same tile (the FSDP / adapter-all-reduce
+   training world).
 
-| leg | config | outcome |
-|-----|--------|---------|
-| A | `publish_every_steps=999` (no weight sync after step 0) | **crash @ step 1** |
-| B | `publish_every_steps=1` (sync every step, 20 publishes, gens up to 3636 tok) | **survived 9 steps clean** |
+Decisive isolation (standalone, torchtune-free; jobs 8559640/8559650/8559661, 2026-06-25):
 
-Same envelope, opposite outcomes; leg B did *more* work and lived. Independently corroborated
-by 2026-06-18 data (predating any 2026-06-24 change): two `max_gen=384` LoRA colocate runs —
-`lora_colocate_20260618_051008` survived 10 steps, `lora_colocate_20260618_070035` crashed.
+| config | real `load_weights` ran? | concurrent multi-rank XCCL? | result |
+|--------|--------------------------|-----------------------------|--------|
+| single-tile vLLM + `load_weights` (R-LW) | yes | no | **clean 0/12** |
+| 12-tile, `load_weights` skipped (KeyError) | no | yes | **clean 12/12** |
+| 12-tile + real `load_weights` (v6) | yes | yes | **CRASH (N=2, byte-identical PDE)** |
 
-**Every apparent deterministic explanation was noise fit to coin-flips** and is REFUTED:
-- NOT a max_gen / per-rank token ceiling — warmup-at-max runs a full `seq_len=1536` generation
-  and survives, then a *shorter* step-1 gen faults; mg512 both crashes and survives.
-- NOT weight sync (`load_weights`) — crashes with sync OFF, survives with sync ON.
-- NOT memory/OOM — 24-28 GiB free at every crash, no creep.
-- NOT vLLM KV config — `max_model_len=1536`, `GPU KV 54,016 tokens`, `num_gpu_blocks` are
-  byte-identical between surviving (mg256) and crashing (mg512) runs (`max_generated_tokens` is
-  a sampling param capped by `max_model_len`; it does not change the engine).
-- NOT our `LinearGRPOLoss` / varlen changes — reproduced on default `GRPOSimpleLoss`; predates
-  them.
+Mechanism: `load_weights` mutates vLLM's resident device weights while the **trainer's XCCL/L0
+driver context is co-resident on the same tile**; that combination corrupts the per-tile page
+tables → CCS NotPresent PDE. **It is the resident co-tenancy, not instantaneous concurrency** — a
+`barrier()`+sync that removes any *in-flight* collective around the publish does NOT help (quiesce
+A/B below, 6/6 crash). This matches the Ray TP=8 W10 finding (zero outstanding submissions still
+wedged → the static two-L0-client footprint is the cause). `vllm_mode=server` is immune (engine in
+a separate process, no shared L0 context); ezpz is immune (its default rollout is in-trainer HF
+`.generate()`, no co-resident vLLM — its vLLM is off-by-default, commented "XPU vLLM is fragile").
 
-`P(crash per generation)` **rises with cumulative generation volume**: max_gen=64 (AGPT-2B
-production) effectively never hits it; mg256 usually survives 9+ steps; mg384/512 are flaky
-(crash some fraction of runs); warmup-forced max-len gen → crash at step 0-1.
-
-## Likely mechanism (best supported, not pinned to a line)
-
-A probabilistic page-table corruption in **vLLM-on-XPU paged-attention KV block recycling**
-under repeated generate cycles — same XPU Level-Zero driver-instability family as the
-documented `empty_cache`/UR-handle leak ([`intel_xpu_resource_leak_bug_report.md`](intel_xpu_resource_leak_bug_report.md))
-and the oneCCL / torch-xpu-ops#3744 leaks ([`ccl_ipc_handle_cache.md`](ccl_ipc_handle_cache.md)).
-Driver/runtime-level, not a torchtune logic bug.
+**Every recipe-config lever was eliminated** by in-framework A/B (Qwen3-4B, mg768, N≥4/cell, all
+crashed; baseline 8/8): `reset_prefix_cache` skip, publish cadence (`publish_every=999`), no-FSDP,
+KV-block headroom, `CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD` {2048,8192}, and `empty_cache`
+cadence. (The earlier "NOT weight sync" A/B was invalid: `publish_every=999` still publishes at
+step 0, so its "sync-off" leg still did one `load_weights` — exactly factor 1.)
 
 ## Practical guidance
 
@@ -66,31 +61,86 @@ Driver/runtime-level, not a torchtune logic bug.
 - **max_gen ≥ 384**: usable but flaky — will fail a fraction of runs. **Not production-reliable.**
 - The paper/BioReason `max_gen=1024` colocate envelope is **blocked** by this until mitigated.
 
-## Mitigations (both heavyweight; no recipe-side deterministic fix exists)
+## Mitigations
 
-1. **Periodic vLLM engine teardown + respawn** (W17/W19 pattern from the Ray TP=8 work,
-   [`xpu_l0_event_pool_co_tenancy.md`](xpu_l0_event_pool_co_tenancy.md)) — resets the L0/KV
-   state and bounds accumulation. Adapt to the per-tile in-process path (no Ray): destroy +
-   rebuild each rank's in-process engine every N steps, reload the adapter. Multi-session build.
-2. **Checkpoint + auto-resume** — accept the flakiness, save every N steps, auto-restart on
-   `banned:1`. Operationally simpler, wastes the partial step.
-3. **Server / dedicated vLLM mode** instead of colocate — moves vLLM to its own process/tiles
-   (no in-process co-residence); the GSM8K production runs already use `vllm_mode=server` at
-   max_gen=512 and do not hit this.
+**No in-process recipe-side fix exists — every lever below that keeps vLLM in-process was tested
+and REFUTED (2026-06-25).** Both L0 driver clients (the vLLM engine and the trainer's XCCL
+context) live in one OS process, and nothing short of process exit evicts either. Only running
+vLLM in a *separate process* (server/dedicated mode) removes a client — but see the server-mode
+caveat below.
+
+1. **Server / dedicated vLLM mode** — `vllm_mode=server`/`dedicated` moves vLLM to its own
+   process/tiles, eliminating factor (1)'s shared L0 context, so the **colocate** fault does not
+   occur. The AGPT-2B GSM8K server production envelope (full-FT, 2B) runs clean for hours.
+   **CAVEAT (2026-06-25):** server mode is NOT a blanket clean path at 4B-LoRA-2N — but the
+   blocker there is a **different bug** from the colocate L0 co-residence fault. A multi-step soak
+   of **Qwen3-4B LoRA 2-node server** faults **trainer-side** at **step ~6** with `banned:1`
+   (jobs 8559836/8559857/8559882, both `delta` and `merged`). **Diagnosed 2026-06-25 from the log
+   (`run_lora_grpo_2node_20260625_051455.log`): this is a trainer-side MEMORY CREEP → OOM, NOT L0
+   co-residence.** vLLM runs on a *separate node* (trainer `x4412c6s2b0n0` vs vLLM
+   `x4412c6s4b0n0`), so the 2-factor mechanism cannot apply; the publish + generation both succeed,
+   then the fault fires in **`ref_fwd`** with `access: 1 (Write)` (colocate fault is
+   `access: 0 (Read)`). Trainer `active` grows monotonically ~2.7 GiB/step
+   (39.2→44.1→49.1→50.6→52.9 GiB, `reserved` 45.6→60.3) and step-6's ref_fwd allocation crosses
+   the 64 GiB tile ceiling. `active` and `reserved` track together → a genuine reference leak, not
+   allocator caching. **ROOT-CAUSED + FIXED 2026-06-25 (job 8561648):** it *was* the
+   `_varlen_out_cache` after all — the per-generation footprint was undercounted ~170×. A leak
+   census showed each ref-forward generation retains **~2.5 GiB** (≈36 distinct
+   `(total_tokens, n_heads, head_dim)` bf16 buffers, ≈69 MiB each, one per layer), keyed by the
+   per-step-varying GSM8K seqlen. The 2026-06-24 FIFO cap was sized against a mistaken
+   ~14.7 MiB/0.44-GiB-per-step estimate and **defaulted to 8**, so up to ~20 GiB of seqlen-keyed
+   generations accumulated → OOM ~step 6 on a 64 GiB tile. **Fix:** default
+   `TORCHTUNE_VARLEN_CACHE_MAX` 8→1 (`torchtune/modules/attention_utils.py`). HW-validated: floor
+   bit-flat 1.43→4.28→4.46→4.25→4.45→4.35→4.33 GiB steps 0-6, full 8-step run **0 crashes**, vs
+   the baseline staircase 3.97→7.01→9.46→12.11→14.67→CRASH. **Not** FSDP sharding (ZeRO-2 and
+   ZeRO-3 both crash, ZeRO-3 sooner). See
+   [the investigation report](../reports/colocate_pagefault_investigation_20260625.md) §"NEW
+   separate issue". So: server mode dodges the *colocate* bug, and the 4B-LoRA-2N server step-6
+   leak is now **fixed** (default cap=1).
+2. **Quiesce-wsync** (`TORCHTUNE_COLOCATE_QUIESCE_WSYNC=1`) — barrier+sync around the publish.
+   **REFUTED** (job 8559693: 6/6 crash, barrier confirmed engaged). A barrier only syncs rank
+   *arrival*; it does not remove the resident co-tenant L0 context. Any *serialization*-based fix
+   is futile. Kept as a documented dead-end (do not use).
+3. **PG teardown around the publish** (`destroy_process_group` before `load_weights`, recreate
+   after — reproducer `--fix cedrain`) — **REFUTED** (job 8559753: still crashes). It only drops
+   the PyTorch PG *wrapper*; the underlying L0 driver context + FSDP device memory persist, so the
+   co-tenancy is unchanged.
+4. **Engine sleep/wake around the publish** (`TORCHTUNE_COLOCATE_SLEEP_WSYNC=1` / `--fix sleep`,
+   `enable_sleep_mode` → `.sleep()` → publish → `.wake_up()`) — **REFUTED** at both
+   `sleep(level=10)` (KV-only; weights stay resident, mutated in place — job 8559763) and
+   `sleep(level=2)` (discard weights — job 8559771). Both crash byte-identically. VLLM sleep frees
+   *vLLM's* device state but not the *trainer's* co-resident L0 context.
+5. **Periodic vLLM engine teardown + respawn** (W17/W19 from the Ray TP=8 work) — **not viable
+   in-process**: `_init_vllm_early` calls `destroy_process_group`, which would also tear down the
+   live XCCL training PG. The Ray version killed a *separate* vLLM actor process; there is no
+   in-process analogue.
+6. **Checkpoint + auto-resume** on `banned:1` — operationally simple, wastes the partial step.
+
+## Practical envelope (colocate, until a mitigation is validated)
+max_gen ≤ 64 safe (AGPT-2B production); ≤ 256 low-risk; ≥ 384 flaky; 1024 blocked. **For mg≥384,
+use server mode** — it is unaffected.
 
 ## Reproduction
 
+**Faithful, torchtune-free (frameworks module only — torch + vllm + ipex + mpi4py):**
 ```bash
-# 1-node, deterministic-ish trigger via warmup-forced max-len gen at larger max_gen:
-env MAX_GEN=512 TORCHTUNE_COLOCATE_NO_FSDP=1 TORCHTUNE_COLOCATE_WARMUP_AT_MAX=1 \
-    TORCHTUNE_COLOCATE_MEM_PROBE=1 NSTEPS=10 \
-  bash experiments/lora_grpo/run_lora_colocate.sh
-# Crashes within the first ~1-2 steps SOME fraction of runs (non-deterministic);
-# run 2-3x to observe both crash and survive. max_gen=256 clears 9+ steps.
+# 12-rank in-process vLLM + XCCL FSDP, with the real Qwen3-4B load_weights publish each step.
+qsub -v STEPS=12,LOAD_REAL=1 experiments/colocate/pbs_repro_multitile.sh
+# Crashes at step 0 with the byte-identical CCS NotPresent PDE banned:1 (N=2). The single-tile
+# control (no XCCL) and the load_weights-skipped run are both CLEAN — see the 2-factor table above.
 ```
-Sweep + isolation jobs: 8559141 (mg 256/512/768), 8559162 (mg512 sync on/off A/B).
+In-framework (the real recipe, mg768 → 4/4 by step ~3-4):
+```bash
+CELL=baseline M=4 MAX_GEN=768 bash experiments/colocate/run_colocate_ab.sh   # under a PBS job
+```
+Jobs: standalone 8559640/8559661 (crash), 8559650 R-LW control (clean); in-framework A/B
+8559411/8559507/8559508/8559513 (all cells crash). Refuted in-process fixes: 8559693 (quiesce),
+8559753 (cedrain PG-teardown), 8559763 (sleep L10), 8559771 (sleep L2) — all crash. Server-mode
+4B-LoRA-2N step-6 trainer fault: 8559836/8559857 (delta), 8559882 (merged). Earlier (superseded)
+sweeps: 8559141, 8559162.
 
 ## Cross-refs
-`memory/project_colocate_mg1024_ccs_pagefault_20260624`,
-`memory/project_linear_grpo_loss_chunked_vocab_20260624`,
-`docs/reports/colocate_memory_varlen_and_chunked_vocab_20260624.md`.
+- [`docs/reports/colocate_pagefault_investigation_20260625.md`](../reports/colocate_pagefault_investigation_20260625.md) — full investigation, crash-rate tables, ezpz consistency check.
+- [`xpu_l0_event_pool_co_tenancy.md`](xpu_l0_event_pool_co_tenancy.md) — the Ray TP=8 two-process analogue (same L0 co-residence family).
+- `memory/project_colocate_pagefault_investigation_20260624`,
+  `memory/project_colocate_mg1024_ccs_pagefault_20260624` (investigation history).
