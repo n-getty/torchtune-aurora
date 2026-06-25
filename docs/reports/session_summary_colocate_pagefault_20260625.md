@@ -7,10 +7,16 @@ functional, performant colocate RL path. Branch: `investigate/colocate-pagefault
 
 - **In-process colocate (vLLM on the same tile as the trainer) is BLOCKED at the Intel driver
   level** — a single-OS-process, two-L0-client page-table corruption. Root-caused precisely and
-  reproduced in a **torchtune-free** script for an Intel/vLLM filing.
+  reproduced in a **torchtune-free** script for an Intel/vLLM filing. *(This is the solid result.)*
 - **Every in-process recipe-side fix was implemented and refuted** (not assumed).
-- **The performant, working RL path is `vllm_mode=server` + `delta` publish** — vLLM in a separate
-  process, ~26.7s/step (2× faster than `merged`), HW-validated bit-exact. Use this for production.
+- **Server mode (vLLM in a separate process) avoids the colocate co-residence fault**, and `delta`
+  publish gives a ~26.8s/step rate (2× faster than `merged`). **HOWEVER** — a multi-step soak run
+  overnight (jobs 8559836, 8559857) uncovered a **separate, reproducible trainer-side
+  `banned:1` at step ~6** in the 4B-LoRA-2N config (both `delta`; `merged` test in flight). So
+  server+delta is **performance-confirmed but NOT yet stability-validated** at this envelope — the
+  earlier "validated" claim rested on a step-time measurement, not a soak (the soak was never run
+  until now). Diagnosis in progress; see below. Known-good reference: AGPT-2B GSM8K server-mode
+  production runs (different recipe/config) run clean.
 
 ## Root cause (definitive)
 
@@ -48,7 +54,12 @@ XCCL PG), so in-process colocate at mg≥384 is driver-blocked.
   (`docs/reports/lora_delta_publish_path_20260617.md`).
 - Launch: `experiments/lora_grpo/run_qwen3_4b_lora_2node.sh` with `LORA_PUBLISH_MODE=delta`, or the
   self-terminating `batch_qwen3_4b_lora_2node.sh -v LORA_PUBLISH_MODE=delta`.
-- **Soak validation:** _job 8559836 (20-step delta) — result pending; fill on completion._
+- **Soak validation:** steps 0-4 ran clean at **~26.8s/step** (matches the validated 26.7s), delta
+  publish join ~0.49s. First 20-step attempt (8559836) hit a **trainer-side** (node 0) FSDP/XCCL
+  `banned:1` at step 6 — NOT vLLM co-residence (vLLM is on node 1); suspected transient node/tile
+  degradation (the separate documented FSDP+XCCL banned:1 class, not the colocate 2-factor bug).
+  Re-running on a fresh allocation (8559857) to confirm — N=1 banned:1 is not conclusive (node
+  variance / degraded-tile discipline). _Re-run result pending._
 
 ## Deliverables (branch `investigate/colocate-pagefault-20260625`)
 
@@ -64,11 +75,24 @@ XCCL PG), so in-process colocate at mg≥384 is driver-blocked.
   `QUIESCE_WSYNC` (refuted), `SLEEP_WSYNC` (refuted) — all default-off, byte-identical off-path;
   CLAUDE.md table rows + `tests/torchtune/dev/rl/test_colocate_skip_reset_prefix.py` (green).
 
-## Recommendation
+## Open issue uncovered by the soak (must resolve before recommending server+delta)
 
-1. **Production RL: use server + delta** (`LORA_PUBLISH_MODE=delta`). Consider making `delta` the
-   YAML default once the soak (8559836) clears 20+ steps GREEN.
-2. **Do not pursue in-process colocate further** without an Intel driver fix — file the standalone
-   reproducer upstream (vLLM-XPU / Intel compute-runtime).
+The 4B-LoRA 2-node server run faults **trainer-side** (node 0, `[default0]`) at **step ~6**,
+entering `grpo_step` after generation — `CCS NotPresent PDE banned:1 access=Write`. Reproduced on
+**two different nodes** (8559836, 8559857) → not node variance. This is a **distinct** fault from
+the colocate 2-factor bug (vLLM is on a separate node here; the publish succeeds each step). It is
+a trainer-side FSDP/XCCL `banned:1` — possibly a known class (e.g. CCL IPC-handle accumulation, the
+`CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD` issue) surfacing at this envelope. Diagnosis in flight:
+- `merged` soak (8559877) — is the fault delta-specific or general to 4B-LoRA-2N?
+- If general: check CCL env (the 2-node launcher vs the AGPT-2B known-good env), lower G/mg.
+
+## Recommendation (interim — pending the diagnosis above)
+
+1. **In-process colocate: do not pursue** without an Intel driver fix — file the torchtune-free
+   reproducer upstream (vLLM-XPU / Intel compute-runtime). This conclusion is solid.
+2. **Server mode is the right architecture** (separate process avoids the co-residence fault), and
+   `delta` gives the 2× step-time win — but **run a clean multi-step soak before declaring it
+   production-ready**; the overnight soak found a step-6 trainer fault still being diagnosed.
+   Known-good today: the AGPT-2B GSM8K server-mode production envelope.
 3. Software stack for the filing: frameworks/2025.3.1, torch 2.10.0a0, ipex 2.10.10, vllm 0.15.0,
    i915 25.2.29, NEO 25.18.33578, ze_loader 1.24.0.
