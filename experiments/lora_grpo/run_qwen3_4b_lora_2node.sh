@@ -685,6 +685,12 @@ export TORCHTUNE_USE_IPEX_VARLEN=${TORCHTUNE_USE_IPEX_VARLEN:-1}
 # phase) — the bisect lever for the 4B-LoRA-2N server step-6 memory leak
 # (docs/bugs/xpu_colocate_generation_pde_nondeterministic.md). No-op when unset.
 export TORCHTUNE_COLOCATE_MEM_PROBE=${MEM_PROBE:-0}
+# Bisect passthrough: the train block runs over an unquoted SSH heredoc that
+# module-purges and re-exports a fixed env list, so an outer-shell export does
+# NOT cross the SSH boundary on its own (the documented "ssh drops un-listed
+# env" trap). Re-export the leak-bisect levers here so they reach the rank.
+export LORA_FSDP_FULL_SHARD=${LORA_FSDP_FULL_SHARD:-0}
+export TORCHTUNE_LEAK_CENSUS=${TORCHTUNE_LEAK_CENSUS:-0}
 export HF_DATASETS_OFFLINE=1
 export HF_HUB_OFFLINE=1
 export HF_DATASETS_CACHE=/lus/flare/projects/ModCon/ngetty/hf_datasets_cache
