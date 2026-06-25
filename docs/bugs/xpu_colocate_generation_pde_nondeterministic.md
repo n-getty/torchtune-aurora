@@ -1,13 +1,16 @@
 # CCS/PDE GPU page fault in per-tile in-process colocate — vLLM weight-publish × XCCL co-residence
 
 **Status**: ROOT CAUSE ISOLATED (2026-06-25) as a **2-factor L0 co-residence interaction**, NOT
-fixable by any recipe-config value. Reproduced byte-identically in a **torchtune-free,
+fixable by any recipe-config value or any in-process mitigation (quiesce / PG-teardown / vLLM
+sleep all REFUTED — see Mitigations). Reproduced byte-identically in a **torchtune-free,
 frameworks-module-only** script. Supersedes the earlier "non-deterministic, unanalyzable" reading
 (that was the low-probability mg512 regime; at mg768 the in-framework recipe faults 8/8). Full
 methodology + crash-rate tables: [`docs/reports/colocate_pagefault_investigation_20260625.md`](../reports/colocate_pagefault_investigation_20260625.md).
 Same broad family as the Ray TP=8 co-tenancy fault
 ([`xpu_l0_event_pool_co_tenancy.md`](xpu_l0_event_pool_co_tenancy.md)) — this is its
 **single-OS-process, in-process TP=1** analogue, firing during/around the colocate weight publish.
+**Server mode avoids THIS fault (separate process), but is not a blanket escape** — a separate
+trainer-side step-6 `banned:1` was found in the Qwen3-4B LoRA 2-node *server* config (Mitigations §1).
 
 ## Symptom
 
@@ -60,20 +63,41 @@ step 0, so its "sync-off" leg still did one `load_weights` — exactly factor 1.
 
 ## Mitigations
 
-1. **Server / dedicated vLLM mode** (RECOMMENDED) — `vllm_mode=server`/`dedicated` moves vLLM to
-   its own process/tiles, eliminating factor (b)'s shared L0 context. GSM8K production already runs
-   this at max_gen=512 with no fault. This is the validated path for mg≥384.
+**No in-process recipe-side fix exists — every lever below that keeps vLLM in-process was tested
+and REFUTED (2026-06-25).** Both L0 driver clients (the vLLM engine and the trainer's XCCL
+context) live in one OS process, and nothing short of process exit evicts either. Only running
+vLLM in a *separate process* (server/dedicated mode) removes a client — but see the server-mode
+caveat below.
+
+1. **Server / dedicated vLLM mode** — `vllm_mode=server`/`dedicated` moves vLLM to its own
+   process/tiles, eliminating factor (1)'s shared L0 context, so the **colocate** fault does not
+   occur. The AGPT-2B GSM8K server production envelope (full-FT, 2B) runs clean for hours.
+   **CAVEAT (2026-06-25):** server mode is NOT a blanket clean path. A first-ever multi-step soak
+   of **Qwen3-4B LoRA 2-node server** faults **trainer-side** (node-0 grpo_step) at **step ~5-6**
+   with the same `banned:1` — reproduced 4× across nodes, **both `delta` and `merged`** publish
+   (jobs 8559836/8559857/8559882). That is a **separate** fault (vLLM is on another node; the
+   publish succeeds), still under diagnosis — see [the investigation report](../reports/colocate_pagefault_investigation_20260625.md)
+   §"NEW separate issue". So: server mode dodges the *colocate* bug, but the 4B-LoRA-2N server
+   config has its own step-6 trainer-side stability fault — **do not assume server+LoRA at 4B/2N is
+   production-ready until that soak clears.** The 2B full-FT server envelope is the known-good one.
 2. **Quiesce-wsync** (`TORCHTUNE_COLOCATE_QUIESCE_WSYNC=1`) — barrier+sync around the publish.
-   **REFUTED 2026-06-25** (A/B job 8559693: 6/6 crash, barrier confirmed engaged). A barrier only
-   syncs rank *arrival*; it does not remove the resident co-tenant L0 context, which is the actual
-   cause. Kept as a documented dead-end (do not use). Implies any *serialization*-based recipe fix
-   is futile — the fix must REMOVE the second L0 client.
-3. **Engine sleep/wake around the publish** (`enable_sleep_mode` → `.sleep()` releases vLLM's
-   device context, publish, `.wake_up()`) — UNTESTED; the most promising recipe-side lever since it
-   actually removes the co-resident L0 client during the mutation. Note vLLM-XPU sleep has its own
-   fragility history (`project_colocate_sleep_8b_validated` — 3-step L0 UR leak); validate before relying.
-4. **Periodic vLLM engine teardown + respawn** (W17/W19 from the Ray TP=8 work) — heavyweight.
-5. **Checkpoint + auto-resume** on `banned:1` — operationally simple, wastes the partial step.
+   **REFUTED** (job 8559693: 6/6 crash, barrier confirmed engaged). A barrier only syncs rank
+   *arrival*; it does not remove the resident co-tenant L0 context. Any *serialization*-based fix
+   is futile. Kept as a documented dead-end (do not use).
+3. **PG teardown around the publish** (`destroy_process_group` before `load_weights`, recreate
+   after — reproducer `--fix cedrain`) — **REFUTED** (job 8559753: still crashes). It only drops
+   the PyTorch PG *wrapper*; the underlying L0 driver context + FSDP device memory persist, so the
+   co-tenancy is unchanged.
+4. **Engine sleep/wake around the publish** (`TORCHTUNE_COLOCATE_SLEEP_WSYNC=1` / `--fix sleep`,
+   `enable_sleep_mode` → `.sleep()` → publish → `.wake_up()`) — **REFUTED** at both
+   `sleep(level=10)` (KV-only; weights stay resident, mutated in place — job 8559763) and
+   `sleep(level=2)` (discard weights — job 8559771). Both crash byte-identically. VLLM sleep frees
+   *vLLM's* device state but not the *trainer's* co-resident L0 context.
+5. **Periodic vLLM engine teardown + respawn** (W17/W19 from the Ray TP=8 work) — **not viable
+   in-process**: `_init_vllm_early` calls `destroy_process_group`, which would also tear down the
+   live XCCL training PG. The Ray version killed a *separate* vLLM actor process; there is no
+   in-process analogue.
+6. **Checkpoint + auto-resume** on `banned:1` — operationally simple, wastes the partial step.
 
 ## Practical envelope (colocate, until a mitigation is validated)
 max_gen ≤ 64 safe (AGPT-2B production); ≤ 256 low-risk; ≥ 384 flaky; 1024 blocked. **For mg≥384,
@@ -93,7 +117,10 @@ In-framework (the real recipe, mg768 → 4/4 by step ~3-4):
 CELL=baseline M=4 MAX_GEN=768 bash experiments/colocate/run_colocate_ab.sh   # under a PBS job
 ```
 Jobs: standalone 8559640/8559661 (crash), 8559650 R-LW control (clean); in-framework A/B
-8559411/8559507/8559508/8559513 (all cells crash). Earlier (superseded) sweeps: 8559141, 8559162.
+8559411/8559507/8559508/8559513 (all cells crash). Refuted in-process fixes: 8559693 (quiesce),
+8559753 (cedrain PG-teardown), 8559763 (sleep L10), 8559771 (sleep L2) — all crash. Server-mode
+4B-LoRA-2N step-6 trainer fault: 8559836/8559857 (delta), 8559882 (merged). Earlier (superseded)
+sweeps: 8559141, 8559162.
 
 ## Cross-refs
 - [`docs/reports/colocate_pagefault_investigation_20260625.md`](../reports/colocate_pagefault_investigation_20260625.md) — full investigation, crash-rate tables, ezpz consistency check.
