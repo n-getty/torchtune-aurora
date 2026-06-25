@@ -121,15 +121,30 @@ single process (R-LW proves the XCCL co-residence factor is required).
      not remove the resident co-tenant L0 context — and *that residency*, not instantaneous
      collective overlap, is the cause (matches Ray TP=8 W10: zero outstanding submissions still
      wedged). **Any serialization-based recipe fix is futile;** the fix must remove the 2nd L0 client.
-   - **Engine sleep/wake around the publish** (`enable_sleep_mode`) — untested; the most promising
-     recipe-side lever since `.sleep()` actually releases vLLM's device context during the mutation.
-     Caveat: vLLM-XPU sleep has its own fragility (3-step L0 UR leak, `project_colocate_sleep_8b`).
-   - **Server/dedicated mode** — the validated path; already runs the paper envelope. Recommended.
-   - Engine teardown+respawn (W17/W19) / checkpoint+auto-resume — heavyweight fallbacks.
+   - **PG teardown around the publish** (`--fix cedrain`: `destroy_process_group` before
+     load_weights, recreate after) — **REFUTED** (job 8559753: still crashes). `destroy_process_group`
+     only drops the PyTorch PG *wrapper*; the underlying L0 driver context + FSDP device memory
+     persist, so the co-tenancy is unchanged.
+   - **vLLM engine sleep/wake around the publish** (`TORCHTUNE_COLOCATE_SLEEP_WSYNC=1` /
+     `--fix sleep`) — **REFUTED** at both `sleep(level=10)` (KV-only — keeps weights resident, so
+     load_weights mutates the same entangled tensors; job 8559763) and `sleep(level=2)` (discard
+     weights; job 8559771). Both crash byte-identically.
+   - **Server/dedicated mode** — the validated, RECOMMENDED path. Removes a whole L0 client by
+     running vLLM in a separate process. With the `delta` publish it is also *fast*: ~26.7s/step
+     (2× faster than `merged`) at G=8/max_gen=384, HW-validated bit-exact
+     (`docs/reports/lora_delta_publish_path_20260617.md`). **This is the performant working RL path.**
+   - Engine teardown+respawn (W17/W19) — not viable in-process: `_init_vllm_early` calls
+     `destroy_process_group`, which would also kill the live XCCL training PG. The Ray version
+     killed a *separate* vLLM actor process; there is no in-process analogue.
 
-   **Refined factor-2:** it is the trainer XCCL/L0 *context residency* on the tile during the
-   weight publish, not an in-flight collective. The standalone factor-2 (multi-rank XCCL world
-   present) holds; the quiesce refutation just shows you can't dodge it by timing.
+   **Why no in-process fix exists (the definitive finding):** both L0 driver clients (the vLLM
+   engine and the trainer's XCCL context) live in **one OS process**. The corruption from
+   `load_weights`-under-co-residence cannot be avoided by serialization (barrier), PG teardown
+   (`destroy_process_group` doesn't free the L0 context), or vLLM sleep (doesn't free the
+   *trainer's* L0 context). Only removing a whole L0 client works — i.e. a separate process —
+   which is exactly why the Ray TP=8 fix had to **kill the vLLM process** (W17). In-process
+   colocate at mg≥384 is therefore **driver-blocked**; the supported performant path is
+   server/dedicated mode (recommended: `+ delta` publish).
 
 ## Artifacts
 

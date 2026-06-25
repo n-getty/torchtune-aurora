@@ -366,6 +366,9 @@ def _init_vllm_tp1(self, cfg, rank, world_size, local_rank,
         dtype="bfloat16",
         disable_custom_all_reduce=True,
     )
+    # _sleep_wsync is computed in the outer _init_vllm_early; re-read from env here since
+    # _init_vllm_tp1 is a separate function (no closure over the caller's local).
+    _sleep_wsync = os.environ.get("TORCHTUNE_COLOCATE_SLEEP_WSYNC", "0") == "1"
     if vllm_mode == "colocate_sleep" or (_sleep_wsync and vllm_mode == "colocate"):
         llm_kwargs["enable_sleep_mode"] = True
     # Pin the KV-cache block count for BOTH colocate and colocate_sleep. Without

@@ -61,6 +61,10 @@ def main() -> int:
     p.add_argument("--load-real-weights", action="store_true",
                    help="load the REAL Qwen3-4B HF-named safetensors into the engine (faithful; "
                         "the self-named round-trip is rejected by vLLM's fused param naming)")
+    p.add_argument("--fix", default="none", choices=["none", "barrier", "sleep", "cedrain"],
+                   help="candidate mitigation wrapped around the load_weights publish (tonight's "
+                        "fast fix harness): barrier (QUIESCE), sleep (KV-sleep/wake), cedrain "
+                        "(destroy+recreate the XCCL trainer PG around the publish)")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--prompt-len", type=int, default=256)
     p.add_argument("--no-vllm", action="store_true",
@@ -129,6 +133,14 @@ def main() -> int:
             if t.is_xpu: return None
             return _oar(t, op=op, group=group, async_op=async_op)
         torch.distributed.all_reduce = _safe_ar
+        # For the sleep fix, apply the XPU sleep patch + enable_sleep_mode BEFORE LLM().
+        if args.fix == "sleep":
+            try:
+                from torchtune.dev.xpu_sleep import patch_vllm_for_xpu_sleep
+                patch_vllm_for_xpu_sleep()
+                _log(rank, "xpu_sleep patch applied (fix=sleep)")
+            except Exception as e:
+                _log(rank, f"WARN xpu_sleep patch failed: {e!r}")
         from vllm import LLM, SamplingParams
         from vllm.v1.executor.uniproc_executor import UniProcExecutor
         _oda = UniProcExecutor._distributed_args
@@ -141,7 +153,8 @@ def main() -> int:
         llm = LLM(model=args.model, tensor_parallel_size=1, gpu_memory_utilization=args.gpu_mem,
                   max_model_len=args.max_model_len, max_num_seqs=args.max_num_seqs,
                   enforce_eager=True, dtype="bfloat16", disable_custom_all_reduce=True,
-                  num_gpu_blocks_override=block_override, enable_prefix_caching=False)
+                  num_gpu_blocks_override=block_override, enable_prefix_caching=False,
+                  enable_sleep_mode=(args.fix == "sleep"))
         _log(rank, f"vLLM up in {time.perf_counter()-t0:.1f}s")
 
         UniProcExecutor._distributed_args = _oda
@@ -264,9 +277,42 @@ def main() -> int:
                                        or (args.load_weights == "once" and step == 0)):
             _names = _real_named if _real_named is not None else _self_named
             try:
+                # --- candidate FIX wrappers (tonight's fast harness) ---
+                # barrier: gloo/XCCL barrier+sync before publish (= recipe QUIESCE; expected fail).
+                # sleep:   vLLM KV-only sleep(10) before publish, wake after (removes vLLM KV/L0).
+                # cedrain: destroy the XCCL trainer PG before publish, recreate after (removes the
+                #          resident XCCL/L0 client entirely — the factor-2 the barrier couldn't).
+                if args.fix == "barrier":
+                    torch.xpu.synchronize(device)
+                    torch.distributed.barrier(); torch.xpu.synchronize(device)
+                elif args.fix == "sleep":
+                    # REPRO_SLEEP_LEVEL: 10=KV-only (weights stay, default), 2=discard weights+KV
+                    # (load_weights then writes fresh tensors — no entanglement), 1=offload weights.
+                    _slv = int(os.environ.get("REPRO_SLEEP_LEVEL", "10"))
+                    torch.xpu.synchronize(device)
+                    try: llm.sleep(level=_slv)
+                    except Exception as _se: _log(rank, f"WARN sleep(level={_slv}): {_se!r}")
+                    torch.xpu.synchronize(device)
+                elif args.fix == "cedrain":
+                    torch.xpu.synchronize(device)
+                    if torch.distributed.is_initialized():
+                        torch.distributed.destroy_process_group()
+                    torch.xpu.synchronize(device)
+
                 vllm_model.load_weights(_names)
                 llm.llm_engine.reset_prefix_cache()
                 torch.xpu.synchronize(device)
+
+                if args.fix == "sleep":
+                    try: llm.wake_up()
+                    except Exception as _we: _log(rank, f"WARN wake: {_we!r}")
+                    torch.xpu.synchronize(device)
+                elif args.fix == "cedrain":
+                    # Recreate the XCCL world PG after the publish (mpi barrier first).
+                    from mpi4py import MPI as _MPI
+                    _MPI.COMM_WORLD.Barrier()
+                    torch.distributed.init_process_group(backend="xccl", world_size=world, rank=rank)
+                    torch.xpu.synchronize(device)
             except Exception as e:
                 _log(rank, f"WARN load_weights step {step} failed: {e!r}")
 

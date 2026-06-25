@@ -29,6 +29,7 @@ MODEL="${MODEL:-/tmp/models/Qwen3-4B}"; STEPS="${STEPS:-8}"; MAX_GEN="${MAX_GEN:
 mkdir -p /tmp/models && rsync -a /lus/flare/projects/ModCon/ngetty/models/Qwen3-4B /tmp/models/ 2>&1 | tail -1
 EXTRA=""; [ "${NO_VLLM:-0}" = "1" ] && EXTRA="--no-vllm"
 [ "${LOAD_REAL:-0}" = "1" ] && EXTRA="${EXTRA} --load-real-weights"
+[ -n "${FIX:-}" ] && EXTRA="${EXTRA} --fix ${FIX}"
 TS=$(date +%Y%m%d_%H%M%S); LOG="$TT/experiments/colocate/repro_logs/MT_${TS}.log"
 mkdir -p "$TT/experiments/colocate/repro_logs"
 echo "=== multitile repro up $(date) world=${WORLD} steps=${STEPS} mg=${MAX_GEN} no_vllm=${NO_VLLM:-0} ==="
