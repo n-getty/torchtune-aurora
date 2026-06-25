@@ -39,7 +39,7 @@ These workloads naturally call `empty_cache()` between forward passes to manage 
 
 ## Reproduction
 
-Self-contained script: `recipes/dev/repro_xpu_resource_leak.py`
+Self-contained script: `experiments/arena_ipc/repro_xpu_resource_leak.py`
 
 ```bash
 # Triggers the bug — FSDP2, RL pattern (~70 iterations):
@@ -174,7 +174,7 @@ The 20+ GiB gap is caused by FSDP AllGather/reshard cycles: each of the 80 layer
 
 ### Verification Results
 
-**Reproduction script** (`recipes/dev/repro_xpu_resource_leak.py`):
+**Reproduction script** (`experiments/arena_ipc/repro_xpu_resource_leak.py`):
 
 | Condition | Iterations | Memory | Result |
 |-----------|-----------|--------|--------|
@@ -267,7 +267,7 @@ We systematically tested each XPU primitive that FSDP uses, in isolation and com
 | **Actual FSDP2** (`fully_shard`) with RL pattern | **~140** | **CRASH** |
 | **Actual FSDP1** (`FullyShardedDataParallel`) with RL pattern | **~290** | **CRASH** |
 
-Test scripts: `recipes/dev/test_raw_allgather_leak.py`, `recipes/dev/test_event_leak.py`, `recipes/dev/test_storage_resize_leak.py`
+Test scripts: `experiments/arena_ipc/test_raw_allgather_leak.py`, `experiments/arena_ipc/test_event_leak.py`, `experiments/arena_ipc/test_storage_resize_leak.py`
 
 All tests run on the same node, same session, confirming the environment is identical.
 
@@ -324,9 +324,9 @@ The investigation proceeded bottom-up: test each XPU primitive in isolation, the
 
 | Script | What it tests | Result |
 |--------|--------------|--------|
-| `recipes/dev/test_raw_allgather_leak.py` | Raw `dist.all_gather()` under `no_grad`, with and without FSDP-like alloc/free pattern | 20,000 ops **STABLE** |
-| `recipes/dev/test_event_leak.py` | `torch.Event`, `stream.record_event()`, multi-stream sync, FSDP-like allgather+events | 10,000 ops **STABLE** |
-| `recipes/dev/test_storage_resize_leak.py` | `storage.resize_(0)`/`resize_(size)` cycles, allgather+resize, full FSDP simulation (4 fwd × 12 layers) | 9,600 cycles **STABLE** |
+| `experiments/arena_ipc/test_raw_allgather_leak.py` | Raw `dist.all_gather()` under `no_grad`, with and without FSDP-like alloc/free pattern | 20,000 ops **STABLE** |
+| `experiments/arena_ipc/test_event_leak.py` | `torch.Event`, `stream.record_event()`, multi-stream sync, FSDP-like allgather+events | 10,000 ops **STABLE** |
+| `experiments/arena_ipc/test_storage_resize_leak.py` | `storage.resize_(0)`/`resize_(size)` cycles, allgather+resize, full FSDP simulation (4 fwd × 12 layers) | 9,600 cycles **STABLE** |
 
 **Conclusion**: All driver primitives (allgather, events, streams, storage resize) are individually stable at 10,000+ ops. The leak is not in the driver layer.
 
@@ -334,9 +334,9 @@ The investigation proceeded bottom-up: test each XPU primitive in isolation, the
 
 | Script | What it tests | Result |
 |--------|--------------|--------|
-| `recipes/dev/test_fsdp_unshard_leak.py` | Actual FSDP `fully_shard()` with bisection: unshard/reshard only, no_grad forward, grad forward, RL pattern, version_counter isolation | All tests 200-500 iters **STABLE** (no `empty_cache()`) |
-| `recipes/dev/test_fsdp_memory_pressure.py` | Full RL pattern with two FSDP models, logprob ops, backward. Tests memory pressure vs tensor ops as trigger | 200 iters **STABLE** (no `empty_cache()`) |
-| `recipes/dev/test_toplevel_fsdp_rl.py` | Full RL with top-level-only `fully_shard()` | 200 iters **STABLE** (no `empty_cache()`) |
+| `experiments/arena_ipc/test_fsdp_unshard_leak.py` | Actual FSDP `fully_shard()` with bisection: unshard/reshard only, no_grad forward, grad forward, RL pattern, version_counter isolation | All tests 200-500 iters **STABLE** (no `empty_cache()`) |
+| `experiments/arena_ipc/test_fsdp_memory_pressure.py` | Full RL pattern with two FSDP models, logprob ops, backward. Tests memory pressure vs tensor ops as trigger | 200 iters **STABLE** (no `empty_cache()`) |
+| `experiments/multinode_32b/test_toplevel_fsdp_rl.py` | Full RL with top-level-only `fully_shard()` | 200 iters **STABLE** (no `empty_cache()`) |
 
 **Conclusion**: FSDP with the RL pattern (multiple no_grad forwards + grad backward) is stable *without* `empty_cache()`. The leak is not in FSDP's unshard/reshard logic itself.
 
@@ -344,9 +344,9 @@ The investigation proceeded bottom-up: test each XPU primitive in isolation, the
 
 | Script | What it tests | Result |
 |--------|--------------|--------|
-| `recipes/dev/test_repro_direct.py` | Exact repro model + RL loop, WITHOUT `empty_cache()` | 200 iters **STABLE** |
-| `recipes/dev/test_empty_cache_leak.py` | Same RL loop WITH `torch.xpu.empty_cache()` between forwards | **CRASH at ~70 iters** |
-| `recipes/dev/test_empty_cache_no_fsdp.py` | Same RL loop + `empty_cache()` but WITHOUT FSDP | 200 iters **STABLE** |
+| `experiments/arena_ipc/test_repro_direct.py` | Exact repro model + RL loop, WITHOUT `empty_cache()` | 200 iters **STABLE** |
+| `experiments/arena_ipc/test_empty_cache_leak.py` | Same RL loop WITH `torch.xpu.empty_cache()` between forwards | **CRASH at ~70 iters** |
+| `experiments/arena_ipc/test_empty_cache_no_fsdp.py` | Same RL loop + `empty_cache()` but WITHOUT FSDP | 200 iters **STABLE** |
 
 **Conclusion**: `empty_cache()` is the trigger, but only in combination with FSDP. Without FSDP, `empty_cache()` is safe. Without `empty_cache()`, FSDP is safe. The leak is in the interaction.
 
@@ -472,7 +472,7 @@ All allocator-level approaches to the 30 GiB splintering gap are exhausted:
 
 ### Resolution: Accept CPU Offload (2026-04-04)
 
-**Context**: The fragmentation investigation was motivated by the 72B optimization roadmap (Phase 8 in `aurora_rl_baselines.md`). With 3 training nodes (36-way FSDP), per-tile allocated memory is only ~24.9 GiB — well within 48 GiB. The goal was to eliminate CPU offload (which adds ~6.5s/step optimizer overhead) by fitting without defragmentation.
+**Context**: The fragmentation investigation was motivated by the 72B optimization roadmap. With 3 training nodes (36-way FSDP), per-tile allocated memory is only ~24.9 GiB — well within 48 GiB. The goal was to eliminate CPU offload (which adds ~6.5s/step optimizer overhead) by fitting without defragmentation.
 
 **Decision**: Accept `fsdp_cpu_offload: True` for 72B models. The 6.5s/step overhead (~8% of 84.6s step time) is not worth fighting a driver-level allocator bug. Optimization effort is better directed at:
 - `forward_batch_size=4` (estimated -28s, 4× more impactful than eliminating offload)

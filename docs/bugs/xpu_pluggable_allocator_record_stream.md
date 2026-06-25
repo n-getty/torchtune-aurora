@@ -148,7 +148,7 @@ provided.
 
 ### Theory 2 (FSDP2 doesn't call `recordStream` at all)
 
-A follow-up audit (`docs/reports/allocator_deep_analysis_20260425.md`) of the
+A follow-up audit (`docs/reports/archive/allocator_deep_analysis_20260425.md`) of the
 shipped FSDP2 source on Aurora found:
 
 ```
@@ -293,4 +293,4 @@ but the configuration is reliable.
 Investigation history (LD_PRELOAD shims, allocator-variant matrix, Phase 1b–9
 findings) is in `experiments/arena_ipc/diag_findings.md`. Independent
 re-analysis disputing the recordStream theory is in
-`docs/reports/allocator_deep_analysis_20260425.md`.
+`docs/reports/archive/allocator_deep_analysis_20260425.md`.

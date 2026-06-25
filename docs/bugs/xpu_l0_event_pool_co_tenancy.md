@@ -21,7 +21,7 @@ This variant surfaced in the Ray-colocate Qwen3-8B TP=8 implementation (8 traine
 | Workaround | Never call `empty_cache()` in FSDP loops | Open question — see "Mitigation candidates" |
 | `device_empty_cache` involved? | Yes (the cause) | No (it's a no-op on XPU; recipe never calls real empty_cache in steady-state) |
 | HBM at crash | Often near limit | ~30 GiB headroom (smoke6/7 evidence) |
-| Reproducer | `recipes/dev/repro_xpu_resource_leak.py` | `experiments/colocate/run_qwen3_8b_colocate_ray.sh` (smokes 3-7, 2026-05-07) |
+| Reproducer | `experiments/arena_ipc/repro_xpu_resource_leak.py` | `experiments/colocate/run_qwen3_8b_colocate_ray.sh` (smokes 3-7, 2026-05-07) |
 
 The two share **the same error code** (UR 40 = `UR_RESULT_ERROR_OUT_OF_RESOURCES`) and likely the **same underlying L0 resource pool**, but they are exhausted by different mechanisms:
 
@@ -179,8 +179,14 @@ If this turns out to be a real L0 driver ceiling on per-tile event/queue resourc
 - [`intel_xpu_resource_leak_bug_report.md`](intel_xpu_resource_leak_bug_report.md) — the iteration-bounded `empty_cache()` + FSDP variant. Same error code, different cause.
 - [`ccl_ipc_handle_cache.md`](ccl_ipc_handle_cache.md) — CCL `banned:1` PDE from IPC handle exhaustion. Distinct from this; manifests as PDE not UR40.
 - `docs/reports/colocate_ray_tp8_status_20260507.md` — the Ray-colocate smoke matrix and full diagnosis.
-- `memory/project_colocate_tp8_ray_implementation.md` — running investigation history.
+- (internal investigation history retained in the project's working notes).
 
 ## Status
 
-**OPEN.** Mitigation sweep in flight on hold 8472800 (debug-scaling, queued 2026-05-07).
+**ROOT CAUSE CONFIRMED; mitigation sweep complete (2026-05-08).** The wedge is the static
+process-context footprint of two L0 driver clients sharing a tile (W4–W16 all negative; W10
+rules out dynamic accumulation; W17 isolates live co-tenancy as the mechanism). Two validated
+production paths: **W2** (8+4 process isolation, 247s/step Qwen3-8B) and **W17+W19** (kill+respawn
+around each BWD, 290s/step). What remains is the Intel-side ask (see "What we need from Intel"):
+a per-tile L0 resource ceiling that two co-resident clients cannot both satisfy during an FSDP
+backward. No application-level fix is possible without process isolation or a driver change.

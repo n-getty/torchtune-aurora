@@ -29,10 +29,12 @@ the default and the high-threshold settings have failure modes:
   The minimum valid value is 1.
 - **One (threshold = 1, WS12 candidate fix):** semantically close to zero — one handle
   is retained between consecutive collectives, then evicted. Accumulation is minimal
-  (1 handle at a time). Whether this prevents the stale-VA fault in the same way as
-  threshold=0 depends on L0 eviction semantics. **Status: queued for validation on
-  EP=16 with max_gen=256 long sequences.**
-  The EP=16 run script (`run_qwen3_30b_ep16_vllm_2node.sh`) now reads
+  (1 handle at a time). **Status: TESTED, FAILED (EP=16 job 8469882, 2026-05-05).**
+  threshold=1 does NOT prevent the step-1 crash on long-completion workloads: immediate
+  eviction creates a per-rank race (rank A closes H(VA) while rank B still holds it from a
+  different cache epoch). See the WS11→WS12 detail at the bottom of "Workarounds". Current
+  production setting remains 65536.
+  The EP=16 run script (`run_qwen3_30b_ep16_vllm_2node.sh`) reads
   `${CCL_ZE_CACHE_OPEN_IPC_HANDLES_THRESHOLD:-65536}` so this can be overridden.
 
 The issue surfaces in two distinct flavors that share the same root cause:
@@ -118,8 +120,7 @@ This is **distinct** from the OFI memory-region (MR) cache. OFI MR is
 user-space libfabric state on Slingshot for cross-node RDMA. CCL IPC handles
 are kernel-space Level Zero state for intra-node XeLink peer access.
 Validated 2026-04-25: `FI_MR_CACHE_MONITOR=userfaultfd` does NOT prevent
-the `banned:1` crash because it manages a different cache (see
-`docs/status.md:1263-1278`).
+the `banned:1` crash because it manages a different cache.
 
 ## Workarounds in this repo
 
@@ -143,8 +144,7 @@ inside step 1. WS12 sets threshold=0 before sourcing the same launcher.
 
 The 65536 setting accumulates ~10.85 GiB of IPC handle memory by end of step 1
 backward on a 10-tile FSDP2 backbone, leaving no room to even reach step 2.
-We use 2-node HSDP instead. See CLAUDE.md "Critical Platform Constraints" and
-`memory/project_xccl_broadcast_test.md` for the full numbers.
+We use 2-node HSDP instead.
 
 ### EP=8 chunked loss (WS11 → WS12)
 
@@ -222,5 +222,5 @@ Either fix would let us drop the threshold tuning entirely.
 | `docs/bugs/intel_xpu_resource_leak_bug_report.md` | `torch.xpu.empty_cache()` + FSDP `storage.resize_()` UR-handle leak | UR_RESULT_ERROR_OUT_OF_RESOURCES at iter ~70 |
 
 Investigation history: `docs/reports/ccl_external_memory_growth_32b.md`,
-`docs/reports/allocator_deep_analysis_20260425.md`, `docs/status.md` (WS9–WS12
+`docs/reports/archive/allocator_deep_analysis_20260425.md`, `docs/status.md` (WS9–WS12
 EP=8 chain).

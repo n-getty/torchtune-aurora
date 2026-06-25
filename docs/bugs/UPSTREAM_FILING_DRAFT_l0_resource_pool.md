@@ -114,7 +114,7 @@ bash /lus/flare/projects/ModCon/ngetty/torchtune/experiments/colocate/run_qwen3_
 
 # Signature 2 (empty_cache+FSDP UR40) — reproduces in <2 min
 python3 -m torch.distributed.run --standalone --nproc_per_node=2 \
-    /lus/flare/projects/ModCon/ngetty/torchtune/recipes/dev/repro_xpu_resource_leak.py \
+    /lus/flare/projects/ModCon/ngetty/torchtune/experiments/arena_ipc/repro_xpu_resource_leak.py \
     --fsdp --layers 12 --hidden 1024 --heads 8
 
 # Signature 3 (CCL IPC handle banned:1) — needs ~30 steps, ~30-60 min
