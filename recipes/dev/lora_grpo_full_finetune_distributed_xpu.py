@@ -1447,11 +1447,18 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
         # so load_weights can still write them; wakes after). Requires enable_sleep_mode at init
         # (gated by the same env in vllm_backend). See docs/reports/colocate_pagefault_investigation_20260625.md.
         _sleep_wsync = os.environ.get("TORCHTUNE_COLOCATE_SLEEP_WSYNC", "0") == "1"
+        # Tracks whether the engine is currently KV-slept so the wake in the
+        # `finally` below ALWAYS runs once a sleep succeeded — even if the merge
+        # or reset_prefix_cache raises. Otherwise an exception between sleep and
+        # wake would strand the in-process engine asleep with KV discarded (and
+        # the publish exception is fatal: fail_on_publish_error propagates it).
+        _engine_asleep = False
         if _sleep_wsync:
             try:
                 if torch.xpu.is_available():
                     torch.xpu.synchronize(self._device)
                 self._vllm_llm.sleep(level=10)  # KV-only discard; weights stay resident
+                _engine_asleep = True
                 if torch.xpu.is_available():
                     torch.xpu.synchronize(self._device)
                 if self._is_rank_zero:
@@ -1459,88 +1466,90 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
                              getattr(self, "_steps_run", -1))
             except Exception as _sl_exc:
                 log.warning("COLOCATE_SLEEP_WSYNC sleep failed: %r", _sl_exc)
-                _sleep_wsync = False  # don't try to wake if sleep failed
 
-        # Cached-base path (opt-in via TORCHTUNE_COLOCATE_CACHED_BASE=1, or whenever
-        # _colocate_base_cache was populated at setup). The frozen base never
-        # changes and the adapter is replicated (FSDP ignored_states), so there is
-        # NO need to summon_full_params every step — re-all-gathering the full base
-        # each step accumulates L0 IPC/UR handles (the exact mechanism the recipe
-        # avoids for adapter params at setup) and is the suspected UR:40 driver at
-        # ~10 steps. With the base cached full per-rank, merge reads the replicated
-        # adapter directly: no per-step collective, no per-step handle churn.
-        _use_cached_base = getattr(self, "_colocate_base_cache", None) is not None
-        if _use_cached_base:
-            for tune_name, merged in iter_merged_lora_layers(
-                self._model, base_weights=self._colocate_base_cache
-            ):
-                hf_name = tune_lora_name_to_hf(tune_name)
-                if hf_name is None:
-                    skipped += 1
-                    log.warning("colocate LoRA sync: no HF mapping for %s — skipping", tune_name)
-                    continue
-                w = self._maybe_unpermute_qk(hf_name, merged.contiguous())
-                llm_model.load_weights([(hf_name, w)])
-                n_synced += 1
-                del w, merged
-                if n_synced % 5 == 0 and torch.xpu.is_available():
-                    gc.collect()
-                    torch.xpu.synchronize(self._device)
-        else:
-            import contextlib as _ctxlib
-            # No-FSDP: weights are full+resident, read module.weight directly (no
-            # summon). FSDP: summon the full sharded param for the merge.
-            _summon_ctx = (
-                _ctxlib.nullcontext()
-                if getattr(self, "_no_fsdp", False)
-                else FSDP.summon_full_params(self._model, writeback=False, rank0_only=False)
-            )
-            with torch.no_grad(), _summon_ctx:
+        try:
+            # Cached-base path (opt-in via TORCHTUNE_COLOCATE_CACHED_BASE=1, or whenever
+            # _colocate_base_cache was populated at setup). The frozen base never
+            # changes and the adapter is replicated (FSDP ignored_states), so there is
+            # NO need to summon_full_params every step — re-all-gathering the full base
+            # each step accumulates L0 IPC/UR handles (the exact mechanism the recipe
+            # avoids for adapter params at setup) and is the suspected UR:40 driver at
+            # ~10 steps. With the base cached full per-rank, merge reads the replicated
+            # adapter directly: no per-step collective, no per-step handle churn.
+            _use_cached_base = getattr(self, "_colocate_base_cache", None) is not None
+            if _use_cached_base:
                 for tune_name, merged in iter_merged_lora_layers(
-                    self._model, base_weights=None
+                    self._model, base_weights=self._colocate_base_cache
                 ):
                     hf_name = tune_lora_name_to_hf(tune_name)
                     if hf_name is None:
                         skipped += 1
-                        log.warning(
-                            "colocate LoRA sync: no HF mapping for %s — skipping", tune_name
-                        )
+                        log.warning("colocate LoRA sync: no HF mapping for %s — skipping", tune_name)
                         continue
-                    # Invert Llama-family Q/K permutation before vLLM (no-op Qwen3).
                     w = self._maybe_unpermute_qk(hf_name, merged.contiguous())
                     llm_model.load_weights([(hf_name, w)])
                     n_synced += 1
                     del w, merged
-                    # gc + sync every 5 params to bound UR-handle pressure from the
-                    # summon all-gathers before the next FSDP backward.
                     if n_synced % 5 == 0 and torch.xpu.is_available():
                         gc.collect()
                         torch.xpu.synchronize(self._device)
+            else:
+                import contextlib as _ctxlib
+                # No-FSDP: weights are full+resident, read module.weight directly (no
+                # summon). FSDP: summon the full sharded param for the merge.
+                _summon_ctx = (
+                    _ctxlib.nullcontext()
+                    if getattr(self, "_no_fsdp", False)
+                    else FSDP.summon_full_params(self._model, writeback=False, rank0_only=False)
+                )
+                with torch.no_grad(), _summon_ctx:
+                    for tune_name, merged in iter_merged_lora_layers(
+                        self._model, base_weights=None
+                    ):
+                        hf_name = tune_lora_name_to_hf(tune_name)
+                        if hf_name is None:
+                            skipped += 1
+                            log.warning(
+                                "colocate LoRA sync: no HF mapping for %s — skipping", tune_name
+                            )
+                            continue
+                        # Invert Llama-family Q/K permutation before vLLM (no-op Qwen3).
+                        w = self._maybe_unpermute_qk(hf_name, merged.contiguous())
+                        llm_model.load_weights([(hf_name, w)])
+                        n_synced += 1
+                        del w, merged
+                        # gc + sync every 5 params to bound UR-handle pressure from the
+                        # summon all-gathers before the next FSDP backward.
+                        if n_synced % 5 == 0 and torch.xpu.is_available():
+                            gc.collect()
+                            torch.xpu.synchronize(self._device)
 
-        # reset_prefix_cache() mutates the vLLM KV block table. It is a no-op when
-        # prefix caching is disabled (the colocate default), but it is on the suspect
-        # list for the colocate generation page fault (a freed/remapped KV page that a
-        # later paged-attention kernel references). TORCHTUNE_COLOCATE_SKIP_RESET_PREFIX=1
-        # lets the page-fault A/B (experiments/colocate/run_colocate_ab.sh, cell=noreset)
-        # isolate it. Default unchanged: the call still fires.
-        if os.environ.get("TORCHTUNE_COLOCATE_SKIP_RESET_PREFIX", "0") != "1":
-            self._vllm_llm.llm_engine.reset_prefix_cache()
-        gc.collect()
-        if torch.xpu.is_available():
-            torch.xpu.synchronize(self._device)
-
-        # Sleep-wsync: wake the engine (re-alloc KV) after the weight publish so the next
-        # generation runs normally. Pairs with the level-10 sleep above.
-        if _sleep_wsync:
-            try:
-                self._vllm_llm.wake_up()
-                if torch.xpu.is_available():
-                    torch.xpu.synchronize(self._device)
-                if self._is_rank_zero:
-                    log.info("COLOCATE_SLEEP_WSYNC step=%d: woke engine after publish",
-                             getattr(self, "_steps_run", -1))
-            except Exception as _wk_exc:
-                log.warning("COLOCATE_SLEEP_WSYNC wake failed: %r", _wk_exc)
+            # reset_prefix_cache() mutates the vLLM KV block table. It is a no-op when
+            # prefix caching is disabled (the colocate default), but it is on the suspect
+            # list for the colocate generation page fault (a freed/remapped KV page that a
+            # later paged-attention kernel references). TORCHTUNE_COLOCATE_SKIP_RESET_PREFIX=1
+            # lets the page-fault A/B (experiments/colocate/run_colocate_ab.sh, cell=noreset)
+            # isolate it. Default unchanged: the call still fires.
+            if os.environ.get("TORCHTUNE_COLOCATE_SKIP_RESET_PREFIX", "0") != "1":
+                self._vllm_llm.llm_engine.reset_prefix_cache()
+            gc.collect()
+            if torch.xpu.is_available():
+                torch.xpu.synchronize(self._device)
+        finally:
+            # Sleep-wsync: wake the engine (re-alloc KV) after the weight publish so the
+            # next generation runs normally. Pairs with the level-10 sleep above. In a
+            # `finally` so a raising merge/reset_prefix can never leave the engine asleep.
+            if _engine_asleep:
+                try:
+                    self._vllm_llm.wake_up()
+                    _engine_asleep = False
+                    if torch.xpu.is_available():
+                        torch.xpu.synchronize(self._device)
+                    if self._is_rank_zero:
+                        log.info("COLOCATE_SLEEP_WSYNC step=%d: woke engine after publish",
+                                 getattr(self, "_steps_run", -1))
+                except Exception as _wk_exc:
+                    log.warning("COLOCATE_SLEEP_WSYNC wake failed: %r", _wk_exc)
 
         # Quiesce-wsync trailing barrier: ensure the weight publish (+ reset_prefix) on every
         # rank has fully completed and the device is idle before any rank resumes XCCL work,
