@@ -31,6 +31,13 @@ cd "${TT}"
 #                   Rules in/out the varlen no-grad output cache as the leak.
 #   LEG=single_bwd: + TORCHTUNE_USE_CHUNKED_LOSS=0 (chunked fwd+bwd).
 #                   Rules in/out per-chunk retention in grpo_step.
+#   LEG=full_shard: + LORA_FSDP_FULL_SHARD=1 (ZeRO-3, reshards after forward).
+#                   PRIMARY FIX CANDIDATE: SHARD_GRAD_OP (ZeRO-2, the default)
+#                   keeps unsharded params resident after forward; the no-grad
+#                   ref_fwd under disable_adapter re-gathers them each step with
+#                   no backward to free them -> ~2.5 GiB/step floor creep (baseline
+#                   leg, job 8560856). FULL_SHARD reshards, so the floor should be
+#                   FLAT. Baseline-leg floor: 3.97->7.01->9.46->12.11->14.67->17.19.
 LEG=${LEG:-baseline}
 
 export MEM_PROBE=1            # -> TORCHTUNE_COLOCATE_MEM_PROBE=1 (per-phase probe)
@@ -40,6 +47,7 @@ case "${LEG}" in
   baseline)   ;;
   novarlen)   export TORCHTUNE_USE_IPEX_VARLEN=0; export TORCHTUNE_MASKFREE_CAUSAL=0 ;;
   single_bwd) export TORCHTUNE_USE_CHUNKED_LOSS=0 ;;
+  full_shard) export LORA_FSDP_FULL_SHARD=1 ;;
   *) echo "unknown LEG=${LEG}"; exit 2 ;;
 esac
 
