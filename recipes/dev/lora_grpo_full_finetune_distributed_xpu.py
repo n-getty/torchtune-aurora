@@ -1443,9 +1443,11 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
         # Sleep-wsync (TORCHTUNE_COLOCATE_SLEEP_WSYNC=1, default off): the colocate page fault is
         # load_weights mutating vLLM's resident weights while the trainer's XCCL/L0 context is
         # co-resident — a barrier does NOT help (quiesce A/B refuted), so instead clear vLLM's own
-        # KV/L0 paging state around the mutation via a KV-only sleep (level 10 keeps weights on GPU
-        # so load_weights can still write them; wakes after). Requires enable_sleep_mode at init
-        # (gated by the same env in vllm_backend). See docs/reports/colocate_pagefault_investigation_20260625.md.
+        # KV/L0 paging state around the mutation via a KV-only sleep. NOTE: level=10 is the
+        # XPU-patched KV-only-discard variant (torchtune.dev.xpu_sleep), NOT an upstream vLLM
+        # sleep level (upstream is 1/2) — it keeps weights on GPU so load_weights can still write
+        # them; wakes after. Requires enable_sleep_mode at init (gated by the same env in
+        # vllm_backend). See docs/reports/colocate_pagefault_investigation_20260625.md.
         _sleep_wsync = os.environ.get("TORCHTUNE_COLOCATE_SLEEP_WSYNC", "0") == "1"
         # Tracks whether the engine is currently KV-slept so the wake in the
         # `finally` below ALWAYS runs once a sleep succeeded — even if the merge
