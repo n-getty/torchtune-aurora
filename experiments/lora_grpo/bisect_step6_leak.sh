@@ -49,6 +49,8 @@ case "${LEG}" in
   single_bwd) export TORCHTUNE_USE_CHUNKED_LOSS=0 ;;
   full_shard) export LORA_FSDP_FULL_SHARD=1 ;;
   census)     export TORCHTUNE_LEAK_CENSUS=1 ;;   # name the retained tensor (diff step N vs N+1)
+  cachemax1)  export TORCHTUNE_VARLEN_CACHE_MAX=1; export TORCHTUNE_LEAK_CENSUS=1 ;;  # fix-test: cap varlen cache at 1 + census
+  novarlen2)  export TORCHTUNE_USE_IPEX_VARLEN=0; export TORCHTUNE_MASKFREE_CAUSAL=0; export TORCHTUNE_LEAK_CENSUS=1 ;;  # varlen fully off + census (does floor flatten?)
   *) echo "unknown LEG=${LEG}"; exit 2 ;;
 esac
 

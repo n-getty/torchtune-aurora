@@ -691,6 +691,7 @@ export TORCHTUNE_COLOCATE_MEM_PROBE=${MEM_PROBE:-0}
 # env" trap). Re-export the leak-bisect levers here so they reach the rank.
 export LORA_FSDP_FULL_SHARD=${LORA_FSDP_FULL_SHARD:-0}
 export TORCHTUNE_LEAK_CENSUS=${TORCHTUNE_LEAK_CENSUS:-0}
+export TORCHTUNE_VARLEN_CACHE_MAX=${TORCHTUNE_VARLEN_CACHE_MAX:-8}
 export HF_DATASETS_OFFLINE=1
 export HF_HUB_OFFLINE=1
 export HF_DATASETS_CACHE=/lus/flare/projects/ModCon/ngetty/hf_datasets_cache
