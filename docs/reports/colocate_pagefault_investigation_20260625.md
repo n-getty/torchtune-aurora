@@ -173,14 +173,36 @@ Evidence it is a **live memory leak** (not allocator caching, not the bounded va
 
 - ~2.7 GiB/step; `active` and `reserved` rise together → genuine reference retention, not caching.
 - Larger than the known `_varlen_out_cache` variable-seqlen leak (capped at
-  `TORCHTUNE_VARLEN_CACHE_MAX=8` ≈ bounded; `varlen=engaged` confirmed in this run), so it is a
-  **separate** retention.
-- Suspects (under bisection): per-step merged-publish staging buffers, master-fp32 copies, or
-  ungated gather buffers in the server publish path.
+  `TORCHTUNE_VARLEN_CACHE_MAX=8`), `varlen=engaged` confirmed in this run.
 
-**Action:** hold-node bisect with a per-step component memory probe + A/B
-(`TORCHTUNE_USE_CHUNKED_LOSS`, varlen off, publish-path probes). Until the leak is fixed,
-4B-LoRA-2N server is **not** production-ready; the known-good server envelope is AGPT-2B full-FT.
+### RESOLVED 2026-06-25 — it WAS `_varlen_out_cache`, footprint undercounted ~170×
+
+A storage-deduped leak census (`TORCHTUNE_LEAK_CENSUS=1`, job 8561648) named the object directly.
+Per-step the only group that grows is **`(total_tokens, n_heads, head_dim)` bf16 ×36** — one
+attention output buffer per layer — and the diff is unambiguous: step 1 holds `(9040,32,128)×36`,
+step 2 adds `(9696,32,128)×36` **while step 1's set is still live**, etc. That is the varlen
+no-grad output-buffer cache: each ref-forward generation is ~2.5 GiB (36 × ≈69 MiB), keyed by the
+per-step-varying GSM8K seqlen.
+
+The 2026-06-24 FIFO cap was correct in *concept* but its size estimate was wrong: it assumed one
+~14.7 MiB buffer per shape (~0.44 GiB/step) and **defaulted the cap to 8**. The true cost is
+~2.5 GiB/generation, so cap=8 ⇒ up to ~20 GiB of seqlen-keyed generations retained ⇒ OOM
+(`banned:1` PDE) around step 6 on a 64 GiB tile.
+
+**Fix:** default `TORCHTUNE_VARLEN_CACHE_MAX` 8→1 (`torchtune/modules/attention_utils.py`).
+Bisect ladder (all 2N, G=8, server, merged):
+
+| leg | sharding / cap | result |
+|-----|----------------|--------|
+| baseline | ZeRO-2, cap 8 | floor 3.97→7.01→9.46→12.11→14.67→**CRASH step 6** |
+| full_shard | ZeRO-3, cap 8 | **CRASH step 1** (reshard transients + banned empty_cache — worse) |
+| **cachemax1** | ZeRO-2, **cap 1** | floor **bit-flat 1.43→4.28→4.46→4.25→4.45→4.35→4.33**, full 8-step run **0 crashes** |
+
+So: **not** the colocate L0 co-residence bug (vLLM on a separate node), **not** FSDP sharding
+(both ZeRO-2 and ZeRO-3 crash; ZeRO-3 sooner), **not** the publish path (rank-0 CPU tensors) —
+it is the varlen no-grad output cache, now fixed by the lowered default. On variable-seqlen RL
+cross-step reuse is ~nil so cap=1 costs nothing; raise the cap for fixed-seqlen (SFT) to recover
+consecutive-same-shape reuse.
 
 ## Artifacts
 

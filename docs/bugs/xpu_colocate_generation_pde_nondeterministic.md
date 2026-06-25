@@ -83,13 +83,20 @@ caveat below.
    `access: 0 (Read)`). Trainer `active` grows monotonically ~2.7 GiB/step
    (39.2→44.1→49.1→50.6→52.9 GiB, `reserved` 45.6→60.3) and step-6's ref_fwd allocation crosses
    the 64 GiB tile ceiling. `active` and `reserved` track together → a genuine reference leak, not
-   allocator caching; larger than the bounded `_varlen_out_cache` leak (capped at
-   `TORCHTUNE_VARLEN_CACHE_MAX=8`, varlen *did* engage here). Suspects: per-step merged-publish
-   staging, master-fp32 copies, or ungated gather buffers in the server publish path — under
-   bisection. See [the investigation report](../reports/colocate_pagefault_investigation_20260625.md)
-   §"NEW separate issue". So: server mode dodges the *colocate* bug; the 4B-LoRA-2N server config
-   has a **separate per-step memory leak** — **do not assume server+LoRA at 4B/2N is
-   production-ready until that leak is fixed.** The 2B full-FT server envelope is the known-good one.
+   allocator caching. **ROOT-CAUSED + FIXED 2026-06-25 (job 8561648):** it *was* the
+   `_varlen_out_cache` after all — the per-generation footprint was undercounted ~170×. A leak
+   census showed each ref-forward generation retains **~2.5 GiB** (≈36 distinct
+   `(total_tokens, n_heads, head_dim)` bf16 buffers, ≈69 MiB each, one per layer), keyed by the
+   per-step-varying GSM8K seqlen. The 2026-06-24 FIFO cap was sized against a mistaken
+   ~14.7 MiB/0.44-GiB-per-step estimate and **defaulted to 8**, so up to ~20 GiB of seqlen-keyed
+   generations accumulated → OOM ~step 6 on a 64 GiB tile. **Fix:** default
+   `TORCHTUNE_VARLEN_CACHE_MAX` 8→1 (`torchtune/modules/attention_utils.py`). HW-validated: floor
+   bit-flat 1.43→4.28→4.46→4.25→4.45→4.35→4.33 GiB steps 0-6, full 8-step run **0 crashes**, vs
+   the baseline staircase 3.97→7.01→9.46→12.11→14.67→CRASH. **Not** FSDP sharding (ZeRO-2 and
+   ZeRO-3 both crash, ZeRO-3 sooner). See
+   [the investigation report](../reports/colocate_pagefault_investigation_20260625.md) §"NEW
+   separate issue". So: server mode dodges the *colocate* bug, and the 4B-LoRA-2N server step-6
+   leak is now **fixed** (default cap=1).
 2. **Quiesce-wsync** (`TORCHTUNE_COLOCATE_QUIESCE_WSYNC=1`) — barrier+sync around the publish.
    **REFUTED** (job 8559693: 6/6 crash, barrier confirmed engaged). A barrier only syncs rank
    *arrival*; it does not remove the resident co-tenant L0 context. Any *serialization*-based fix
