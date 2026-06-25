@@ -77,8 +77,14 @@ def _init_vllm_early(self, cfg):
     vllm_mode = cfg.get("vllm_mode", "colocate")
     tp_size = cfg.get("vllm_tensor_parallel_size", 1)
 
-    # For colocate_sleep mode, apply XPU sleep patches BEFORE importing vLLM LLM
-    if vllm_mode == "colocate_sleep":
+    # For colocate_sleep mode, apply XPU sleep patches BEFORE importing vLLM LLM.
+    # Also apply them for plain colocate when TORCHTUNE_COLOCATE_SLEEP_WSYNC=1 — that fix
+    # wraps the per-step load_weights publish in sleep(KV-discard)/wake to clear vLLM's KV/L0
+    # paging state during the weight mutation (the 2-factor colocate page-fault: load_weights ×
+    # resident XCCL/L0 context — a barrier doesn't help, so we instead reset the engine's L0
+    # paging around the mutation). Requires enable_sleep_mode=True at engine init (below).
+    _sleep_wsync = os.environ.get("TORCHTUNE_COLOCATE_SLEEP_WSYNC", "0") == "1"
+    if vllm_mode == "colocate_sleep" or (_sleep_wsync and vllm_mode == "colocate"):
         from torchtune.dev.xpu_sleep import patch_vllm_for_xpu_sleep
         patch_vllm_for_xpu_sleep()
 
@@ -360,7 +366,7 @@ def _init_vllm_tp1(self, cfg, rank, world_size, local_rank,
         dtype="bfloat16",
         disable_custom_all_reduce=True,
     )
-    if vllm_mode == "colocate_sleep":
+    if vllm_mode == "colocate_sleep" or (_sleep_wsync and vllm_mode == "colocate"):
         llm_kwargs["enable_sleep_mode"] = True
     # Pin the KV-cache block count for BOTH colocate and colocate_sleep. Without
     # an override, vLLM profiles KV to fill the gpu_memory_utilization budget and

@@ -1,0 +1,141 @@
+# Colocate vLLM generation page fault — systematic investigation (2026-06-25)
+
+Follow-up to `docs/bugs/xpu_colocate_generation_pde_nondeterministic.md`. That doc concluded the
+fault was "probabilistic, no recipe-side fix." This investigation tested that conclusion with a
+crash-rate methodology (N≥4/cell, genuine-fault-verified) and a dependency-limited standalone
+reproducer. **Both halves of the original conclusion are refined: the fault is near-deterministic
+at mg768, and "no recipe-side fix" is now established by elimination rather than assumed.**
+
+> STATUS: complete. Headline result — the fault is a **2-factor interaction** reproduced in a
+> **torchtune-free, frameworks-module-only** script: it requires BOTH (a) a real vLLM
+> `load_weights()` weight-publish into the live in-process engine AND (b) concurrent cross-rank
+> XCCL collectives on the same tiles. Neither factor alone faults.
+
+## Method
+
+- **In-framework A/B** (`experiments/colocate/run_colocate_ab.sh` + `pbs_colocate_ab.sh`): the real
+  12-rank LoRA-GRPO colocate recipe, Qwen3-4B, mg768, one independent variable per cell, M=4 runs
+  each, back-to-back on one node. Crash = genuine `CCS NotPresent PDE banned:1` in the run log
+  (verified, not just nonzero exit).
+- **Standalone reproducer** (`scratch/repro_colocate_pagefault*.py`): torch + vLLM only, ZERO
+  torchtune. Single-tile ladder (R-A..R-E) and a 12-rank multi-tile variant (in-process vLLM +
+  XCCL FSDP per rank). Confirmed faithful to the recipe's vLLM init (identical KV geometry).
+
+## Result 1 — the fault is near-DETERMINISTIC at mg768, not stochastic
+
+Baseline (real recipe) crashes **4/4** at **step ~3-4**, after 3 clean steps with real reward.
+The precursor is striking and reproducible across **5/5** runs: steps 0-2 run ~23s with the
+adapter all-reduce (a 66 MB XCCL collective) at <2s; **at step 3 that all-reduce explodes to
+39-41s**, then the GPU page fault fires at ~55 GiB free (not OOM). The original "stochastic"
+reading was the lower-probability mg512 regime; at mg768 it is essentially deterministic.
+
+## Result 2 — every recipe-side lever ELIMINATED
+
+All cells crashed 4/4 with the genuine fault (mg768):
+
+| Cell | varies | crashed/N | conclusion |
+|------|--------|-----------|------------|
+| baseline | — | **8/8** | reliable repro |
+| noreset | `SKIP_RESET_PREFIX=1` (reset_prefix_cache skipped, verified) | 4/4 | reset_prefix NOT trigger |
+| pub999 | `publish_every=999` (one step-0 publish only) | 4/4 | publish *cadence* NOT trigger (still publishes at step 0) |
+| nofsdp | `NO_FSDP=1` (no FSDP wrap/collectives) | 4/4 | FSDP wrap NOT required (crashes slightly earlier) |
+| bigkv | 4000 KV blocks, gpu_mem 0.55 | 4/4 | KV headroom does not help |
+| ccl_mid / ccl_low | IPC-handle cache threshold 8192 / 2048 | 4/4 / 4/4 | IPC-handle threshold does not help |
+| noreclaim | `NO_FSDP` + ~no empty_cache | 4/4 | empty_cache cadence does not help |
+
+Every application-config lever fails. This matches the Ray TP=8 co-tenancy W-probe history
+(`xpu_l0_event_pool_co_tenancy.md`: W4-W16 all failed; only process isolation worked). **The fault
+is a driver-level L0 co-residence interaction, not addressable by recipe config.** The
+architectural fix is `vllm_mode=server`/`dedicated` (separate process) — already the validated
+production path at mg512+. (Note: pub999 still crashes because it *does* publish at step 0 — see
+the standalone isolation below, which proves the weight-publish itself, not its cadence, is one of
+the two required factors.)
+
+## Result 3 — standalone single-tile ladder: clean (rules out single-tile causes)
+
+| Rung | adds | crashed/N |
+|------|------|-----------|
+| R-A | vLLM generate only | 0/12 |
+| R-B | + resident model | 0/12 |
+| R-D | + trainer compute + empty_cache churn | 0/12 |
+
+(R-E `--fsdp on` was a harness error — world=1 FSDP all_reduce on gloo — not a GPU fault.)
+The single-tile harness cannot reproduce the fault → it requires multi-rank co-residence.
+
+## Result 4 — standalone MULTI-TILE reproducer: clean across iterations (so far)
+
+12-rank in-process vLLM + XCCL FSDP, torchtune-free (`frameworks` module only: torch + vllm +
+ipex + mpi4py). Iterated to isolate the trigger:
+- v1 trivial trainer: 12/12 clean. v2 + activation pressure: clean. v3 + real SDPA attention
+  (driven to 20.8 GiB free ≈ real crash envelope): clean. v4 40-step volume: clean (AR ≤0.15s)
+  → **volume is not the trigger**.
+- v5 per-step `load_weights` (self-named round-trip): clean — but `load_weights` threw
+  `KeyError(qkv_proj)` (vLLM expects HF checkpoint names), so it never executed. Inconclusive.
+- **v6** per-step `load_weights` of the **real Qwen3-4B HF safetensors** into the live engine:
+  **CRASH — byte-identical `CCS NotPresent PDE banned:1` + NEO `drm_neo.cpp:288`**, at step 0
+  right after all 12 ranks ran load_weights (0 load failures, 398 HF params/3 shards). Reproduced
+  N=2 (jobs 8559640, 8559661).
+- **R-LW** (single-tile control): vLLM + the *same* real `load_weights()` each step, but NO
+  XCCL multi-rank trainer → **0/12 clean** (load_weights ran, 12 iters). load_weights ALONE does
+  not fault.
+
+**This isolates a 2-factor interaction:**
+
+| config | real `load_weights` ran? | concurrent multi-rank XCCL? | faults? |
+|--------|--------------------------|-----------------------------|---------|
+| R-LW (1 tile) | yes | no | clean 0/12 |
+| v5 (12 tiles) | no (KeyError) | yes | clean 12/12 |
+| v6 (12 tiles) | yes | yes | **CRASH** |
+
+The fault requires **both** a real weight-publish into the live in-process vLLM engine **and**
+concurrent cross-rank XCCL collectives on the same tiles. Neither alone suffices. Mechanistically:
+`load_weights` mutates vLLM's resident device tensors (`copy_` into model weights) while XCCL holds
+L0 driver state on the same tile — the combination corrupts the per-tile page tables → CCS
+NotPresent PDE. `vllm_mode=server` is immune because the engine is a separate process (no shared
+L0 context); ezpz is immune because its default rollout is in-trainer HF `.generate()` with no
+second co-resident engine (its vLLM is off-by-default — "XPU vLLM is fragile").
+
+**`scratch/repro_colocate_pagefault_multitile.py` (run with `--load-real-weights`) is the minimal
+faithful, torchtune-free reproducer** — the Intel/vLLM handoff artifact. It cannot be reduced to a
+single process (R-LW proves the XCCL co-residence factor is required).
+
+## Conclusion
+
+1. **Mechanism (refined):** a **2-factor L0 co-residence interaction** — a real vLLM
+   `load_weights()` weight-publish into the live in-process engine, concurrent with cross-rank
+   XCCL collectives on the same tile, corrupts the per-tile GPU page tables → `CCS NotPresent PDE
+   banned:1`. Same family as the Ray TP=8 UR40 co-tenancy wedge; this is the single-OS-process
+   in-process analogue. The original "stochastic KV-paging" reading was the low-probability mg512
+   regime; at mg768 it is near-deterministic (baseline 8/8).
+2. **No recipe-config fix exists** — established by eliminating *every* application lever
+   (reset_prefix, publish cadence, FSDP, KV headroom, IPC-handle threshold, empty_cache cadence),
+   not assumed. Use `vllm_mode=server`/`dedicated` for mg≥384 (the validated production path).
+   Colocate is safe only at small mg (≤256 low-risk; ≤64 AGPT-2B production).
+3. **Handoff:** `scratch/repro_colocate_pagefault_multitile.py --load-real-weights` is a faithful,
+   **torchtune-free** (frameworks-module-only) reproducer — crashes N=2 with the byte-identical
+   driver signature. This is the clean artifact to file with Intel/vLLM. It needs the multi-tile
+   XCCL world (single-process R-LW control is clean), so it cannot be reduced below 12 ranks.
+4. **Mitigations:**
+   - **Quiesce XCCL around the publish** (`TORCHTUNE_COLOCATE_QUIESCE_WSYNC=1`) — **REFUTED**
+     (job 8559693: 6/6 crash, barrier confirmed engaged). A barrier syncs rank *arrival* but does
+     not remove the resident co-tenant L0 context — and *that residency*, not instantaneous
+     collective overlap, is the cause (matches Ray TP=8 W10: zero outstanding submissions still
+     wedged). **Any serialization-based recipe fix is futile;** the fix must remove the 2nd L0 client.
+   - **Engine sleep/wake around the publish** (`enable_sleep_mode`) — untested; the most promising
+     recipe-side lever since `.sleep()` actually releases vLLM's device context during the mutation.
+     Caveat: vLLM-XPU sleep has its own fragility (3-step L0 UR leak, `project_colocate_sleep_8b`).
+   - **Server/dedicated mode** — the validated path; already runs the paper envelope. Recommended.
+   - Engine teardown+respawn (W17/W19) / checkpoint+auto-resume — heavyweight fallbacks.
+
+   **Refined factor-2:** it is the trainer XCCL/L0 *context residency* on the tile during the
+   weight publish, not an in-flight collective. The standalone factor-2 (multi-rank XCCL world
+   present) holds; the quiesce refutation just shows you can't dodge it by timing.
+
+## Artifacts
+
+- `scratch/repro_colocate_pagefault.py` (single-tile ladder), `..._multitile.py` (12-rank).
+- `experiments/colocate/{run_repro_ladder,run_colocate_ab,pbs_colocate_ab,pbs_repro_multitile}.sh`.
+- `experiments/colocate/{repro_results,ab_results}.tsv` (raw crash-rate data).
+- `experiments/colocate/README_repro.md` (Intel handoff package).
+- Recipe: env-gated `TORCHTUNE_COLOCATE_SKIP_RESET_PREFIX` guard +
+  `tests/torchtune/dev/rl/test_colocate_skip_reset_prefix.py` (CPU, green).

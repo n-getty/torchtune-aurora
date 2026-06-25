@@ -1401,6 +1401,24 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
         t0 = time.perf_counter()
+        # Quiesce-wsync (TORCHTUNE_COLOCATE_QUIESCE_WSYNC=1, default off): the colocate
+        # generation page fault is a 2-factor interaction — a real vLLM load_weights()
+        # weight-publish into the live in-process engine CONCURRENT with cross-rank XCCL
+        # collectives on the same tile corrupts the per-tile L0 page tables (CCS NotPresent
+        # PDE banned:1). Neither factor alone faults (HW-isolated 2026-06-25, jobs 8559640/
+        # 8559650/8559661; see docs/reports/colocate_pagefault_investigation_20260625.md).
+        # This barrier forces every rank to a common point with NO XCCL collective in flight,
+        # then syncs the device, BEFORE any load_weights mutation begins — removing the
+        # overlap. A matching barrier runs after the publish. The barrier completes before the
+        # mutation, so it does not itself overlap. Cheap; only the 2 barriers + 1 sync.
+        _quiesce = os.environ.get("TORCHTUNE_COLOCATE_QUIESCE_WSYNC", "0") == "1"
+        if _quiesce:
+            if torch.xpu.is_available():
+                torch.xpu.synchronize(self._device)
+            if torch.distributed.is_initialized():
+                torch.distributed.barrier()
+            if torch.xpu.is_available():
+                torch.xpu.synchronize(self._device)
         # Opt-in leak diagnostic: log free HBM before the sync each step so a
         # monotonic decline (UR-handle accumulation under summon+vLLM co-tenancy)
         # is visible in the log. Off by default (set TORCHTUNE_COLOCATE_MEM_PROBE=1).
@@ -1421,6 +1439,27 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
         )
         n_synced = 0
         skipped = 0
+
+        # Sleep-wsync (TORCHTUNE_COLOCATE_SLEEP_WSYNC=1, default off): the colocate page fault is
+        # load_weights mutating vLLM's resident weights while the trainer's XCCL/L0 context is
+        # co-resident — a barrier does NOT help (quiesce A/B refuted), so instead clear vLLM's own
+        # KV/L0 paging state around the mutation via a KV-only sleep (level 10 keeps weights on GPU
+        # so load_weights can still write them; wakes after). Requires enable_sleep_mode at init
+        # (gated by the same env in vllm_backend). See docs/reports/colocate_pagefault_investigation_20260625.md.
+        _sleep_wsync = os.environ.get("TORCHTUNE_COLOCATE_SLEEP_WSYNC", "0") == "1"
+        if _sleep_wsync:
+            try:
+                if torch.xpu.is_available():
+                    torch.xpu.synchronize(self._device)
+                self._vllm_llm.sleep(level=10)  # KV-only discard; weights stay resident
+                if torch.xpu.is_available():
+                    torch.xpu.synchronize(self._device)
+                if self._is_rank_zero:
+                    log.info("COLOCATE_SLEEP_WSYNC step=%d: KV-sleep before publish",
+                             getattr(self, "_steps_run", -1))
+            except Exception as _sl_exc:
+                log.warning("COLOCATE_SLEEP_WSYNC sleep failed: %r", _sl_exc)
+                _sleep_wsync = False  # don't try to wake if sleep failed
 
         # Cached-base path (opt-in via TORCHTUNE_COLOCATE_CACHED_BASE=1, or whenever
         # _colocate_base_cache was populated at setup). The frozen base never
@@ -1478,10 +1517,42 @@ class LoRAGRPODistributedXPU(FTRecipeInterface):
                         gc.collect()
                         torch.xpu.synchronize(self._device)
 
-        self._vllm_llm.llm_engine.reset_prefix_cache()
+        # reset_prefix_cache() mutates the vLLM KV block table. It is a no-op when
+        # prefix caching is disabled (the colocate default), but it is on the suspect
+        # list for the colocate generation page fault (a freed/remapped KV page that a
+        # later paged-attention kernel references). TORCHTUNE_COLOCATE_SKIP_RESET_PREFIX=1
+        # lets the page-fault A/B (experiments/colocate/run_colocate_ab.sh, cell=noreset)
+        # isolate it. Default unchanged: the call still fires.
+        if os.environ.get("TORCHTUNE_COLOCATE_SKIP_RESET_PREFIX", "0") != "1":
+            self._vllm_llm.llm_engine.reset_prefix_cache()
         gc.collect()
         if torch.xpu.is_available():
             torch.xpu.synchronize(self._device)
+
+        # Sleep-wsync: wake the engine (re-alloc KV) after the weight publish so the next
+        # generation runs normally. Pairs with the level-10 sleep above.
+        if _sleep_wsync:
+            try:
+                self._vllm_llm.wake_up()
+                if torch.xpu.is_available():
+                    torch.xpu.synchronize(self._device)
+                if self._is_rank_zero:
+                    log.info("COLOCATE_SLEEP_WSYNC step=%d: woke engine after publish",
+                             getattr(self, "_steps_run", -1))
+            except Exception as _wk_exc:
+                log.warning("COLOCATE_SLEEP_WSYNC wake failed: %r", _wk_exc)
+
+        # Quiesce-wsync trailing barrier: ensure the weight publish (+ reset_prefix) on every
+        # rank has fully completed and the device is idle before any rank resumes XCCL work,
+        # so the next collective cannot overlap a still-in-flight load_weights mutation.
+        if _quiesce:
+            if torch.distributed.is_initialized():
+                torch.distributed.barrier()
+            if torch.xpu.is_available():
+                torch.xpu.synchronize(self._device)
+            if self._is_rank_zero:
+                log.info("COLOCATE_QUIESCE_WSYNC step=%d: barriered publish (no XCCL overlap)",
+                         getattr(self, "_steps_run", -1))
 
         if self._is_rank_zero:
             log.info(
