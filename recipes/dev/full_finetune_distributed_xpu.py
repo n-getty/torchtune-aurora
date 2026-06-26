@@ -478,7 +478,29 @@ class FullFinetuneRecipeDistributedXPU(FTRecipeInterface):
             self._compile_model = compile.get("model", True)
             self._compile_loss = compile.get("loss", True)
             self._compile_optimizer_step = compile.get("optimizer_step", False)
-            self._compile_scale_grads = compile.get("scale_grads", True)
+            # scale_grads compile defaults OFF on XPU: scale_grads_ is a trivial
+            # _foreach_mul_ over all param grads (no compute to fuse), and tracing
+            # it over a decoupled-head_dim model's mixed parameter shapes (Qwen3-4B:
+            # q_proj 2560->4096, output 4096->2560, q/k_norm size 128) raises
+            # `AssertionError: 2 != 1` in dynamo's symbolic-shape solver at the
+            # first optimizer step (HW-confirmed eager AND compiled, job 8562753 —
+            # the failure is the COMPILED grad-scaler, NOT the model forward).
+            # Mirrors loss/optimizer_step already defaulting off for the same
+            # first-step-crash reason. CUDA keeps the prior default.
+            _scale_grads_default = self._device.type != "xpu"
+            self._compile_scale_grads = compile.get(
+                "scale_grads", _scale_grads_default
+            )
+        # compile_dynamic=True uses symbolic shapes. Default True on XPU (matches
+        # the GRPO recipe). Needed for variable seqlen AND for clean per-layer
+        # capture of decoupled-head_dim models (Qwen3-4B head_dim=128 !=
+        # embed_dim//num_heads=80); static capture is more fragile there. The
+        # model-forward layers DO compile under dynamic=True (job 8562753 reached
+        # Inductor codegen + step 0); the only residual blocker was the grad-scaler
+        # above, now disabled on XPU.
+        self._compile_dynamic = cfg.get(
+            "compile_dynamic", True if self._device.type == "xpu" else False
+        )
         if self._compile_model:
             # Capture scalar outputs is required to compile MoE
             torch._dynamo.config.capture_scalar_outputs = True
@@ -738,7 +760,9 @@ class FullFinetuneRecipeDistributedXPU(FTRecipeInterface):
             model = config.instantiate(cfg_model)
 
         if self._compile_model:
-            training.compile_model(model, verbose=self._is_rank_zero)
+            training.compile_model(
+                model, verbose=self._is_rank_zero, dynamic=self._compile_dynamic
+            )
 
         if self._enable_fp8_training:
             # Requires https://github.com/pytorch/pytorch/pull/148922
