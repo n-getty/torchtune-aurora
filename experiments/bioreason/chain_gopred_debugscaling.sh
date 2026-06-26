@@ -107,7 +107,14 @@ export TORCHTUNE_VARLEN_NOGRAD_BYPASS=${TORCHTUNE_VARLEN_NOGRAD_BYPASS:-1}
 # step time floor is ~max(gen,train) instead of gen+train. HW-validated 2026-06-23 (~30% win,
 # staleness=1, ratios~1.0, IS-corrected via GRPOLoss). The async YAML sets loss=GRPOLoss +
 # always_compute_rollout_logprobs=true (the required combo). Set USE_ASYNC=0 for the sync path.
-USE_ASYNC=${USE_ASYNC:-1}
+# DEFAULT 0 (SYNC) as of 2026-06-26: the 4N async A/B (job 8567749) MEASURED async as
+# net-negative — always_compute_rollout_logprobs + GRPOLoss DOUBLED grpo (33->~70s), exceeding
+# the gen it hid; AND weight_lag stuck at 2 (not 1) → IS ratio blew to 634599 at step 6
+# (correctness risk). At 2N single-replica, SYNC (GRPOSimpleLoss) keeps grpo ~33s AND lets
+# seqs_per_engine=2 fan 16 seqs over 8 engines (band_size=12, not capped by replicas like 4N's
+# 12/3=4). So the clean wins (protein=128, 8 engines, fbs=2) without the async tax/bug. Set
+# USE_ASYNC=1 only after async staleness=1 is actually fixed. See memory entry.
+USE_ASYNC=${USE_ASYNC:-0}
 if [ "$USE_ASYNC" = "1" ]; then
     export CONFIG=${CONFIG:-recipes/configs/dev/production/bioreason_4b_lora_grpo_2node_server_xpu_async.yaml}
 fi
@@ -127,10 +134,21 @@ export WSYNC_PATH=${WSYNC_PATH:-$CHAIN_OUT/wsync/weight_update.raw}
 # sequence truncated to max_protein_len; a mismatch -> KeyError on lookup). Both set to 128.
 export EXTRA_OVERRIDES="dataset.inject_go_pred=true dataset.max_protein_len=${MAX_PROTEIN_LEN} esm3_cache_path=${ESM3_CACHE_PATH} max_seq_len=${MAX_SEQ_LEN} vllm_max_model_len=${VLLM_MAX_MODEL_LEN} save_every_n_steps=${SAVE_EVERY} output_dir=${CHAIN_OUT} lr_scheduler=null ${RESUME_OVR} ${EXTRA_OVERRIDES:-}"
 
+# Retry-once-on-boot-flake: the Aurora vLLM EngineCore boot flake fails FAST (<BOOT_WINDOW,
+# before training) and clears on relaunch. A real failure is slow. Retry once if fast-fail.
+BOOT_WINDOW=${BOOT_WINDOW:-600}
 t0=$(date +%s)
 bash "$TT/experiments/bioreason/run_bioreason_2node_server.sh"
 RC=$?
 dt=$(( $(date +%s) - t0 ))
+if [ $RC -ne 0 ] && [ $dt -lt $BOOT_WINDOW ]; then
+    echo "=== link=$LINK FAST-FAIL rc=$RC dt=${dt}s — likely vLLM boot flake, retrying once ===" | tee -a "$CHAIN_STATE/chain.log"
+    sleep 20
+    t0=$(date +%s)
+    bash "$TT/experiments/bioreason/run_bioreason_2node_server.sh"
+    RC=$?
+    dt=$(( $(date +%s) - t0 ))
+fi
 echo "=== link=$LINK train rc=$RC dt=${dt}s $(date) ===" | tee -a "$CHAIN_STATE/chain.log"
 
 # ---- decide whether to chain the next link ----
