@@ -130,10 +130,23 @@ export WSYNC_PATH=${WSYNC_PATH:-$CHAIN_OUT/wsync/weight_update.raw}
 # --max-model-len to the vLLM SERVER, not to the recipe config (recipe-side prompt truncation).
 export EXTRA_OVERRIDES="dataset.inject_go_pred=true dataset.max_protein_len=${MAX_PROTEIN_LEN} esm3_cache_path=${ESM3_CACHE_PATH} max_seq_len=${MAX_SEQ_LEN} vllm_max_model_len=${VLLM_MAX_MODEL_LEN} lr_scheduler=null ${EXTRA_OVERRIDES:-}"
 
+# Retry-once-on-boot-flake: the Aurora vLLM EngineCore boot flake ("WorkerProc init failed",
+# "Failed core proc(s): {}") fails FAST (<BOOT_WINDOW, before any training step) and clears on
+# a relaunch. A real failure is slow (after boot). So if the launcher exits non-zero in under
+# BOOT_WINDOW with 0 steps trained, retry once in-job (same nodes; the flake is per-spawn).
+BOOT_WINDOW=${BOOT_WINDOW:-600}
 t0=$(date +%s)
 bash "$TT/experiments/bioreason/run_bioreason_Nnode_hsdp.sh"
 RC=$?
 dt=$(( $(date +%s) - t0 ))
+if [ $RC -ne 0 ] && [ $dt -lt $BOOT_WINDOW ]; then
+    echo "=== link=$LINK FAST-FAIL rc=$RC dt=${dt}s (<${BOOT_WINDOW}s) — likely vLLM boot flake, retrying once ===" | tee -a "$CHAIN_STATE/chain.log"
+    sleep 20
+    t0=$(date +%s)
+    bash "$TT/experiments/bioreason/run_bioreason_Nnode_hsdp.sh"
+    RC=$?
+    dt=$(( $(date +%s) - t0 ))
+fi
 echo "=== link=$LINK train rc=$RC dt=${dt}s $(date) ===" | tee -a "$CHAIN_STATE/chain.log"
 
 # ---- decide whether to chain the next link ----
