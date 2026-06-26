@@ -19,7 +19,7 @@ tokenizer:
   _component_: torchtune.models.gemma4.gemma4_tokenizer
   tokenizer_json_path: ${base_model_path}/tokenizer.json
   tokenizer_config_json_path: ${base_model_path}/tokenizer_config.json
-  max_seq_len: 4096
+  max_seq_len: 8192
 
 model:
   _component_: torchtune.dev.bioreason.model_native.BioReasonNativeModel
@@ -50,7 +50,7 @@ save_every_n_epochs: 1
 dataset:
   _component_: torchtune.dev.bioreason.dataset_sft.bioreason_sft_dataset
   data_files: ${sft_data_file}
-  max_seq_len: 4096
+  max_seq_len: 8192
   max_protein_len: 2048
   num_go_tokens: 200
   protein_token_id: 262142

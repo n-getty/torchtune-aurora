@@ -63,6 +63,9 @@ class _SideInputDataLoader:
     def sampler(self):
         return self._dl.sampler
 
+    def __len__(self):
+        return len(self._dl)
+
     def state_dict(self):
         return self._dl.state_dict()
 
@@ -331,7 +334,7 @@ class BioReasonSFTRecipeDistributedXPU(FullFinetuneRecipeDistributedXPU):
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
 
-    # ── loss: splice multimodal embeds (grad on) + native decoder forward ─────
+    # ── loss: native decoder forward (splice runs INSIDE forward) ─────────────
     def _loss_step(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
         labels = batch.pop("labels")
         tokens = batch["tokens"]
@@ -339,13 +342,15 @@ class BioReasonSFTRecipeDistributedXPU(FullFinetuneRecipeDistributedXPU):
         protein_sequences = side.get("protein_sequences", [])
         go_aspects = side.get("go_aspects", None)
 
+        # The embed-splice MUST run inside model.forward (under the root FSDP forward
+        # hook) so tok_embeddings.weight is unsharded — building embeds out here leaves
+        # it a DTensor and aten.embedding errors on mixed Tensor/DTensor.
         with self.activations_handling_ctx:
-            input_embeds = self._model.build_full_embeds_train(
+            outputs = self._model(
                 tokens,
                 protein_sequences=protein_sequences,
                 go_aspects=go_aspects,
             )
-            outputs = self._model(input_embeds=input_embeds)
 
         # SFTLoss (chunked) consumes the list of logit chunks directly. Non-SFTLoss
         # (plain CE) needs flat [N, vocab] / [N] — mirror the parent.

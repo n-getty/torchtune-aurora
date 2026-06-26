@@ -268,11 +268,24 @@ def test_C_chunked_loss_end_to_end():
     assert m.protein_projection[0].weight.grad.abs().sum().item() > 0
 
 
-def test_H_recipe_uses_grad_enabled_splice():
+def test_H_recipe_runs_splice_inside_forward():
+    """The recipe must call model(tokens, protein_sequences=...) so the splice (and its
+    tok_embeddings lookup) runs INSIDE forward, under the root FSDP hook — building embeds
+    outside leaves the sharded weight a DTensor and aten.embedding errors. And it must NOT
+    use the no_grad build_prompt_embeds (projections must train through the splice)."""
     recipe = (_REPO / "recipes" / "dev" / "sft_bioreason_distributed_xpu.py").read_text()
-    # must use the grad-enabled splice, NOT the no_grad build_prompt_embeds
-    assert "build_full_embeds_train" in recipe
+    assert "protein_sequences=protein_sequences" in recipe
     assert "build_prompt_embeds" not in recipe
+
+
+def test_H_forward_in_splice_matches_prebuilt():
+    """forward(tokens, side inputs) (splice inside) == forward(input_embeds=build(...))."""
+    m, seqs = _tiny_model()
+    toks = torch.tensor([_mkrow(5), _mkrow(4) + [0]])
+    pre = m.build_full_embeds_train(toks, seqs, ["all", "all"])
+    out_pre = m(input_embeds=pre)
+    out_in = m(toks, protein_sequences=seqs, go_aspects=["all", "all"])
+    assert torch.allclose(out_pre, out_in, atol=1e-5)
 
 
 def test_H_config_dataset_model_placeholder_ids_agree():

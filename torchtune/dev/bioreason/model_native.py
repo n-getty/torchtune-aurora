@@ -143,16 +143,23 @@ class BioReasonNativeModel(nn.Module):
                 esm3_cache_path, protein_model_name
             )
         self._protein_hidden = protein_hidden
+        # NOTE: do NOT call .to(device=...) here — under a meta-device build context
+        # (the distributed recipe builds the wrapper on meta before FSDP2 sharding),
+        # .to(real_device) on a meta param raises "Cannot copy out of meta tensor".
+        # The recipe re-inits these projections (to_empty + reset_parameters) on device
+        # after sharding. For the single-process/CPU path (tests), they land on the
+        # ambient default device, which is correct. Set dtype via the constructor so it
+        # holds in both regimes without a meta-incompatible copy.
         self.protein_projection = nn.Sequential(
-            nn.Linear(protein_hidden, hidden_size),
+            nn.Linear(protein_hidden, hidden_size, dtype=dtype),
             nn.GELU(),
-            nn.Linear(hidden_size, hidden_size),
-        ).to(device=device, dtype=dtype)
+            nn.Linear(hidden_size, hidden_size, dtype=dtype),
+        )
         self.go_projection = nn.Sequential(
-            nn.Linear(self.GO_DIM, hidden_size),
+            nn.Linear(self.GO_DIM, hidden_size, dtype=dtype),
             nn.GELU(),
-            nn.Linear(hidden_size, hidden_size),
-        ).to(device=device, dtype=dtype)
+            nn.Linear(hidden_size, hidden_size, dtype=dtype),
+        )
 
         # ── ESM3 pre-encode cache (no live encoder) ───────────────────────────
         self._esm3_cache = None
@@ -386,15 +393,32 @@ class BioReasonNativeModel(nn.Module):
 
     def forward(
         self,
-        input_embeds: torch.Tensor,
+        tokens: Optional[torch.Tensor] = None,
+        *,
+        protein_sequences: Optional[list[str]] = None,
+        go_aspects: Optional[list[str]] = None,
+        batch_idx_map: Optional[list[int]] = None,
+        input_embeds: Optional[torch.Tensor] = None,
         mask: Optional[torch.Tensor] = None,
         input_pos: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Run the native Gemma 4 decoder on pre-spliced embeds.
+        """Run the native Gemma 4 decoder.
 
-        ``mask=None`` -> causal by default; right-padding is handled by label masking
-        (pad positions never enter the loss). Returns logits [B, S, vocab].
+        The embed-splice runs HERE (inside the module's forward) so the splice's
+        ``self._embed(tokens)`` lookup executes under the root FSDP forward hook —
+        ``tok_embeddings.weight`` is unsharded to a plain tensor at that point.
+        Building the embeds OUTSIDE forward (e.g. in the recipe) leaves the weight as a
+        sharded DTensor and ``aten.embedding`` errors on mixed Tensor/DTensor.
+
+        Pass ``tokens`` + the multimodal side inputs (training path). ``input_embeds``
+        may be passed directly to bypass the splice (used by the CPU equivalence test).
+        ``mask=None`` -> causal by default; right-padding handled by label masking.
+        Returns logits [B, S, vocab].
         """
+        if input_embeds is None:
+            input_embeds = self._splice_embeds(
+                tokens, protein_sequences or [], go_aspects, batch_idx_map
+            )
         return self.backbone(
             tokens=None,
             input_embeds=input_embeds,

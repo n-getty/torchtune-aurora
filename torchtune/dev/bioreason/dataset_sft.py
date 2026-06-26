@@ -240,25 +240,31 @@ class BioReasonSFTDataset(Dataset):
         prompt_ids = self._build_prompt_ids(ex, protein_seq)
         target_ids = self._build_target_ids(ex)
 
+        # Budget: keep the FULL prompt (the placeholder runs are load-bearing for the
+        # embed-splice and must never be cut) and truncate the TARGET from the right to
+        # fit max_seq_len. Truncating the prompt would desync the placeholder count from
+        # the ESM3/GO features. If the prompt alone exceeds the budget, the example can't
+        # train under this max_seq_len — fail loudly with actionable guidance.
+        room_for_target = self.max_seq_len - len(prompt_ids)
+        if room_for_target <= 0:
+            raise ValueError(
+                f"Prompt ({len(prompt_ids)} tokens: {len(protein_seq) + 2} protein + "
+                f"{self.num_go_tokens} GO + text) exceeds max_seq_len={self.max_seq_len}. "
+                f"Raise max_seq_len or lower max_protein_len/num_go_tokens."
+            )
+        target_ids = target_ids[:room_for_target]
+
         tokens = prompt_ids + target_ids
         labels = [CROSS_ENTROPY_IGNORE_IDX] * len(prompt_ids) + list(target_ids)
 
-        # Truncate (right) to max_seq_len, keeping tokens/labels aligned.
-        tokens = tokens[: self.max_seq_len]
-        labels = labels[: self.max_seq_len]
-
-        # Fail-fast data-pipeline check: placeholder counts survived assembly.
+        # Invariant: placeholder counts intact (prompt was never truncated).
         n_prot = sum(1 for t in tokens if t == self.protein_token_id)
         n_go = sum(1 for t in tokens if t == self.go_token_id)
-        # (counts can be < expected only if truncation cut into the prompt — that would
-        # break the embed-splice contract, so surface it.)
         expected_prot = len(protein_seq) + 2
-        if n_prot != expected_prot or n_go != self.num_go_tokens:
-            raise ValueError(
-                f"Placeholder count mismatch after assembly/truncation: "
-                f"protein {n_prot}!={expected_prot} or GO {n_go}!={self.num_go_tokens}. "
-                f"Increase max_seq_len (prompt too long for the budget)."
-            )
+        assert n_prot == expected_prot and n_go == self.num_go_tokens, (
+            f"placeholder count desync (protein {n_prot}/{expected_prot}, "
+            f"GO {n_go}/{self.num_go_tokens}) — prompt assembly bug"
+        )
 
         return {
             "tokens": torch.tensor(tokens, dtype=torch.long),
