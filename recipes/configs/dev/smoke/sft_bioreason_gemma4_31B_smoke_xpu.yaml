@@ -1,0 +1,114 @@
+# BioReason Gemma 4 31B SFT — 1-node tiny-data SMOKE (Aurora / XPU)
+#
+# Forward/loss/backward + memory-fit check at seq=4K on 6 PVC tiles. One parquet shard,
+# a handful of steps. NOT a convergence run — gates the HW bring-up before scale.
+#
+# Recipe: recipes/dev/sft_bioreason_distributed_xpu.py
+#
+# PREREQUISITE: esm3_cache_path must cover the validation parquet sequences.
+
+name: sft_bioreason_gemma4_31b_smoke
+output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/experiments/bioreason/runs/${name}
+base_model_path: /lus/flare/projects/ModCon/ngetty/models/gemma-4-31B
+# Smoke on the smaller validation shard (7365 rows) to keep load fast.
+sft_data_file: /lus/flare/projects/ModCon/ngetty/datasets/bioreason_sft_reasoning/data/validation-00000-of-00001.parquet
+esm3_cache_path: /lus/flare/projects/ModCon/ngetty/datasets/bioreason_sft_reasoning/esm3_cache_2048.pt
+go_embedding_path: /lus/flare/projects/ModCon/ngetty/models/bioreason-pro-sft/go_embedding.pt
+
+tokenizer:
+  _component_: torchtune.models.gemma4.gemma4_tokenizer
+  tokenizer_json_path: ${base_model_path}/tokenizer.json
+  tokenizer_config_json_path: ${base_model_path}/tokenizer_config.json
+  max_seq_len: 4096
+
+model:
+  _component_: torchtune.dev.bioreason.model_native.BioReasonNativeModel
+  hidden_size: 5376
+  protein_token_id: 262142
+  go_token_id: 262143
+  enable_lora: true
+  lora_rank: 32
+  lora_alpha: 64
+  apply_lora_to_mlp: true
+  esm3_cache_path: ${esm3_cache_path}
+  go_embedding_path: ${go_embedding_path}
+
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [
+    model-00001-of-00002.safetensors,
+    model-00002-of-00002.safetensors,
+  ]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: GEMMA4
+
+resume_from_checkpoint: false
+save_every_n_epochs: 1
+
+dataset:
+  _component_: torchtune.dev.bioreason.dataset_sft.bioreason_sft_dataset
+  data_files: ${sft_data_file}
+  max_seq_len: 4096
+  max_protein_len: 2048
+  num_go_tokens: 200
+  protein_token_id: 262142
+  go_token_id: 262143
+  train_on_reasoning: true
+  inject_go_pred: true
+seed: 1234
+shuffle: true
+collate_fn: torchtune.dev.bioreason.dataset_sft.bioreason_sft_collate_fn
+dataloader_num_workers: 0
+
+epochs: 1
+max_steps_per_epoch: 5
+batch_size: 1
+gradient_accumulation_steps: 1
+clip_grad_norm: 1.0
+
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 1.0e-4
+  weight_decay: 0.0
+  fused: true
+
+loss:
+  _component_: torchtune.modules.loss.CEWithChunkedOutputLoss
+  num_output_chunks: 8
+
+enable_activation_checkpointing: true
+enable_activation_offloading: false
+fsdp_cpu_offload: false
+fsdp_reshard_after_forward: true
+data_parallel_replicate_dim: 1
+data_parallel_shard_dim: -1
+tensor_parallel_dim: 1
+
+device: xpu
+dtype: bf16
+compile: false
+
+log_level: INFO
+log_every_n_steps: 1
+log_peak_memory_stats: true
+
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: false
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: true
+  cuda: false
+  profile_memory: false
+  with_stack: false
+  record_shapes: false
+  with_flops: false
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1

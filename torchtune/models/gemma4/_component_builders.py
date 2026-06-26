@@ -11,17 +11,24 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from torchtune.models.gemma._component_builders import gemma_mlp
+from torchtune.models.gemma._component_builders import gemma_mlp, lora_gemma_mlp
 from torchtune.models.gemma.gemma_norm_embedding import GemmaNormEmbeddings
+from torchtune.modules.common_utils import _register_reparametrize_state_dict_hooks
 from torchtune.models.gemma.rms_norm import GemmaRMSNorm
 from torchtune.models.gemma2._component_builders import Gemma2FinalNorm
 from torchtune.models.gemma4._attention import Gemma4Attention
 from torchtune.models.gemma4._moe import Gemma4MoeRouter
 from torchtune.models.qwen2._positional_embeddings import Qwen2RotaryPositionalEmbeddings
-from torchtune.modules import TransformerDecoder, TransformerSelfAttentionLayer, TiedLinear
+from torchtune.modules import (
+    FrozenNF4Linear,
+    TransformerDecoder,
+    TransformerSelfAttentionLayer,
+    TiedLinear,
+)
 from torchtune.modules.attention_utils import _MaskType
 from torchtune.modules.moe import MoE
 from torchtune.modules.moe.experts import GroupedExperts
+from torchtune.modules.peft import DoRALinear, LORA_ATTN_MODULES, LoRALinear
 
 
 # Default Gemma 4 layer pattern: 5 sliding + 1 full, repeated 10 times
@@ -482,4 +489,243 @@ def gemma4_26b_a4b(
         head_dim=local_head_dim,  # Use local head_dim (25 of 30 layers are sliding)
         norm=Gemma2FinalNorm(final_capping_value, embed_dim, eps=norm_eps),
     )
+    return model
+
+
+def lora_gemma4_self_attention(
+    lora_modules: list[LORA_ATTN_MODULES],
+    *,
+    # Gemma4Attention args
+    embed_dim: int,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    pos_embeddings: nn.Module,
+    max_seq_len: int,
+    attn_dropout: float = 0.0,
+    sliding_window_size: Optional[int] = None,
+    softcapping: Optional[float] = None,
+    query_pre_attn_scalar: Optional[int] = None,
+    partial_rotary_factor: float = 1.0,
+    k_eq_v: bool = False,
+    norm_eps: float = 1e-6,
+    # LoRA args
+    lora_rank: int,
+    lora_alpha: float,
+    lora_dropout: float = 0.0,
+    use_dora: bool = False,
+    quantize_base: bool = False,
+) -> Gemma4Attention:
+    """Build a single Gemma4Attention block with LoRA applied to the requested
+    projections. Mirrors the dense construction in :func:`gemma4` (same q/k/v/output
+    shapes, q_norm/k_norm, RoPE) but swaps in :class:`LoRALinear`/:class:`DoRALinear`
+    for the projections named in ``lora_modules``.
+
+    The ``k_eq_v`` (global) layers structurally share K and V (``v_proj`` is an
+    ``nn.Identity`` in the dense builder), so ``v_proj`` LoRA is silently skipped on
+    those layers — there is no value projection to adapt.
+    """
+    if not lora_modules:
+        raise ValueError(
+            f"Must pass one or more of {LORA_ATTN_MODULES} as lora_modules"
+        )
+    adapter_cls = DoRALinear if use_dora else LoRALinear
+
+    def _proj(in_dim, out_dim, name):
+        if name in lora_modules:
+            return adapter_cls(
+                in_dim,
+                out_dim,
+                rank=lora_rank,
+                alpha=lora_alpha,
+                dropout=lora_dropout,
+                quantize_base=quantize_base,
+            )
+        if quantize_base:
+            return FrozenNF4Linear(in_dim, out_dim, bias=False)
+        return nn.Linear(in_dim, out_dim, bias=False)
+
+    q_proj = _proj(embed_dim, num_heads * head_dim, "q_proj")
+    k_proj = _proj(embed_dim, num_kv_heads * head_dim, "k_proj")
+    # Global layers (k_eq_v) have no value projection — keep the dense builder's
+    # nn.Identity so v == k structurally. LoRA on v_proj is a no-op there.
+    if k_eq_v:
+        v_proj = nn.Identity()
+    else:
+        v_proj = _proj(embed_dim, num_kv_heads * head_dim, "v_proj")
+    output_proj = _proj(num_heads * head_dim, embed_dim, "output_proj")
+
+    return Gemma4Attention(
+        embed_dim=embed_dim,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        q_proj=q_proj,
+        k_proj=k_proj,
+        v_proj=v_proj,
+        output_proj=output_proj,
+        pos_embeddings=pos_embeddings,
+        q_norm=GemmaRMSNorm(head_dim, eps=norm_eps),
+        k_norm=GemmaRMSNorm(head_dim, eps=norm_eps),
+        kv_cache=None,
+        max_seq_len=max_seq_len,
+        attn_dropout=attn_dropout,
+        sliding_window_size=sliding_window_size,
+        softcapping=softcapping,
+        query_pre_attn_scalar=query_pre_attn_scalar,
+        partial_rotary_factor=partial_rotary_factor,
+        k_eq_v=k_eq_v,
+    )
+
+
+def lora_gemma4(
+    lora_attn_modules: list[LORA_ATTN_MODULES],
+    apply_lora_to_mlp: bool = False,
+    *,
+    # gemma4 args (mirror :func:`gemma4`)
+    vocab_size: int,
+    num_layers: int,
+    num_heads: int,
+    embed_dim: int,
+    intermediate_dim: int,
+    max_seq_len: int,
+    local_head_dim: int,
+    local_num_kv_heads: int,
+    local_rope_base: float,
+    sliding_window_size: int,
+    global_head_dim: int,
+    global_num_kv_heads: int,
+    global_rope_base: float,
+    global_partial_rotary_factor: float,
+    global_k_eq_v: bool,
+    attn_dropout: float = 0.0,
+    norm_eps: float = 1e-6,
+    final_capping_value: float = 30.0,
+    query_pre_attn_scalar: Optional[int] = None,
+    layer_types: Optional[list[str]] = None,
+    # LoRA args
+    lora_rank: int,
+    lora_alpha: float,
+    lora_dropout: float = 0.0,
+    use_dora: bool = False,
+    quantize_base: bool = False,
+) -> TransformerDecoder:
+    """
+    Return a Gemma 4 :class:`TransformerDecoder` with LoRA applied to the requested
+    attention projections (and optionally the MLP) in each layer.
+
+    Structurally identical to :func:`gemma4` — same heterogeneous sliding/global
+    attention (5:1), per-layer ``layer_scalar``, ``GemmaNormEmbeddings`` + tied output.
+    The output projection is tied to the token embeddings and is therefore NOT
+    LoRA-adaptable (matching :func:`lora_gemma2`).
+
+    Args:
+        lora_attn_modules (list[LORA_ATTN_MODULES]): which attention linears to adapt,
+            from ``{"q_proj", "k_proj", "v_proj", "output_proj"}``. ``v_proj`` is a
+            no-op on global (``k_eq_v``) layers, which have no value projection.
+        apply_lora_to_mlp (bool): whether to apply LoRA to each layer's MLP. Default: False.
+
+    Returns:
+        TransformerDecoder: Gemma 4 model with LoRA on a subset of projections.
+    """
+    if layer_types is None:
+        layer_types = _GEMMA4_LAYER_TYPES
+    assert len(layer_types) == num_layers, (
+        f"layer_types length ({len(layer_types)}) must match num_layers ({num_layers})"
+    )
+
+    local_rope = Qwen2RotaryPositionalEmbeddings(
+        dim=local_head_dim,
+        max_seq_len=max_seq_len,
+        base=local_rope_base,
+    )
+    global_rotary_dim = int(global_head_dim * global_partial_rotary_factor)
+    global_rope = Qwen2RotaryPositionalEmbeddings(
+        dim=global_rotary_dim,
+        max_seq_len=max_seq_len,
+        base=global_rope_base,
+    )
+
+    layers = nn.ModuleList()
+    for layer_idx in range(num_layers):
+        is_global = layer_types[layer_idx] == "full_attention"
+        if is_global:
+            head_dim = global_head_dim
+            num_kv_heads = global_num_kv_heads
+            rope = global_rope
+            sliding_window = None
+            partial_rotary = global_partial_rotary_factor
+            k_eq_v = global_k_eq_v
+        else:
+            head_dim = local_head_dim
+            num_kv_heads = local_num_kv_heads
+            rope = local_rope
+            sliding_window = sliding_window_size
+            partial_rotary = 1.0
+            k_eq_v = False
+
+        if apply_lora_to_mlp:
+            mlp = lora_gemma_mlp(
+                dim=embed_dim,
+                hidden_dim=intermediate_dim,
+                lora_rank=lora_rank,
+                lora_alpha=lora_alpha,
+                lora_dropout=lora_dropout,
+                use_dora=use_dora,
+                quantize_base=quantize_base,
+            )
+        else:
+            mlp = gemma_mlp(
+                dim=embed_dim, hidden_dim=intermediate_dim, quantize_base=quantize_base
+            )
+
+        self_att = lora_gemma4_self_attention(
+            lora_modules=lora_attn_modules,
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            pos_embeddings=rope,
+            max_seq_len=max_seq_len,
+            attn_dropout=attn_dropout,
+            sliding_window_size=sliding_window,
+            softcapping=None,
+            query_pre_attn_scalar=query_pre_attn_scalar,
+            partial_rotary_factor=partial_rotary,
+            k_eq_v=k_eq_v,
+            norm_eps=norm_eps,
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            use_dora=use_dora,
+            quantize_base=quantize_base,
+        )
+
+        layer = Gemma4TransformerLayer(
+            attn=self_att,
+            mlp=mlp,
+            sa_norm=GemmaRMSNorm(embed_dim, eps=norm_eps),
+            mlp_norm=GemmaRMSNorm(embed_dim, eps=norm_eps),
+            sa_scale=GemmaRMSNorm(embed_dim, eps=norm_eps),
+            mlp_scale=GemmaRMSNorm(embed_dim, eps=norm_eps),
+        )
+        layers.append(layer)
+
+    tok_embeddings = GemmaNormEmbeddings(vocab_size, embed_dim)
+    output_proj = TiedLinear(tok_embeddings)
+    model = TransformerDecoder(
+        tok_embeddings=tok_embeddings,
+        layers=layers,
+        max_seq_len=max_seq_len,
+        num_heads=num_heads,
+        output=output_proj,
+        head_dim=local_head_dim,
+        norm=Gemma2FinalNorm(final_capping_value, embed_dim, eps=norm_eps),
+    )
+
+    if quantize_base:
+        _register_reparametrize_state_dict_hooks(
+            model, dtype=tok_embeddings.weight.dtype
+        )
+
     return model
