@@ -58,7 +58,15 @@ run_leg() {
   # The launcher writes a timestamped LOG per invocation (run_bioreason_2node_*.log),
   # so the two legs' logs are distinct even though TRAIN_LOG (/tmp) is reused.
   bash "$TT/experiments/bioreason/run_bioreason_2node_server.sh"
-  echo "=== leg $tag rc=$? ==="
+  local rc=$?
+  echo "=== leg $tag rc=$rc ==="
+  # Copy this leg's launcher LOG (shared FS, timestamped; the watcher SSH tees the
+  # train-node Step lines into it) to a stable leg-tagged path so the orchestrator can
+  # assess the gopredON leg specifically (the newest run_*.log after both legs is coldOFF).
+  mkdir -p "$TT/experiments/bioreason/overnight_state"
+  local _newest; _newest=$(ls -t $TT/experiments/bioreason/run_bioreason_2node_*.log 2>/dev/null | head -1)
+  [ -n "$_newest" ] && cp -f "$_newest" \
+        "$TT/experiments/bioreason/overnight_state/smoke_${tag}_launcher.log" 2>/dev/null || true
 }
 
 # Leg A: go_pred ON (the new path) first — if it OOMs/truncates we learn immediately.

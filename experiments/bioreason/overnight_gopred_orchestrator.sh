@@ -46,20 +46,21 @@ for i in $(seq 1 240); do  # up to 8h
   sleep 120
 done
 
-# ---- Phase 3: assess smoke health (gopredON leg) ----
-# GREEN gate: gopredON leg ran >=4 steps with ratios=1.0 and NO banned:1/Traceback/NaN,
-# and reward fired (some nonzero). The launcher's timestamped log holds the Step lines;
-# find the most recent train log.
+# ---- Phase 3: assess smoke health (gopredON leg specifically) ----
+# GREEN gate: gopredON leg ran >=4 steps with ratios=1.0 and NO banned:1/Traceback/NaN/
+# truncation error, and reward fired (some nonzero). The smoke copies each leg's launcher
+# LOG to overnight_state/smoke_<tag>_launcher.log (gopredON = the one we gate on).
 GREEN=0
-NEWEST_TRAINLOG=$(ls -t $TT/experiments/bioreason/run_bioreason_2node_*.log 2>/dev/null | head -1)
-if [ -n "${NEWEST_TRAINLOG:-}" ]; then
-  steps=$(grep -cE "^Step [0-9]+ " "$NEWEST_TRAINLOG" 2>/dev/null | head -1); steps=${steps:-0}
-  banned=$(grep -ciE "banned:1|Traceback|UR_RESULT_ERROR|nan" "$NEWEST_TRAINLOG" 2>/dev/null | head -1); banned=${banned:-0}
-  nonzero=$(grep -oE "rewards:[0-9.]+" "$NEWEST_TRAINLOG" 2>/dev/null | grep -vE "rewards:0\.0+$" | head -1)
-  log "smoke health: steps=$steps banned/err=$banned nonzero_reward_seen=${nonzero:-none} log=$NEWEST_TRAINLOG"
+GLOG=$SD/smoke_gopredON_launcher.log
+if [ -f "$GLOG" ]; then
+  steps=$(grep -cE "^Step [0-9]+ " "$GLOG" 2>/dev/null | head -1); steps=${steps:-0}
+  banned=$(grep -ciE "banned:1|Traceback|UR_RESULT_ERROR|[^a-z]nan[^a-z]|truncat.*error|CUDA error|XPU out of memory" "$GLOG" 2>/dev/null | head -1); banned=${banned:-0}
+  nonzero=$(grep -oE "rewards:[0-9.]+" "$GLOG" 2>/dev/null | grep -vE "rewards:0\.0+$" | head -1)
+  ratios_ok=$(grep -oE "ratios:[0-9.]+" "$GLOG" 2>/dev/null | grep -cE "ratios:1\.0" | head -1); ratios_ok=${ratios_ok:-0}
+  log "smoke gopredON health: steps=$steps banned/err=$banned nonzero_reward=${nonzero:-none} ratios1.0_count=$ratios_ok log=$GLOG"
   if [ "$steps" -ge 4 ] && [ "$banned" -eq 0 ] && [ -n "$nonzero" ]; then GREEN=1; fi
 else
-  log "WARN: no train log found to assess smoke"
+  log "WARN: gopredON launcher log not found at $GLOG; cannot assess smoke"
 fi
 
 if [ "$GREEN" -ne 1 ]; then
