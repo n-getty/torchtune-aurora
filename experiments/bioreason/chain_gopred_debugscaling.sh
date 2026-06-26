@@ -84,12 +84,15 @@ echo "=== link=$LINK train rc=$RC dt=${dt}s $(date) ===" | tee -a "$CHAIN_STATE/
 # We can't know exactly how many steps completed before a walltime kill; estimate from the
 # train log's last METRICS step= and add to DONE_STEPS. Conservative: if no steps detected,
 # don't advance (avoids an infinite chain on a boot-failing link).
-LAST_STEP=$(grep -oE "METRICS step=[0-9]+" "$CHAIN_OUT"/logs/*.txt 2>/dev/null | grep -oE "[0-9]+" | sort -n | tail -1)
+# The recipe DiskLogger writes "$CHAIN_OUT/logs/log_*.txt" with lines "Step N | ..."; the
+# 2N server LAUNCHER log "run_bioreason_2node_*.log" mirrors them as "METRICS step=N".
+# Read BOTH formats from BOTH sources so the chain advances regardless of which is present.
+_max_step() { grep -hoE "Step [0-9]+ \||METRICS step=[0-9]+" "$@" 2>/dev/null | grep -oE "[0-9]+" | sort -n | tail -1; }
+LAST_STEP=$(_max_step "$CHAIN_OUT"/logs/log_*.txt)
 LAST_STEP=${LAST_STEP:-0}
-# Fall back to the launcher LOG if the recipe metric_logger dir differs.
 if [ "$LAST_STEP" -eq 0 ]; then
-    _ll=$(ls -t $TT/experiments/bioreason/run_bioreason_Nnode_*.log 2>/dev/null | head -1)
-    [ -n "$_ll" ] && LAST_STEP=$(grep -oE "METRICS step=[0-9]+" "$_ll" 2>/dev/null | grep -oE "[0-9]+" | sort -n | tail -1)
+    _ll=$(ls -t $TT/experiments/bioreason/run_bioreason_2node_*.log 2>/dev/null | head -1)
+    [ -n "$_ll" ] && LAST_STEP=$(_max_step "$_ll")
     LAST_STEP=${LAST_STEP:-0}
 fi
 NEW_DONE=$(( DONE_STEPS + LAST_STEP ))
