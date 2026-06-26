@@ -49,10 +49,13 @@ python experiments/bioreason/precompute_esm3_cache.py \
    must be lower). No number to status.md without GREEN health.
 4. **2–4 node scale**, confirm no_sync/ZeRO-2 reproduces, no banned:1, short run.
 5. **Eval** (Task #6 remaining): the save override writes a MERGED Gemma4 HF checkpoint + the
-   projections. Add `--backbone native` is NOT needed if eval loads the merged HF dir directly —
-   point the existing `experiments/bioreason/eval_cafa_fmax.py` at the saved epoch dir
-   (`--ckpt_dir <epoch>`, `--proj_dir <epoch>`, `--esm3_cache_path <test cache>`) since the merged
-   backbone is a complete Gemma4 model for vLLM. **Success = F_max 0.66–0.70.**
+   projections. The GEMMA4 `FullModelHFCheckpointer` runs `gemma4_tune_to_hf` and writes HF
+   safetensors. CAVEAT (eval-branch work, verify post-smoke): `eval_cafa_fmax.py` builds the embed
+   layer via `BioReasonModel` (HF `AutoModelForCausalLM`) and serves with vLLM + the gemma4 overlay
+   (`recipes/dev/vllm_gemma4_overlay/`). The merged HF checkpoint is a custom `gemma4` arch — the
+   eval embed-layer load + vLLM serve must use the overlay, NOT stock AutoModel. Expect a small
+   eval adapter (load `tok_embeddings` from the saved safetensors via the gemma4 key map; serve the
+   merged dir under the overlay). **Success = F_max 0.66–0.70.**
 
 ## Open risks for the smoke
 - 31B + multimodal + seq=4K memory on 6 PVC tiles — may need more nodes / activation offload /
