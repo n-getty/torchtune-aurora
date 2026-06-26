@@ -72,6 +72,15 @@ export TORCHTUNE_VLLM_STOP_TOKENS=${TORCHTUNE_VLLM_STOP_TOKENS:-1}
 export VLLM_MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-7168}
 export MAX_SEQ_LEN=${MAX_SEQ_LEN:-6144}
 
+# ASYNC generation (default ON): overlaps the ~67s vLLM gen behind the backward pass, so the
+# step time floor is ~max(gen,train) instead of gen+train. HW-validated 2026-06-23 (~30% win,
+# staleness=1, ratios~1.0, IS-corrected via GRPOLoss). The async YAML sets loss=GRPOLoss +
+# always_compute_rollout_logprobs=true (the required combo). Set USE_ASYNC=0 for the sync path.
+USE_ASYNC=${USE_ASYNC:-1}
+if [ "$USE_ASYNC" = "1" ]; then
+    export CONFIG=${CONFIG:-recipes/configs/dev/production/bioreason_4b_lora_grpo_2node_server_xpu_async.yaml}
+fi
+
 # Use the 2N SERVER launcher (1 train node + 1 vLLM node, single replicate) — the path the
 # go_pred smoke validated. The HSDP launcher needs >=3 nodes; this fits select=2 cleanly.
 # The 2N server launcher only forwards EXTRA_OVERRIDES, so pass resume/save/output there.
@@ -124,7 +133,7 @@ fi
 NEXT=$(( LINK + 1 ))
 echo "$NEW_DONE" > "$CHAIN_STATE/cumulative_steps"
 nextjob=$(qsub -W depend=afterany:${PBS_JOBID} \
-     -v CHAIN_TARGET=$CHAIN_TARGET,CHAIN_STEPS=$CHAIN_STEPS,SAVE_EVERY=$SAVE_EVERY,LINK=$NEXT,DONE_STEPS=$NEW_DONE,CHAIN_OUT=$CHAIN_OUT,GRPO_SAMPLES=$GRPO_SAMPLES,BATCH_SIZE=$BATCH_SIZE,FORWARD_BATCH_SIZE=$FORWARD_BATCH_SIZE,MAX_GEN_TOKENS=$MAX_GEN_TOKENS \
+     -v CHAIN_TARGET=$CHAIN_TARGET,CHAIN_STEPS=$CHAIN_STEPS,SAVE_EVERY=$SAVE_EVERY,LINK=$NEXT,DONE_STEPS=$NEW_DONE,CHAIN_OUT=$CHAIN_OUT,GRPO_SAMPLES=$GRPO_SAMPLES,BATCH_SIZE=$BATCH_SIZE,FORWARD_BATCH_SIZE=$FORWARD_BATCH_SIZE,MAX_GEN_TOKENS=$MAX_GEN_TOKENS,USE_ASYNC=$USE_ASYNC \
      "$TT/experiments/bioreason/chain_gopred_debugscaling.sh" 2>&1)
 echo "=== submitted next link=$NEXT: $nextjob ===" | tee -a "$CHAIN_STATE/chain.log"
 exit $RC

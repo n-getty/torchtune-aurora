@@ -52,6 +52,12 @@ dataset:
   max_seq_len: ${max_seq_len}
   max_protein_len: 2048
   num_go_tokens: 200
+  # TRAIN/SFT/EVAL prompt match (2026-06-26): inject GO-GPT go_pred as go_speculations,
+  # matching SFT training + the fixed eval (~3x reward vs cold prompt, smoke A/B). The raised
+  # seq budget (max_seq_len=6144, vllm_max_model_len=7168) is passed by the launcher
+  # EXTRA_OVERRIDES so the longer prompt is never truncated. See
+  # memory/project_bioreason_eval_fixed_rl_flat_vs_sft_20260626.
+  inject_go_pred: true
 
 collate_fn: torchtune.dev.bioreason.dataset.bioreason_collate_fn
 
