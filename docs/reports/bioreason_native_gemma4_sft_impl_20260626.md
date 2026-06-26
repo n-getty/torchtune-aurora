@@ -41,9 +41,16 @@ Run: `module load frameworks && pytest tests/torchtune/dev/bioreason/test_native
   `max_seq_len` 4096→8192 (Gemma4 native max).
 - Per-step time will inform the full-run node-day estimate (sanity-bound: SFT no-gen ≈ 25–30 s
   vs GRPO ~117 s with gen — consistent).
+- **Checkpoint save validated**: the save override gathered the FSDP2 state, merged LoRA
+  (W_eff), and wrote a complete **merged Gemma4 HF checkpoint** (13 safetensors shards ~58 GB)
+  + `config.json` + `tokenizer.json` + `protein_projection.pt` / `go_projection.pt` to
+  `epoch_0` — exactly the layout the eval harness consumes. (Smoke checkpoint deleted after
+  verification to reclaim disk.)
 
 Remaining for a production run: scale to 2–4 nodes (full train shards, ~22K steps), confirm
-the checkpoint save round-trips through the gemma4 vLLM overlay, then F_max eval.
+the merged checkpoint loads under the gemma4 vLLM overlay for eval, then F_max eval. ESM3 cache
+over the full SFT train shards (this smoke only built the validation shard's cache) is the
+one remaining precompute.
 
 ## HW smoke runbook (Task #6 — needs a held node)
 
