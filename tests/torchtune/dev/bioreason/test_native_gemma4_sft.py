@@ -247,6 +247,27 @@ def test_G_lora_merge_for_save():
     assert all(not k.startswith("backbone.") for k in out)
 
 
+def test_C_chunked_loss_end_to_end():
+    """The recipe's loss path: set_num_output_chunks -> model returns a chunk list ->
+    CEWithChunkedOutputLoss yields a finite scalar -> grads flow to the projections.
+    Mirrors _loss_step under the SFTLoss (chunked) branch."""
+    from torchtune.modules.loss import CEWithChunkedOutputLoss
+
+    m, seqs = _tiny_model()
+    loss = CEWithChunkedOutputLoss(num_output_chunks=4, ignore_index=-100)
+    loss.set_model_output(m)  # -> m.set_num_output_chunks(4)
+    toks = torch.tensor([_mkrow(5), _mkrow(4) + [0]])
+    emb = m.build_full_embeds_train(toks, seqs, ["all", "all"])
+    out = m(input_embeds=emb)
+    assert isinstance(out, list) and len(out) == 4
+    labels = torch.full(toks.shape, -100)
+    labels[:, -3:] = toks[:, -3:]
+    l = loss(out, labels)
+    assert torch.isfinite(l)
+    l.backward()
+    assert m.protein_projection[0].weight.grad.abs().sum().item() > 0
+
+
 def test_H_recipe_uses_grad_enabled_splice():
     recipe = (_REPO / "recipes" / "dev" / "sft_bioreason_distributed_xpu.py").read_text()
     # must use the grad-enabled splice, NOT the no_grad build_prompt_embeds
