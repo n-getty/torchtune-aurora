@@ -107,50 +107,23 @@ class BioReasonSFTRecipeDistributedXPU(FullFinetuneRecipeDistributedXPU):
         )
         init_start = time.perf_counter()
 
-        # Build the wrapper directly on device (the backbone is large; ESM3/GO caches
-        # are CPU dicts). config.instantiate builds BioReasonNativeModel from the YAML;
-        # the device is injected here so the YAML stays device-agnostic.
-        with training.set_default_dtype(self._dtype):
+        # Build the wrapper on META device so the 31B backbone never materializes full
+        # on one tile (mirrors the parent's meta-init + sharded-load pattern; a direct
+        # on-device build would OOM before sharding). The ESM3 cache (torch.load CPU
+        # dict) and GO-embedding load inside __init__ are unaffected by the default
+        # device; we relocate the GO cache to the real device after sharding.
+        with training.set_default_dtype(self._dtype), torch.device("meta"):
             model: BioReasonNativeModel = config.instantiate(
                 cfg_model, device=self._device, dtype=self._dtype
             )
 
-        # Activation checkpointing on the decoder layers (matches the parent: wrap by
-        # the transformer self-attention layer type, which subsumes Gemma4TransformerLayer).
+        # Activation checkpointing on the decoder layers (wrap by the transformer
+        # self-attention layer type, which subsumes Gemma4TransformerLayer).
         if enable_activation_checkpointing:
             training.set_activation_checkpointing(
                 model.backbone,
                 auto_wrap_policy={_parent_mod.modules.TransformerSelfAttentionLayer},
             )
-
-        # Load the GEMMA4 backbone weights (full state dict) into model.backbone. The
-        # checkpointer produced tune-format keys for a TransformerDecoder; they map onto
-        # backbone.* (the wrapper's only checkpointed subtree). Projections train from
-        # scratch, so load with strict=False and assert the backbone matched.
-        missing, unexpected = model.backbone.load_state_dict(
-            model_state_dict, strict=False
-        )
-        # Allow only LoRA adapter params (lora_a/lora_b/magnitude) to be "missing" — the
-        # base checkpoint has no adapters. Anything else missing is a real error.
-        real_missing = [
-            k for k in missing
-            if not any(s in k for s in ("lora_a", "lora_b", "magnitude"))
-        ]
-        if real_missing:
-            raise RuntimeError(
-                f"Backbone state_dict load: {len(real_missing)} unexpected MISSING keys "
-                f"(first few: {real_missing[:5]}). Checkpoint/arch mismatch."
-            )
-        if unexpected:
-            raise RuntimeError(
-                f"Backbone state_dict load: {len(unexpected)} UNEXPECTED keys "
-                f"(first few: {unexpected[:5]})."
-            )
-        utils.log_rank_zero(
-            self._logger,
-            f"Loaded GEMMA4 backbone ({len(model_state_dict)} tensors; "
-            f"{len(missing)} adapter/proj keys init-from-scratch).",
-        )
 
         # FSDP2 shard the whole wrapper (backbone + projections). The parent's
         # _loss_step/no_sync paths call set_requires_gradient_sync on self._model, so the
@@ -173,11 +146,61 @@ class BioReasonSFTRecipeDistributedXPU(FullFinetuneRecipeDistributedXPU):
                 dp_mesh=self.world_mesh[dp_mesh_dim_names],
             )
 
-        # RoPE buffers are not in the state dict — re-init on device.
+        # Initialize the meta-built non-base modules BEFORE loading the base weights
+        # (canonical torchtune LoRA order, recipes/lora_finetune_distributed.py:566-584):
+        #   - LoRA adapters (AdapterModule): to_empty + initialize_parameters
+        #   - the from-scratch protein/GO projections (plain nn.Sequential): to_empty +
+        #     reset_parameters per Linear
+        #   - RoPE buffers: rope_init
+        # to_empty is applied PER-MODULE (never on the whole model — that would wipe the
+        # base weights once loaded; here base is still meta so order also matters).
+        from torchtune.modules.peft import AdapterModule
+
         with training.set_default_dtype(self._dtype), self._device:
             for m in model.modules():
+                if isinstance(m, AdapterModule):
+                    m.to_empty(device=self._device)
+                    m.initialize_parameters()
                 if hasattr(m, "rope_init"):
                     m.rope_init()
+            for proj in (model.protein_projection, model.go_projection):
+                proj.to_empty(device=self._device)
+                for layer in proj:
+                    if hasattr(layer, "reset_parameters"):
+                        layer.reset_parameters()
+
+        # Load the GEMMA4 base weights into the sharded model via the FSDP2-aware loader
+        # (full CPU state dict -> sharded DTensors per rank, no full materialization).
+        # strict=False: adapters/projections are not in the base checkpoint (already
+        # initialized above); keys are backbone.* in the wrapper, so prefix them.
+        _prefixed = {f"backbone.{k}": v for k, v in model_state_dict.items()}
+        base_missing, base_unexpected = training.load_from_full_model_state_dict(
+            model,
+            _prefixed,
+            self._device,
+            strict=False,
+            cpu_offload=fsdp_cpu_offload,
+        )
+        _real_unexpected = list(base_unexpected or [])
+        if _real_unexpected:
+            raise RuntimeError(
+                f"Base load: {len(_real_unexpected)} UNEXPECTED keys "
+                f"(first few: {_real_unexpected[:5]}). Checkpoint/arch mismatch."
+            )
+        utils.log_rank_zero(
+            self._logger,
+            f"Loaded GEMMA4 base ({len(model_state_dict)} tensors) into sharded backbone.",
+        )
+
+        # GO embedding cache must be a real tensor (loaded with map_location=device in
+        # __init__, so unaffected by the meta context).
+        if (
+            "all" in model._go_embed_cache
+            and model._go_embed_cache["all"].device.type == "meta"
+        ):
+            raise RuntimeError(
+                "GO embedding cache landed on meta — set go_embedding_path to a real file."
+            )
 
         self.activations_handling_ctx = training.get_act_offloading_ctx_manager(
             model, enable_activation_offloading, activation_offloading_use_streams
