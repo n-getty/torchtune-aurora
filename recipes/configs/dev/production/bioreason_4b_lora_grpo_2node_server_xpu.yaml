@@ -59,6 +59,15 @@ dataset:
   #     (200,2560); 50 sliced off 75% of the GO graph context the model expects.
   max_protein_len: 2048
   num_go_tokens: 200
+  # TRAIN/SFT/EVAL prompt-distribution match (2026-06-26). The SFT ckpt was trained to
+  # REFINE GO-GPT's predictions (the `go_pred` column, injected as "go_speculations"),
+  # and the fixed eval injects them too (eval_cafa_fmax.py --inject_go_pred lifted the
+  # published SFT from 0.41 -> ~0.65 F_max). RL training previously used a COLD prompt
+  # with NO go_pred -> RL optimized an off-distribution prompt unlike both SFT and eval,
+  # the leading suspect for flat eval F_max. inject_go_pred=true builds the SAME
+  # paper-faithful prompt the eval uses. Set false to reproduce the old cold prompt for
+  # an A/B. See memory/project_bioreason_eval_fixed_rl_flat_vs_sft_20260626.
+  inject_go_pred: true
 
 collate_fn: torchtune.dev.bioreason.dataset.bioreason_collate_fn
 

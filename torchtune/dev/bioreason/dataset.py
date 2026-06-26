@@ -26,6 +26,17 @@ PROTEIN_PAD = "<|protein_pad|>"
 GO_PAD = "<|go_graph_pad|>"
 
 
+def _nonempty(v) -> bool:
+    """True if a parquet cell (str / list / ndarray / None) holds real content.
+    go_{bp,mf,cc} are stored as ndarrays; len() works but `if v` is ambiguous for arrays."""
+    if v is None:
+        return False
+    try:
+        return len(v) > 0
+    except TypeError:
+        return bool(v)
+
+
 class BioReasonRLDataset(Dataset):
     """
     Dataset for BioReason-Pro GRPO RL fine-tuning.
@@ -45,6 +56,7 @@ class BioReasonRLDataset(Dataset):
         max_protein_len: int = 512,
         num_go_tokens: int = 200,
         answer_column: str = "go_ids",
+        inject_go_pred: bool = False,
     ):
         self.tokenizer = tokenizer
         self.max_seq_len = max_seq_len
@@ -56,6 +68,17 @@ class BioReasonRLDataset(Dataset):
         # so RL optimized toward another model's guesses, not truth — flat reward +
         # can degrade eval F_max. Kept configurable only for A/B against the old runs.
         self.answer_column = answer_column
+        # Train/eval/SFT prompt-distribution match. The SFT ckpt was TRAINED to REFINE
+        # GO-GPT's predictions (the `go_pred` column, injected as "go_speculations"), and
+        # the fixed eval injects them too (eval_cafa_fmax.py --inject_go_pred, which lifted
+        # the published SFT from 0.41 → ~0.65 F_max). But RL training used a COLD prompt
+        # with NO go_pred → RL optimized an off-distribution prompt that differs from both
+        # SFT and eval. inject_go_pred=True builds the SAME paper-faithful prompt the eval
+        # uses (paper's _format_reasoning_prompt + format_cafa5_for_protein_llm), so the
+        # train, SFT, and eval prompt distributions all match. Default False keeps the
+        # legacy cold-prompt path byte-identical for A/B. See
+        # memory/project_bioreason_eval_fixed_rl_flat_vs_sft_20260626.
+        self.inject_go_pred = inject_go_pred
 
         self.examples = self._load(data_files)
         logger.info(f"Loaded {len(self.examples)} BioReason RL examples from {data_files}")
@@ -109,6 +132,63 @@ class BioReasonRLDataset(Dataset):
     def __len__(self) -> int:
         return len(self.examples)
 
+    # Verbatim from BioReason-Pro/bioreason2/dataset/prompts/cafa5.py — the
+    # CAFA5_REASONING_TEMPLATE_WITH_CONTEXT* the published SFT was trained on and the
+    # fixed eval uses. Reproduced here (rather than imported) to keep the dataloader hot
+    # path free of the heavy bioreason2 import; test_bioreason_go_pred_prompt asserts byte
+    # equality against the paper module so any upstream drift is caught.
+    _SYS_WITH_CONTEXT = (
+        "You are a scientific assistant specialized in protein function prediction. "
+        "Given a protein sequence, organism information, and additional context (InterPro "
+        "domain annotations and/or initial GO term speculations), step-by-step reason about "
+        "the InterPro terms, Gene Ontology (GO) terms regarding molecular function, "
+        "biological process, and cellular component, protein-protein interactions (PPI), and "
+        "overall function. Use the provided information as a starting point and improve upon "
+        "it with deeper analysis. Provide a summary of your findings in your final answer."
+    )
+
+    def _build_go_pred_prompt_text(self, ex: dict) -> str:
+        """Fold the paper's system+user WITH_CONTEXT* prompt into a single text block,
+        injecting go_pred as go_speculations. Selects the PPI variant when ppi_formatted is
+        present (matches _format_reasoning_prompt's branch: ppi_in_prompt and (interpro or
+        go_speculations)). go_aspects_suffix is built from which go_{mf,cc,bp} are present."""
+        org = ex.get("organism", "") or "Unknown"
+        interpro_data = ex.get("interpro_formatted", "") or ""
+        ppi_data = ex.get("ppi_formatted", "") or ""
+        go_spec = ex.get("go_pred", "") or ""
+
+        # go_aspects_suffix (paper order: MF, CC, BP)
+        aspects = []
+        if _nonempty(ex.get("go_mf")):
+            aspects.append("Molecular Function")
+        if _nonempty(ex.get("go_cc")):
+            aspects.append("Cellular Component")
+        if _nonempty(ex.get("go_bp")):
+            aspects.append("Biological Process")
+        go_aspects_suffix = (
+            f" and focus more on its {', '.join(aspects)}." if aspects else "."
+        )
+
+        if ppi_data and (interpro_data or go_spec):
+            user = (
+                f"Given the protein above from organism {org} with the following InterPro "
+                f"annotations:\n{interpro_data if interpro_data else 'None'}\n\n"
+                f"And the following protein-protein interaction partners:\n"
+                f"{ppi_data if ppi_data else 'None'}\n\n"
+                f"And the following initial GO term speculations:\n"
+                f"{go_spec if go_spec else 'None'}\n\n"
+                f"Reason about the function of the protein{go_aspects_suffix}"
+            )
+        else:
+            user = (
+                f"Given the protein above from organism {org} with the following InterPro "
+                f"annotations:\n{interpro_data}\n\n"
+                f"And the following initial GO term speculations:\n{go_spec}\n\n"
+                f"Reason about the function of the protein."
+            )
+        # format_cafa5_for_protein_llm folds system + user into the single text block.
+        return f"{self._SYS_WITH_CONTEXT.strip()}\n\n{user.strip()}"
+
     def __getitem__(self, idx: int) -> dict:
         ex = self.examples[idx]
 
@@ -134,13 +214,21 @@ class BioReasonRLDataset(Dataset):
         org = ex.get("organism", "")
         ppi = ex.get("ppi_formatted", "")
         interpro = ex.get("interpro_formatted", "")
-        prompt_text = (
-            f"Protein: {name} ({org})\n"
-            f"Function: {func}\n"
-            + (f"Domains: {interpro}\n" if interpro else "")
-            + (f"Interactions: {ppi}\n" if ppi else "")
-            + "Predict the GO terms for this protein."
-        )
+        if self.inject_go_pred:
+            # Paper-faithful prompt (system+user folded into the text block), injecting
+            # go_pred as "go_speculations" exactly as the fixed eval does. We build the
+            # text here (NOT via the heavy bioreason2 import in the dataloader hot path)
+            # but mirror _format_reasoning_prompt's CAFA5_REASONING_TEMPLATE_WITH_CONTEXT*
+            # verbatim so train == eval == SFT. Pinned by test_bioreason_go_pred_prompt.
+            prompt_text = self._build_go_pred_prompt_text(ex)
+        else:
+            prompt_text = (
+                f"Protein: {name} ({org})\n"
+                f"Function: {func}\n"
+                + (f"Domains: {interpro}\n" if interpro else "")
+                + (f"Interactions: {ppi}\n" if ppi else "")
+                + "Predict the GO terms for this protein."
+            )
 
         # Truncate protein sequence to max length
         protein_seq = protein_seq[:self.max_protein_len]
@@ -238,6 +326,7 @@ def bioreason_rl_dataset(
     max_protein_len: int = 512,
     num_go_tokens: int = 200,
     answer_column: str = "go_ids",
+    inject_go_pred: bool = False,
 ) -> BioReasonRLDataset:
     """TorchTune component factory for use in YAML configs."""
     return BioReasonRLDataset(
@@ -247,6 +336,7 @@ def bioreason_rl_dataset(
         max_protein_len=max_protein_len,
         num_go_tokens=num_go_tokens,
         answer_column=answer_column,
+        inject_go_pred=inject_go_pred,
     )
 
 
