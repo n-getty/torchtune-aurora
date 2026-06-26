@@ -53,10 +53,10 @@ done
 GREEN=0
 GLOG=$SD/smoke_gopredON_launcher.log
 if [ -f "$GLOG" ]; then
-  steps=$(grep -cE "^Step [0-9]+ " "$GLOG" 2>/dev/null | head -1); steps=${steps:-0}
+  steps=$(grep -cE "METRICS step=[0-9]+|^Step [0-9]+ " "$GLOG" 2>/dev/null | head -1); steps=${steps:-0}
   banned=$(grep -ciE "banned:1|Traceback|UR_RESULT_ERROR|[^a-z]nan[^a-z]|truncat.*error|CUDA error|XPU out of memory" "$GLOG" 2>/dev/null | head -1); banned=${banned:-0}
-  nonzero=$(grep -oE "rewards:[0-9.]+" "$GLOG" 2>/dev/null | grep -vE "rewards:0\.0+$" | head -1)
-  ratios_ok=$(grep -oE "ratios:[0-9.]+" "$GLOG" 2>/dev/null | grep -cE "ratios:1\.0" | head -1); ratios_ok=${ratios_ok:-0}
+  nonzero=$(grep -oE "rewards=[0-9.]+" "$GLOG" 2>/dev/null | grep -vE "rewards=0.0+$" | head -1)
+  ratios_ok=$(grep -oE "ratios=[0-9.]+" "$GLOG" 2>/dev/null | grep -cE "ratios=1.0" | head -1); ratios_ok=${ratios_ok:-0}
   log "smoke gopredON health: steps=$steps banned/err=$banned nonzero_reward=${nonzero:-none} ratios1.0_count=$ratios_ok log=$GLOG"
   if [ "$steps" -ge 4 ] && [ "$banned" -eq 0 ] && [ -n "$nonzero" ]; then GREEN=1; fi
 else
