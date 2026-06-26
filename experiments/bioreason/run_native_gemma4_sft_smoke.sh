@@ -52,11 +52,16 @@ mkdir -p "${LOGDIR}"
 cd "${PROJDIR}"
 
 # ── Step 1: ESM3 cache over the SFT validation shard (one tile) ───────────────
+# The precompute script takes a DIRECTORY (processes every .parquet in it). Stage the
+# validation shard alone into a smoke dir so we only encode ~7365 seqs, not all 124K.
+STAGE_DIR=/lus/flare/projects/ModCon/ngetty/datasets/bioreason_sft_reasoning/_smoke_val
 if [ "${SKIP_CACHE:-0}" != "1" ] && [ ! -f "${CACHE}" ]; then
+    mkdir -p "${STAGE_DIR}"
+    ln -sf "${VAL_PARQUET}" "${STAGE_DIR}/validation-00000-of-00001.parquet"
     echo "=== [smoke] ESM3 precompute -> ${CACHE} $(date) ===" | tee "${LOGDIR}/precompute.log"
     ZE_AFFINITY_MASK=0 PYTHONPATH="${BIOREASON_DEPS}:${BIOREASON_SRC}:${PROJDIR}" \
         python experiments/bioreason/precompute_esm3_cache.py \
-        --data_dir "${VAL_PARQUET}" \
+        --data_dir "${STAGE_DIR}" \
         --out "${CACHE}" \
         --max_protein_len 2048 \
         --log_every 200 --flush_every 1000 \
