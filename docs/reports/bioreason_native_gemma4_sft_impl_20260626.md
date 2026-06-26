@@ -28,6 +28,23 @@ Run: `module load frameworks && pytest tests/torchtune/dev/bioreason/test_native
 - `test_reward_target_and_propagation::test_dataset_source_has_no_go_pred_default` (1): naive
   substring match against `dataset.py`'s go_pred prompt-injection (untouched).
 
+## HW smoke RESULT (2026-06-26, node x4108c2s5b0n0, job 8570128) — GREEN
+
+1-node / 6-tile smoke, `sft_bioreason_gemma4_31B_smoke_xpu.yaml`, validation shard:
+- **31B LoRA loads + FSDP2-shards at 9.66 GiB/tile** (10.26 GiB reserved) — fits a 64 GiB
+  tile with huge headroom; could scale seq/batch or drop to fewer tiles.
+- **5/5 SFT steps at seq=8192**, loss 41.9 → 35.4 (clear learning), ~25–30 s/step, setup ~25 s.
+- Four bugs the smoke surfaced and fixed (committed): meta-device `.to()` on projections;
+  `_SideInputDataLoader.__len__`; **FSDP2 DTensor embed-splice must run inside `forward`**
+  (was outside → `aten.embedding` mixed Tensor/DTensor); seq budget — the BioReason prompt
+  is large (p99 4618, max 5046 tok) so truncate the TARGET only, never the prompt; raised
+  `max_seq_len` 4096→8192 (Gemma4 native max).
+- Per-step time will inform the full-run node-day estimate (sanity-bound: SFT no-gen ≈ 25–30 s
+  vs GRPO ~117 s with gen — consistent).
+
+Remaining for a production run: scale to 2–4 nodes (full train shards, ~22K steps), confirm
+the checkpoint save round-trips through the gemma4 vLLM overlay, then F_max eval.
+
 ## HW smoke runbook (Task #6 — needs a held node)
 
 PREREQUISITE — build the ESM3 cache over the SFT sequences (ESM3 needs XPU, do on a tile):
