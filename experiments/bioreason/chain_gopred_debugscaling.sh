@@ -58,7 +58,13 @@ export NSTEPS=$CHAIN_STEPS
 # Match the VALIDATED 2N go_pred smoke envelope (G=8, bs=2) — NOT the 4N HSDP G=24 config.
 export GRPO_SAMPLES=${GRPO_SAMPLES:-8}
 export BATCH_SIZE=${BATCH_SIZE:-2}
-export FORWARD_BATCH_SIZE=${FORWARD_BATCH_SIZE:-1}
+# fbs=2 (NOT 1): num_seqs=bs*G=16 -> 8 backward chunks instead of 16, halving the per-step
+# FSDP allgather+reduce-scatter collective count. The smoke/link-1 used fbs=1 -> grpo=33.5s
+# (~2x the 45-53s baseline's ~17s at fbs=4); fbs=2 recovers ~half of that. Conservative vs
+# fbs=4 because the go_pred prompt (~3400 tok vs baseline ~2250) raises backward activation
+# memory; link-1 peaked at only 56/64 GiB at fbs=1 so fbs=2 has headroom. If a link OOMs,
+# the chain's 0-progress guard halts it -> drop back to fbs=1.
+export FORWARD_BATCH_SIZE=${FORWARD_BATCH_SIZE:-2}
 export MAX_GEN_TOKENS=${MAX_GEN_TOKENS:-1024}
 export REF_FORWARD_BATCH_SIZE=${REF_FORWARD_BATCH_SIZE:-16}
 export TORCHTUNE_USE_CHUNKED_LOSS=${TORCHTUNE_USE_CHUNKED_LOSS:-0}
@@ -118,7 +124,7 @@ fi
 NEXT=$(( LINK + 1 ))
 echo "$NEW_DONE" > "$CHAIN_STATE/cumulative_steps"
 nextjob=$(qsub -W depend=afterany:${PBS_JOBID} \
-     -v CHAIN_TARGET=$CHAIN_TARGET,CHAIN_STEPS=$CHAIN_STEPS,SAVE_EVERY=$SAVE_EVERY,LINK=$NEXT,DONE_STEPS=$NEW_DONE,CHAIN_OUT=$CHAIN_OUT,GRPO_SAMPLES=$GRPO_SAMPLES,BATCH_SIZE=$BATCH_SIZE,MAX_GEN_TOKENS=$MAX_GEN_TOKENS \
+     -v CHAIN_TARGET=$CHAIN_TARGET,CHAIN_STEPS=$CHAIN_STEPS,SAVE_EVERY=$SAVE_EVERY,LINK=$NEXT,DONE_STEPS=$NEW_DONE,CHAIN_OUT=$CHAIN_OUT,GRPO_SAMPLES=$GRPO_SAMPLES,BATCH_SIZE=$BATCH_SIZE,FORWARD_BATCH_SIZE=$FORWARD_BATCH_SIZE,MAX_GEN_TOKENS=$MAX_GEN_TOKENS \
      "$TT/experiments/bioreason/chain_gopred_debugscaling.sh" 2>&1)
 echo "=== submitted next link=$NEXT: $nextjob ===" | tee -a "$CHAIN_STATE/chain.log"
 exit $RC
