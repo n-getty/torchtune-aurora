@@ -55,16 +55,11 @@ fi
 # ---- training env (go_pred, raised seq budget; matches batch_prod_rl_4n_gopred.sh) ----
 export ENABLE_LORA=1
 export NSTEPS=$CHAIN_STEPS
-# Match the VALIDATED 2N go_pred smoke envelope (G=8, bs=2) — NOT the 4N HSDP G=24 config.
+# EXACT match to the VALIDATED 2N go_pred SMOKE (8 clean steps): G=8, bs=2, fbs=1.
+# fbs reverted 2->1: the smoke that PROVED go_pred stable used fbs=1. Don't deviate.
 export GRPO_SAMPLES=${GRPO_SAMPLES:-8}
 export BATCH_SIZE=${BATCH_SIZE:-2}
-# fbs=2 (NOT 1): num_seqs=bs*G=16 -> 8 backward chunks instead of 16, halving the per-step
-# FSDP allgather+reduce-scatter collective count. The smoke/link-1 used fbs=1 -> grpo=33.5s
-# (~2x the 45-53s baseline's ~17s at fbs=4); fbs=2 recovers ~half of that. Conservative vs
-# fbs=4 because the go_pred prompt (~3400 tok vs baseline ~2250) raises backward activation
-# memory; link-1 peaked at only 56/64 GiB at fbs=1 so fbs=2 has headroom. If a link OOMs,
-# the chain's 0-progress guard halts it -> drop back to fbs=1.
-export FORWARD_BATCH_SIZE=${FORWARD_BATCH_SIZE:-2}
+export FORWARD_BATCH_SIZE=${FORWARD_BATCH_SIZE:-1}
 export MAX_GEN_TOKENS=${MAX_GEN_TOKENS:-1024}
 export REF_FORWARD_BATCH_SIZE=${REF_FORWARD_BATCH_SIZE:-16}
 export TORCHTUNE_USE_CHUNKED_LOSS=${TORCHTUNE_USE_CHUNKED_LOSS:-0}
@@ -110,14 +105,14 @@ fi
 RESUME_OVR=""
 [ -n "$RESUME" ] && RESUME_OVR="lora_adapter_path=$RESUME"
 export WSYNC_PATH=${WSYNC_PATH:-$CHAIN_OUT/wsync/weight_update.raw}
-# CONSTANT LR (lr_scheduler=null): the config's cosine warmup (num_warmup_steps=50) ramps lr
-# from ~6e-8 over 50 steps, but each chain link is ~24 steps and resets the scheduler — so a
-# warmup-per-link would keep lr near-zero forever and the chain would barely train. Constant
-# lr=3e-6 (the config's peak) gives every link the full learning rate. lr_scheduler=null is
-# tolerated by the recipe (see feedback_grpo_step_based_resume).
-# esm3_cache_path and dataset.max_protein_len MUST agree (the cache is keyed by the
-# sequence truncated to max_protein_len; a mismatch -> KeyError on lookup). Both set to 128.
-export EXTRA_OVERRIDES="dataset.inject_go_pred=true dataset.max_protein_len=${MAX_PROTEIN_LEN} esm3_cache_path=${ESM3_CACHE_PATH} max_seq_len=${MAX_SEQ_LEN} vllm_max_model_len=${VLLM_MAX_MODEL_LEN} save_every_n_steps=${SAVE_EVERY} output_dir=${CHAIN_OUT} lr_scheduler=null ${RESUME_OVR} ${EXTRA_OVERRIDES:-}"
+# LR: SHORT WARMUP, not constant-full-lr. lr_scheduler=null (constant lr=3e-6 from step 1) was
+# the DESTABILIZER: it gave step-1 kl_loss=5505 + SIGSEGV (vs the prod run's warmup step-1
+# lr=6e-8/kl=0.19 that ran 178 steps). A big first update with no warmup blows the policy off ref.
+# Keep the cosine scheduler but cut num_warmup_steps 50->8 so warmup actually completes within an
+# ~18-step link (step1 lr~3.75e-7 ramping to 3e-6 by step 8). Per-link warmup re-runs on resume
+# but only costs ~8 gentle steps/link — far better than a step-1 blowup. esm3_cache_path and
+# dataset.max_protein_len MUST agree (cache keyed by truncated seq).
+export EXTRA_OVERRIDES="dataset.inject_go_pred=true dataset.max_protein_len=${MAX_PROTEIN_LEN} esm3_cache_path=${ESM3_CACHE_PATH} max_seq_len=${MAX_SEQ_LEN} vllm_max_model_len=${VLLM_MAX_MODEL_LEN} save_every_n_steps=${SAVE_EVERY} output_dir=${CHAIN_OUT} lr_scheduler.num_warmup_steps=8 ${RESUME_OVR} ${EXTRA_OVERRIDES:-}"
 
 # Retry-once-on-boot-flake: the Aurora vLLM EngineCore boot flake fails FAST (<BOOT_WINDOW,
 # before training) and clears on relaunch. A real failure is slow. Retry once if fast-fail.
