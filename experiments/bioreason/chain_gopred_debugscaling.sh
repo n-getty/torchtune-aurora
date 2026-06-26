@@ -71,37 +71,22 @@ export TORCHTUNE_USE_CHUNKED_LOSS=${TORCHTUNE_USE_CHUNKED_LOSS:-0}
 export TORCHTUNE_VLLM_STOP_TOKENS=${TORCHTUNE_VLLM_STOP_TOKENS:-1}
 
 # ── PROMPT-LENGTH lever (the real gen cost driver) ──────────────────────────────
-# The 57.5s vLLM gen is dominated by PREFILL of the protein placeholders (len(seq)+2 per
-# protein). max_protein_len 2048 -> 128 cuts prompt ~3480 -> ~1560 tok (~halves prefill).
-# JUSTIFIED: the fidelity A/B (memory project_bioreason_replication_gaps) showed protein
-# 128 vs 2048 is F_max-NEUTRAL (0.4303 vs 0.4170) — the model predicts GO from the TEXT
-# context (interpro/ppi/go_pred), not the long protein embedding. The 128 ESM3 cache is
-# already built (datasets/bioreason_rl/esm3_cache.pt). go_pred TEXT (p95 ~1960 tok) is NOT
-# truncated: prompt ~= 130(prot)+200(go)+1960(text)+80 ~= 2370 -> max_seq_len=4096 safe.
-export MAX_PROTEIN_LEN=${MAX_PROTEIN_LEN:-128}
-export ESM3_CACHE_PATH=${ESM3_CACHE_PATH:-/lus/flare/projects/ModCon/ngetty/datasets/bioreason_rl/esm3_cache.pt}
-# max_seq_len=4608: measured 0/800 rows truncate at protein=128 (max untruncated prompt 4356;
-# the go_pred TEXT tail, not protein, sets this). vs the old 6144 (protein=2048). vLLM ctx =
-# 4608 prompt + 1024 gen = 5632. Still ~halves prefill vs the old protein-2048/6144 envelope.
-export MAX_SEQ_LEN=${MAX_SEQ_LEN:-4608}
-export VLLM_MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-5632}
-
-# ── ENGINE UTILIZATION lever ────────────────────────────────────────────────────
-# Default seqs_per_engine=4 fans bsz=16 over only 4 of the 12 vLLM tiles (8 idle). =2 ->
-# 8 engines (2 seqs each), spreading the decode across more tiles. (=1 -> 12 engines but
-# 16/12 is uneven.) Cuts the throughput-bound part of gen; the longest single seq still
-# sets a floor.
-export TORCHTUNE_VLLM_SEQS_PER_ENGINE=${TORCHTUNE_VLLM_SEQS_PER_ENGINE:-2}
-
-# ── VARLEN (no-grad ref/rollout forwards) ───────────────────────────────────────
-# HONEST SCOPE: BioReason's backbone is HF AutoModelForCausalLM(attn_implementation=sdpa),
-# so torchtune's attention_utils varlen only engages if HF SDPA routes through it; and even
-# then it speeds only OUR HF forwards (ref_fwd ~9s + grpo policy fwd), NOT the 57.5s vLLM
-# gen (vLLM has its own kernels). NOGRAD_BYPASS is required for var-len prompts (CLAUDE.md).
-# Low-risk to set; verify 'varlen=engaged' in the log — if it stays 'requested-but-skipped'
-# the HF backbone isn't wired to it (a known gap) and this is a harmless no-op.
-export TORCHTUNE_USE_IPEX_VARLEN=${TORCHTUNE_USE_IPEX_VARLEN:-1}
-export TORCHTUNE_VARLEN_NOGRAD_BYPASS=${TORCHTUNE_VARLEN_NOGRAD_BYPASS:-1}
+# ── REVERTED TO VALIDATED-STABLE ENVELOPE (2026-06-26) ──────────────────────────
+# The speculative gen levers were REMOVED after job 8568194 hit banned:1 PDE at step 3
+# (GPU NotPresent Write, mem FLAT 55.8 GiB = NOT OOM). The 2N go_pred SMOKE (8 clean steps)
+# and the prod go_pred run (178 steps) BOTH used protein=2048 + NO varlen bypass; my chain
+# was the only thing that added VARLEN_NOGRAD_BYPASS=1 (engages the IPEX varlen kernel on
+# ref/rollout fwds) and protein=128 — and it died at step 3. AND the gen levers were MEASURED
+# to NOT help anyway (protein=128: gen 65.7 vs 67s — gen is DECODE-bound not prefill-bound;
+# seqs_per_engine: didn't propagate + would reduce batching). So: revert to the validated
+# protein=2048 envelope, varlen bypass OFF. Keep only the PROVEN wins: go_pred, fbs=2,
+# constant lr. See memory project_bioreason_eval_fixed_rl_flat_vs_sft_20260626.
+export MAX_PROTEIN_LEN=${MAX_PROTEIN_LEN:-2048}
+export ESM3_CACHE_PATH=${ESM3_CACHE_PATH:-/lus/flare/projects/ModCon/ngetty/datasets/bioreason_rl/esm3_cache_2048.pt}
+export MAX_SEQ_LEN=${MAX_SEQ_LEN:-6144}
+export VLLM_MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-7168}
+# varlen bypass OFF (was the step-3 banned:1 trigger); IPEX varlen flag harmless if path unused.
+export TORCHTUNE_VARLEN_NOGRAD_BYPASS=${TORCHTUNE_VARLEN_NOGRAD_BYPASS:-0}
 
 # ASYNC generation (default ON): overlaps the ~67s vLLM gen behind the backward pass, so the
 # step time floor is ~max(gen,train) instead of gen+train. HW-validated 2026-06-23 (~30% win,
