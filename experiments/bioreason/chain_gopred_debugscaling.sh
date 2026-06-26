@@ -72,7 +72,12 @@ export MAX_SEQ_LEN=${MAX_SEQ_LEN:-6144}
 RESUME_OVR=""
 [ -n "$RESUME" ] && RESUME_OVR="lora_adapter_path=$RESUME"
 export WSYNC_PATH=${WSYNC_PATH:-$CHAIN_OUT/wsync/weight_update.raw}
-export EXTRA_OVERRIDES="dataset.inject_go_pred=true max_seq_len=${MAX_SEQ_LEN} vllm_max_model_len=${VLLM_MAX_MODEL_LEN} save_every_n_steps=${SAVE_EVERY} output_dir=${CHAIN_OUT} ${RESUME_OVR} ${EXTRA_OVERRIDES:-}"
+# CONSTANT LR (lr_scheduler=null): the config's cosine warmup (num_warmup_steps=50) ramps lr
+# from ~6e-8 over 50 steps, but each chain link is ~24 steps and resets the scheduler — so a
+# warmup-per-link would keep lr near-zero forever and the chain would barely train. Constant
+# lr=3e-6 (the config's peak) gives every link the full learning rate. lr_scheduler=null is
+# tolerated by the recipe (see feedback_grpo_step_based_resume).
+export EXTRA_OVERRIDES="dataset.inject_go_pred=true max_seq_len=${MAX_SEQ_LEN} vllm_max_model_len=${VLLM_MAX_MODEL_LEN} save_every_n_steps=${SAVE_EVERY} output_dir=${CHAIN_OUT} lr_scheduler=null ${RESUME_OVR} ${EXTRA_OVERRIDES:-}"
 
 t0=$(date +%s)
 bash "$TT/experiments/bioreason/run_bioreason_2node_server.sh"
