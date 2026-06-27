@@ -171,3 +171,41 @@ ACTIONABLE: BioReason prompts are p50≈1770 / p99≈4618 / max≈5046 tok; seq=
 of examples (long tail truncates). Testing BioReason-Qwen at seq=4096/12-tile now — expected
 to clear the L0 wall. Production envelope: seq=4096 (or 6144), NOT 8192, at 12-tile single
 node. seq=8192 would need fewer tiles, more nodes, or activation offloading — a separate opt.
+
+## ★★★ ACTUAL ROOT CAUSE (2026-06-27, final, catchable traceback): XPU SDPA O(S²) at long seq
+
+The 2-tile run gave a CATCHABLE OutOfMemoryError (vs the uncatchable banned:1/UR:40 at more
+tiles) with a full traceback — the diagnostic that ends the guessing:
+
+  qwen3/_attention.py:261 -> attention_utils.py:428 _sdpa_call -> F.scaled_dot_product_attention
+  torch.OutOfMemoryError: Tried to allocate **9.00 GiB** (one SDPA call)
+
+9.00 GiB = 64 heads × 6144 × 6144 × 4 bytes (fp32) = the FULL [B, n_heads, S, S] score tensor.
+**XPU's scaled_dot_product_attention falls back to the MATH backend for the autograd
+(training) path and materializes O(S²) fp32 scores.** This is the SAME mechanism as the
+Gemma "could not create a memory" at gemma4/_attention.py and the 12-tile banned:1/UR:40 —
+all are the O(S²) attention-score allocation at long seq, surfacing as different L0 error
+flavors depending on tile count / MR-monitor.
+
+Why text-only seq=2048 was the only clean run: 64×2048²×4 = 1.0 GiB per SDPA call (survivable);
+seq=6144 → 9 GiB (OOM). It was NEVER Gemma-vs-Qwen or multimodal-vs-text — it was ALWAYS
+seq-length × the O(S²) math-SDPA fallback. Every crash is explained by this one cause.
+
+KEY CONSTRAINT INTERACTION: BioReason's longest prompts (2048-residue protein) need seq≥~5046,
+but seq≥~3000 already makes the O(S²) score tensor too big to train a 32B at on these tiles.
+seq and the data requirement are fundamentally in tension under math-SDPA.
+
+CRITICAL UNKNOWN (next session): IPEX varlen does NOT help — it's no-grad-only (training fwd
+always uses standard SDPA; CLAUDE.md line 306). So the lever is: does XPU/this torch expose a
+MEMORY-EFFICIENT SDPA backend for the AUTOGRAD path (flash/mem-efficient), or must we use an
+explicit chunked/flash-attention implementation for the Gemma4/Qwen3 attention training forward?
+The working GRPO baselines run at shorter effective seq, so this O(S²)-at-long-seq-training wall
+may simply not have been hit before. This is the real blocker for 32B SFT at seq>~3K on XPU.
+
+NOT a quick env fix. Candidate solutions to investigate: (1) a flash-attention kernel for XPU
+training (IPEX has varlen_fwd but no autograd — needs the bwd); (2) sample packing to keep
+per-sequence S small while filling the budget (packing makes uniform S, but the LONGEST single
+protein still needs ~5046 contiguous — packing does NOT reduce the max single-doc length, so the
+O(S²) per-document cost in a block-diagonal mask remains... unless block-sparse flex-attention,
+which is CUDA-only on XPU); (3) cap max_protein_len lower (e.g. 1024 → ~1290-tok prompt → 3-head
+seqs fit) accepting protein-info loss + an ESM3 cache rebuild.
