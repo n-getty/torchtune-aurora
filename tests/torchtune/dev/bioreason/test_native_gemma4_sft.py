@@ -327,3 +327,59 @@ def test_H_dataset_prompt_matches_rl_dataset():
         rl.BioReasonRLDataset.__new__(rl.BioReasonRLDataset), ex
     )
     assert sft_text == rl_text
+
+
+# ── I: Gemma4 SDPA attention == legacy math path (the OOM fix) ─────────────────
+def _g4_attn(head_dim, num_kv_heads, num_heads, sliding, k_eq_v, partial):
+    from torchtune.models.gemma4._attention import Gemma4Attention
+    from torchtune.models.gemma.rms_norm import GemmaRMSNorm
+    from torchtune.models.qwen2._positional_embeddings import (
+        Qwen2RotaryPositionalEmbeddings,
+    )
+
+    rope = Qwen2RotaryPositionalEmbeddings(
+        dim=int(head_dim * partial), max_seq_len=128, base=10000.0
+    )
+    return Gemma4Attention(
+        embed_dim=64, num_heads=num_heads, num_kv_heads=num_kv_heads, head_dim=head_dim,
+        q_proj=nn.Linear(64, num_heads * head_dim, bias=False),
+        k_proj=nn.Linear(64, num_kv_heads * head_dim, bias=False),
+        v_proj=(nn.Identity() if k_eq_v else nn.Linear(64, num_kv_heads * head_dim, bias=False)),
+        output_proj=nn.Linear(num_heads * head_dim, 64, bias=False),
+        pos_embeddings=rope, q_norm=GemmaRMSNorm(head_dim), k_norm=GemmaRMSNorm(head_dim),
+        kv_cache=None, max_seq_len=128, attn_dropout=0.0, sliding_window_size=sliding,
+        softcapping=None, query_pre_attn_scalar=head_dim, partial_rotary_factor=partial,
+        k_eq_v=k_eq_v,
+    ).eval()
+
+
+@pytest.mark.parametrize(
+    "name,cfg",
+    [
+        ("local_sliding", (16, 2, 4, 16, False, 1.0)),
+        ("global_full_keqv_partial", (32, 1, 4, None, True, 0.25)),
+    ],
+)
+def test_I_gemma4_sdpa_matches_math(name, cfg):
+    """The SDPA path (default) must be numerically equivalent to the legacy
+    matmul->softmax(float)->matmul path it replaces — for both Gemma4 layer types.
+    This is the fix for the S^2 score-materialization OOM (52 GiB at seq=8192/12 tiles)."""
+    import torchtune.models.gemma4._attention as live
+
+    torch.manual_seed(0)
+    head_dim, nkv, nh, sliding, k_eq_v, partial = cfg
+    m = _g4_attn(head_dim, nkv, nh, sliding, k_eq_v, partial)
+    x = torch.randn(2, 40, 64)
+    prev = live._GEMMA4_SDPA
+    try:
+        live._GEMMA4_SDPA = False
+        with torch.no_grad():
+            out_math = m(x, x)
+        live._GEMMA4_SDPA = True
+        with torch.no_grad():
+            out_sdpa = m(x, x)
+    finally:
+        live._GEMMA4_SDPA = prev
+    assert torch.allclose(out_math, out_sdpa, atol=1e-4), (
+        f"{name}: max diff {(out_math - out_sdpa).abs().max().item():.2e}"
+    )

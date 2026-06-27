@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
+import os
 from typing import Optional
 
 import torch
@@ -14,6 +15,16 @@ from torchtune.modules.attention_utils import _MaskType
 from torchtune.modules.kv_cache import KVCache
 
 logger = logging.getLogger(__name__)
+
+# Use torch SDPA (flash / mem-efficient) instead of the hand-rolled
+# matmul -> softmax(float32) -> matmul. The manual path MATERIALIZES the full
+# [b, n_heads, S, S] scores AND upcasts them to fp32 — at S=8192 / 32 heads that is
+# ~8.6 GiB of fp32 scores PER global-attention layer (the 52 GiB OOM at 12 tiles).
+# SDPA fuses the scores internally (O(S) memory). Default ON; set =0 to A/B against
+# the legacy math path. Gemma4 has softcapping=None on every layer (builder), so SDPA
+# is exact here; the custom query_pre_attn_scalar is passed through SDPA's scale= arg.
+_GEMMA4_SDPA = os.environ.get("TORCHTUNE_GEMMA4_SDPA", "1") == "1"
+_logged_sdpa_once = False
 
 
 class Gemma4Attention(nn.Module):
@@ -230,6 +241,50 @@ class Gemma4Attention(nn.Module):
             if self.kv_cache is not None and self.cache_enabled:
                 k, v = self.kv_cache.update(k, v)
 
+        # ── SDPA path (default): fused flash / mem-efficient attention ────────
+        # softcapping is None for all Gemma4 layers, so SDPA is numerically exact.
+        # When a sliding window is set, restrict each query to the last
+        # `sliding_window_size` keys; otherwise plain causal. q/k/v are already
+        # [b, n_heads, s, head_dim] with GQA expanded, and self.scaling carries the
+        # Gemma query_pre_attn_scalar (passed via SDPA's scale=, NOT pre-multiplied).
+        if _GEMMA4_SDPA and self.softcapping is None:
+            global _logged_sdpa_once
+            if not _logged_sdpa_once:
+                logger.info("Gemma4Attention: using torch SDPA (fused, O(S) memory)")
+                _logged_sdpa_once = True
+
+            attn_mask = None
+            use_causal = False
+            if mask is not None:
+                # Caller-provided boolean/additive mask: hand to SDPA as attn_mask.
+                # SDPA wants True = attend for a bool mask; convert additive if needed.
+                attn_mask = mask
+                if attn_mask.dim() == 3:
+                    attn_mask = attn_mask.unsqueeze(1)
+            elif self.sliding_window_size is not None:
+                # Banded causal mask: |i - j| within the window AND j <= i. Bool [s, s];
+                # at S=8192 this is ~64 MiB (bool) vs ~8.6 GiB of fp32 scores — 100x less,
+                # and it is NOT upcast or multiplied by n_heads.
+                idx = torch.arange(s_x, device=x.device)
+                causal = idx[:, None] >= idx[None, :]
+                within = (idx[:, None] - idx[None, :]) < self.sliding_window_size
+                attn_mask = (causal & within)[None, None, :, :]
+            else:
+                use_causal = True  # let SDPA build the causal mask internally
+
+            output = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=attn_mask,
+                dropout_p=self.attn_dropout if self.training else 0.0,
+                is_causal=use_causal,
+                scale=self.scaling,
+            )
+            output = output.transpose(1, 2).contiguous().view(b, s_x, -1)
+            return self.output_proj(output)
+
+        # ── Legacy math path (TORCHTUNE_GEMMA4_SDPA=0): materializes S^2 scores ──
         q.mul_(self.scaling)
         output = torch.matmul(q, k.transpose(2, 3))
 
