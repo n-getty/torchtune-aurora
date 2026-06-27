@@ -80,7 +80,18 @@ max_protein_len=2048 → KeyError if the dataset truncates to a different length
 Per-rank memory logging (not just rank 0) would have made this obvious immediately. Worth adding a
 max-over-ranks peak-memory all-reduce to the recipe's metric logging.
 
-## RESOLUTION (2026-06-27, node x4311c4s3b0n0) — 12-tile training works
+## ⚠️ CORRECTION: the section below claimed "RESOLVED" prematurely — it is NOT
+
+The LinearCrossEntropyLoss + userfaultfd run completed steps 1-3 (loss 41.2→36.8→35.8) then
+**banned:1 PDE'd on rank2 at the step 3→4 transition** — same crash point as before. I called
+it resolved after seeing step 3 clear, BEFORE the run cleared the step-3→4 boundary where it
+actually dies. So: LinearCrossEntropyLoss genuinely fixed the "not allocated yet" loss error
+(real progress — the loss now runs), and userfaultfd did NOT eliminate the banned:1 (it
+persists at step 3-4 across every allocator/loss/MR-monitor combination tried). The banned:1
+at the step-3→4 transition on 12-tile single-node FSDP2 is the durable, still-OPEN blocker.
+Read the section below as "loss-path fixed, banned:1 still open," not "resolved."
+
+## RESOLUTION ATTEMPT (2026-06-27, node x4311c4s3b0n0) — loss fixed, banned:1 STILL OPEN
 
 The "12-tile OOM" was THREE stacked failures, peeled back one HW iteration at a time
 (earlier single-cause diagnoses were each partial):
