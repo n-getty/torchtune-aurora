@@ -37,12 +37,15 @@ export HF_HOME=/lus/flare/projects/ModCon/ngetty/hf_cache
 unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy ftp_proxy
 export no_proxy="*" NO_PROXY="*"
 export ZE_FLAT_DEVICE_HIERARCHY=FLAT
-# Custom USM caching allocator: pools the FSDP AllGather buffer at a stable VA so
-# OFI/Slingshot registers it ONCE instead of accumulating a fresh DMA registration per
-# step (the step-3 banned:1 / NotPresent PDE on multi-tile FSDP2). Same hook GRPO-32B
-# uses. See bugs/project_ccl_ipc_handle_cache.md.
-export XPU_USM_ALLOC_SO=${XPU_USM_ALLOC_SO:-/lus/flare/projects/ModCon/ngetty/torchtune/recipes/dev/usm_caching_alloc.so}
+# Custom USM allocator (usm_pending_alloc.so): working recordStream so FSDP cross-stream
+# AllGather reads a valid buffer instead of a recycled VA. Fixes the step-3 banned:1 /
+# NotPresent PDE on multi-tile FSDP2 (OFI MR accumulation from the default allocator's
+# fresh-VA-per-step). Passed 8 steps Qwen3-32B 10-rank FSDP @3.5s/step. See
+# bugs/project_ccl_ipc_handle_cache.md + experiments/multinode_32b/pbs_32b_colocate_pending_alloc.sh.
+export XPU_USM_ALLOC_SO=${XPU_USM_ALLOC_SO:-/lus/flare/projects/ModCon/ngetty/torchtune/experiments/arena_ipc/usm_pending_alloc.so}
 export PYTORCH_ALLOC_CONF=${PYTORCH_ALLOC_CONF:-garbage_collection_threshold:0.99}
+# OFI deregisters freed memory regions (the 32B FSDP MR-accumulation knob).
+export FI_MR_CACHE_MONITOR=${FI_MR_CACHE_MONITOR:-userfaultfd}
 export PYTHONUNBUFFERED=1
 # Single-node CCL row (torchrun --standalone)
 export CCL_PROCESS_LAUNCHER=none CCL_ATL_TRANSPORT=ofi CCL_OP_SYNC=1 CCL_WORKER_COUNT=1
