@@ -37,6 +37,18 @@ import torch
 import torch.nn as nn
 
 from torchtune.models.gemma4 import gemma4_31b, lora_gemma4_31b
+from torchtune.models.qwen3 import qwen3_32b, lora_qwen3_32b
+
+# Backbone registry: name -> (dense_builder, lora_builder). The wrapper is
+# backbone-agnostic — it reuses backbone.tok_embeddings for the splice and feeds
+# input_embeds, which works for any TransformerDecoder. Gemma4 applies a sqrt(H)
+# embedding scale inside tok_embeddings (GemmaNormEmbeddings); Qwen3 uses a plain
+# nn.Embedding (no scale). Either way the splice uses the SAME embedding the decoder
+# would, so text/target tokens enter at the correct magnitude for that backbone.
+_BACKBONES = {
+    "gemma4_31b": (gemma4_31b, lora_gemma4_31b),
+    "qwen3_32b": (qwen3_32b, lora_qwen3_32b),
+}
 
 logger = logging.getLogger(__name__)
 
@@ -112,27 +124,32 @@ class BioReasonNativeModel(nn.Module):
         self.go_token_id = go_token_id
         self._has_lora = bool(enable_lora)
 
-        # ── Backbone (native Gemma 4 TransformerDecoder) ──────────────────────
+        # ── Backbone (native TransformerDecoder: gemma4_31b or qwen3_32b) ─────
         if backbone is not None:
             self.backbone = backbone
-        elif enable_lora:
-            if lora_attn_modules is None:
-                lora_attn_modules = ["q_proj", "k_proj", "v_proj", "output_proj"]
-            self.backbone = lora_gemma4_31b(
-                lora_attn_modules=lora_attn_modules,
-                apply_lora_to_mlp=apply_lora_to_mlp,
-                lora_rank=lora_rank,
-                lora_alpha=lora_alpha,
-                lora_dropout=lora_dropout,
-            )
-        elif backbone_builder == "gemma4_31b":
-            self.backbone = gemma4_31b()
+        elif backbone_builder in _BACKBONES:
+            dense_builder, lora_builder = _BACKBONES[backbone_builder]
+            if enable_lora:
+                if lora_attn_modules is None:
+                    lora_attn_modules = ["q_proj", "k_proj", "v_proj", "output_proj"]
+                self.backbone = lora_builder(
+                    lora_attn_modules=lora_attn_modules,
+                    apply_lora_to_mlp=apply_lora_to_mlp,
+                    lora_rank=lora_rank,
+                    lora_alpha=lora_alpha,
+                    lora_dropout=lora_dropout,
+                )
+            else:
+                self.backbone = dense_builder()
         else:
-            raise ValueError(f"Unknown backbone_builder: {backbone_builder!r}")
+            raise ValueError(
+                f"Unknown backbone_builder: {backbone_builder!r} "
+                f"(known: {sorted(_BACKBONES)})"
+            )
 
-        # ★ Reuse tok_embeddings (GemmaNormEmbeddings — applies the sqrt(H) scale) so
-        # text/completion embeds enter the layers at the same magnitude the decoder
-        # expects. Do NOT load a separate nn.Embedding.
+        # Reuse the backbone's own tok_embeddings for the splice. Feeding input_embeds
+        # bypasses this layer in forward, but using it keeps text/target tokens at the
+        # exact magnitude the decoder expects (Gemma4: sqrt(H)-scaled; Qwen3: plain).
         self._embed = self.backbone.tok_embeddings
 
         # ── Trainable projection MLPs (fresh init; SFT trains them) ───────────

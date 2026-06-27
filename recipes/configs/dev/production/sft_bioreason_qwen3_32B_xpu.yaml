@@ -1,0 +1,138 @@
+# BioReason multimodal SFT — native Qwen3-32B backbone (Aurora / XPU)
+#
+# Backbone swapped from Gemma4-31B → Qwen3-32B: Gemma4's custom attention OOMs at 12-tile
+# single-node FSDP2 (gemma4/_attention.py SDPA workspace; see
+# docs/reports/bioreason_sft_oom_diagnosis_20260627.md). Qwen3-32B (our validated 32B GRPO
+# arch) trains clean at full node, 3.4× faster. Same multimodal machinery (ESM3+GO splice,
+# LinearCrossEntropyLoss, SDPA).
+#
+# Recipe: recipes/dev/sft_bioreason_distributed_xpu.py
+#
+# MEMORY / TOPOLOGY: the frozen Qwen3-32B base is 61 GiB bf16 → DDP (full replica/tile) is
+# IMPOSSIBLE on a 64 GiB tile. Must shard the base (HSDP/FSDP). Throughput is maximized by
+# the SMALLEST shard-group that fits (more replication = more data-parallelism, less per-step
+# AllGather span). Memory model (LoRA, AC on, seq~4K):
+#   shard=2  → base 30.5 GiB/tile + ~10 act + buffers ≈ 43 GiB (6 replicas) ← aggressive/fastest
+#   shard=3  → base 20.3 GiB/tile ≈ 33 GiB (4 replicas)                      ← safe
+#   shard=12 → base 5.1 GiB/tile (1 replica, full shard)                     ← slowest, baseline
+# Default below = shard=2/replicate=6. If it OOMs, fall back to shard=3 (replicate=4).
+#
+# PREREQUISITE: ESM3 cache over the SFT sequences (esm3_cache_path), max_protein_len=2048.
+
+name: sft_bioreason_qwen3_32b_xpu
+output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/experiments/bioreason/runs/${name}
+base_model_path: /lus/flare/projects/ModCon/ngetty/models/Qwen3-32B
+sft_data_dir: /lus/flare/projects/ModCon/ngetty/datasets/bioreason_sft_reasoning/data
+esm3_cache_path: /lus/flare/projects/ModCon/ngetty/datasets/bioreason_sft_reasoning/esm3_cache_2048.pt
+go_embedding_path: /lus/flare/projects/ModCon/ngetty/models/bioreason-pro-sft/go_embedding.pt
+
+# ── Tokenizer (Qwen3) ─────────────────────────────────────────────────────────
+tokenizer:
+  _component_: torchtune.models.qwen3.qwen3_tokenizer
+  path: ${base_model_path}/vocab.json
+  merges_file: ${base_model_path}/merges.txt
+  max_seq_len: 8192
+
+# ── Model (native-Qwen3 BioReason wrapper; device/dtype injected by the recipe) ─
+# protein/go ids are RESERVED Qwen vocab gap ids (151643/151644; gap 151643-151935 is free).
+model:
+  _component_: torchtune.dev.bioreason.model_native.BioReasonNativeModel
+  backbone_builder: qwen3_32b
+  hidden_size: 5120
+  protein_token_id: 151643
+  go_token_id: 151644
+  enable_lora: true
+  lora_rank: 32
+  lora_alpha: 64
+  apply_lora_to_mlp: true
+  esm3_cache_path: ${esm3_cache_path}
+  go_embedding_path: ${go_embedding_path}
+
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [
+    model-00001-of-00017.safetensors, model-00002-of-00017.safetensors,
+    model-00003-of-00017.safetensors, model-00004-of-00017.safetensors,
+    model-00005-of-00017.safetensors, model-00006-of-00017.safetensors,
+    model-00007-of-00017.safetensors, model-00008-of-00017.safetensors,
+    model-00009-of-00017.safetensors, model-00010-of-00017.safetensors,
+    model-00011-of-00017.safetensors, model-00012-of-00017.safetensors,
+    model-00013-of-00017.safetensors, model-00014-of-00017.safetensors,
+    model-00015-of-00017.safetensors, model-00016-of-00017.safetensors,
+    model-00017-of-00017.safetensors,
+  ]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: QWEN2   # Qwen3 uses the QWEN2 weight-conversion path
+
+resume_from_checkpoint: false
+save_every_n_epochs: 1
+
+# ── Dataset ───────────────────────────────────────────────────────────────────
+dataset:
+  _component_: torchtune.dev.bioreason.dataset_sft.bioreason_sft_dataset
+  data_files: ${sft_data_dir}
+  max_seq_len: 8192
+  max_protein_len: 2048
+  num_go_tokens: 200
+  protein_token_id: 151643
+  go_token_id: 151644
+  train_on_reasoning: true
+  inject_go_pred: true
+seed: 1234
+shuffle: true
+collate_fn: torchtune.dev.bioreason.dataset_sft.bioreason_sft_collate_fn
+dataloader_num_workers: 0
+
+# ── Training envelope ─────────────────────────────────────────────────────────
+epochs: 3
+batch_size: 1
+gradient_accumulation_steps: 4
+clip_grad_norm: 1.0
+
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 1.0e-4
+  weight_decay: 0.0
+  fused: true
+
+loss:
+  _component_: torchtune.modules.loss.LinearCrossEntropyLoss
+
+# ── Distributed / FSDP — HSDP shard=2, replicate=6 (throughput-optimal that fits) ─
+enable_activation_checkpointing: true
+enable_activation_offloading: false
+fsdp_cpu_offload: false
+fsdp_reshard_after_forward: true
+data_parallel_replicate_dim: 6
+data_parallel_shard_dim: 2
+tensor_parallel_dim: 1
+
+# ── XPU ───────────────────────────────────────────────────────────────────────
+device: xpu
+dtype: bf16
+compile: false
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+log_level: INFO
+log_every_n_steps: 1
+log_peak_memory_stats: true
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: false
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: true
+  cuda: false
+  profile_memory: false
+  with_stack: false
+  record_shapes: false
+  with_flops: false
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1
