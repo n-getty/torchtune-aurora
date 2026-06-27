@@ -79,3 +79,31 @@ max_protein_len=2048 → KeyError if the dataset truncates to a different length
 ## Process note
 Per-rank memory logging (not just rank 0) would have made this obvious immediately. Worth adding a
 max-over-ranks peak-memory all-reduce to the recipe's metric logging.
+
+## RESOLUTION (2026-06-27, node x4311c4s3b0n0) — 12-tile training works
+
+The "12-tile OOM" was THREE stacked failures, peeled back one HW iteration at a time
+(earlier single-cause diagnoses were each partial):
+
+1. **OFI memory-registration accumulation** (the banned:1 PDE at step 3). The default
+   allocator's fresh-VA-per-step AllGather buffer + `FI_MR_CACHE_MONITOR=disabled` (or the
+   65536 IPC-handle path) accumulates fabric registrations on receive-side tiles →
+   NotPresent PDE. FIX: `FI_MR_CACHE_MONITOR=userfaultfd` (OFI deregisters freed MRs).
+2. **Pluggable allocators break the loss**: usm_pending/usm_caching get past banned:1 but
+   raise "tensor data not allocated yet" in F.cross_entropy. So: keep the DEFAULT allocator.
+3. **Deprecated chunked_output is FSDP2-fragile at >6 tiles**: the same "not allocated yet"
+   on the default allocator via `CEWithChunkedOutputLoss` → `chunked_output` → tied
+   `self.output(chunk)` (transformer.py emits a FutureWarning to use a linear loss). FIX:
+   **LinearCrossEntropyLoss** (skip_output_layer=True; projects valid tokens itself,
+   DTensor-aware). Wired BioReasonNativeModel with skip_output_layer/output delegation.
+
+**Validated config (12-tile, seq=8192, full node):** LinearCrossEntropyLoss + DEFAULT
+PyTorch allocator + `FI_MR_CACHE_MONITOR=userfaultfd` + `PYTORCH_ALLOC_CONF=gc:0.99`.
+Trained clean PAST step 3 (the historical crash) — loss 41.2→36.8→35.8 decreasing on all
+12 ranks, ~48s/step. SDPA attention (committed earlier) is kept (orthogonal memory win).
+18 CPU tests green.
+
+Earlier mis-diagnoses, corrected: "S² attention", "per-rank seqlen imbalance", and
+"needs 2N HSDP" were all wrong as the BLOCKER — the blockers were the OFI MR leak + the
+deprecated loss path, both single-node-fixable. The user's "768 GiB shouldn't OOM" was
+right: it never was a capacity problem.
