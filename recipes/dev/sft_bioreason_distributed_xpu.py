@@ -120,9 +120,21 @@ class BioReasonSFTRecipeDistributedXPU(FullFinetuneRecipeDistributedXPU):
                 cfg_model, device=self._device, dtype=self._dtype
             )
 
-        # Activation checkpointing on the decoder layers (wrap by the transformer
-        # self-attention layer type, which subsumes Gemma4TransformerLayer).
-        if enable_activation_checkpointing:
+        # Activation checkpointing on the decoder layers.
+        #   - full AC (enable_activation_checkpointing=True, ac_mode=None): checkpoint
+        #     every transformer layer.
+        #   - selective AC (enable_activation_checkpointing=False, ac_mode="selective",
+        #     ac_option=N|"op"): checkpoint every Nth layer / selective-op — trades the
+        #     memory headroom we have for less recompute. Mirrors the parent recipe.
+        if (not enable_activation_checkpointing) and (ac_mode is not None):
+            from torchtune.training.activations import (
+                apply_selective_activation_checkpointing,
+            )
+
+            apply_selective_activation_checkpointing(
+                model.backbone, ac_mode, ac_option
+            )
+        elif enable_activation_checkpointing and ac_mode is None:
             training.set_activation_checkpointing(
                 model.backbone,
                 auto_wrap_policy={_parent_mod.modules.TransformerSelfAttentionLayer},
