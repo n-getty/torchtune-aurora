@@ -146,3 +146,28 @@ dataset_sft, recipe, SDPA, LinearCE wiring) ports to a Qwen3-32B backbone with m
 (swap gemma4_31b()/lora_gemma4_31b() → qwen3_32b()/lora_qwen3_32b(), hidden_size 5376→5120,
 reserved placeholder ids, GEMMA4→QWEN2 checkpointer). Gemma4 attention is a separate,
 deferred investigation.
+
+## ★★ TRUE ROOT CAUSE (2026-06-27, corrected again): seq=8192 @ 32B/12-tile, NOT Gemma
+
+My "Gemma4-specific" conclusion had a SEQ-LENGTH CONFOUND: I compared Gemma@seq8192 vs
+Qwen@seq2048 (the Qwen fits-test was seq=2048). Controlled re-test at matched seq exposes it:
+
+| model        | seq  | result                          |
+|--------------|------|---------------------------------|
+| Qwen text    | 2048 | ✅ clean 12/12, 13s/step         |
+| Qwen text    | 8192 + userfaultfd | ⏸ HANG at step-0 fwd (loadavg high, no progress) |
+| Qwen text    | 8192, no userfaultfd | ❌ UR:40 UR_RESULT_ERROR_OUT_OF_RESOURCES, step 0 |
+| Qwen BioReason | 8192 | ❌ banned:1 step 0              |
+| Gemma BioReason| 8192 | ❌ banned:1 / OOM step 3        |
+
+CONCLUSION: the blocker is **seq=8192 at 32B dense / 12-tile single-node FSDP2** — a Level
+Zero resource wall (UR:40 / banned:1 / hang depending on MR-monitor), independent of model
+(Gemma OR Qwen) and of the multimodal path. seq=2048 is comfortably under it. So neither
+"Gemma attention" nor "BioReason multimodal" is the root cause — both were seq=8192 victims.
+(Gemma is still ~3.4× slower than Qwen and worth replacing for throughput, but it was NOT
+the crash cause.)
+
+ACTIONABLE: BioReason prompts are p50≈1770 / p99≈4618 / max≈5046 tok; seq=4096 covers ~97%
+of examples (long tail truncates). Testing BioReason-Qwen at seq=4096/12-tile now — expected
+to clear the L0 wall. Production envelope: seq=4096 (or 6144), NOT 8192, at 12-tile single
+node. seq=8192 would need fewer tiles, more nodes, or activation offloading — a separate opt.
