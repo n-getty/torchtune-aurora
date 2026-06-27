@@ -37,14 +37,16 @@ export HF_HOME=/lus/flare/projects/ModCon/ngetty/hf_cache
 unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy ftp_proxy
 export no_proxy="*" NO_PROXY="*"
 export ZE_FLAT_DEVICE_HIERARCHY=FLAT
-# Custom USM allocator (usm_pending_alloc.so): working recordStream so FSDP cross-stream
-# AllGather reads a valid buffer instead of a recycled VA. Fixes the step-3 banned:1 /
-# NotPresent PDE on multi-tile FSDP2 (OFI MR accumulation from the default allocator's
-# fresh-VA-per-step). Passed 8 steps Qwen3-32B 10-rank FSDP @3.5s/step. See
-# bugs/project_ccl_ipc_handle_cache.md + experiments/multinode_32b/pbs_32b_colocate_pending_alloc.sh.
-export XPU_USM_ALLOC_SO=${XPU_USM_ALLOC_SO:-/lus/flare/projects/ModCon/ngetty/torchtune/experiments/arena_ipc/usm_pending_alloc.so}
+# Memory/MR strategy for multi-tile FSDP2 (the step-3 banned:1 fix):
+#   - DEFAULT PyTorch allocator (XPU_USM_ALLOC_SO empty). The pluggable allocators
+#     (usm_pending/usm_caching) break the chunked-loss path with "tensor data not
+#     allocated yet"; the default allocator + LinearCrossEntropyLoss is clean.
+#   - FI_MR_CACHE_MONITOR=userfaultfd: OFI deregisters freed memory regions so the
+#     per-step AllGather VA churn does NOT accumulate fabric registrations (the OFI MR
+#     leak that caused the step-3 NotPresent PDE under FI_MR_CACHE_MONITOR=disabled).
+# See bugs/project_ccl_ipc_handle_cache.md.
+export XPU_USM_ALLOC_SO=${XPU_USM_ALLOC_SO:-}
 export PYTORCH_ALLOC_CONF=${PYTORCH_ALLOC_CONF:-garbage_collection_threshold:0.99}
-# OFI deregisters freed memory regions (the 32B FSDP MR-accumulation knob).
 export FI_MR_CACHE_MONITOR=${FI_MR_CACHE_MONITOR:-userfaultfd}
 export PYTHONUNBUFFERED=1
 # Single-node CCL row (torchrun --standalone)

@@ -383,3 +383,29 @@ def test_I_gemma4_sdpa_matches_math(name, cfg):
     assert torch.allclose(out_math, out_sdpa, atol=1e-4), (
         f"{name}: max diff {(out_math - out_sdpa).abs().max().item():.2e}"
     )
+
+
+# ── J: LinearCrossEntropyLoss wiring (the >6-tile FSDP fix) ────────────────────
+def test_J_linear_ce_loss_wiring():
+    """LinearCrossEntropyLoss.set_model_output must wire to the wrapper: set
+    skip_output_layer=True, grab model.output; then forward returns HIDDEN states and
+    the loss projects+CEs internally. This replaces the deprecated chunked_output path
+    that raised "tensor data not allocated yet" under FSDP2 at >6 tiles."""
+    from torchtune.modules.loss import LinearCrossEntropyLoss
+
+    m, seqs = _tiny_model()
+    loss = LinearCrossEntropyLoss(num_output_chunks=2)
+    loss.set_model_output(m)
+    assert m.skip_output_layer is True
+    assert loss.linear_projection is m.output
+
+    toks = torch.tensor([_mkrow(5), _mkrow(4) + [0]])
+    out = m(toks, protein_sequences=seqs, go_aspects=["all", "all"])
+    # hidden states (emb_dim), NOT vocab logits
+    assert out.shape[-1] == m.hidden_size
+    labels = torch.full(toks.shape, -100)
+    labels[:, -3:] = toks[:, -3:]
+    l = loss(out, labels)
+    assert torch.isfinite(l)
+    l.backward()
+    assert m.protein_projection[0].weight.grad.abs().sum().item() > 0

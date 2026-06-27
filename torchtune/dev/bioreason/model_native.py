@@ -391,6 +391,26 @@ class BioReasonNativeModel(nn.Module):
 
     # ── forward (native decoder) ──────────────────────────────────────────────
 
+    # ── LinearCrossEntropyLoss wiring ─────────────────────────────────────────
+    # The modern SFT loss (LinearCrossEntropyLoss) calls set_model_output(model),
+    # which sets model.skip_output_layer=True and grabs model.output, then does the
+    # vocab projection ITSELF chunk-by-chunk on only the valid (non-ignored) tokens.
+    # This is the FSDP-correct replacement for the now-deprecated chunked_output path
+    # (which materializes per-chunk full-vocab logits via the tied output weight and
+    # raises "tensor ... data is not allocated yet" under FSDP2 sharding at >6 tiles).
+    # Delegate both attributes to the backbone so the loss drives the decoder directly.
+    @property
+    def output(self):
+        return self.backbone.output
+
+    @property
+    def skip_output_layer(self) -> bool:
+        return self.backbone.skip_output_layer
+
+    @skip_output_layer.setter
+    def skip_output_layer(self, value: bool) -> None:
+        self.backbone.skip_output_layer = value
+
     def forward(
         self,
         tokens: Optional[torch.Tensor] = None,
@@ -403,6 +423,9 @@ class BioReasonNativeModel(nn.Module):
         input_pos: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run the native Gemma 4 decoder.
+
+        Returns logits [B,S,vocab] normally, OR hidden states [B,S,emb_dim] when
+        skip_output_layer is set (LinearCrossEntropyLoss does the projection itself).
 
         The embed-splice runs HERE (inside the module's forward) so the splice's
         ``self._embed(tokens)`` lookup executes under the root FSDP forward hook —

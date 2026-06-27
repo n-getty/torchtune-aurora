@@ -75,8 +75,11 @@ optimizer:
   fused: true
 
 loss:
-  _component_: torchtune.modules.loss.CEWithChunkedOutputLoss
-  num_output_chunks: 8
+  # LinearCrossEntropyLoss (NOT the deprecated CEWithChunkedOutputLoss): the model
+  # returns hidden states (skip_output_layer) and the loss projects+CEs per chunk on
+  # only the valid tokens. The chunked-output path raised "tensor data not allocated
+  # yet" under FSDP2 at >6 tiles (deprecated; transformer.py warns to use a linear loss).
+  _component_: torchtune.modules.loss.LinearCrossEntropyLoss
 
 enable_activation_checkpointing: true
 enable_activation_offloading: false
