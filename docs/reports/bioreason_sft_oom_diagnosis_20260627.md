@@ -59,6 +59,23 @@ imbalance.
   max_protein_len (loses protein info).
 - **HSDP shard=2**: too little sharding → 31 GiB base/tile → OOM.
 
+## SDPA helps but is not sufficient (measured)
+Clean A/B on the known-good 6-tile topology, seq=8192:
+- **SDPA ON**: survived to **step 6** (loss 30.7) before a long-draw rank banned:1'd.
+- Prior legacy-attention 12-tile runs: banned:1 at **step 3**.
+SDPA lowers per-rank memory so the run survives more steps before an unlucky max-length draw
+spikes — but it does NOT eliminate the spike. Confirms: SDPA is a real improvement (keep it),
+packing is the actual fix. (rank-0 peak stayed 9.66 GiB throughout; the crashing rank is a
+different one that drew a long sequence — same imbalance signature.)
+
+## Recommendation
+Stop interactive ablations (debug-queue node init proved flaky after banned:1, and the real
+lever is implementation work, not a config sweep). Next focused work item: **implement
+multimodal-aware sample packing** (uniform-length bins; placeholder splice + block-diagonal
+mask per sub-sequence), CPU-validated first, then a fresh hold. Capping seq/protein is a dead
+end — seq cap errors long-prompt examples; protein cap breaks the ESM3 cache (keyed at
+max_protein_len=2048 → KeyError if the dataset truncates to a different length).
+
 ## Process note
 Per-rank memory logging (not just rank 0) would have made this obvious immediately. Worth adding a
 max-over-ranks peak-memory all-reduce to the recipe's metric logging.
