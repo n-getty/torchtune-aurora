@@ -83,6 +83,38 @@ class BioReasonSFTRecipeDistributedXPU(FullFinetuneRecipeDistributedXPU):
     """Native-Gemma4 multimodal SFT recipe."""
 
     def __init__(self, cfg: DictConfig):
+        # ── Custom USM caching allocator (MUST run before any XPU allocation, i.e.
+        # before super().__init__ touches the device). The parent SFT recipe has no
+        # allocator hook, so it gets the DEFAULT XPU allocator: a FRESH VA per step for
+        # each FSDP AllGather param buffer. OFI/Slingshot registers each new VA for DMA
+        # and never deregisters → receive-side AllGather tiles accumulate external,
+        # PyTorch-invisible fabric memory until l0_free→0 → a write to a recycled VA
+        # → NotPresent PDE → banned:1 (observed at step ~3 on 12-tile FSDP2; rank0
+        # looked fine at 4.85 GiB because the leak is external/uncounted). The custom
+        # allocator (usm_caching_alloc.so) pools the AllGather buffer at a STABLE VA so
+        # OFI registers once → flat memory. This is the same hook the GRPO recipe uses
+        # to run 32B; see bugs/project_ccl_ipc_handle_cache.md (CONFIRMED fix).
+        _usm_so = os.environ.get("XPU_USM_ALLOC_SO")
+        if _usm_so:
+            from torch.xpu.memory import (
+                XPUPluggableAllocator,
+                change_current_allocator,
+            )
+
+            _usm_alloc = XPUPluggableAllocator(
+                _usm_so, "xpu_usm_malloc", "xpu_usm_free"
+            )
+            change_current_allocator(_usm_alloc)
+            # Pluggable allocator doesn't implement getDeviceStats/emptyCache —
+            # monkeypatch the memory-query API to no-ops so logging doesn't crash.
+            torch.xpu.memory_allocated = lambda device=None: 0
+            torch.xpu.memory_reserved = lambda device=None: 0
+            torch.xpu.max_memory_allocated = lambda device=None: 0
+            torch.xpu.max_memory_reserved = lambda device=None: 0
+            torch.xpu.reset_peak_memory_stats = lambda device=None: None
+            torch.xpu.empty_cache = lambda: None
+            torch.xpu.memory_stats = lambda device=None: {}
+
         super().__init__(cfg)
         self._current_side_inputs: dict = {}
         # Stash the LoRA rank/alpha for checkpoint-time merge (parent doesn't keep cfg).

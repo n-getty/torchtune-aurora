@@ -34,7 +34,11 @@ export HF_HOME=/lus/flare/projects/ModCon/ngetty/hf_cache
 unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy ftp_proxy
 export no_proxy="*" NO_PROXY="*"
 export ZE_FLAT_DEVICE_HIERARCHY=FLAT
-unset XPU_USM_ALLOC_SO PYTORCH_ALLOC_CONF
+# Custom USM caching allocator (pools FSDP AllGather VA → OFI registers once, no
+# per-step accumulation → no step-3 banned:1). Same hook GRPO-32B uses. See
+# bugs/project_ccl_ipc_handle_cache.md.
+export XPU_USM_ALLOC_SO=${XPU_USM_ALLOC_SO:-/lus/flare/projects/ModCon/ngetty/torchtune/recipes/dev/usm_caching_alloc.so}
+export PYTORCH_ALLOC_CONF=${PYTORCH_ALLOC_CONF:-garbage_collection_threshold:0.99}
 export PYTHONUNBUFFERED=1
 
 # ── Single-node CCL row (NOT pmix/mpi — hangs torchrun --standalone) ──────────

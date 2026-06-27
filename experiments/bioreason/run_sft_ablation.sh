@@ -37,7 +37,12 @@ export HF_HOME=/lus/flare/projects/ModCon/ngetty/hf_cache
 unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy ftp_proxy
 export no_proxy="*" NO_PROXY="*"
 export ZE_FLAT_DEVICE_HIERARCHY=FLAT
-unset XPU_USM_ALLOC_SO PYTORCH_ALLOC_CONF
+# Custom USM caching allocator: pools the FSDP AllGather buffer at a stable VA so
+# OFI/Slingshot registers it ONCE instead of accumulating a fresh DMA registration per
+# step (the step-3 banned:1 / NotPresent PDE on multi-tile FSDP2). Same hook GRPO-32B
+# uses. See bugs/project_ccl_ipc_handle_cache.md.
+export XPU_USM_ALLOC_SO=${XPU_USM_ALLOC_SO:-/lus/flare/projects/ModCon/ngetty/torchtune/recipes/dev/usm_caching_alloc.so}
+export PYTORCH_ALLOC_CONF=${PYTORCH_ALLOC_CONF:-garbage_collection_threshold:0.99}
 export PYTHONUNBUFFERED=1
 # Single-node CCL row (torchrun --standalone)
 export CCL_PROCESS_LAUNCHER=none CCL_ATL_TRANSPORT=ofi CCL_OP_SYNC=1 CCL_WORKER_COUNT=1
