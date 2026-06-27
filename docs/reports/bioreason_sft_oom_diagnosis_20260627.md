@@ -130,7 +130,7 @@ Control experiment (node x4311c4s3b0n0): **Qwen3-32B text-only SFT**, stock dens
 full-shard 12 tiles, SAME env (default alloc + userfaultfd). Config
 `sft_qwen3_32B_fitstest_xpu.yaml`, launcher `run_qwen3_32b_fitstest.sh`.
 
-RESULT: **clean past step 3** (where Gemma4 died in EVERY config), loss 2.35→1.77→1.50
+RESULT: **clean ALL 12/12 steps** (where Gemma4 died in EVERY config), loss 2.35→1.77→1.50
 decreasing on all 12 ranks, **~14 s/step (vs Gemma4's ~48 s/step — 3.4× faster)**, zero
 banned:1 / OOM / "could not create a memory". 12-tile single-node FSDP2 of a 32B dense
 model is NOT the problem — Qwen3-32B (our validated 32B GRPO baseline arch) just works.
