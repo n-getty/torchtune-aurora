@@ -118,3 +118,31 @@ Earlier mis-diagnoses, corrected: "S² attention", "per-rank seqlen imbalance", 
 "needs 2N HSDP" were all wrong as the BLOCKER — the blockers were the OFI MR leak + the
 deprecated loss path, both single-node-fixable. The user's "768 GiB shouldn't OOM" was
 right: it never was a capacity problem.
+
+## ★ DISCRIMINATOR: Qwen3-32B trains clean at 12 tiles — crash is GEMMA4-SPECIFIC
+
+After the loss-path fixes, the Gemma4-31B 12-tile run's FINAL failure was at
+`gemma4/_attention.py:275` (the SDPA path): "could not create a memory" — oneDNN cannot
+allocate the attention workspace — on the long-sequence rank, after 2 clean steps.
+
+Control experiment (node x4311c4s3b0n0): **Qwen3-32B text-only SFT**, stock dense recipe
+(full_finetune_distributed_xpu.py), alpaca packed seq=2048, LinearCrossEntropyLoss,
+full-shard 12 tiles, SAME env (default alloc + userfaultfd). Config
+`sft_qwen3_32B_fitstest_xpu.yaml`, launcher `run_qwen3_32b_fitstest.sh`.
+
+RESULT: **clean past step 3** (where Gemma4 died in EVERY config), loss 2.35→1.77→1.50
+decreasing on all 12 ranks, **~14 s/step (vs Gemma4's ~48 s/step — 3.4× faster)**, zero
+banned:1 / OOM / "could not create a memory". 12-tile single-node FSDP2 of a 32B dense
+model is NOT the problem — Qwen3-32B (our validated 32B GRPO baseline arch) just works.
+
+CONCLUSION: the BioReason 12-tile blocker is **Gemma4-specific** — almost certainly the
+custom Gemma4Attention (hand-rolled module, heterogeneous local/global head dims, the SDPA
+workspace it requests). NOT scale, NOT topology, NOT the allocator, NOT the recipe.
+
+IMPLICATION / next step: per the user's call, swap the BioReason backbone from Gemma4-31B
+to **Qwen3-32B** — it has all our validated 32B FSDP2/CCL/allocator infra, trains clean at
+full node, and is 3.4× faster per step. The native-Gemma4 multimodal machinery (model_native,
+dataset_sft, recipe, SDPA, LinearCE wiring) ports to a Qwen3-32B backbone with minimal change
+(swap gemma4_31b()/lora_gemma4_31b() → qwen3_32b()/lora_qwen3_32b(), hidden_size 5376→5120,
+reserved placeholder ids, GEMMA4→QWEN2 checkpointer). Gemma4 attention is a separate,
+deferred investigation.
