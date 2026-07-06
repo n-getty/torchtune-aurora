@@ -65,6 +65,10 @@ Related CCL/XPU bugs in this dir: `ccl_ipc_handle_cache.md` (L0 IPC handle XeLin
 fast path this bug fails to establish), `intel_ccl_expandable_segments_bug.md`,
 `xpu_l0_event_pool_co_tenancy.md`.
 
+Not the same bug (same fabric/CCL *class*, different failure mode):
+`fsdp_gradient_allreduce_deadlock_192rank.md` — a silent FSDP gradient-AllReduce **hang** at 192
+ranks (native FSDP, no vLLM), vs. this steady-state **throughput** host-fallback under HF-accelerate.
+
 ## Full investigation + repro
 
 `docs/reports/sft_throughput_aurora_vs_polaris_handoff_20260619.md` and harness
