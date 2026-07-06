@@ -6,21 +6,34 @@
 **Workload:** NOT this repo — V-JEPA 2.1 ViT-G 2B continued-pretrain (sibling project
 `/flare/ModCon/ngetty/vjepa2`). Recorded here because it is the same *outward class* as our
 large-scale FSDP hangs and gets conflated with them.
-**Status:** open ALCF ticket (draft: `/flare/ModCon/ngetty/vjepa2/docs/ALCF_TICKET_fsdp_allreduce_deadlock.md`),
-root cause not closed. Reproduced 2× with captured tracebacks (jobs 8645821, 8646258).
+**Status:** open ALCF ticket (draft: `/flare/ModCon/ngetty/vjepa2/docs/ALCF_TICKET_fsdp_allreduce_deadlock.md`,
+updated 2026-07-06), root cause not closed. Reproduced 2× with captured tracebacks (jobs 8645821, 8646258).
 
 ## Symptom
 
-Intermittent (~1 deadlock / 3.5 h) silent hang in the **FSDP backward gradient AllReduce**. Not a
-crash, not a dead rank — a collective-boundary split: the cohort desynchronizes across an FSDP
-collective and blocks forever. Captured via per-rank `faulthandler.dump_traceback_later`:
-- majority (114 / 372 dumps) parked in backward `_reduce_grad` → `all_reduce` over the 16-node
-  replicate group (`_runtime_utils.py:872 _reduce_grad` ← `:766 _post_backward_hook`);
-- minority (~10 / 24) one collective away in forward unshard (`:421 _pre_forward_unshard`).
+Silent hang in the **FSDP backward gradient AllReduce** at a **measured MTTF of ~3h43m** (walltime
+set to 4 h in-script since MTTF < walltime → no job reaches the wall; training limps forward
+e15→e214+/~epoch 313 via self-healing checkpoint-resume). Not a crash, not a dead rank — a
+collective-boundary split: the cohort desynchronizes across an FSDP collective and blocks forever.
+Captured via per-rank `faulthandler.dump_traceback_later`:
+- majority (114 / 372 dumps) parked in backward `_reduce_grad` → cross-node `all_reduce` over the
+  16-node replicate PG (`_runtime_utils.py:872 _reduce_grad` ← `:766 _post_backward_hook`);
+- minority (~10 / 24) in **forward** `_pre_forward_unshard` (`:421`) — a within-node `all_gather` on
+  the shard PG. NB HYBRID_SHARD_ZERO2 = SHARD_GRAD_OP, so there is no backward re-unshard: those
+  ranks are in a genuine forward pass, i.e. a full iteration skewed from the backward majority.
 
-2B (depth 48) hangs; identical stack/launcher/config on **1B (depth 40) is clean >11k iters**.
+2B (depth 48) hangs; identical stack/launcher/config on **1B (depth 40) is clean >11k iters**
+(2B has ~2× the per-rank AllReduce payload — consistent with "longer window → more chance for a
+schedule skew to open," not necessarily "more bytes → more fabric stress").
 Ruled out by the ticket (with evidence): dead rank, walltime, AllReduce algorithm (ring == double_tree),
 memory/IPC leak (flat backward floor), `libpil4dfs`/DAOS-17499 (on Lustre), specific bad node.
+
+**Lag cause staged as hypotheses (ticket 2026-07-06 is honest that this is unsettled):**
+(1) transient CXI/dragonfly fabric contention (leading, not isolated); (2) **decode-latency
+outliers** — the captured-hang jobs ran `num_workers=2` with a high-bitrate source (heichole,
+~1765 ms/clip, ~4× others); at `num_workers=0` dataload-time is p50≈1s/p99≈10s with decode on the
+critical path. A clean isolation is running (nw=0 + heichole re-encoded); if deadlocks persist at the
+same MTTF that isolates the fabric hypothesis.
 
 ## Why this is DISTINCT from every bug in this dir
 
@@ -33,21 +46,29 @@ memory/IPC leak (flat backward floor), `libpil4dfs`/DAOS-17499 (on Lustre), spec
 | `ccl_ipc_handle_cache.md`, `intel_ccl_expandable_segments_bug.md`, `xpu_pluggable_allocator_record_stream.md`, `project_step3_bwd_spike.md` | All end in a **`banned:1` GPU page-fault crash**. This is a hang; the ticket rules out the memory-leak class (flat floor). |
 | `intel_xpu_resource_leak_bug_report.md` | UR-handle leak → `OUT_OF_RESOURCES` **crash** ~iter 70. Crash, not hang. |
 
-## Caveat on the ticket's framing (before trusting "CXI contention → straggler")
+## Open technical gap (crux of the ticket's Ask #1)
 
-The ticket attributes the hang to transient fabric contention producing a straggler that never
-rejoins. That is a plausible *trigger* but is in tension with the *mechanism* the traceback shows:
-a pure fabric slowdown on a correct SPMD program does **not** deadlock — all ranks wait at the *same*
-collective and drain when the straggler arrives. A **collective-boundary split** (some ranks a
-collective *ahead* in forward unshard while the majority is behind in backward reduce) is the
-signature of a **rank-schedule divergence** — mismatched collectives that can never rendezvous.
-Fabric contention likely just widens the AllReduce window enough for an FSDP1 prefetch/reshard
-ordering divergence (or a rank-subset branch, e.g. NaN/inf guard) to manifest.
+The updated ticket rightly decouples *the deadlock mechanism* (an FSDP collective desync that can't
+tolerate a transiently-slow rank) from *why a rank lags*. But the unresolved point is that a purely
+**transient** slowdown on a **matched** collective cannot produce a **permanent** hang — the peers
+wait, the straggler arrives, the collective drains. Something must convert the delay into an ordering
+mismatch, and the captured stacks show two DIFFERENT collectives on two DIFFERENT PGs:
+- 114 ranks in cross-node `all_reduce` on the **replicate PG** (backward `_reduce_grad`);
+- 10 ranks in within-node `all_gather` on the **shard PG** (forward `_pre_forward_unshard`).
 
-**Consequence for the ask:** a CCL timeout+retry only helps if the stuck ranks are on the *same*
-collective (same PG + shape). If they are on *different* collectives, no CCL tuning recovers it and
-the fix is on the FSDP-schedule side. Confirm the two frame groups are issuing the same collective
-before promising a CCL-tuning fix will land.
+These two readings imply **opposite answers to Ask #1**, and one cheap diagnostic distinguishes them
+— **which nodes are the 10/24 forward-unshard ranks on** (the per-incident nodefiles are already
+attached to the ticket):
+- concentrated on 1–2 nodes → within-node shard-PG **collective-order divergence** → no CCL
+  timeout+retry can fix a mismatch; the fix is FSDP-schedule-side.
+- scattered ~1/node → cross-PG **straggler cascade** (a node's stalled shard-PG all_gather emits no
+  rank into the replicate all_reduce → other 15 nodes hang) → a replicate-`all_reduce` timeout is a
+  plausible mitigation.
+
+Recommend adding that rank-locality breakdown (`awk` over the attached nodefile) before filing — it
+turns Ask #1 from "is there a setting?" into a question ALCF can answer decisively. The phrase
+"cannot tolerate a transiently-slow rank" presumes the same-collective reading; back it with the
+node-locality data.
 
 ## Cross-reference
 
