@@ -48,15 +48,22 @@ _log: logging.Logger = get_logger()
 
 _USE_FUSED_ROPE = os.environ.get("TORCHTUNE_USE_FUSED_ROPE", "0") == "1"
 
-_triton = None
-_tl = None
+# NOTE: the kernels MUST use the conventional aliases ``triton`` / ``tl`` (not private
+# ``_triton``/``_tl``). Under torch.compile, Inductor re-codegens any @triton.jit kernel
+# reached during tracing into a fresh module that imports triton as ``triton`` and
+# triton.language as ``tl``; private aliases in the kernel source then raise
+# ``NameError: name '_tl' is not defined`` at Inductor compile time. (Same fix as
+# _fused_rmsnorm_xpu.py commit d305760b; RoPE is off by default so it never hit HW, but
+# TORCHTUNE_USE_FUSED_ROPE=1 + compile would crash identically without this.)
+triton = None
+tl = None
 if _USE_FUSED_ROPE:
     try:
-        import triton as _triton
-        import triton.language as _tl
+        import triton
+        import triton.language as tl
     except ImportError:
-        _triton = None
-        _tl = None
+        triton = None
+        tl = None
 
 # Imported lazily inside the swap helper to avoid a hard dep at import time.
 try:
@@ -69,35 +76,35 @@ except Exception:  # pragma: no cover
 _SWAP_LOG_DONE = False
 
 
-if _triton is not None:
+if triton is not None:
 
     def _warp_configs():
         return [
-            _triton.Config({}, num_warps=w, num_stages=1)
+            triton.Config({}, num_warps=w, num_stages=1)
             for w in (1, 2, 4, 8, 16)
         ]
 
-    @_triton.autotune(configs=_warp_configs(), key=["HALF"])
-    @_triton.jit
+    @triton.autotune(configs=_warp_configs(), key=["HALF"])
+    @triton.jit
     def _rope_fwd_kernel(
         X_ptr, COS_ptr, SIN_ptr, OUT_ptr,
         n_heads, HALF,
         stride_xr, stride_cr,
-        NEG_SIN: _tl.constexpr,          # False=forward, True=backward (sin negated)
-        BLOCK: _tl.constexpr,
+        NEG_SIN: tl.constexpr,          # False=forward, True=backward (sin negated)
+        BLOCK: tl.constexpr,
     ):
         # One program per row = one (b, s, head) slice of head_dim = 2*HALF elements.
-        row = _tl.program_id(0)
+        row = tl.program_id(0)
         pos = row // n_heads             # (b,s) flat position -> cos/sin row
-        offs = _tl.arange(0, BLOCK)
+        offs = tl.arange(0, BLOCK)
         mask = offs < HALF
 
         x_base = X_ptr + row * stride_xr
-        x1 = _tl.load(x_base + offs, mask=mask, other=0.0).to(_tl.float32)
-        x2 = _tl.load(x_base + HALF + offs, mask=mask, other=0.0).to(_tl.float32)
+        x1 = tl.load(x_base + offs, mask=mask, other=0.0).to(tl.float32)
+        x2 = tl.load(x_base + HALF + offs, mask=mask, other=0.0).to(tl.float32)
 
-        c = _tl.load(COS_ptr + pos * stride_cr + offs, mask=mask, other=1.0).to(_tl.float32)
-        s = _tl.load(SIN_ptr + pos * stride_cr + offs, mask=mask, other=0.0).to(_tl.float32)
+        c = tl.load(COS_ptr + pos * stride_cr + offs, mask=mask, other=1.0).to(tl.float32)
+        s = tl.load(SIN_ptr + pos * stride_cr + offs, mask=mask, other=0.0).to(tl.float32)
         if NEG_SIN:
             s = -s
 
@@ -105,12 +112,12 @@ if _triton is not None:
         y2 = x2 * c + x1 * s
 
         o_base = OUT_ptr + row * stride_xr
-        _tl.store(o_base + offs, y1, mask=mask)
-        _tl.store(o_base + HALF + offs, y2, mask=mask)
+        tl.store(o_base + offs, y1, mask=mask)
+        tl.store(o_base + HALF + offs, y2, mask=mask)
 
     def _launch(x2d, cos2d, sin2d, n_heads, half, neg_sin):
         out = torch.empty_like(x2d)
-        BLOCK = _triton.next_power_of_2(half)
+        BLOCK = triton.next_power_of_2(half)
         _rope_fwd_kernel[(x2d.shape[0],)](
             x2d, cos2d, sin2d, out,
             n_heads, half,
@@ -182,7 +189,7 @@ class FusedQwen2RoPE(nn.Module):
     def forward(self, x: torch.Tensor, input_pos: Optional[torch.Tensor] = None) -> torch.Tensor:
         # x: [b, s, n_h, h_d]
         b, s, nh, hd = x.shape
-        if _triton is None or x.device.type != "xpu" or hd % 2 != 0:
+        if triton is None or x.device.type != "xpu" or hd % 2 != 0:
             return self._eager(x, input_pos)
 
         # Build cos/sin as [b*s, h_d] to match the kernel's (row // n_h) indexing.
@@ -220,7 +227,7 @@ def maybe_swap_rope_for_fused(model: nn.Module) -> int:
     global _SWAP_LOG_DONE
     if not _USE_FUSED_ROPE:
         return 0
-    if _triton is None or Qwen2RotaryPositionalEmbeddings is None:
+    if triton is None or Qwen2RotaryPositionalEmbeddings is None:
         if not _SWAP_LOG_DONE:
             _log.info("fused_rope=disabled (triton or Qwen2RoPE import failed)")
             _SWAP_LOG_DONE = True
