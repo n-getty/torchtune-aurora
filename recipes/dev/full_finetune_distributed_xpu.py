@@ -819,6 +819,29 @@ class FullFinetuneRecipeDistributedXPU(FTRecipeInterface):
                 model, auto_wrap_policy={modules.TransformerSelfAttentionLayer}
             )
 
+        # Optional: swap eager RMSNorm -> fused Triton RMSNorm on XPU (gated by
+        # TORCHTUNE_USE_FUSED_RMSNORM=1). MUST run before shard_model so the fused
+        # module's transplanted .scale parameter is the one that gets sharded.
+        # No-op when the flag is off or Triton is unavailable.
+        from torchtune.modules._fused_rmsnorm_xpu import maybe_swap_rmsnorm_for_fused
+
+        _n_fused = maybe_swap_rmsnorm_for_fused(model)
+        if _n_fused:
+            utils.log_rank_zero(
+                self._logger, f"fused RMSNorm engaged: {_n_fused} modules swapped"
+            )
+
+        # Optional: swap eager RoPE -> fused Triton RoPE on XPU (gated by
+        # TORCHTUNE_USE_FUSED_ROPE=1). RoPE has no params, so order vs shard_model
+        # is immaterial; kept here alongside the norm swap. No-op when off/unavailable.
+        from torchtune.modules._fused_rope_xpu import maybe_swap_rope_for_fused
+
+        _n_rope = maybe_swap_rope_for_fused(model)
+        if _n_rope:
+            utils.log_rank_zero(
+                self._logger, f"fused RoPE engaged: {_n_rope} modules swapped"
+            )
+
         # Apply Fully Sharded Data Parallelism to the model
         if self.parallel_dims.dp_shard_enabled or self.parallel_dims.cp_enabled:
             fsdp_shard_conditions = [
@@ -1206,6 +1229,18 @@ class FullFinetuneRecipeDistributedXPU(FTRecipeInterface):
                     running_loss += current_loss
                     # For optimizer in backward, we need to normalize before calling backward
                     # This case and gradient accumulation are mutually exclusive
+                    # DIAGNOSTIC (TORCHTUNE_BIOREASON_TIMING=1, rank0): time the backward.
+                    # Backward is otherwise untimed; this is the only hook needed to split
+                    # the opt-step into fwd/bwd/optim for the MFU diagnosis. No-op when unset;
+                    # does NOT alter training. Mirrors the forward timing in the SFT recipe.
+                    _bwd_timing = (
+                        os.environ.get("TORCHTUNE_BIOREASON_TIMING") == "1"
+                        and self._is_rank_zero
+                    )
+                    if _bwd_timing:
+                        if self._device.type == "xpu":
+                            torch.xpu.synchronize()
+                        _bwd_t0 = time.perf_counter()
                     if self._optimizer_in_bwd:
                         torch.distributed.all_reduce(num_tokens)
                         torch.distributed.all_reduce(running_loss)
@@ -1265,8 +1300,23 @@ class FullFinetuneRecipeDistributedXPU(FTRecipeInterface):
                                 self._model.set_requires_gradient_sync(True)
                             current_loss.backward()
 
+                    if _bwd_timing:
+                        if self._device.type == "xpu":
+                            torch.xpu.synchronize()
+                        self._logger.info(
+                            "[bioreason-timing] bwd %.3fs" % (time.perf_counter() - _bwd_t0)
+                        )
+
                 # Optimizer step (if not fused in backward call)
                 if (batch_count + 1) % self._gradient_accumulation_steps == 0:
+                    _optim_timing = (
+                        os.environ.get("TORCHTUNE_BIOREASON_TIMING") == "1"
+                        and self._is_rank_zero
+                    )
+                    if _optim_timing:
+                        if self._device.type == "xpu":
+                            torch.xpu.synchronize()
+                        _optim_t0 = time.perf_counter()
                     if not self._optimizer_in_bwd:
                         # Get total number of tokens across all ranks to normalize gradients
                         torch.distributed.all_reduce(num_tokens)
@@ -1290,6 +1340,14 @@ class FullFinetuneRecipeDistributedXPU(FTRecipeInterface):
                                 grad_norm = grad_norm.full_tensor()
                         self._optimizer.step()
                         self._optimizer.zero_grad(set_to_none=True)
+
+                    if _optim_timing:
+                        if self._device.type == "xpu":
+                            torch.xpu.synchronize()
+                        self._logger.info(
+                            "[bioreason-timing] optim %.3fs"
+                            % (time.perf_counter() - _optim_t0)
+                        )
 
                     # Step the learning rate scheduler
                     if self._lr_scheduler is not None:
