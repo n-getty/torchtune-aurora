@@ -37,15 +37,21 @@ _log: logging.Logger = get_logger()
 _USE_FUSED_RMSNORM = os.environ.get("TORCHTUNE_USE_FUSED_RMSNORM", "0") == "1"
 
 # Triton is optional; guard the import so importing this module never hard-fails.
-_triton = None
-_tl = None
+# NOTE: the kernels MUST use the conventional aliases ``triton`` / ``tl`` (not private
+# ``_triton``/``_tl``). Under torch.compile, Inductor re-codegens any @triton.jit kernel
+# reached during tracing into a fresh module that imports triton as ``triton`` and
+# triton.language as ``tl``; private aliases in the kernel source then raise
+# ``NameError: name '_tl' is not defined`` at Inductor compile time. (HW-caught: fused+compile
+# A/B job 8676886, 2026-07-16 — autokernel's own tests passed only because they ran compile-OFF.)
+triton = None
+tl = None
 if _USE_FUSED_RMSNORM:
     try:
-        import triton as _triton
-        import triton.language as _tl
+        import triton
+        import triton.language as tl
     except ImportError:
-        _triton = None
-        _tl = None
+        triton = None
+        tl = None
 
 _SWAP_LOG_DONE = False
 
@@ -54,39 +60,39 @@ _SWAP_LOG_DONE = False
 # Triton kernels (defined only if triton imported). num_stages=1 is an XPU
 # requirement (multi-stage pipelining is unsupported on PVC).
 # ---------------------------------------------------------------------------
-if _triton is not None:
+if triton is not None:
 
     def _warp_configs():
         return [
-            _triton.Config({}, num_warps=w, num_stages=1)
+            triton.Config({}, num_warps=w, num_stages=1)
             for w in (1, 2, 4, 8, 16, 32)
         ]
 
-    @_triton.autotune(configs=_warp_configs(), key=["N"])
-    @_triton.jit
+    @triton.autotune(configs=_warp_configs(), key=["N"])
+    @triton.jit
     def _rmsnorm_fwd_kernel(
         X_ptr, W_ptr, Y_ptr, R_ptr,
         M, N,
         stride_xm, stride_xn,
         stride_ym, stride_yn,
         eps,
-        BLOCK_SIZE: _tl.constexpr,
+        BLOCK_SIZE: tl.constexpr,
     ):
-        row = _tl.program_id(0)
-        offs = _tl.arange(0, BLOCK_SIZE)
+        row = tl.program_id(0)
+        offs = tl.arange(0, BLOCK_SIZE)
         mask = offs < N
-        x = _tl.load(X_ptr + row * stride_xm + offs * stride_xn,
-                     mask=mask, other=0.0).to(_tl.float32)
-        ms = _tl.sum(x * x, axis=0) / N
-        r = 1.0 / _tl.sqrt(ms + eps)
-        _tl.store(R_ptr + row, r)
+        x = tl.load(X_ptr + row * stride_xm + offs * stride_xn,
+                     mask=mask, other=0.0).to(tl.float32)
+        ms = tl.sum(x * x, axis=0) / N
+        r = 1.0 / tl.sqrt(ms + eps)
+        tl.store(R_ptr + row, r)
         xn = x * r
         xn_cast = xn.to(Y_ptr.dtype.element_ty)          # torchtune casts BEFORE scale
-        w = _tl.load(W_ptr + offs, mask=mask, other=0.0)
-        _tl.store(Y_ptr + row * stride_ym + offs * stride_yn, xn_cast * w, mask=mask)
+        w = tl.load(W_ptr + offs, mask=mask, other=0.0)
+        tl.store(Y_ptr + row * stride_ym + offs * stride_yn, xn_cast * w, mask=mask)
 
-    @_triton.autotune(configs=_warp_configs(), key=["N"])
-    @_triton.jit
+    @triton.autotune(configs=_warp_configs(), key=["N"])
+    @triton.jit
     def _rmsnorm_bwd_kernel(
         X_ptr, W_ptr, G_ptr, R_ptr,
         DX_ptr, DSP_ptr,
@@ -95,22 +101,22 @@ if _triton is not None:
         stride_gm, stride_gn,
         stride_dxm, stride_dxn,
         stride_dspm, stride_dspn,
-        BLOCK_SIZE: _tl.constexpr,
+        BLOCK_SIZE: tl.constexpr,
     ):
-        row = _tl.program_id(0)
-        offs = _tl.arange(0, BLOCK_SIZE)
+        row = tl.program_id(0)
+        offs = tl.arange(0, BLOCK_SIZE)
         mask = offs < N
-        x = _tl.load(X_ptr + row * stride_xm + offs * stride_xn,
-                     mask=mask, other=0.0).to(_tl.float32)
-        g = _tl.load(G_ptr + row * stride_gm + offs * stride_gn,
-                     mask=mask, other=0.0).to(_tl.float32)
-        w = _tl.load(W_ptr + offs, mask=mask, other=0.0).to(_tl.float32)
-        r = _tl.load(R_ptr + row)
+        x = tl.load(X_ptr + row * stride_xm + offs * stride_xn,
+                     mask=mask, other=0.0).to(tl.float32)
+        g = tl.load(G_ptr + row * stride_gm + offs * stride_gn,
+                     mask=mask, other=0.0).to(tl.float32)
+        w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        r = tl.load(R_ptr + row)
         xn = x * r
-        c = _tl.sum(g * w * x, axis=0)
+        c = tl.sum(g * w * x, axis=0)
         dx = r * w * g - x * (r * r * r) * c / N
-        _tl.store(DX_ptr + row * stride_dxm + offs * stride_dxn, dx, mask=mask)
-        _tl.store(DSP_ptr + row * stride_dspm + offs * stride_dspn, g * xn, mask=mask)
+        tl.store(DX_ptr + row * stride_dxm + offs * stride_dxn, dx, mask=mask)
+        tl.store(DSP_ptr + row * stride_dspm + offs * stride_dspn, g * xn, mask=mask)
 
     class _FusedRMSNormFn(torch.autograd.Function):
         @staticmethod
@@ -122,7 +128,7 @@ if _triton is not None:
             weight_c = weight.contiguous()
             y2d = torch.empty_like(x2d)
             r = torch.empty(M, device=x2d.device, dtype=torch.float32)
-            BLOCK_SIZE = _triton.next_power_of_2(N)
+            BLOCK_SIZE = triton.next_power_of_2(N)
             _rmsnorm_fwd_kernel[(M,)](
                 x2d, weight_c, y2d, r,
                 M, N,
@@ -143,7 +149,7 @@ if _triton is not None:
             g2d = grad_out.reshape(-1, N).contiguous()
             dx2d = torch.empty_like(x2d)
             dscale_partial = torch.empty(M, N, device=x2d.device, dtype=torch.float32)
-            BLOCK_SIZE = _triton.next_power_of_2(N)
+            BLOCK_SIZE = triton.next_power_of_2(N)
             _rmsnorm_bwd_kernel[(M,)](
                 x2d, weight_c, g2d, r,
                 dx2d, dscale_partial,
@@ -176,7 +182,7 @@ class FusedRMSNorm(nn.Module):
         # Fallback to the exact eager formula when the fused path can't run:
         # non-XPU device, triton missing, or a last dim too large for one block.
         if (
-            _triton is None
+            triton is None
             or x.device.type != "xpu"
             or self.normalized_shape[0] > 131072
         ):
@@ -212,7 +218,7 @@ def maybe_swap_rmsnorm_for_fused(model: nn.Module) -> int:
     global _SWAP_LOG_DONE
     if not _USE_FUSED_RMSNORM:
         return 0
-    if _triton is None:
+    if triton is None:
         if not _SWAP_LOG_DONE:
             _log.info("fused_rmsnorm=disabled (triton import failed)")
             _SWAP_LOG_DONE = True
