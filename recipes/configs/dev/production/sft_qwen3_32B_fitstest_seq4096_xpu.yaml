@@ -1,0 +1,100 @@
+# Qwen3-32B text-only SFT fits-test — Aurora (XPU, 12-tile single-node FSDP2)
+#
+# PURPOSE: disambiguate the Gemma4-31B 12-tile crash. Nearly all our 32B FSDP2/CCL/allocator
+# baselines are validated on Qwen3-32B (GRPO). If Qwen3-32B SFT trains clean at 12 tiles with
+# the SAME recipe/env, the Gemma4 crash is Gemma-specific (custom attention workspace alloc at
+# gemma4/_attention.py:275). If Qwen3-32B ALSO crashes, it's a general 32B-SFT-at-12-tile issue.
+#
+# Deliberately MINIMAL: stock dense SFT recipe (full_finetune_distributed_xpu.py), text-only
+# alpaca, LinearCrossEntropyLoss, full-shard 12 tiles — zero BioReason/Gemma variables.
+
+name: sft_qwen3_32b_fitstest_seq4096
+output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/experiments/bioreason/runs/${name}
+base_model_path: /lus/flare/projects/ModCon/ngetty/models/Qwen3-32B
+
+model:
+  _component_: torchtune.models.qwen3.qwen3_32b
+
+tokenizer:
+  _component_: torchtune.models.qwen3.qwen3_tokenizer
+  path: ${base_model_path}/vocab.json
+  merges_file: ${base_model_path}/merges.txt
+  max_seq_len: 4096
+
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [
+    model-00001-of-00017.safetensors, model-00002-of-00017.safetensors,
+    model-00003-of-00017.safetensors, model-00004-of-00017.safetensors,
+    model-00005-of-00017.safetensors, model-00006-of-00017.safetensors,
+    model-00007-of-00017.safetensors, model-00008-of-00017.safetensors,
+    model-00009-of-00017.safetensors, model-00010-of-00017.safetensors,
+    model-00011-of-00017.safetensors, model-00012-of-00017.safetensors,
+    model-00013-of-00017.safetensors, model-00014-of-00017.safetensors,
+    model-00015-of-00017.safetensors, model-00016-of-00017.safetensors,
+    model-00017-of-00017.safetensors,
+  ]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: QWEN2   # Qwen3 tied embeds; QWEN2 type handles missing lm_head
+
+resume_from_checkpoint: false
+
+dataset:
+  _component_: torchtune.datasets.alpaca_dataset
+  source: tatsu-lab/alpaca
+  train_on_input: true
+  packed: true
+seed: 1234
+shuffle: true
+dataloader_num_workers: 4
+
+epochs: 1
+max_steps_per_epoch: 12
+batch_size: 1
+gradient_accumulation_steps: 1
+clip_grad_norm: null
+
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 1.0e-5
+  weight_decay: 0.0
+  fused: true
+
+loss:
+  _component_: torchtune.modules.loss.LinearCrossEntropyLoss
+
+enable_activation_checkpointing: true
+enable_activation_offloading: false
+fsdp_cpu_offload: false
+fsdp_reshard_after_forward: true
+data_parallel_replicate_dim: 1
+data_parallel_shard_dim: -1
+tensor_parallel_dim: 1
+
+device: xpu
+dtype: bf16
+compile: false
+
+log_level: INFO
+log_every_n_steps: 1
+log_peak_memory_stats: true
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: false
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: true
+  cuda: false
+  profile_memory: false
+  with_stack: false
+  record_shapes: false
+  with_flops: false
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1

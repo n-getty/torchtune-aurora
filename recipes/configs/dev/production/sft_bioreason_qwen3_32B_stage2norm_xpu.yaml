@@ -1,0 +1,160 @@
+# BioReason multimodal SFT — STAGE 2 on the CLEAN (LayerNorm) projector, Qwen3-32B / XPU
+#
+# ★ RUN 2 (gated Stage-2 backbone, 2026-07-01). LoRA-finetunes the backbone ON TOP OF the
+# validated clean Stage-1 projector (frozen-backbone + LayerNorm, layer-37 — the one that scored
+# F_max 0.6008 with 0 collapse). This is the published recipe's Stage 2, and the 0.6686 anchor is
+# a post-Stage-2 number: projector-only saturates F_max short of the anchor because the go_pred
+# leak buries the protein-use gradient; backbone training has the capacity to exploit it.
+#
+# ★★ GATED — the PRIOR Stage-2 collapsed to ':' (project_bioreason_sft_lora_splice_collapse),
+# BUT that was on the OLD UNBOUNDED projector (norm ~721, no LayerNorm). This config differs in
+# the exact variables implicated: (1) projector_output_norm=true bounds the spliced features to
+# ~sqrt(H) every step (in-distribution, non-drifting inputs to the backbone), (2) lr lowered
+# 1e-4 -> 2e-5 so adapters can't overfit the leaked text target fast. Whether Stage-2 is now
+# collapse-safe is OPEN: after the FIRST checkpoint (~step 10) run probe_collapse.py against the
+# epoch dir. If ':' reappears -> STOP (LayerNorm didn't save Stage-2; fall back to Run-1
+# projector-only). If coherent -> continue. Probe-then-trust, never train-long-then-discover.
+#
+# Differences from sft_bioreason_qwen3_32B_stage2_xpu.yaml: stage1_proj_dir -> the CLEAN
+# stage1norm projector, projector_output_norm=true (MUST match the saved projector's index-3
+# LayerNorm or the load fails), lr=2e-5, separate name/output_dir.
+#
+# NOTE: go_pred_dropout is OFF (0.0). Run 1 (2026-07-02) proved 50% dropout DEGRADES generation
+# (F_max 0.4973 vs 0.6008 baseline; go_pred is answer scaffolding, not just a copy-shortcut) —
+# see project_bioreason_leakdrop_negative_20260702. Stage-2 trains on the clean go_pred-on
+# distribution matching eval, on the 0.6008 stage1norm projector.
+#
+# Recipe: recipes/dev/sft_bioreason_distributed_xpu.py
+
+name: sft_bioreason_qwen3_32b_stage2norm_xpu
+output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/experiments/bioreason/runs/${name}
+base_model_path: /lus/flare/projects/ModCon/ngetty/models/Qwen3-32B
+sft_data_dir: /lus/flare/projects/ModCon/ngetty/datasets/bioreason_sft_reasoning/data
+esm3_cache_path: /lus/flare/projects/ModCon/ngetty/datasets/bioreason_sft_reasoning/esm3_cache_2048_l37.safetensors
+go_embedding_path: /lus/flare/projects/ModCon/ngetty/models/bioreason-pro-sft/go_embedding.pt
+
+# ★ CLEAN Stage-1 projector (frozen-backbone + LayerNorm, layer-37). Its protein_projection.pt /
+# go_projection.pt carry the index-3 LayerNorm keys -> projector_output_norm MUST be true below.
+# Default = the F_max-0.6008 stage1norm run; repoint to the leakdrop run if Run-1 eval favors it.
+stage1_proj_dir: /lus/flare/projects/ModCon/ngetty/torchtune/experiments/bioreason/runs/sft_qwen3_32b_stage1norm/epoch_0
+
+# ── Tokenizer (Qwen3) ─────────────────────────────────────────────────────────
+tokenizer:
+  _component_: torchtune.models.qwen3.qwen3_tokenizer
+  path: ${base_model_path}/vocab.json
+  merges_file: ${base_model_path}/merges.txt
+  max_seq_len: 6144
+
+# ── Model — STAGE 2: LoRA backbone + LOCKED clean (LayerNorm) projector ──────────
+model:
+  _component_: torchtune.dev.bioreason.model_native.BioReasonNativeModel
+  backbone_builder: qwen3_32b
+  hidden_size: 5120
+  protein_token_id: 151643
+  go_token_id: 151644
+  enable_lora: true          # Stage 2: LoRA-finetune the backbone
+  freeze_backbone: false     # (ignored under LoRA; base frozen except adapters)
+  freeze_projector: true     # LOCK the aligned projector; only LoRA trains
+  projector_output_norm: true  # ★ MUST match the loaded clean projector's index-3 LayerNorm
+  lora_rank: 32
+  lora_alpha: 64
+  apply_lora_to_mlp: true
+  esm3_cache_path: ${esm3_cache_path}
+  go_embedding_path: ${go_embedding_path}
+
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [
+    model-00001-of-00017.safetensors, model-00002-of-00017.safetensors,
+    model-00003-of-00017.safetensors, model-00004-of-00017.safetensors,
+    model-00005-of-00017.safetensors, model-00006-of-00017.safetensors,
+    model-00007-of-00017.safetensors, model-00008-of-00017.safetensors,
+    model-00009-of-00017.safetensors, model-00010-of-00017.safetensors,
+    model-00011-of-00017.safetensors, model-00012-of-00017.safetensors,
+    model-00013-of-00017.safetensors, model-00014-of-00017.safetensors,
+    model-00015-of-00017.safetensors, model-00016-of-00017.safetensors,
+    model-00017-of-00017.safetensors,
+  ]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: QWEN2
+
+resume_from_checkpoint: false
+save_every_n_epochs: 1
+
+# ── Dataset — same leak reduction as Run 1 (drop go_pred on 50% of samples) ─────
+dataset:
+  _component_: torchtune.dev.bioreason.dataset_sft.bioreason_sft_dataset
+  data_files: ${sft_data_dir}
+  max_seq_len: 6144
+  max_protein_len: 2048
+  num_go_tokens: 200
+  protein_token_id: 151643
+  go_token_id: 151644
+  train_on_reasoning: true
+  inject_go_pred: true
+  go_pred_dropout: 0.0            # OFF — Run 1 proved dropout DEGRADES generation (F_max
+                                 # 0.4973 vs 0.6008; 60/280 empty + "Okay Okay" loops).
+                                 # go_pred is answer-scaffolding, not just a copy-shortcut.
+                                 # Stage-2 trains on the clean go_pred-on distribution (=eval).
+                                 # See project_bioreason_leakdrop_negative_20260702.
+  go_pred_dropout_seed: 1234
+seed: 1234
+shuffle: true
+collate_fn: torchtune.dev.bioreason.dataset_sft.bioreason_sft_collate_fn
+dataloader_num_workers: 0
+
+# ── Training envelope — Stage 2: lr 2e-5 (LOWERED from 1e-4 for collapse safety) ─
+epochs: 1
+max_steps_per_epoch: null
+batch_size: 1
+gradient_accumulation_steps: 4
+clip_grad_norm: 1.0
+
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 2.0e-5
+  weight_decay: 0.0
+  fused: true
+
+loss:
+  _component_: torchtune.modules.loss.LinearCrossEntropyLoss
+
+# ── Distributed / FSDP — full 12-way shard ──────────────────────────────────────
+enable_activation_checkpointing: true
+enable_activation_offloading: false
+fsdp_cpu_offload: false
+fsdp_reshard_after_forward: true
+data_parallel_replicate_dim: 1
+data_parallel_shard_dim: -1
+tensor_parallel_dim: 1
+pad_to_fixed: true
+
+# ── XPU ───────────────────────────────────────────────────────────────────────
+device: xpu
+dtype: bf16
+compile: false
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+log_level: INFO
+log_every_n_steps: 1
+log_peak_memory_stats: true
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: false
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: true
+  cuda: false
+  profile_memory: false
+  with_stack: false
+  record_shapes: false
+  with_flops: false
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1

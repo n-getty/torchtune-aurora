@@ -1,31 +1,28 @@
-# BioReason multimodal SFT — native Qwen3-32B backbone (Aurora / XPU)
+# BioReason SFT — EXHAUSTIVE TARGET + PROTEIN-EMBED OFF (Exp 2b, embed-off leg), Qwen3-32B (XPU)
 #
-# Backbone swapped from Gemma4-31B → Qwen3-32B: Gemma4's custom attention OOMs at 12-tile
-# single-node FSDP2 (gemma4/_attention.py SDPA workspace; see
-# docs/reports/bioreason_sft_oom_diagnosis_20260627.md). Qwen3-32B (our validated 32B GRPO
-# arch) trains clean at full node, 3.4× faster. Same multimodal machinery (ESM3+GO splice,
-# LinearCrossEntropyLoss, SDPA).
+# ★ EXP 2b (2026-07-02) — the embed-on/off ablation the PAPER SKIPPED, as a clean single-variable
+# A/B. This is the embed-OFF leg; the embed-ON leg is the Exp-1 exhaustive run
+# (sft_bioreason_qwen3_32B_stage1norm_exhaustive_xpu.yaml). BOTH use the exhaustive target so the
+# ONLY difference is disable_protein_splice — a breadth-matched controlled test of the protein-
+# embedding modality's F_max contribution.
+#
+# model.disable_protein_splice=true: keep the protein PLACEHOLDER tokens (identical seqlen/format/
+# attention structure) but do NOT write projected ESM3 features — the plain placeholder embedding
+# stays. Trained from scratch this way (NOT eval-time yanked), so it is NOT OOD — the model learns
+# WITHOUT the embedding. If embed-OFF matches embed-ON F_max, the ESM3 embedding is redundant with
+# go_pred (already GO-GPT/ESM2 sequence-derived); if embed-OFF is worse, the embedding genuinely
+# contributes. See docs/reports/bioreason_multimodality_thesis_analysis_20260702.
+#
+# Differences from the exhaustive (embed-ON) config: model.disable_protein_splice=true, separate
+# name/output_dir. Everything else identical (frozen, LayerNorm, layer-37, lr 1e-4, exhaustive).
 #
 # Recipe: recipes/dev/sft_bioreason_distributed_xpu.py
-#
-# MEMORY / TOPOLOGY (HW-VALIDATED 2026-06-27): full 12-way shard (shard=-1/replicate=1),
-# pad_to_fixed. The blocker was NEVER base size — it was VARIABLE per-step tensor shape at bs=1
-# (per-batch-max padding) churning XPU allocator VAs -> banned:1 at step 2 (no empty_cache under
-# FSDP + OFI MR). Fixed by pad_to_fixed (constant [1,max_seq_len] every step) + padding with a
-# neutral id (Qwen3 pad_id 151643 collides with protein_token_id). seq=4096 validated 10/10
-# clean (loss 15.78->0.07); seq=6144 chosen here for reasoning fidelity (only 4% of targets
-# truncated vs 23% at 4096) — HW-validate the 6144 fixed-shape transient fits before the full
-# run. See docs/reports/bioreason_sft_oom_diagnosis_20260627.md.
-#
-# PREREQUISITE: ESM3 cache over the *training* SFT sequences (esm3_cache_path),
-# max_protein_len=2048. The shipped cache is VALIDATION-only — precompute over the train
-# parquets before the full run (experiments/bioreason/precompute_esm3_cache.py).
 
-name: sft_bioreason_qwen3_32b_xpu
+name: sft_bioreason_qwen3_32b_exhaustive_noembed_xpu
 output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/experiments/bioreason/runs/${name}
 base_model_path: /lus/flare/projects/ModCon/ngetty/models/Qwen3-32B
 sft_data_dir: /lus/flare/projects/ModCon/ngetty/datasets/bioreason_sft_reasoning/data
-esm3_cache_path: /lus/flare/projects/ModCon/ngetty/datasets/bioreason_sft_reasoning/esm3_cache_2048.safetensors
+esm3_cache_path: /lus/flare/projects/ModCon/ngetty/datasets/bioreason_sft_reasoning/esm3_cache_2048_l37.safetensors
 go_embedding_path: /lus/flare/projects/ModCon/ngetty/models/bioreason-pro-sft/go_embedding.pt
 
 # ── Tokenizer (Qwen3) ─────────────────────────────────────────────────────────
@@ -35,18 +32,18 @@ tokenizer:
   merges_file: ${base_model_path}/merges.txt
   max_seq_len: 6144
 
-# ── Model (native-Qwen3 BioReason wrapper; device/dtype injected by the recipe) ─
-# protein/go ids are RESERVED Qwen vocab gap ids (151643/151644; gap 151643-151935 is free).
+# ── Model — STAGE 1: frozen backbone, no LoRA, train projections only ──────────
 model:
   _component_: torchtune.dev.bioreason.model_native.BioReasonNativeModel
   backbone_builder: qwen3_32b
   hidden_size: 5120
   protein_token_id: 151643
   go_token_id: 151644
-  enable_lora: true
-  lora_rank: 32
-  lora_alpha: 64
-  apply_lora_to_mlp: true
+  enable_lora: false
+  freeze_backbone: true
+  projector_output_norm: true
+  disable_protein_splice: true    # ★ EXP 2b embed-OFF leg: placeholder tokens kept, ESM3
+                                  # features NOT written. The ONLY diff vs the embed-ON run.
   esm3_cache_path: ${esm3_cache_path}
   go_embedding_path: ${go_embedding_path}
 
@@ -66,12 +63,12 @@ checkpointer:
   ]
   recipe_checkpoint: null
   output_dir: ${output_dir}
-  model_type: QWEN2   # Qwen3 uses the QWEN2 weight-conversion path
+  model_type: QWEN2
 
 resume_from_checkpoint: false
 save_every_n_epochs: 1
 
-# ── Dataset ───────────────────────────────────────────────────────────────────
+# ── Dataset — EXHAUSTIVE TARGET: append full GT GO-term list for breadth ─────────
 dataset:
   _component_: torchtune.dev.bioreason.dataset_sft.bioreason_sft_dataset
   data_files: ${sft_data_dir}
@@ -82,14 +79,15 @@ dataset:
   go_token_id: 151644
   train_on_reasoning: true
   inject_go_pred: true
+  exhaustive_target: true          # ★ EXP 1: append full GT GO-term list to the target
 seed: 1234
 shuffle: true
 collate_fn: torchtune.dev.bioreason.dataset_sft.bioreason_sft_collate_fn
 dataloader_num_workers: 0
 
-# ── Training envelope ─────────────────────────────────────────────────────────
-epochs: 3
-max_steps_per_epoch: null   # null = run the full epoch (recipe reads cfg.max_steps_per_epoch directly)
+# ── Training envelope — Stage 1: 1 epoch, lr 1e-4 ───────────────────────────────
+epochs: 1
+max_steps_per_epoch: null
 batch_size: 1
 gradient_accumulation_steps: 4
 clip_grad_norm: 1.0
@@ -103,11 +101,7 @@ optimizer:
 loss:
   _component_: torchtune.modules.loss.LinearCrossEntropyLoss
 
-# ── Distributed / FSDP — full 12-way shard (HW-VALIDATED 2026-06-27) ─────────────
-# shard=-1/replicate=1 = the working fitstest + validated BioReason envelope (10/10 clean,
-# loss 15.78->0.07). The earlier shard=2/replicate=6 "throughput" idea was wrong: at 32B the
-# per-tile base at shard=2 is ~30.5 GiB, and the real blocker was never base size but VARIABLE
-# per-step shape (now fixed by pad_to_fixed). Keep full-shard; revisit HSDP for multi-node only.
+# ── Distributed / FSDP — full 12-way shard ──────────────────────────────────────
 enable_activation_checkpointing: true
 enable_activation_offloading: false
 fsdp_cpu_offload: false
@@ -115,7 +109,6 @@ fsdp_reshard_after_forward: true
 data_parallel_replicate_dim: 1
 data_parallel_shard_dim: -1
 tensor_parallel_dim: 1
-# Constant per-step batch shape (XPU 32B banned:1 fix; recipe default True). Required.
 pad_to_fixed: true
 
 # ── XPU ───────────────────────────────────────────────────────────────────────

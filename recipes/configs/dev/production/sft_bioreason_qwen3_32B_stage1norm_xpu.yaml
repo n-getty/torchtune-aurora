@@ -1,0 +1,188 @@
+# BioReason multimodal SFT — FROZEN-BACKBONE + LayerNorm-PROJECTOR, native Qwen3-32B (XPU)
+#
+# ★★ THE CAPABILITY PATH (option 3, 2026-06-30). Probe job 8576095 proved LoRA finetuning
+# BREAKS the backbone's ability to GENERATE from spliced protein/GO embeds (':' collapse with
+# splice, coherent text-only) — see project_bioreason_sft_lora_splice_collapse_20260630. The
+# BASE Qwen3-32B already reasons coherently from a correctly-scaled splice (Stage-1 step-10 gave
+# 6/6 real text). So this config: NO LoRA (frozen backbone, sidesteps the LoRA bug) + train ONLY
+# the projector, with a LayerNorm on the projector OUTPUT (projector_output_norm=true) to BOUND
+# its magnitude — fixing the over-amplification trap (a plain frozen-backbone projector drifts
+# proj-out norm 721->1629 past loss-saturation -> re-breaks the splice -> ':'). LayerNorm pins
+# per-row norm to ~sqrt(H)~71, bounded forever, so a LONG run can't over-amplify. Matches the
+# published go_graph_encoder (which uses LayerNorm). This is the cleanest route to a coherent,
+# protein-conditioned 32B that beats the 0.30 echo-go_pred floor.
+#
+# (historical context of the epoch_0 ':' collapse that started the two-stage work):
+# The published BioReason recipe is TWO-STAGE (LLaVA-style alignment). Our first attempt did
+# only Stage 2 (LoRA + fresh projections trained together at lr=1e-4): the backbone instantly
+# learned the go_pred TEXT shortcut (loss->2e-4 in ~25 steps) before the projections could
+# align, so protein_projection stayed at init -> raw norm-10600 ESM3 features projected to
+# norm-14959 swamped the norm-1.8 text context -> degenerate ':' at generation. The published
+# fix is Stage 1: FREEZE the entire backbone and train ONLY the protein/GO projections — with
+# the backbone unable to change, the only way to lower loss is to make the spliced multimodal
+# features informative. There is no shortcut to fall into.
+#   Published Stage 1: text_model_finetune=False (frozen, no LoRA), train projector+GO, 1 epoch,
+#   lr=1e-4, warmup_ratio=0.1. (scripts/sh_train_protein_qwen_staged.sh)
+#
+# After this stage: eval the frozen-base + aligned-projector checkpoint to CONFIRM protein
+# features became informative (no ':' collapse, real GO terms) BEFORE committing to Stage 2.
+#
+# Differences from the full (Stage-2/legacy) config: enable_lora=false, freeze_backbone=true,
+# epochs=1, separate output_dir. Everything else (seq6144, full-shard, pad_to_fixed, ESM3/GO
+# caches, ids) is identical — same data distribution as Stage 2 and eval.
+#
+# Recipe: recipes/dev/sft_bioreason_distributed_xpu.py
+
+name: sft_bioreason_qwen3_32b_stage1norm_xpu
+output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/experiments/bioreason/runs/${name}
+base_model_path: /lus/flare/projects/ModCon/ngetty/models/Qwen3-32B
+sft_data_dir: /lus/flare/projects/ModCon/ngetty/datasets/bioreason_sft_reasoning/data
+# LAYER-37 ESM3 cache (the scale fix). The final-layer (-1) cache has per-row norm ~10600,
+# which the projector cannot bridge before the go_pred text leak kills the loss gradient ->
+# ':' collapse (HW-confirmed: 10-step Stage-1 left norm ~7768, still ':'). Published recipe
+# uses layer 37. Built by precompute_esm3_layer37.sh.
+esm3_cache_path: /lus/flare/projects/ModCon/ngetty/datasets/bioreason_sft_reasoning/esm3_cache_2048_l37.safetensors
+go_embedding_path: /lus/flare/projects/ModCon/ngetty/models/bioreason-pro-sft/go_embedding.pt
+
+# ── Tokenizer (Qwen3) ─────────────────────────────────────────────────────────
+tokenizer:
+  _component_: torchtune.models.qwen3.qwen3_tokenizer
+  path: ${base_model_path}/vocab.json
+  merges_file: ${base_model_path}/merges.txt
+  max_seq_len: 6144
+
+# ── Model — STAGE 1: frozen backbone, no LoRA, train projections only ──────────
+# protein/go ids are RESERVED Qwen vocab gap ids (151643/151644; gap 151643-151935 is free).
+model:
+  _component_: torchtune.dev.bioreason.model_native.BioReasonNativeModel
+  backbone_builder: qwen3_32b
+  hidden_size: 5120
+  protein_token_id: 151643
+  go_token_id: 151644
+  enable_lora: false              # NO LoRA — backbone fully frozen (sidesteps LoRA splice bug)
+  freeze_backbone: true           # train ONLY protein_projection + go_projection
+  projector_output_norm: true     # LayerNorm on projector output -> BOUNDED magnitude (no
+                                  # over-amplify; per-row norm ~sqrt(H)~71). The whole point.
+  esm3_cache_path: ${esm3_cache_path}
+  go_embedding_path: ${go_embedding_path}
+
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [
+    model-00001-of-00017.safetensors, model-00002-of-00017.safetensors,
+    model-00003-of-00017.safetensors, model-00004-of-00017.safetensors,
+    model-00005-of-00017.safetensors, model-00006-of-00017.safetensors,
+    model-00007-of-00017.safetensors, model-00008-of-00017.safetensors,
+    model-00009-of-00017.safetensors, model-00010-of-00017.safetensors,
+    model-00011-of-00017.safetensors, model-00012-of-00017.safetensors,
+    model-00013-of-00017.safetensors, model-00014-of-00017.safetensors,
+    model-00015-of-00017.safetensors, model-00016-of-00017.safetensors,
+    model-00017-of-00017.safetensors,
+  ]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: QWEN2   # Qwen3 uses the QWEN2 weight-conversion path
+
+resume_from_checkpoint: false
+save_every_n_epochs: 1
+
+# ── Dataset (identical distribution to Stage 2 + eval) ──────────────────────────
+dataset:
+  _component_: torchtune.dev.bioreason.dataset_sft.bioreason_sft_dataset
+  data_files: ${sft_data_dir}
+  max_seq_len: 6144
+  max_protein_len: 2048
+  num_go_tokens: 200
+  protein_token_id: 151643
+  go_token_id: 151644
+  train_on_reasoning: true
+  inject_go_pred: true
+seed: 1234
+shuffle: true
+collate_fn: torchtune.dev.bioreason.dataset_sft.bioreason_sft_collate_fn
+dataloader_num_workers: 0
+
+# ── Training envelope — Stage 1: 1 epoch, lr 1e-4 (published Stage 1) ────────────
+epochs: 1
+max_steps_per_epoch: null
+batch_size: 1
+gradient_accumulation_steps: 4
+clip_grad_norm: 1.0
+
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 1.0e-4
+  weight_decay: 0.0
+  fused: true
+
+loss:
+  _component_: torchtune.modules.loss.LinearCrossEntropyLoss
+
+# ── Distributed / FSDP — full 12-way shard (HW-VALIDATED 2026-06-27) ─────────────
+enable_activation_checkpointing: true
+enable_activation_offloading: false
+fsdp_cpu_offload: false
+fsdp_reshard_after_forward: true    # MUST stay true for 32B: ZeRO-2 (=false) keeps params resident
+                                     # post-fwd -> 53+ GiB alloc -> OOM on a 64 GiB tile (job 8672602,
+                                     # 2N). reshard=true runs at ~21 GiB reserved (soak 8671166). ZeRO-2
+                                     # is ALSO a null on the 2N step tax (job 8671990: T=145 vs F=144) —
+                                     # the 2N slowdown is the FORWARD all-gather, not the backward re-gather.
+                                     # (ZeRO-2 works for AGPT-2B 2B but NOT for 32B — model-size dependent.)
+data_parallel_replicate_dim: 1
+data_parallel_shard_dim: -1
+tensor_parallel_dim: 1
+pad_to_fixed: true
+
+# ── Throughput: bucketed per-bucket batch sizing (HW-VALIDATED 2026-07-15, jobs 8674109/8674383) ──
+# The 65% GEMM floor is attacked by filling the fixed shape with real tokens instead of ~43% pad.
+# Length-grouped batch sampler: 79% of the corpus (<=4096) trains at seq4096 in bs2 microbatches;
+# the >4096 tail stays seq6144 bs1. This is PLAIN CAUSAL per row (mask=None) -> the shipped FLASH
+# kernel handles it natively (NO flex — token PACKING via block-diag flex was HW-REFUTED, flex bwd
+# 5-10x too slow, see project_bioreason_sft_packing_scope_20260715). 2-shape set is banned:1-safe
+# (>=3 distinct [bs,seq] churn XPU allocator VAs). 4096xbs2 attn transient == 6144xbs1 (memory-safe).
+# bs2/seq4096 amortizes the FSDP weight-gather ~16.6%/sample on flash (vs 4.5% on pre-flash math —
+# flash's cheap attention is what makes batching pay). Weighted throughput ~1.49x vs pad_to_fixed bs1;
+# ~1.60x stacked with compile below. batch_size is IGNORED when bucket_batch_sizes is set (sampler
+# owns sizing); gradient_accumulation_steps still applies. See LengthGroupedDistributedBatchSampler.
+pad_buckets: [4096, 6144]
+bucket_batch_sizes: [2, 1]
+
+# ── XPU ───────────────────────────────────────────────────────────────────────
+device: xpu
+dtype: bf16
+# Per-layer backbone torch.compile (dynamic). HW-VALIDATED +5.8% seq6144 stacked on flash+bucketbs
+# (soak job 8674383: 15 steps clean, NO recompile churn across the finite 2-shape bucket set — dynamic
+# caches 2 graphs and reuses them — NO banned:1, loss monotonic, ~6.8%/sample on top of bucketbs).
+# One-time ~420s compile in step 1 (step1 188.75s -> steady 78.4s/it), amortizes in ~80 steps.
+# The BioReason subclass reimplements _setup_model, so this is read via _compile_model -> compile_model
+# (targets only TransformerSelfAttentionLayer; the multimodal splice stays eager). loss:false avoids the
+# LinearCrossEntropyLoss compile edge. Requires TORCHTUNE_USE_XPU_FLASH=1 (launcher default).
+compile:
+  model: true
+  loss: false
+  optimizer_step: false
+  scale_grads: false
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+log_level: INFO
+log_every_n_steps: 1
+log_peak_memory_stats: true
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: false
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: true
+  cuda: false
+  profile_memory: false
+  with_stack: false
+  record_shapes: false
+  with_flops: false
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1

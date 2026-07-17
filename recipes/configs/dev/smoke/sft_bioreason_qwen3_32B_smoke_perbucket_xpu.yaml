@@ -1,30 +1,23 @@
-# BioReason multimodal SFT — native Qwen3-32B backbone (Aurora / XPU)
+# BioReason Qwen3-32B SFT — 1-node SMOKE for PER-BUCKET BATCH SIZING (throughput lever).
 #
-# Backbone swapped from Gemma4-31B → Qwen3-32B: Gemma4's custom attention OOMs at 12-tile
-# single-node FSDP2 (gemma4/_attention.py SDPA workspace; see
-# docs/reports/bioreason_sft_oom_diagnosis_20260627.md). Qwen3-32B (our validated 32B GRPO
-# arch) trains clean at full node, 3.4× faster. Same multimodal machinery (ESM3+GO splice,
-# LinearCrossEntropyLoss, SDPA).
+# Difference from smoke_bucket: adds `bucket_batch_sizes: [4, 2, 1]` aligned to
+# `pad_buckets: [2048, 4096, 6144]`. A length-grouped distributed batch sampler
+# (LengthGroupedDistributedBatchSampler) then gives each length bucket its own batch size,
+# so short sequences amortize the 65 GiB FSDP weight-gather over 4 samples/sweep while the
+# rare long ones stay bs1 — over the FULL corpus (no seq cap, no dropped data). This is the
+# production throughput answer the seq-cap sweep (4.8x) could not give without coverage loss.
+#
+# Memory ceiling check (attn transient at bf16, the thing that forced bs1):
+#   2048 x bs4 = 16.8M elems, 4096 x bs2 = 33.6M, 6144 x bs1 = 37.7M  -> all <= the
+#   validated 6144-bs1 ceiling. Safe by construction.
 #
 # Recipe: recipes/dev/sft_bioreason_distributed_xpu.py
-#
-# MEMORY / TOPOLOGY (HW-VALIDATED 2026-06-27): full 12-way shard (shard=-1/replicate=1),
-# pad_to_fixed. The blocker was NEVER base size — it was VARIABLE per-step tensor shape at bs=1
-# (per-batch-max padding) churning XPU allocator VAs -> banned:1 at step 2 (no empty_cache under
-# FSDP + OFI MR). Fixed by pad_to_fixed (constant [1,max_seq_len] every step) + padding with a
-# neutral id (Qwen3 pad_id 151643 collides with protein_token_id). seq=4096 validated 10/10
-# clean (loss 15.78->0.07); seq=6144 chosen here for reasoning fidelity (only 4% of targets
-# truncated vs 23% at 4096) — HW-validate the 6144 fixed-shape transient fits before the full
-# run. See docs/reports/bioreason_sft_oom_diagnosis_20260627.md.
-#
-# PREREQUISITE: ESM3 cache over the *training* SFT sequences (esm3_cache_path),
-# max_protein_len=2048. The shipped cache is VALIDATION-only — precompute over the train
-# parquets before the full run (experiments/bioreason/precompute_esm3_cache.py).
+# Smoke uses the validation shard (fast load); the production config points at the train dir.
 
-name: sft_bioreason_qwen3_32b_xpu
+name: sft_bioreason_qwen3_32b_smoke_perbucket
 output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/experiments/bioreason/runs/${name}
 base_model_path: /lus/flare/projects/ModCon/ngetty/models/Qwen3-32B
-sft_data_dir: /lus/flare/projects/ModCon/ngetty/datasets/bioreason_sft_reasoning/data
+sft_data_file: /lus/flare/projects/ModCon/ngetty/datasets/bioreason_sft_reasoning/data/validation-00000-of-00001.parquet
 esm3_cache_path: /lus/flare/projects/ModCon/ngetty/datasets/bioreason_sft_reasoning/esm3_cache_2048.safetensors
 go_embedding_path: /lus/flare/projects/ModCon/ngetty/models/bioreason-pro-sft/go_embedding.pt
 
@@ -36,7 +29,6 @@ tokenizer:
   max_seq_len: 6144
 
 # ── Model (native-Qwen3 BioReason wrapper; device/dtype injected by the recipe) ─
-# protein/go ids are RESERVED Qwen vocab gap ids (151643/151644; gap 151643-151935 is free).
 model:
   _component_: torchtune.dev.bioreason.model_native.BioReasonNativeModel
   backbone_builder: qwen3_32b
@@ -66,7 +58,7 @@ checkpointer:
   ]
   recipe_checkpoint: null
   output_dir: ${output_dir}
-  model_type: QWEN2   # Qwen3 uses the QWEN2 weight-conversion path
+  model_type: QWEN2
 
 resume_from_checkpoint: false
 save_every_n_epochs: 1
@@ -74,7 +66,7 @@ save_every_n_epochs: 1
 # ── Dataset ───────────────────────────────────────────────────────────────────
 dataset:
   _component_: torchtune.dev.bioreason.dataset_sft.bioreason_sft_dataset
-  data_files: ${sft_data_dir}
+  data_files: ${sft_data_file}
   max_seq_len: 6144
   max_protein_len: 2048
   num_go_tokens: 200
@@ -82,16 +74,36 @@ dataset:
   go_token_id: 151644
   train_on_reasoning: true
   inject_go_pred: true
+  drop_over_length: true
 seed: 1234
 shuffle: true
 collate_fn: torchtune.dev.bioreason.dataset_sft.bioreason_sft_collate_fn
 dataloader_num_workers: 0
 
 # ── Training envelope ─────────────────────────────────────────────────────────
-epochs: 3
-max_steps_per_epoch: null   # null = run the full epoch (recipe reads cfg.max_steps_per_epoch directly)
+epochs: 1
+max_steps_per_epoch: 12
+# batch_size is IGNORED when bucket_batch_sizes is set (the batch sampler owns sizing).
 batch_size: 1
 gradient_accumulation_steps: 4
+
+# Per-bucket batch sizing (throughput lever) — buckets + per-bucket batch size, aligned.
+# Buckets TUNED to the measured corpus dist (validation shard: 40% <=3072, 79% <=4096, p50=3265)
+# AND the validated attn-transient ceiling b*S^2 <= 37.7M elems (= the 6.04 GiB fp32 score tensor
+# that 6144xbs1 sits at). Max safe bs: 3072->4, 4096->2, 6144->1 (each bucket at its ceiling:
+# 3072xbs4 has the SAME 6.04 GiB score transient as the validated 6144xbs1). [2048,...] wastes the
+# bs4 tier here (only 2% <=2048); [3072,4096,6144][4,2,1] = 1.98x fewer FSDP gather-sweeps
+# (309 vs 613/rank) over the FULL corpus, no dropped data. Re-tune buckets per corpus for prod.
+pad_to_fixed: true
+# TWO buckets only: [4096, 6144] is the EXACT shape set the prior bucket run (job 8656593) proved
+# clean for 12 steps on the default allocator (max_protein_len=2048 on this corpus never yields
+# <4096-that-matters; that run saw only 4096+6144). Adding a 3rd shape (3072) widened the VA-churn
+# surface and hit banned:1 at step2. bs2 on the 79% <=4096 majority => 1.65x fewer FSDP gather-sweeps
+# (372 vs 613/rank), isolating per-bucket BATCH SIZING (bs2 vs bs1) on a known-safe shape set. 4096xbs2
+# == 6144xbs1 attn-transient (both 6.04 GiB, at the validated ceiling). Re-add a 3rd bucket only with
+# a working allocator fix.
+pad_buckets: [4096, 6144]
+bucket_batch_sizes: [2, 1]
 clip_grad_norm: 1.0
 
 optimizer:
@@ -103,11 +115,7 @@ optimizer:
 loss:
   _component_: torchtune.modules.loss.LinearCrossEntropyLoss
 
-# ── Distributed / FSDP — full 12-way shard (HW-VALIDATED 2026-06-27) ─────────────
-# shard=-1/replicate=1 = the working fitstest + validated BioReason envelope (10/10 clean,
-# loss 15.78->0.07). The earlier shard=2/replicate=6 "throughput" idea was wrong: at 32B the
-# per-tile base at shard=2 is ~30.5 GiB, and the real blocker was never base size but VARIABLE
-# per-step shape (now fixed by pad_to_fixed). Keep full-shard; revisit HSDP for multi-node only.
+# ── Distributed / FSDP — full shard (baseline-comparable) ─────────────────────
 enable_activation_checkpointing: true
 enable_activation_offloading: false
 fsdp_cpu_offload: false
@@ -115,8 +123,6 @@ fsdp_reshard_after_forward: true
 data_parallel_replicate_dim: 1
 data_parallel_shard_dim: -1
 tensor_parallel_dim: 1
-# Constant per-step batch shape (XPU 32B banned:1 fix; recipe default True). Required.
-pad_to_fixed: true
 
 # ── XPU ───────────────────────────────────────────────────────────────────────
 device: xpu

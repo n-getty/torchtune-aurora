@@ -1,0 +1,134 @@
+# BioReason Qwen3-32B SFT — PROFILING config (MFU diagnosis, NOT a training run).
+#
+# Fixed-shape [1,4096] (pad_to_fixed, pad_buckets=null => ONE VA, no banned:1) matching the
+# 102s/step baseline geometry (full-shard, bs1, ga4, AC on). XPU Kineto profiler enabled to
+# capture ONE full opt-step (4 fwd + 4 bwd + optim). Schedule counts MICROBATCHES (profiler.step
+# is outside the ga gate): wait8(=2 opt-steps) + warmup4(=1) + active4(=1 full opt-step) ->
+# iteration_16/. with_flops for MFU. See docs plan / analyze_profile_trace.py.
+
+name: sft_bioreason_qwen3_32b_compile_seq4096
+output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/experiments/bioreason/runs/${name}
+base_model_path: /lus/flare/projects/ModCon/ngetty/models/Qwen3-32B
+sft_data_file: /lus/flare/projects/ModCon/ngetty/datasets/bioreason_sft_reasoning/data/validation-00000-of-00001.parquet
+esm3_cache_path: /lus/flare/projects/ModCon/ngetty/datasets/bioreason_sft_reasoning/esm3_cache_2048.safetensors
+go_embedding_path: /lus/flare/projects/ModCon/ngetty/models/bioreason-pro-sft/go_embedding.pt
+
+# ── Tokenizer (Qwen3) ─────────────────────────────────────────────────────────
+tokenizer:
+  _component_: torchtune.models.qwen3.qwen3_tokenizer
+  path: ${base_model_path}/vocab.json
+  merges_file: ${base_model_path}/merges.txt
+  max_seq_len: 4096
+
+model:
+  _component_: torchtune.dev.bioreason.model_native.BioReasonNativeModel
+  backbone_builder: qwen3_32b
+  hidden_size: 5120
+  protein_token_id: 151643
+  go_token_id: 151644
+  enable_lora: true
+  lora_rank: 32
+  lora_alpha: 64
+  apply_lora_to_mlp: true
+  esm3_cache_path: ${esm3_cache_path}
+  go_embedding_path: ${go_embedding_path}
+
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [
+    model-00001-of-00017.safetensors, model-00002-of-00017.safetensors,
+    model-00003-of-00017.safetensors, model-00004-of-00017.safetensors,
+    model-00005-of-00017.safetensors, model-00006-of-00017.safetensors,
+    model-00007-of-00017.safetensors, model-00008-of-00017.safetensors,
+    model-00009-of-00017.safetensors, model-00010-of-00017.safetensors,
+    model-00011-of-00017.safetensors, model-00012-of-00017.safetensors,
+    model-00013-of-00017.safetensors, model-00014-of-00017.safetensors,
+    model-00015-of-00017.safetensors, model-00016-of-00017.safetensors,
+    model-00017-of-00017.safetensors,
+  ]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: QWEN2
+
+resume_from_checkpoint: false
+save_every_n_epochs: 1
+
+# ── Dataset (fixed [1,4096]) ────────────────────────────────────────────────────
+dataset:
+  _component_: torchtune.dev.bioreason.dataset_sft.bioreason_sft_dataset
+  data_files: ${sft_data_file}
+  max_seq_len: 4096
+  max_protein_len: 2048
+  num_go_tokens: 200
+  protein_token_id: 151643
+  go_token_id: 151644
+  train_on_reasoning: true
+  inject_go_pred: true
+  drop_over_length: true
+seed: 1234
+shuffle: true
+collate_fn: torchtune.dev.bioreason.dataset_sft.bioreason_sft_collate_fn
+dataloader_num_workers: 0
+
+# ── Training envelope (matches 102s baseline geometry) ──────────────────────────
+epochs: 1
+max_steps_per_epoch: 6
+batch_size: 1
+gradient_accumulation_steps: 4
+pad_to_fixed: true
+pad_buckets: null
+clip_grad_norm: 1.0
+
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 1.0e-4
+  weight_decay: 0.0
+  fused: true
+
+loss:
+  _component_: torchtune.modules.loss.LinearCrossEntropyLoss
+
+# ── Distributed / FSDP — full shard (the 102s baseline) ─────────────────────────
+enable_activation_checkpointing: true
+enable_activation_offloading: false
+fsdp_cpu_offload: false
+fsdp_reshard_after_forward: true
+data_parallel_replicate_dim: 1
+data_parallel_shard_dim: -1
+tensor_parallel_dim: 1
+
+device: xpu
+dtype: bf16
+compile:
+  model: true
+  loss: false
+  optimizer_step: false
+  scale_grads: false
+
+log_level: INFO
+log_every_n_steps: 1
+log_peak_memory_stats: true
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+
+# ── PROFILER (the point of this config) ─────────────────────────────────────────
+# Kineto XPU trace of ONE full opt-step. schedule in MICROBATCHES (ga=4):
+#   wait 8 (skip 2 opt-steps of init noise) + warmup 4 (prime 1) + active 4 (capture 1 step)
+# -> iteration_16/ with r{rank}-*.trace.json.gz + rank{rank}_key_averages.txt.
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: false
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: true
+  cuda: false
+  xpu: true
+  profile_memory: false
+  with_stack: false
+  record_shapes: true
+  with_flops: true
+  wait_steps: 8
+  warmup_steps: 4
+  active_steps: 4
+  num_cycles: 1
