@@ -33,6 +33,78 @@ if _USE_IPEX_VARLEN:
     except ImportError:
         _USE_IPEX_VARLEN = False
 
+# Opt-in compiled flex_attention training path (XPU only).
+# Set TORCHTUNE_USE_XPU_FLEX=1 to route causal SDPA calls through a compiled
+# torch.nn.attention.flex_attention on XPU. UNLIKE the IPEX varlen path above,
+# flex has an autograd kernel, so this engages on the TRAINING (grad-enabled)
+# forward — it removes the O(S^2) [B,H,S,S] fp32 score materialization that the
+# XPU math-SDPA backend does (validated seq6144: 1.13 GiB vs 5.6 GiB math S^2),
+# which is what forces batch_size=1 on 32B (bs>1 OOMs in math SDPA). Numerically
+# equivalent to math SDPA within the bf16 noise floor (fwd max|d| 0.0156 < bf16
+# floor 0.0307; grad max|d| dq/dk/dv 0.016-0.06).
+#
+# NOTE: deliberately independent of _SUPPORTS_FLEX_ATTENTION (which is CUDA-only)
+# — widening that guard would activate the existing no-kernel_options compiled
+# flex (which fails an XPU Triton static_assert) and flip packed_block_causal_mask
+# onto hardcoded device="cuda". This path lives entirely inside _sdpa_call.
+#
+# The compiled flex ONLY compiles on the XPU Triton backend when kernel_options
+# force EQUAL backward block sizes (BLOCK_M1=N1=M2=N2); the default config fails
+# `static_assert(BLOCK_M2 % BLOCK_N2 == 0)`. Block size is env-tunable for a PVC
+# sweep (correctness is block-independent; step-time is not).
+# Opt-in native SYCL-TLA flash-attention training path (XPU only).
+# Set TORCHTUNE_USE_XPU_FLASH=1 to route causal SDPA calls through the compiled
+# SYCL-TLA fused flash kernel that already ships in frameworks/2025.3.1
+# (libtorch-xpu-ops-sycltla-mha_{fwd,bwd}.so). UNLIKE the XPU_FLEX path, this is
+# the VENDOR fused kernel with a native BACKWARD — no Triton, no compile. It has
+# BOTH passes for bf16, head_dim {64,96,128,192,256}, causal (validated GATE 0,
+# job 8659275): peak fwd 1.07 / bwd 1.50 GiB vs math 5.92 / 8.24 at [1,40,4096,128]
+# (~5.5x memory cut), which is what removes the O(S^2) [B,H,S,S] fp32 score
+# materialization that forces batch_size=1 on 32B.
+#
+# TWO requirements empirically established (GATE 0):
+#   1. Must FORCE the FLASH backend: torch's XPU auto-dispatch (_fused_sdp_choice)
+#      never selects flash even when it is viable — it falls to math. We wrap the
+#      call in torch.nn.attention.sdpa_kernel([SDPBackend.FLASH_ATTENTION]).
+#   2. q/k/v must be in BSHD MEMORY layout (shape [B,H,S,D] with the strides of a
+#      transpose(1,2) over a contiguous [B,S,H,D]). Standard C-contiguous [B,H,S,D]
+#      is rejected with "No available kernel". We coerce with
+#      .transpose(1,2).contiguous().transpose(1,2) (no-op cost for the already-
+#      transposed q; one small copy for GQA-flattened k/v).
+# Guards: XPU only, mask=None, is_causal=True, dropout==0 (the fused kernel rejects
+# dropout>0 and any attn_mask). Numerically equal to math within the bf16 floor.
+_USE_XPU_FLASH = os.environ.get("TORCHTUNE_USE_XPU_FLASH", "0") == "1"
+_xpu_flash_sdpa_kernel = None
+_xpu_flash_backend = None
+if _USE_XPU_FLASH:
+    try:
+        from torch.nn.attention import (
+            sdpa_kernel as _xpu_flash_sdpa_kernel,
+            SDPBackend as _xpu_flash_SDPBackend,
+        )
+
+        _xpu_flash_backend = _xpu_flash_SDPBackend.FLASH_ATTENTION
+    except ImportError:
+        _USE_XPU_FLASH = False
+
+_USE_XPU_FLEX = os.environ.get("TORCHTUNE_USE_XPU_FLEX", "0") == "1"
+_XPU_FLEX_BLOCK = int(os.environ.get("TORCHTUNE_XPU_FLEX_BLOCK", "64"))
+_XPU_FLEX_MASK_CACHE_MAX = max(
+    1, int(os.environ.get("TORCHTUNE_XPU_FLEX_MASK_CACHE_MAX", "4"))
+)
+_xpu_flex_attention = None
+_xpu_flex_create_block_mask = None
+_xpu_flex_BlockMask = None
+if _USE_XPU_FLEX:
+    try:
+        from torch.nn.attention.flex_attention import (
+            BlockMask as _xpu_flex_BlockMask,
+            create_block_mask as _xpu_flex_create_block_mask,
+            flex_attention as _xpu_flex_attention,
+        )
+    except ImportError:
+        _USE_XPU_FLEX = False
+
 _log: logging.Logger = get_logger()
 
 # One-shot per-worker log: surfaces whether IPEX varlen actually engaged on
@@ -76,6 +148,242 @@ def _reset_varlen_log_for_testing() -> None:
     """Reset the one-shot varlen log flag. Test use only."""
     global _VARLEN_LOG_DONE
     _VARLEN_LOG_DONE = False
+
+
+# ── Compiled flex_attention (XPU training path) ──────────────────────────────
+# Built once at import when TORCHTUNE_USE_XPU_FLEX=1. The compiled callable is
+# wrapped in torch.compiler.disable(recursive=False) so it stays compiled even if
+# an outer torch.compile(model) is active (nested compile is unsupported), mirror-
+# ing compile_friendly_flex_attention. Equal-block kernel_options are baked in
+# (required for the XPU Triton backend to compile the backward — see the flag doc).
+# TORCHTUNE_XPU_FLEX_AUTOTUNE=1: let Inductor search block configs (mode=
+# "max-autotune") instead of pinning our equal-block kernel_options. The pinned
+# equal-block was chosen only because it COMPILES on the XPU backend; it is not
+# perf-tuned for PVC (block-64 measured ~1.5x slower/opt-step than math SDPA).
+# When autotune is on we do NOT pass kernel_options (autotune picks the blocks).
+_XPU_FLEX_AUTOTUNE = os.environ.get("TORCHTUNE_XPU_FLEX_AUTOTUNE", "0") == "1"
+_xpu_flex_compiled = None
+if _USE_XPU_FLEX and _xpu_flex_attention is not None:
+    _XPU_FLEX_KERNEL_OPTS = {
+        "BLOCK_M1": _XPU_FLEX_BLOCK,
+        "BLOCK_N1": _XPU_FLEX_BLOCK,
+        "BLOCK_M2": _XPU_FLEX_BLOCK,
+        "BLOCK_N2": _XPU_FLEX_BLOCK,
+    }
+    try:
+        if _XPU_FLEX_AUTOTUNE:
+            _xpu_flex_attention_compiled = torch.compile(
+                _xpu_flex_attention, mode="max-autotune"
+            )
+
+            @torch.compiler.disable(recursive=False)
+            def _xpu_flex_compiled(q, k, v, block_mask):  # noqa: F811
+                # No kernel_options: Inductor autotunes the block config.
+                return _xpu_flex_attention_compiled(q, k, v, block_mask=block_mask)
+
+        else:
+            _xpu_flex_attention_compiled = torch.compile(_xpu_flex_attention)
+
+            @torch.compiler.disable(recursive=False)
+            def _xpu_flex_compiled(q, k, v, block_mask):  # noqa: F811
+                return _xpu_flex_attention_compiled(
+                    q, k, v, block_mask=block_mask, kernel_options=_XPU_FLEX_KERNEL_OPTS
+                )
+
+    except Exception as e:  # pragma: no cover - hardware/toolchain dependent
+        _log.info("XPU flex compile setup failed (%s); disabling.", str(e)[:120])
+        _USE_XPU_FLEX = False
+
+# FIFO-bounded causal BlockMask cache. BlockMask is broadcast over batch/head
+# (B=None, H=None) so the mask depends only on the sequence length S; keying on
+# (S, device) is correct. Bucketing keeps the key set finite (a handful of S).
+_xpu_flex_mask_cache: "OrderedDict" = OrderedDict()
+_XPU_FLEX_LOG_DONE: bool = False
+
+
+def _reset_xpu_flex_log_for_testing() -> None:
+    """Reset the one-shot XPU-flex log flag + mask cache. Test use only."""
+    global _XPU_FLEX_LOG_DONE
+    _XPU_FLEX_LOG_DONE = False
+    _xpu_flex_mask_cache.clear()
+
+
+def _log_xpu_flex_status_once(
+    mask, is_causal: bool, dropout_p: float, device_type: str
+) -> None:
+    global _XPU_FLEX_LOG_DONE
+    if _XPU_FLEX_LOG_DONE:
+        return
+    _XPU_FLEX_LOG_DONE = True
+    if not _USE_XPU_FLEX:
+        _log.info("xpu_flex=disabled (TORCHTUNE_USE_XPU_FLEX unset)")
+        return
+    if _xpu_flex_compiled is None:
+        _log.info("xpu_flex=disabled (flex_attention import/compile failed)")
+        return
+    reasons = []
+    if mask is not None:
+        reasons.append("mask is not None")
+    if not is_causal:
+        reasons.append("is_causal=False")
+    if dropout_p != 0.0:
+        reasons.append(f"dropout_p={dropout_p}")
+    if device_type != "xpu":
+        reasons.append(f"device={device_type}")
+    if reasons:
+        _log.info("xpu_flex=requested-but-skipped (%s)", ", ".join(reasons))
+    else:
+        _log.info("xpu_flex=engaged (block=%d, grad=%s)", _XPU_FLEX_BLOCK, torch.is_grad_enabled())
+
+
+_XPU_FLASH_LOG_DONE: bool = False
+
+
+def _reset_xpu_flash_log_for_testing() -> None:
+    """Reset the one-shot XPU-flash log flag. Test use only."""
+    global _XPU_FLASH_LOG_DONE
+    _XPU_FLASH_LOG_DONE = False
+
+
+def _log_xpu_flash_status_once(
+    mask, is_causal: bool, dropout_p: float, device_type: str
+) -> None:
+    global _XPU_FLASH_LOG_DONE
+    if _XPU_FLASH_LOG_DONE:
+        return
+    _XPU_FLASH_LOG_DONE = True
+    if not _USE_XPU_FLASH:
+        _log.info("xpu_flash=disabled (TORCHTUNE_USE_XPU_FLASH unset)")
+        return
+    if _xpu_flash_sdpa_kernel is None:
+        _log.info("xpu_flash=disabled (sdpa_kernel import failed)")
+        return
+    reasons = []
+    if mask is not None:
+        reasons.append("mask is not None")
+    if not is_causal:
+        reasons.append("is_causal=False")
+    if dropout_p != 0.0:
+        reasons.append(f"dropout_p={dropout_p}")
+    if device_type != "xpu":
+        reasons.append(f"device={device_type}")
+    if reasons:
+        _log.info("xpu_flash=requested-but-skipped (%s)", ", ".join(reasons))
+    else:
+        _log.info("xpu_flash=engaged (grad=%s)", torch.is_grad_enabled())
+
+
+def _to_bshd_memory(t: torch.Tensor) -> torch.Tensor:
+    """Coerce a [B, H, S, D] tensor to BSHD memory layout.
+
+    The SYCL-TLA flash kernel requires q/k/v to be in BSHD memory (shape stays
+    [B, H, S, D] but the underlying storage is that of a contiguous [B, S, H, D]
+    transposed on dims 1<->2). Standard C-contiguous [B, H, S, D] is rejected with
+    "No available kernel" (GATE 0, job 8659275).
+
+    If ``t`` is already such a view (already-BSHD-contiguous), the round-trip is a
+    cheap no-op-ish reallocation; for a GQA-flattened contiguous-BHSD k/v it is one
+    copy of the (small) tensor. We detect the already-correct case to skip the copy.
+    """
+    # A tensor is already in BSHD memory iff its [B,S,H,D] view is contiguous.
+    b, h, s, d = t.shape
+    if t.transpose(1, 2).is_contiguous():
+        return t
+    return t.transpose(1, 2).contiguous().transpose(1, 2)
+
+
+def _xpu_flash_call(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, dropout_p: float
+) -> torch.Tensor:
+    """Native SYCL-TLA fused flash causal attention on XPU (fwd + bwd).
+
+    q, k, v arrive as [B, H, S, D] (already GQA-expanded). We coerce each to BSHD
+    memory and force the FLASH backend (auto-dispatch never picks it). Returns
+    [B, H, S, D] to match the SDPA caller.
+    """
+    q = _to_bshd_memory(q)
+    k = _to_bshd_memory(k)
+    v = _to_bshd_memory(v)
+    with _xpu_flash_sdpa_kernel([_xpu_flash_backend]):
+        return nn.functional.scaled_dot_product_attention(
+            q, k, v, attn_mask=None, dropout_p=dropout_p, is_causal=True
+        )
+
+
+def _xpu_flex_causal_mask(seq_len: int, device: torch.device):
+    """Fetch/build a cached causal BlockMask for the given seq_len on device.
+
+    B=None, H=None so the mask broadcasts over batch and heads; only S varies.
+    FIFO-bounded so variable-seqlen workloads do not accumulate masks forever.
+    """
+    key = (seq_len, str(device))
+    bm = _xpu_flex_mask_cache.get(key)
+    if bm is None:
+        def _causal(b, h, q_idx, kv_idx):
+            return q_idx >= kv_idx
+
+        bm = _xpu_flex_create_block_mask(
+            _causal, B=None, H=None, Q_LEN=seq_len, KV_LEN=seq_len, device=device
+        )
+        _xpu_flex_mask_cache[key] = bm
+        _xpu_flex_mask_cache.move_to_end(key)
+        while len(_xpu_flex_mask_cache) > _XPU_FLEX_MASK_CACHE_MAX:
+            _xpu_flex_mask_cache.popitem(last=False)
+    return bm
+
+
+def xpu_packed_block_causal_mask(
+    seq_lens: list[list[int]],
+    max_seq_len: int,
+    device: torch.device,
+):
+    """Build a block-diagonal (document) causal BlockMask for token PACKING on XPU.
+
+    This is the XPU analogue of :func:`packed_block_causal_mask` (which hardcodes
+    ``device="cuda"`` and is gated on the CUDA-only ``_SUPPORTS_FLEX_ATTENTION``). Each row
+    of ``seq_lens`` is that pack's per-document lengths (summing to ``max_seq_len``); a query
+    attends a key iff they are in the SAME document AND causal (q_idx >= kv_idx). Returns a
+    BlockMask consumable by the compiled flex kernel (the ``_sdpa_call`` BlockMask branch).
+
+    Requires ``TORCHTUNE_USE_XPU_FLEX=1`` (the create_block_mask import). Raises otherwise.
+    """
+    if _xpu_flex_create_block_mask is None:
+        raise RuntimeError(
+            "xpu_packed_block_causal_mask requires TORCHTUNE_USE_XPU_FLEX=1 (flex import)."
+        )
+    B = len(seq_lens)
+    # document_ids[b, pos] = which document position `pos` belongs to in pack b.
+    document_ids = torch.zeros((B, max_seq_len), dtype=torch.int32, device=device)
+    for b, lens in enumerate(seq_lens):
+        off = 0
+        for doc_id, L in enumerate(lens):
+            end = min(off + int(L), max_seq_len)
+            if end > off:
+                document_ids[b, off:end] = doc_id
+            off = end
+            if off >= max_seq_len:
+                break
+
+    def _block_causal(b, h, q_idx, kv_idx):
+        return (q_idx >= kv_idx) & (document_ids[b, q_idx] == document_ids[b, kv_idx])
+
+    # B set (per-pack document layout differs); H broadcasts.
+    return _xpu_flex_create_block_mask(
+        _block_causal, B=B, H=None, Q_LEN=max_seq_len, KV_LEN=max_seq_len, device=device
+    )
+
+
+def _xpu_flex_call(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> torch.Tensor:
+    """Compiled flex_attention causal call on XPU.
+
+    q, k, v arrive as [B, H, S, D] already GQA-expanded (flex's expected layout),
+    so no repacking is needed. Returns [B, H, S, D] to match the SDPA caller.
+    """
+    seq_len = q.shape[2]
+    block_mask = _xpu_flex_causal_mask(seq_len, q.device)
+    return _xpu_flex_compiled(q, k, v, block_mask)
 
 
 def _compute_maskfree_causal(
@@ -402,6 +710,53 @@ def _sdpa_or_flex_attention() -> Callable:
         dropout_p: float,
         is_causal: bool,
     ) -> torch.Tensor:
+        # XPU token-PACKING branch (highest precedence): a BlockMask means sample packing
+        # with a block-diagonal (document) mask — doc A must not attend doc B. The flash
+        # and varlen branches below are causal-ONLY (mask=None) and cannot express this, so
+        # packing MUST route through compiled flex (which takes an arbitrary BlockMask and
+        # has an autograd kernel). Gated on XPU + flex-available; the flash-causal path
+        # (mask=None) is unaffected. See BioReasonPackedSFTDataset / packing scope memo.
+        if (
+            _USE_XPU_FLEX
+            and _xpu_flex_compiled is not None
+            and _xpu_flex_BlockMask is not None
+            and isinstance(mask, _xpu_flex_BlockMask)
+            and dropout_p == 0.0
+            and q.device.type == "xpu"
+        ):
+            return _xpu_flex_compiled(q, k, v, mask)
+
+        # Native SYCL-TLA fused flash branch (XPU, causal-only, no mask, no dropout).
+        # This is the VENDOR fused kernel with a native backward — it removes the
+        # O(S^2) score materialization that forces batch_size=1, at ~5.5x less peak
+        # memory than math (GATE 0). Preferred over flex (Triton, ~1.5x slower) and
+        # varlen (no autograd) when available. Takes precedence over both.
+        _log_xpu_flash_status_once(mask, is_causal, dropout_p, q.device.type)
+        if (
+            _USE_XPU_FLASH
+            and _xpu_flash_sdpa_kernel is not None
+            and mask is None
+            and is_causal
+            and dropout_p == 0.0
+            and q.device.type == "xpu"
+        ):
+            return _xpu_flash_call(q, k, v, dropout_p)
+
+        # Compiled flex_attention branch (XPU, causal-only, no mask, no dropout).
+        # UNLIKE varlen below, flex has an autograd kernel, so this engages on the
+        # grad-enabled TRAINING forward — removing the O(S^2) score materialization
+        # that forces batch_size=1. Takes precedence over varlen when both are set.
+        _log_xpu_flex_status_once(mask, is_causal, dropout_p, q.device.type)
+        if (
+            _USE_XPU_FLEX
+            and _xpu_flex_compiled is not None
+            and mask is None
+            and is_causal
+            and dropout_p == 0.0
+            and q.device.type == "xpu"
+        ):
+            return _xpu_flex_call(q, k, v)
+
         # IPEX varlen branch: only valid for causal-only, no mask, no dropout, on XPU,
         # and only for no-grad paths (ref fwd, rollout logprobs).
         # torch_ipex::varlen_fwd has no registered autograd kernel; running it under

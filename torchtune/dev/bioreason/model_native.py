@@ -50,6 +50,43 @@ _BACKBONES = {
     "qwen3_32b": (qwen3_32b, lora_qwen3_32b),
 }
 
+
+class _LazySafetensorsCache:
+    """Lazy, scalable ESM3 feature cache backed by a single safetensors file.
+
+    Mirrors the dict `.get(key)` / `.__getitem__` / `in` / `len` API the embed-splice
+    uses, but reads ONLY the requested tensor's bytes per lookup (safe_open get_tensor),
+    never the whole file. This is what lets 12 same-node ranks share one ~200 GiB cache
+    without each deserializing the full pickle (the .pt path was ~93% I/O-blocked at scale
+    and blew walltime; see feedback_esm3_cache_mmap_required_at_scale + the safetensors
+    conversion). The handle is opened once; the key set comes from the header (cheap).
+    """
+
+    def __init__(self, path: str):
+        from safetensors import safe_open
+
+        self._path = path
+        # framework="pt", device="cpu": get_tensor returns a CPU torch.Tensor slice.
+        self._f = safe_open(path, framework="pt", device="cpu")
+        self._keys = set(self._f.keys())
+
+    def get(self, key, default=None):
+        if key not in self._keys:
+            return default
+        return self._f.get_tensor(key)
+
+    def __getitem__(self, key):
+        return self._f.get_tensor(key)
+
+    def __contains__(self, key):
+        return key in self._keys
+
+    def __len__(self):
+        return len(self._keys)
+
+    def keys(self):
+        return self._keys
+
 logger = logging.getLogger(__name__)
 
 
@@ -82,6 +119,20 @@ class BioReasonNativeModel(nn.Module):
         proj_resume_dir (Optional[str]): dir with protein_projection.pt/go_projection.pt
             to resume trained projections (e.g. continuing a run).
         enable_lora (bool): build the LoRA backbone variant. Default: False.
+        freeze_backbone (bool): Stage-1 alignment mode — freeze the ENTIRE backbone and
+            train ONLY the protein/GO projections (no LoRA). Ignored when enable_lora=True
+            (LoRA already freezes the base). Default: False. See the trainable-param
+            policy note in __init__ for the two-stage (LLaVA-style) rationale.
+        freeze_projector (bool): Stage-2 only (enable_lora=True) — freeze the protein/GO
+            projections at their loaded (Stage-1-aligned) values so only the LoRA adapters
+            train. Prevents the projector over-amplification trap on a long run (a trainable
+            projector drifts norm 721->1044 in 10 steps once loss saturates). Default: False.
+        projector_output_norm (bool): append a LayerNorm to each projector so the spliced
+            feature magnitude is BOUNDED (per-row norm ~sqrt(H)) and cannot over-amplify.
+            Fixes the frozen-backbone over-amplification trap (proj-out norm 721->1629 ->
+            ':' collapse) without LoRA — the cleanest capability path, since the base backbone
+            already reasons coherently from a correctly-scaled splice (LoRA itself breaks
+            splice-generation; see the recipe notes). Default: False.
         lora_rank (int): LoRA rank. Default: 32.
         lora_alpha (float): LoRA alpha. Default: 64.
         lora_dropout (float): LoRA dropout. Default: 0.0.
@@ -105,11 +156,16 @@ class BioReasonNativeModel(nn.Module):
         go_embedding_path: Optional[str] = None,
         proj_resume_dir: Optional[str] = None,
         enable_lora: bool = False,
+        freeze_backbone: bool = False,
+        freeze_projector: bool = False,
+        projector_output_norm: bool = False,
         lora_rank: int = 32,
         lora_alpha: float = 64.0,
         lora_dropout: float = 0.0,
         lora_attn_modules: Optional[list[str]] = None,
         apply_lora_to_mlp: bool = True,
+        disable_protein_splice: bool = False,
+        disable_go_splice: bool = False,
         # Test-injection hooks (production passes paths/None for all three):
         backbone: Optional[nn.Module] = None,
         protein_hidden_override: Optional[int] = None,
@@ -123,6 +179,13 @@ class BioReasonNativeModel(nn.Module):
         self.protein_token_id = protein_token_id
         self.go_token_id = go_token_id
         self._has_lora = bool(enable_lora)
+        self._freeze_backbone = bool(freeze_backbone)
+        self._freeze_projector = bool(freeze_projector)
+        self._projector_output_norm = bool(projector_output_norm)
+        # Modality-ablation switches (Exp 2, embed-on/off): keep placeholder tokens but skip
+        # writing projected features. Isolate the protein / GO modality's contribution.
+        self.disable_protein_splice = bool(disable_protein_splice)
+        self.disable_go_splice = bool(disable_go_splice)
 
         # ── Backbone (native TransformerDecoder: gemma4_31b or qwen3_32b) ─────
         if backbone is not None:
@@ -167,16 +230,25 @@ class BioReasonNativeModel(nn.Module):
         # after sharding. For the single-process/CPU path (tests), they land on the
         # ambient default device, which is correct. Set dtype via the constructor so it
         # holds in both regimes without a meta-incompatible copy.
-        self.protein_projection = nn.Sequential(
-            nn.Linear(protein_hidden, hidden_size, dtype=dtype),
-            nn.GELU(),
-            nn.Linear(hidden_size, hidden_size, dtype=dtype),
-        )
-        self.go_projection = nn.Sequential(
-            nn.Linear(self.GO_DIM, hidden_size, dtype=dtype),
-            nn.GELU(),
-            nn.Linear(hidden_size, hidden_size, dtype=dtype),
-        )
+        # projector_output_norm: append a LayerNorm to each projector so the spliced
+        # feature magnitude is BOUNDED and cannot over-amplify. Without it, a frozen-backbone
+        # projector trained past loss-saturation drifts its output per-row norm 721 -> 1629
+        # and re-breaks the splice -> ':' collapse (HW-confirmed). LayerNorm pins per-element
+        # output to ~unit (per-row norm ~sqrt(H) ~71, well below the 721 the base tolerated
+        # AND bounded). Matches the published go_graph_encoder, which uses LayerNorm. The
+        # recipe's post-meta reset_parameters loop re-inits it (weight=1, bias=0).
+        def _proj(in_dim):
+            layers = [
+                nn.Linear(in_dim, hidden_size, dtype=dtype),
+                nn.GELU(),
+                nn.Linear(hidden_size, hidden_size, dtype=dtype),
+            ]
+            if self._projector_output_norm:
+                layers.append(nn.LayerNorm(hidden_size, dtype=dtype))
+            return nn.Sequential(*layers)
+
+        self.protein_projection = _proj(protein_hidden)
+        self.go_projection = _proj(self.GO_DIM)
 
         # ── ESM3 pre-encode cache (no live encoder) ───────────────────────────
         self._esm3_cache = None
@@ -210,17 +282,43 @@ class BioReasonNativeModel(nn.Module):
         if proj_resume_dir is not None:
             self._load_projections(proj_resume_dir)
 
-        # ── Freeze the LoRA base; keep adapters + projections trainable ───────
-        # The lora_gemma4 builder does NOT freeze the base (the standard torchtune LoRA
-        # recipe does it via set_trainable_params). Here the trainable set is the LoRA
-        # adapters PLUS the from-scratch protein/GO projections. The projections live
-        # OUTSIDE backbone, so freeze only the backbone's non-adapter params.
+        # ── Trainable-param policy (three regimes) ────────────────────────────
+        # The published BioReason recipe is TWO-STAGE (LLaVA-style alignment):
+        #   Stage 1 (freeze_backbone=True, enable_lora=False): backbone FULLY FROZEN,
+        #     train ONLY protein/GO projections. With the backbone unable to change,
+        #     the only way to reduce loss is to make the spliced protein/GO features
+        #     informative — there is no text shortcut to fall into. This is the fix
+        #     for the epoch_0 failure (single-stage LoRA learned the go_pred text
+        #     shortcut at lr=1e-4 in ~25 steps; the projection stayed at init ->
+        #     norm-10600 ESM3 feats swamped context -> ':' collapse at gen).
+        #   Stage 2 (enable_lora=True): LoRA-finetune the backbone on top of the
+        #     Stage-1-aligned projections (loaded via proj_resume_dir). Base frozen
+        #     except adapters; projections continue training.
+        #   Full-FT (neither): everything trainable (legacy; not the published path).
         if self._has_lora:
+            # Stage 2: freeze base, keep LoRA adapters + projections trainable. The
+            # lora_gemma4 builder does NOT freeze the base (the standard torchtune LoRA
+            # recipe does it via set_trainable_params). The projections live OUTSIDE
+            # backbone, so freeze only the backbone's non-adapter params.
             from torchtune.modules.peft import get_adapter_params
 
             adapter_keys = set(get_adapter_params(self.backbone).keys())
             for name, p in self.backbone.named_parameters():
                 p.requires_grad = name in adapter_keys
+            # Projections: trainable by default, BUT freeze_projector locks them at the
+            # Stage-1-aligned values. Needed for a long Stage-2 run: the go_pred text leak
+            # drives loss to ~0 fast, after which a trainable projector OVER-AMPLIFIES
+            # (proj-out norm 721->1044 in just 10 Stage-2 steps) and re-breaks the scale
+            # -> ':' collapse. Freezing keeps the validated norm-721 alignment while only
+            # the LoRA backbone learns to reason from the spliced features.
+            if self._freeze_projector:
+                for proj in (self.protein_projection, self.go_projection):
+                    for p in proj.parameters():
+                        p.requires_grad = False
+        elif self._freeze_backbone:
+            # Stage 1: freeze the ENTIRE backbone; only projections train.
+            for p in self.backbone.parameters():
+                p.requires_grad = False
             # projections stay trainable (default requires_grad=True)
 
     # ── cache / hidden-dim helpers ────────────────────────────────────────────
@@ -272,7 +370,22 @@ class BioReasonNativeModel(nn.Module):
                 f"ESM3 cache model mismatch: sidecar='{meta.get('esm3_model_name')}' "
                 f"vs requested='{protein_model_name}'. Re-run precompute."
             )
-        cache = torch.load(cache_path, map_location="cpu")
+        # safetensors path (PREFERRED at scale): lazy per-key reads via safe_open. The
+        # .pt-dict path does NOT scale — even torch.load(mmap=True) must deserialize the
+        # whole pickle (121645-entry index) per reader, so 12 same-node ranks each stream
+        # ~200 GiB from DAOS = ~93% I/O-blocked, blowing walltime (job 8572649). The lazy
+        # cache reads only the small header once + each [L+2,dim] slice on demand. Convert
+        # with experiments/bioreason/convert_esm3_cache_to_safetensors.py. See
+        # feedback_esm3_cache_mmap_required_at_scale.
+        if cache_path.endswith(".safetensors"):
+            cache = _LazySafetensorsCache(cache_path)
+            if len(cache) == 0:
+                raise ValueError(f"ESM3 safetensors cache at {cache_path} is empty.")
+            return cache, meta
+        # Legacy .pt dict path: mmap defers raw storage bytes (avoids the 12×-RAM OOM that
+        # wedged a node), but still deserializes the full pickle index — slow at scale.
+        # Kept for the small validation-only cache; prefer safetensors for the train cache.
+        cache = torch.load(cache_path, map_location="cpu", mmap=True)
         if not isinstance(cache, dict) or not cache:
             raise ValueError(f"ESM3 cache at {cache_path} is empty or not a dict.")
         return cache, meta
@@ -317,12 +430,20 @@ class BioReasonNativeModel(nn.Module):
         embeds = self._embed(input_ids)  # [B, S, H], scaled by sqrt(H)
 
         # Protein features (cache lookup -> projection)
-        if protein_sequences:
+        # Ablation (disable_protein_splice, Exp 2 embed-on/off): keep placeholder tokens but
+        # skip writing projected ESM3 features — the plain placeholder embedding stays. Holds
+        # seqlen/format constant to isolate the protein-embedding modality's contribution.
+        if protein_sequences and not getattr(self, "disable_protein_splice", False):
             if batch_idx_map is None:
                 batch_idx_map = list(range(B))
             if self._esm3_cache is None:
                 raise RuntimeError("ESM3 cache not loaded but protein_sequences passed.")
             per_item: list[list[torch.Tensor]] = [[] for _ in range(B)]
+            import os as _os
+            import time as _time
+
+            _timing = _os.environ.get("TORCHTUNE_BIOREASON_TIMING") == "1"
+            _t0 = _time.perf_counter() if _timing else 0.0
             for seq_idx, seq in enumerate(protein_sequences):
                 k = self.esm3_cache_key(seq)
                 t = self._esm3_cache.get(k)
@@ -333,6 +454,12 @@ class BioReasonNativeModel(nn.Module):
                         f"the full dataset."
                     )
                 per_item[batch_idx_map[seq_idx]].append(t)
+            if _timing:
+                logger.info(
+                    "[bioreason-timing] esm3_cache_read %d proteins in %.3fs",
+                    len(protein_sequences),
+                    _time.perf_counter() - _t0,
+                )
             raw = [
                 torch.cat(per_item[i], dim=0)
                 if per_item[i]
@@ -350,13 +477,40 @@ class BioReasonNativeModel(nn.Module):
             embeds = embeds.clone()
             embeds[mask] = flat
 
-        # GO features (cached -> projection)
-        go_embeds = self._get_go_embeds(go_aspects or ["all"] * B, B)
-        if go_embeds is not None:
+        # GO features (cached -> projection). disable_go_splice: same ablation for GO.
+        # go_aspects is per-DOCUMENT (one entry per protein/GO doc). Without packing that is
+        # one doc per batch row (len == B); with packing several docs share a row and
+        # batch_idx_map[doc_idx] gives the owning row. Assemble GO features per document and
+        # scatter into the row's GO placeholders left-to-right, mirroring the protein path —
+        # otherwise a 2-doc pack has 2*num_go_tokens placeholders but only one doc's features
+        # ("GO token count 400 != GO features 200", HW job 8673929).
+        _go_aspects = go_aspects if go_aspects is not None else (["all"] * B)
+        go_embeds = self._get_go_embeds(_go_aspects, len(_go_aspects))
+        if go_embeds is not None and not getattr(self, "disable_go_splice", False):
             go_mask = input_ids == self.go_token_id
-            go_per_item = go_mask.sum(dim=1)
-            sliced = [go_embeds[i][: go_per_item[i].item()] for i in range(B)]
-            flat_go = torch.cat(sliced, dim=0).to(device=self.device, dtype=self.dtype)
+            go_per_item = go_mask.sum(dim=1)  # GO tokens present in each batch ROW
+            _go_bmap = batch_idx_map
+            if _go_bmap is None:
+                _go_bmap = list(range(len(go_embeds)))
+            # Group per-document GO caches by owning batch row (document order), then take
+            # exactly the row's GO-token count from the front of the row's concatenated
+            # caches. Each doc contributes its num_go_tokens (<=200) prefix; a row with no
+            # GO tokens (text-only) slices to length 0. Without packing this reduces to the
+            # prior per-row `go_embeds[i][:count]`. batch_idx_map carries the doc->row map so
+            # a multi-doc pack fills all its GO blocks (HW bug 8673929: 2-doc pack had 400
+            # placeholders but the old per-row path supplied only one doc's 200 features).
+            go_per_row: list[list[torch.Tensor]] = [[] for _ in range(B)]
+            for doc_idx, ge in enumerate(go_embeds):
+                go_per_row[_go_bmap[doc_idx]].append(ge)
+            row_go = []
+            for i in range(B):
+                cat = (
+                    torch.cat(go_per_row[i], dim=0)
+                    if go_per_row[i]
+                    else torch.zeros((0, self.GO_DIM))
+                )
+                row_go.append(cat[: int(go_per_item[i].item())])
+            flat_go = torch.cat(row_go, dim=0).to(device=self.device, dtype=self.dtype)
             flat_go = self.go_projection(flat_go)
             if go_mask.sum().item() != flat_go.shape[0]:
                 raise ValueError(

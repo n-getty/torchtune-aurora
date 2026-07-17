@@ -121,10 +121,32 @@ class BioReasonModel(nn.Module):
         esm3_cache_path: Optional[str] = None,
         adapter_path: Optional[str] = None,
         proj_resume_dir: Optional[str] = None,
+        backbone_device_map: Optional[object] = None,
+        projector_output_norm: bool = False,
+        disable_protein_splice: bool = False,
+        disable_go_splice: bool = False,
     ):
         super().__init__()
         _ensure_paths()
+        # Modality-ablation switches (Exp 2, embed-on/off): keep placeholder tokens but skip
+        # writing the projected features. Isolate the protein / GO modality's contribution.
+        self.disable_protein_splice = bool(disable_protein_splice)
+        self.disable_go_splice = bool(disable_go_splice)
+        # Must match the TRAINED projector arch (model_native.projector_output_norm). When the
+        # checkpoint was trained with a LayerNorm-capped projector, the eval-side projector here
+        # MUST include the same LayerNorm or the strict load_state_dict fails. Auto-detected
+        # from the projection .pt below if not set explicitly.
+        self._projector_output_norm = bool(projector_output_norm)
 
+        # backbone_device_map: when set (e.g. "auto" or a dict), the HF backbone is
+        # loaded SHARDED across multiple devices via HF naive model-parallel instead of
+        # a single `.to(device)`. REQUIRED to host a 32B for generation on XPU: 62 GiB
+        # bf16 weights don't fit one 64 GiB tile with KV+activation headroom (vLLM TP=1
+        # AND single-tile HF both OOM). With device_map across 2 tiles (~31 GiB/tile)
+        # .generate(inputs_embeds=) fits comfortably. ESM3 cache + projections stay on
+        # `device` (the primary tile); build_prompt_embeds output is moved to the
+        # backbone's input device by the caller. Single-tile path (None) is unchanged.
+        self._backbone_device_map = backbone_device_map
         self.device = device
         self.dtype = dtype
         self._ckpt_dir = ckpt_dir
@@ -145,12 +167,26 @@ class BioReasonModel(nn.Module):
 
         # ── LLM backbone ──────────────────────────────────────────────────────
         logger.info("Loading Qwen3 LLM backbone...")
-        self.backbone = AutoModelForCausalLM.from_pretrained(
-            ckpt_dir,
-            torch_dtype=dtype,
-            attn_implementation=attn_implementation,
-            trust_remote_code=True,
-        ).to(device)
+        if self._backbone_device_map is not None:
+            # Sharded multi-device load (HF naive MP). Do NOT call .to(device) after —
+            # device_map already placed the layers; .to() would collapse them onto one
+            # device and re-OOM. The embedding/first layer lands on the "lowest" device
+            # in the map (typically `device`/xpu:0), which is where generate expects
+            # inputs_embeds — the eval moves pe to backbone.get_input_embeddings().weight.device.
+            self.backbone = AutoModelForCausalLM.from_pretrained(
+                ckpt_dir,
+                torch_dtype=dtype,
+                attn_implementation=attn_implementation,
+                trust_remote_code=True,
+                device_map=self._backbone_device_map,
+            )
+        else:
+            self.backbone = AutoModelForCausalLM.from_pretrained(
+                ckpt_dir,
+                torch_dtype=dtype,
+                attn_implementation=attn_implementation,
+                trust_remote_code=True,
+            ).to(device)
 
         # ── PEFT-LoRA on the HF backbone (published BioReason-Pro RL recipe) ───
         # The backbone is an HF AutoModelForCausalLM, so we wrap it with PEFT
@@ -256,17 +292,18 @@ class BioReasonModel(nn.Module):
             self.protein_encoder.model.to(device=device)
             protein_hidden = self.protein_encoder.embedding_dim
 
-        self.protein_projection = nn.Sequential(
-            nn.Linear(protein_hidden, self.hidden_size),
-            nn.GELU(),
-            nn.Linear(self.hidden_size, self.hidden_size),
-        ).to(device=device, dtype=dtype)
+        def _proj(in_dim):
+            layers = [
+                nn.Linear(in_dim, self.hidden_size),
+                nn.GELU(),
+                nn.Linear(self.hidden_size, self.hidden_size),
+            ]
+            if self._projector_output_norm:
+                layers.append(nn.LayerNorm(self.hidden_size))
+            return nn.Sequential(*layers).to(device=device, dtype=dtype)
 
-        self.go_projection = nn.Sequential(
-            nn.Linear(2560, self.hidden_size),
-            nn.GELU(),
-            nn.Linear(self.hidden_size, self.hidden_size),
-        ).to(device=device, dtype=dtype)
+        self.protein_projection = _proj(protein_hidden)
+        self.go_projection = _proj(2560)
 
         # ── GO encoder (optional, usually frozen with cached output) ──────────
         self.go_encoder = None
@@ -335,6 +372,17 @@ class BioReasonModel(nn.Module):
                 f"ESM3 cache model mismatch: sidecar='{meta.get('esm3_model_name')}' "
                 f"vs requested='{protein_model_name}'. Re-run precompute."
             )
+        # safetensors path (lazy per-key reads) — matches model_native._load_esm3_cache.
+        # The layer-37 caches are written as safetensors; the legacy small .pt caches still
+        # load via torch.load. Without this branch the eval would crash on a .safetensors
+        # path (torch.load can't read it).
+        if cache_path.endswith(".safetensors"):
+            from torchtune.dev.bioreason.model_native import _LazySafetensorsCache
+
+            cache = _LazySafetensorsCache(cache_path)
+            if len(cache) == 0:
+                raise ValueError(f"ESM3 safetensors cache at {cache_path} is empty.")
+            return cache, meta
         cache = torch.load(cache_path, map_location="cpu")
         if not isinstance(cache, dict) or not cache:
             raise ValueError(f"ESM3 cache at {cache_path} is empty or not a dict.")
@@ -434,7 +482,11 @@ class BioReasonModel(nn.Module):
         embeds = self._embed(input_ids)  # [B, ctx_len, H]
 
         # Protein embeddings
-        if protein_sequences:
+        # Ablation (disable_protein_splice): keep the protein PLACEHOLDER tokens (identical
+        # seqlen/format/attention structure) but do NOT overwrite them with projected ESM3
+        # features — the plain placeholder-id embedding stays. Isolates the protein-embedding
+        # modality's contribution (Exp 2, embed-on/off). Default False = normal splice.
+        if protein_sequences and not getattr(self, "disable_protein_splice", False):
             if batch_idx_map is None:
                 batch_idx_map = list(range(B))
             if self._esm3_cache is not None:
@@ -479,9 +531,9 @@ class BioReasonModel(nn.Module):
                 )
             embeds[mask] = flat
 
-        # GO embeddings
+        # GO embeddings (disable_go_splice: same ablation mechanism for the GO modality)
         go_embeds = self._get_go_embeds(go_aspects or ["all"] * B, B)
-        if go_embeds is not None:
+        if go_embeds is not None and not getattr(self, "disable_go_splice", False):
             go_mask = input_ids == self.go_token_id
             # go_embedding.pt has shape [max_go_tokens, 2560].  Slice each batch item's
             # embedding to the number of GO placeholder tokens actually present.
