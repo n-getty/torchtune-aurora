@@ -33,6 +33,14 @@ REPO_ROOT = Path(__file__).resolve().parents[4]
 CLAUDE_MD = REPO_ROOT / "CLAUDE.md"
 CODE_DIRS = [REPO_ROOT / "torchtune", REPO_ROOT / "recipes"]
 
+# CLAUDE.md is gitignored + only force-tracked in some checkouts; a fresh clone
+# or CI checkout may not have it. These doc<->code guards only make sense when
+# the doc is present, so skip (don't fail) when it is absent.
+_requires_claude_md = pytest.mark.skipif(
+    not CLAUDE_MD.exists(),
+    reason="CLAUDE.md not present in this checkout (gitignored/untracked)",
+)
+
 FLAG_RE = re.compile(r"TORCHTUNE_[A-Z0-9_]+")
 
 # The "supported, documented" set is the flags that appear as the FIRST cell of
@@ -70,6 +78,7 @@ def _code_flags() -> set[str]:
     return found
 
 
+@_requires_claude_md
 def test_documented_flags_are_wired_in_code():
     """Every TORCHTUNE_* flag in the CLAUDE.md table must exist in code."""
     documented = _documented_flags()
@@ -84,6 +93,7 @@ def test_documented_flags_are_wired_in_code():
     )
 
 
+@_requires_claude_md
 def test_report_undocumented_flags():
     """Non-failing: surface code flags missing from CLAUDE.md for awareness."""
     documented = _documented_flags()
