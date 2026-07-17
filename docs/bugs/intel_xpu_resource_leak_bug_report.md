@@ -1,6 +1,21 @@
 # XPU UR_RESULT_ERROR_OUT_OF_RESOURCES: `empty_cache()` + FSDP `storage.resize_()` Leak
 
-**Status**: ROOT CAUSE IDENTIFIED, ALL ALLOCATOR MITIGATIONS EXHAUSTED, ACCEPT CPU OFFLOAD FOR 72B (2026-04-04)
+> **CORRECTION (2026-07-06): this is a device-global MEMORY leak, not a "UR-handle" leak, and it is
+> the SAME bug as ALCF #143 / Intel MLSL-4397 — do NOT file it as a separate ALCF issue.** The doc
+> below repeatedly claims "memory_allocated is stable → this is NOT a standard memory leak → the leaked
+> resource is UR handles." That conclusion was drawn from torch `memory_stats` only. A `mem_get_info`
+> (device-global free) reading — which #143 showed torch counters are blind to — was taken on the FSDP
+> repro on 2026-07-06 (job 8648224, node x4103c2s5b0n0) and shows free memory falling **dead-linear at
+> −0.867 GiB/iter** (62.49→0.08 GiB over 73 iters) while `memory_allocated`/`memory_reserved` stay
+> pinned at 1.3/4.6 GiB; the `UR_RESULT_ERROR_OUT_OF_RESOURCES` fires exactly at device-global
+> exhaustion (~iter 73), NOT at a fixed handle count. That is the #143 signature. The leak here is
+> driven by FSDP's collectives (all_gather/reduce_scatter) rather than the bare list-style
+> `dist.all_gather` in the original #143 report — a broader trigger, same oneCCL root. **Everything
+> else in this doc — the reproducer, the iteration counts, the workaround (no empty_cache in FSDP
+> loops), the 72B fragmentation impact — remains valid; only the *named leaked resource* ("UR handle")
+> is wrong.** Log: `experiments/colocate/bugverify_logs/5disc_leak_20260706_204751.log`. Route via #143.
+
+**Status**: ROOT CAUSE IDENTIFIED, ALL ALLOCATOR MITIGATIONS EXHAUSTED, ACCEPT CPU OFFLOAD FOR 72B (2026-04-04). **Reclassified 2026-07-06 as = ALCF #143 / MLSL-4397 (device-global mem leak); see correction banner above.**
 
 **Revalidated 2026-04-23 on frameworks/2025.3.1 (torch 2.10.0a0+git449b176, Level Zero 1.24.0, I915_25.2.29): bug still active, identical signature and crash counts.** FSDP2+RL+`empty_cache()` crashes at iter ~70-75 with `UR_RESULT_ERROR_OUT_OF_RESOURCES`; FSDP1 crashes at iter ~145-150; workaround (no `empty_cache()` in FSDP loops) stable through 250 iterations. Frame-version upgrade does NOT fix this. Logs: `experiments/empty_cache_revalidate/`.
 

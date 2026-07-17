@@ -84,6 +84,11 @@ txt = open(log, errors="ignore").read()
 steps = re.findall(r"time_per_step_s['\"]?:\s*([0-9.]+)", txt)
 toks  = re.findall(r"tokens_per_second_per_gpu['\"]?:\s*([0-9.]+)", txt)
 peak  = re.findall(r"peak memory (?:reserved|active)[^0-9]*([0-9.]+)\s*GiB", txt)
+# Fallback: tqdm progress line prints the average as "<N>s/it" (e.g. "87.68s/it").
+# The recipe does not always emit time_per_step_s; capture the s/it averages so the
+# A/B still reports a number instead of n=0.
+if not steps:
+    steps = re.findall(r"([0-9.]+)s/it\]", txt)
 st = [float(x) for x in steps][warmup:]
 tk = [float(x) for x in toks][warmup:]
 def med(a): return round(statistics.median(a), 3) if a else None

@@ -81,13 +81,55 @@ def main() -> int:
     ap.add_argument("--out", default=None, help="cache .pt path (default <data_dir>/esm3_cache.pt)")
     ap.add_argument("--max_protein_len", type=int, default=128)
     ap.add_argument("--esm3_model_name", default="esm3_sm_open_v1")
+    ap.add_argument("--embedding_layer", type=int, default=-1,
+                    help="ESM3 transformer block to extract per-residue features from. "
+                         "-1 = final output (norm ~10600, NOT bridgeable by the projector "
+                         "-> ':' collapse). The published BioReason recipe uses 37 (of 48), "
+                         "whose mid-block features have a far smaller, trainable-from norm. "
+                         "Use 37 to match the published recipe. The sidecar records this so a "
+                         "stale -1 cache can't be silently reused with a layer-37 run.")
     ap.add_argument("--log_every", type=int, default=100)
     ap.add_argument("--flush_every", type=int, default=500,
                     help="checkpoint the partial cache to disk every N new seqs")
+    ap.add_argument("--shard", type=int, default=0,
+                    help="this worker's shard index in [0, nshards). Each shard encodes "
+                         "todo[shard::nshards] and writes <out>.shard<shard> (no overwrite "
+                         "of the main cache). Run --merge after all shards finish.")
+    ap.add_argument("--nshards", type=int, default=1,
+                    help="total shards (e.g. 12 tiles). nshards=1 = single-process (legacy).")
+    ap.add_argument("--merge", action="store_true",
+                    help="merge all <out>.shard* + existing <out> into <out> and write sidecar.")
     args = ap.parse_args()
 
     out_path = args.out or os.path.join(args.data_dir, "esm3_cache.pt")
     sidecar = out_path + ".json"
+
+    # ── merge mode: combine shard files + existing cache into the final out_path ──
+    if args.merge:
+        merged: dict = {}
+        if os.path.exists(out_path):
+            merged.update(torch.load(out_path, map_location="cpu"))
+            print(f"[merge] base cache: {len(merged)} keys", flush=True)
+        import re as _re
+        shard_files = sorted(
+            os.path.join(os.path.dirname(out_path) or ".", fn)
+            for fn in os.listdir(os.path.dirname(out_path) or ".")
+            if _re.match(_re.escape(os.path.basename(out_path)) + r"\.shard\d+$", fn)
+        )
+        for sf in shard_files:
+            d = torch.load(sf, map_location="cpu")
+            merged.update(d)
+            print(f"[merge] +{len(d)} from {os.path.basename(sf)} -> {len(merged)} total", flush=True)
+        if not merged:
+            raise RuntimeError("merge produced empty cache — no shards/base found.")
+        embedding_dim = int(next(iter(merged.values())).shape[-1])
+        _atomic_save(merged, out_path)
+        with open(sidecar, "w") as f:
+            json.dump({"max_protein_len": args.max_protein_len, "embedding_dim": embedding_dim,
+                       "esm3_model_name": args.esm3_model_name, "n_seqs": len(merged),
+                       "embedding_layer": args.embedding_layer}, f, indent=2)
+        print(f"[merge] wrote {len(merged)} keys -> {out_path} (+ sidecar)", flush=True)
+        return
 
     device = (
         torch.device("xpu") if (hasattr(torch, "xpu") and torch.xpu.is_available())
@@ -100,14 +142,29 @@ def main() -> int:
     print(f"[precompute] {len(uniq)} unique truncated sequences "
           f"(max_protein_len={args.max_protein_len})", flush=True)
 
-    # Resume: load any existing partial cache.
-    cache: dict[str, torch.Tensor] = {}
-    if os.path.exists(out_path):
-        cache = torch.load(out_path, map_location="cpu")
-        print(f"[precompute] resuming: {len(cache)} keys already cached", flush=True)
+    # Sharded mode: each worker owns todo[shard::nshards] and writes its own shard file.
+    # Resume reads BOTH the main cache (already-encoded) AND this shard's own partial file.
+    sharded = args.nshards > 1
+    write_path = f"{out_path}.shard{args.shard}" if sharded else out_path
 
-    todo = [s for s in uniq if _esm3_cache_key(s) not in cache]
-    print(f"[precompute] {len(todo)} sequences to encode", flush=True)
+    already = set()
+    if os.path.exists(out_path):
+        base = torch.load(out_path, map_location="cpu")
+        already |= set(base.keys())
+        print(f"[precompute] base cache: {len(base)} keys already encoded", flush=True)
+    cache: dict[str, torch.Tensor] = {}
+    if sharded and os.path.exists(write_path):
+        cache = torch.load(write_path, map_location="cpu")
+        already |= set(cache.keys())
+        print(f"[precompute shard{args.shard}] resuming own shard: {len(cache)} keys", flush=True)
+    elif not sharded and os.path.exists(out_path):
+        cache = torch.load(out_path, map_location="cpu")
+
+    # Owned subset for this shard, minus anything already encoded (base or own partial).
+    owned = uniq[args.shard::args.nshards] if sharded else uniq
+    todo = [s for s in owned if _esm3_cache_key(s) not in already]
+    print(f"[precompute shard{args.shard}/{args.nshards}] {len(todo)} sequences to encode "
+          f"(of {len(owned)} owned)", flush=True)
 
     if todo:
         # Reuse the model wrapper's path/env setup: it inserts BIOREASON_SRC/DEPS
@@ -117,7 +174,10 @@ def main() -> int:
         _ensure_paths()
         from bioreason2.models.protein_encoder import create_protein_encoder
 
-        enc = create_protein_encoder(args.esm3_model_name, inference_mode=True)
+        enc = create_protein_encoder(
+            args.esm3_model_name, inference_mode=True,
+            embedding_layer=args.embedding_layer,
+        )
         enc.model.to(device=device)
         embedding_dim = int(enc.embedding_dim)
 
@@ -132,18 +192,24 @@ def main() -> int:
                 rate = (i + 1) / max(time.perf_counter() - t0, 1e-6)
                 print(f"[precompute] {i + 1}/{len(todo)} ({rate:.1f} seq/s)", flush=True)
             if (i + 1) % args.flush_every == 0:
-                _atomic_save(cache, out_path)
-                print(f"[precompute] flushed partial cache ({len(cache)} keys)", flush=True)
-    else:
-        # Nothing to do, but we may still need embedding_dim for the sidecar.
+                _atomic_save(cache, write_path)
+                print(f"[precompute shard{args.shard}] flushed ({len(cache)} keys)", flush=True)
+    elif cache:
         embedding_dim = int(next(iter(cache.values())).shape[-1])
+    else:
+        embedding_dim = None
 
-    _atomic_save(cache, out_path)
+    _atomic_save(cache, write_path)
+    if sharded:
+        print(f"[precompute shard{args.shard}] DONE wrote {len(cache)} keys -> {write_path}. "
+              f"Run --merge after all shards finish.", flush=True)
+        return
     meta = {
         "max_protein_len": args.max_protein_len,
         "embedding_dim": embedding_dim,
         "esm3_model_name": args.esm3_model_name,
         "n_seqs": len(cache),
+        "embedding_layer": args.embedding_layer,
     }
     with open(sidecar, "w") as f:
         json.dump(meta, f, indent=2)

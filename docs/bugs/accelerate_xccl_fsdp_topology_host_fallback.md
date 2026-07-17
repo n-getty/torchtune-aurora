@@ -2,7 +2,19 @@
 
 **System:** Aurora (ALCF), Intel Max 1550, `frameworks/2025.3.1` (torch 2.10+xpu, oneCCL 2021.17),
 HF `accelerate 1.12.0` + `trl 1.5.1` FSDP (NOT torchtune's native FSDP).
-**Status:** root cause narrowed, not closed. Reproduced on Qwen3-4B, 12 tiles, 1 node.
+**Status:** **NOT AN ALCF PLATFORM BUG — do not file to AuroraBugTracking (decided 2026-07-06).**
+The native-FSDP control the "Likely fix directions" section below asked for already exists in
+`benchmarks/sft_throughput_aurora_vs_polaris/` and *disconfirms* the platform-bug framing. In one
+PBS job on one node (`logs/pbs_fix_final.out`), native torchtune full-FT, native torchtune LoRA, and
+accelerate/TRL full-FT **all emit the identical 12× `comm_dev_uuids ... node_dev_uuids size 1`
+warning** — yet native full-FT runs at **4.79 s/step** (`results/fixfinal_tt_full.json`) vs
+accelerate/TRL full-FT at **13.59 s/step** (`results/parity_aurora_full.json`), same Qwen3-4B / 12
+tiles / seqlen 2048 / FULL_SHARD. The warning is therefore **engine-independent and benign** under
+per-rank `ZE_AFFINITY_MASK`; it is NOT the host-fallback marker this doc originally read it as. The
+2.84× gap is inside **HF-accelerate's FSDP FULL_SHARD path**, not the Aurora oneCCL stack (REPORT.md
+attributes it to accelerate's default sharding leaving ~12× on the table, recoverable with
+SHARD_GRAD_OP/HYBRID_SHARD). If pursued at all, this is an upstream **HF-accelerate** issue, not an
+ALCF/Intel platform ticket. Reproduced on Qwen3-4B, 12 tiles, 1 node.
 
 ## Symptom
 

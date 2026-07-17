@@ -5,7 +5,7 @@ set -eo pipefail   # no set -u
 
 PROJDIR=/lus/flare/projects/ModCon/ngetty/torchtune
 RECIPE="${PROJDIR}/recipes/dev/full_finetune_distributed_xpu.py"
-CONFIG="${PROJDIR}/recipes/configs/dev/production/sft_qwen3_32B_fitstest_xpu.yaml"
+CONFIG="${CONFIG:-${PROJDIR}/recipes/configs/dev/production/sft_qwen3_32B_fitstest_xpu.yaml}"
 NPROC="${NPROC:-12}"
 
 module load frameworks/2025.3.1 2>/dev/null || module load frameworks 2>/dev/null || true
