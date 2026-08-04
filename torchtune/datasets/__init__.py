@@ -18,6 +18,10 @@ from torchtune.datasets._samsum import samsum_dataset
 from torchtune.datasets._sft import SFTDataset
 from torchtune.datasets._slimorca import slimorca_dataset
 from torchtune.datasets._stack_exchange_paired import stack_exchange_paired_dataset
+from torchtune.datasets._synthetic import (
+    SyntheticFixedLengthDataset,
+    synthetic_fixed_length_dataset,
+)
 from torchtune.datasets._text_completion import (
     text_completion_dataset,
     TextCompletionDataset,
@@ -44,4 +48,6 @@ __all__ = [
     "SFTDataset",
     "hh_rlhf_helpful_dataset",
     "multimodal",
+    "SyntheticFixedLengthDataset",
+    "synthetic_fixed_length_dataset",
 ]

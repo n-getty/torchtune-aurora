@@ -71,6 +71,10 @@ def _run_import(recipe_path: str, class_name: str) -> subprocess.CompletedProces
             "recipes/dev/lora_finetune_distributed_xpu.py",
             "LoRAFinetuneRecipeDistributedXPU",
         ),
+        (
+            "recipes/dev/full_finetune_moe_distributed_xpu.py",
+            "FullFinetuneMoEDistributedXPU",
+        ),
     ],
 )
 def test_xpu_sft_recipe_imports_on_cpu_host(recipe_path: str, classname: str) -> None:

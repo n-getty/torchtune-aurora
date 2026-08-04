@@ -1,0 +1,157 @@
+# BioReason multimodal SFT — FROZEN-BACKBONE + LayerNorm-PROJECTOR, Qwen3.6-27B (HF-wrapper, XPU)
+#
+# Qwen3.6-27B (Qwen3.5-family hybrid linear-attention: model_type=qwen3_5, 48 Gated-DeltaNet +
+# 16 full-attention layers, interval-4 pattern) integrated via the HF-wrapper adapter
+# (torchtune/dev/bioreason/hf_qwen35_backbone.py::HFQwen35Backbone) — NOT a native torchtune
+# port. See /home/ngetty/.claude/plans/jiggly-jumping-garden.md for the full integration plan.
+#
+# This is Stage 1 of the published two-stage (LLaVA-style) BioReason recipe, cloned from the
+# validated sft_bioreason_qwen3_32B_stage1norm_xpu.yaml: backbone fully FROZEN, only the
+# protein/GO projections train (LayerNorm-bounded output, sidesteps the over-amplification /
+# ':' collapse trap documented on the Qwen3-32B config). Everything else (seq6144,
+# full-shard, pad_to_fixed, ESM3/GO caches) mirrors the 32B config except:
+#   - base_model_path / backbone_builder / hf_backbone_config_path: point at the real
+#     Qwen3.5-27B HF checkpoint and route through the HF-wrapper backbone_builder.
+#   - protein_token_id / go_token_id: RESERVED ids in Qwen3.5-27B's own vocab gap (see below),
+#     NOT the Qwen3-32B values (151643/151644 — wrong vocab, would collide with a real token
+#     here since Qwen3.5's tokenizer.json only defines up to id 248076).
+#   - checkpointer: placeholder-only. Base weights are loaded directly in _setup_model via
+#     load_qwen35_safetensors()+remap_qwen35_checkpoint_keys() (see plan §3b) — this repo's
+#     FullModelHFCheckpointer has no model_type entry for qwen3_5 and its conversion logic
+#     does not apply to this architecture. The block below exists ONLY because the parent
+#     recipe's __init__ (full_finetune_distributed_xpu.py) reads cfg.checkpointer.model_type
+#     directly (activation-offloading hint check) before _NullBaseCheckpointer is wired in;
+#     any model_type != "LLAMA3_VISION" satisfies it. checkpoint_dir/checkpoint_files are unused.
+#   - compile: false — torch.compile/fused-RMSNorm/fused-RoPE all target torchtune-native
+#     module classes (TransformerSelfAttentionLayer/RMSNorm/RotaryPositionalEmbeddings), none
+#     of which exist in the HF Qwen3_5ForCausalLM tree; the recipe now logs this explicitly as
+#     a documented no-op if compile is ever flipped true (see plan §3d), but v1 keeps it off.
+#   - pad_buckets/bucket_batch_sizes: NOT carried over from the 32B config. This architecture's
+#     memory/compute profile (linear-attention layers, no flash/compile engagement) is
+#     unvalidated — start with fixed-shape padding only; bucketed-batch tuning is a follow-on.
+#
+# Recipe: recipes/dev/sft_bioreason_distributed_xpu.py
+
+name: sft_bioreason_qwen36_27b_stage1norm_xpu
+output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/experiments/bioreason/runs/${name}
+base_model_path: /lus/flare/projects/ModCon/ngetty/models/Qwen3.5-27B
+sft_data_dir: /lus/flare/projects/ModCon/ngetty/datasets/bioreason_sft_reasoning/data
+# LAYER-37 ESM3 cache (the scale fix — see the Qwen3-32B config for the full rationale).
+esm3_cache_path: /lus/flare/projects/ModCon/ngetty/datasets/bioreason_sft_reasoning/esm3_cache_2048_l37.safetensors
+go_embedding_path: /lus/flare/projects/ModCon/ngetty/models/bioreason-pro-sft/go_embedding.pt
+
+# ── Tokenizer (Qwen3.5-27B: BPE vocab.json/merges.txt, same format as Qwen3) ────────────────
+# qwen3_tokenizer is format-generic (reads vocab.json+merges.txt directly, no hardcoded vocab
+# size) — confirmed working unchanged against this vocab (248044 base + added-token ids up to
+# 248076) via direct construction + encode/decode round-trip. special_tokens_path points at
+# tokenizer.json so <think>/</think>/<tool_call>/etc. resolve to THIS checkpoint's real ids
+# (248068/248069/248058/... — NOT the Qwen3-32B QWEN3_SPECIAL_TOKENS defaults, which are wrong
+# ids for this vocab).
+tokenizer:
+  _component_: torchtune.models.qwen3.qwen3_tokenizer
+  path: ${base_model_path}/vocab.json
+  merges_file: ${base_model_path}/merges.txt
+  special_tokens_path: ${base_model_path}/tokenizer.json
+  max_seq_len: 6144
+
+# ── Model — STAGE 1: frozen HF-wrapper backbone, no LoRA, train projections only ────────────
+# protein/go ids: Qwen3.5-27B's tokenizer.json defines ids [0, 248076] (248044 base BPE tokens
+# + 33 added/special tokens up to 248076); text_config.vocab_size=248320 leaves [248077, 248319]
+# (243 ids) RESERVED/unused — analogous to the Qwen3 151643-151935 gap the 32B config uses.
+model:
+  _component_: torchtune.dev.bioreason.model_native.BioReasonNativeModel
+  backbone_builder: qwen3_5_27b_hf
+  hf_backbone_config_path: ${base_model_path}/config.json
+  hidden_size: 5120
+  protein_token_id: 248077
+  go_token_id: 248078
+  enable_lora: false              # NO LoRA — backbone fully frozen (sidesteps LoRA splice bug)
+  freeze_backbone: true           # train ONLY protein_projection + go_projection
+  projector_output_norm: true     # LayerNorm on projector output -> BOUNDED magnitude
+  esm3_cache_path: ${esm3_cache_path}
+  go_embedding_path: ${go_embedding_path}
+
+# Placeholder only — see header comment. Base weights load via load_qwen35_safetensors() in
+# _setup_model, NOT through this checkpointer. model_type is read once (activation-offloading
+# hint check) by the parent's __init__ before _is_hf_backbone routing takes over; any value
+# other than LLAMA3_VISION satisfies it.
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: []
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: QWEN3
+
+resume_from_checkpoint: false
+save_every_n_epochs: 1
+
+# ── Dataset (identical distribution to Stage 2 + eval) ──────────────────────────
+dataset:
+  _component_: torchtune.dev.bioreason.dataset_sft.bioreason_sft_dataset
+  data_files: ${sft_data_dir}
+  max_seq_len: 6144
+  max_protein_len: 2048
+  num_go_tokens: 200
+  protein_token_id: 248077
+  go_token_id: 248078
+  train_on_reasoning: true
+  inject_go_pred: true
+seed: 1234
+shuffle: true
+collate_fn: torchtune.dev.bioreason.dataset_sft.bioreason_sft_collate_fn
+dataloader_num_workers: 0
+
+# ── Training envelope — Stage 1: 1 epoch, lr 1e-4 (published Stage 1) ────────────
+epochs: 1
+max_steps_per_epoch: null
+batch_size: 1
+gradient_accumulation_steps: 4
+clip_grad_norm: 1.0
+
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 1.0e-4
+  weight_decay: 0.0
+  fused: true
+
+loss:
+  _component_: torchtune.modules.loss.LinearCrossEntropyLoss
+
+# ── Distributed / FSDP — full 12-way shard ───────────────────────────────────────
+enable_activation_checkpointing: true
+enable_activation_offloading: false
+fsdp_cpu_offload: false
+fsdp_reshard_after_forward: true
+data_parallel_replicate_dim: 1
+data_parallel_shard_dim: -1
+tensor_parallel_dim: 1
+pad_to_fixed: true
+
+# ── XPU ───────────────────────────────────────────────────────────────────────
+device: xpu
+dtype: bf16
+compile: false
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+log_level: INFO
+log_every_n_steps: 1
+log_peak_memory_stats: true
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: false
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: true
+  cuda: false
+  profile_memory: false
+  with_stack: false
+  record_shapes: false
+  with_flops: false
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1

@@ -116,11 +116,22 @@ epochs: 1
 
 clip_grad_norm: 1.0
 
-# Plain on-device AdamW — EP=8 halves sharded params to ~625M, FP32 optimizer
-# state ~5 GiB per rank, fits the post-v9-release ~7 GiB headroom.
-# Switch to torchtune.dev.bioreason.optim.AdamWBf16 if OOM persists at v10 step 1.
+# AdamWBf16 (CPU-side, safe default regardless of forward_batch_size).
+# UPDATE (2026-07-21): plain on-device torch.optim.AdamW(fused=True) is a big
+# win (~2x step time) but had appeared to CRASH banned:1 at G=4/fbs=2+ (memory
+# climbs to ~57.5 GiB pre-crash). ROOT-CAUSED same day: that crash was actually
+# GroupedExpertsHF's padded-BMM forward allocating a fresh [E, max_count, dim]
+# tensor every call, NOT an AdamW-specific fragmentation ceiling. Fixed by
+# TORCHTUNE_MOE_SEQUENTIAL_EXPERTS=1 (HW-validated: G=4/fbs=2 AND G=8/fbs=4
+# both clean 4/4 with plain AdamW + this flag, ~83s/step vs ~166s with
+# AdamWBf16 — roughly halves the step). If also setting
+# TORCHTUNE_MOE_SEQUENTIAL_EXPERTS=1 (auto-enabled by
+# run_qwen3_30b_ep8_vllm_2node.sh at forward_batch_size>=4), override to
+# torch.optim.AdamW + fused=True for a ~2x win at any G tested so far. See
+# memory/project_ep8_plain_adamw_breakthrough_20260721.md and
+# memory/project_qwen3_moe_padded_bmm_l0_exhaustion_fix_20260721.md.
 optimizer:
-  _component_: torch.optim.AdamW
+  _component_: torchtune.dev.bioreason.optim.AdamWBf16
   lr: 5e-6
 lr_scheduler:
   _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup

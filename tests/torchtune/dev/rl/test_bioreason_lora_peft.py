@@ -21,10 +21,13 @@ without instantiating the full BioReasonModel (which needs ESM3 + a checkpoint
      sync relies on (it brackets the param gather in merge/unmerge so vLLM
      receives the merged W_eff).
 """
+import types
+
 import pytest
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("peft")
+nn = torch.nn
 
 from torchtune.dev.bioreason.model import BioReasonModel
 
@@ -270,3 +273,32 @@ def test_bf16_base_keeps_adapters_bf16_for_fsdp1_uniform_dtype():
     assert dtypes == {torch.bfloat16}, (
         f"trainable adapters must be uniform bf16 for FSDP1, got {dtypes}"
     )
+
+
+# ── 3. _embed freeze (regression guard for the H200-sibling-project bug class) ─
+
+def test_freeze_embed_copy_sets_requires_grad_false():
+    """self._embed is a standalone completion-token-lookup copy, loaded
+    independently from checkpoint safetensors (NOT a reference into
+    self.backbone), so get_peft_model's freeze has no visibility into it.
+
+    A sibling HF/PEFT BioReason stack left this exact tensor unfrozen under
+    LoRA (only the projections were explicitly frozen; the separate embedding
+    copy defaulted to requires_grad=True and trained silently every step,
+    ~778M extra params at 32B scale — 5.7x the intended LoRA adapter size).
+    _freeze_embed_copy is called unconditionally in __init__ regardless of
+    enable_lora; this pins that it actually does the freeze.
+    """
+    stub = types.SimpleNamespace(_embed=nn.Embedding(5, 4))
+    BioReasonModel._freeze_embed_copy(stub)
+    assert stub._embed.weight.requires_grad is False
+
+
+def test_freeze_embed_copy_freezes_even_without_lora():
+    """The freeze must not be conditioned on _has_lora — full-FT (enable_lora=
+    False) also treats _embed as a fixed convenience copy, never a trained
+    parameter, matching model_native.py's frozen-by-construction tok_embeddings
+    alias semantics."""
+    stub = types.SimpleNamespace(_has_lora=False, _embed=nn.Embedding(5, 4))
+    BioReasonModel._freeze_embed_copy(stub)
+    assert stub._embed.weight.requires_grad is False

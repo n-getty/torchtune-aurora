@@ -120,11 +120,17 @@ class GroupedExperts(nn.Module):
             return x_zero + anchor
 
         # Round before int conversion to guard against float32 rounding (e.g. 44.9999 → 45).
-        counts = num_tokens_per_expert.round().to(torch.int64)
-        out = torch.empty(total, self.dim, dtype=x.dtype, device=x.device)
+        counts = (
+            num_tokens_per_expert
+            if not torch.is_floating_point(num_tokens_per_expert)
+            else num_tokens_per_expert.round().to(torch.int64)
+        )
+        count_list = counts.tolist()
+        out = torch.empty(
+            (total, *x.shape[1:-1], self.dim), dtype=x.dtype, device=x.device
+        )
         offset = 0
-        for e in range(E):
-            count = int(counts[e].item())
+        for e, count in enumerate(count_list):
             if count == 0:
                 continue
             x_e = x[offset : offset + count]  # [count, dim] — slice, no new alloc
@@ -178,9 +184,18 @@ class GroupedExperts(nn.Module):
         assert (
             x.dtype == w1.dtype == w2.dtype == w3.dtype == torch.bfloat16
         ), "torch._grouped_mm only supports bf16 dtypes"
-        h = self.act_fn(torch._grouped_mm(x, w1, offs=offsets))
-        h = h * torch._grouped_mm(x, w3, offs=offsets)
-        out = torch._grouped_mm(h, w2, offs=offsets)
+        measurement = getattr(self, "_moe_measurement", None)
+        if measurement is not None and measurement.enabled:
+            with measurement.time("grouped_gemm_gate"):
+                h = self.act_fn(torch._grouped_mm(x, w1, offs=offsets))
+            with measurement.time("grouped_gemm_up"):
+                h = h * torch._grouped_mm(x, w3, offs=offsets)
+            with measurement.time("grouped_gemm_down"):
+                out = torch._grouped_mm(h, w2, offs=offsets)
+        else:
+            h = self.act_fn(torch._grouped_mm(x, w1, offs=offsets))
+            h = h * torch._grouped_mm(x, w3, offs=offsets)
+            out = torch._grouped_mm(h, w2, offs=offsets)
         return out
 
 

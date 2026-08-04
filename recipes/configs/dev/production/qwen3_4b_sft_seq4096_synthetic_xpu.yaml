@@ -1,0 +1,126 @@
+# Qwen3-4B FULL SFT throughput benchmark — seq_len=4096, SYNTHETIC data — Aurora (XPU)
+#
+# Sibling of qwen3_4b_sft_throughput_aurora_xpu.yaml (packed alpaca @ seq2048/
+# seq1536, the PERMANENT short-sequence data point — do not edit that file or
+# treat this one as superseding it). This is the isoFLOPs-style, LONGER/
+# REALISTIC-sequence-length variant of the MoE-vs-dense MFU comparison
+# (memory/project_moe_sft_profiling_gradrelease_bottleneck_20260724.md,
+# "MFU-20% push" 2026-07-25 entries), built because the alpaca/packed
+# comparison's short (~85-token median) and highly variable length structurally
+# blocked flash attention for BOTH models (packing's block-diagonal mask
+# conflicts with the mask=None-only native flash kernel).
+#
+# Uses torchtune.datasets.synthetic_fixed_length_dataset: every sample is
+# EXACTLY tokenizer.max_seq_len tokens, so the standard (non-packed) SFT
+# collate never adds padding and never constructs a mask key — mask=None
+# reaches attention by construction (CPU-proven,
+# tests/torchtune/datasets/test_synthetic_fixed_length_dataset.py), letting
+# TORCHTUNE_USE_XPU_FLASH=1 engage with zero new code. dataset.packed is
+# intentionally ABSENT — packing is unneeded (every sample already the
+# target length) and would reintroduce the block-diagonal mask that blocks
+# flash.
+#
+# Run matched to the MoE EP=8 tile count (NPROC=8, not the full 12) via
+# benchmarks/sft_throughput_aurora_vs_polaris/run_aurora_torchtune.sh
+# NPROC=8 EXTRA_OVERRIDES='...' — see the seq1536 matched-comparison
+# precedent in memory (job 8699055, 2026-07-24) for why 8 not 12.
+#
+# Recipe:   recipes/dev/full_finetune_distributed_xpu.py
+# Launcher: benchmarks/sft_throughput_aurora_vs_polaris/run_aurora_torchtune.sh
+
+name: qwen3_4b_sft_seq4096_synthetic
+output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/benchmarks/sft_throughput_aurora_vs_polaris/runs/${name}
+base_model_path: /lus/flare/projects/ModCon/ngetty/models/Qwen3-4B
+
+# ── Model ────────────────────────────────────────────────────────────────────
+model:
+  _component_: torchtune.models.qwen3.qwen3_4b_instruct
+
+# ── Tokenizer ────────────────────────────────────────────────────────────────
+tokenizer:
+  _component_: torchtune.models.qwen3.qwen3_tokenizer
+  path: ${base_model_path}/vocab.json
+  merges_file: ${base_model_path}/merges.txt
+  max_seq_len: 4096
+
+# ── Checkpointer ─────────────────────────────────────────────────────────────
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [
+    model-00001-of-00003.safetensors,
+    model-00002-of-00003.safetensors,
+    model-00003-of-00003.safetensors,
+  ]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  # Qwen3-4B is missing lm_head.weight on HF (tied embeds); QWEN2 type handles it.
+  model_type: QWEN2
+
+resume_from_checkpoint: false
+
+# ── Dataset (synthetic, fixed-length @ tokenizer.max_seq_len, no padding) ─────
+dataset:
+  _component_: torchtune.datasets.synthetic_fixed_length_dataset
+  seq_len: 4096
+  vocab_size: 151936   # Qwen3 vocab size; set explicitly so this doesn't depend
+                       # on tokenizer internals (Qwen3Tokenizer has no vocab_size
+                       # attribute, only `encoder` — a dict).
+  num_samples: 10000
+seed: 1234
+shuffle: true
+dataloader_num_workers: 4
+
+# ── Training envelope ─────────────────────────────────────────────────────────
+epochs: 1
+max_steps_per_epoch: 55      # ~10 warmup + ~45 measured (launcher trims warmup)
+batch_size: 2                # re-check memory headroom without flash; drop to 1 if needed
+gradient_accumulation_steps: 1
+clip_grad_norm: null
+
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 1.0e-5
+  weight_decay: 0.0
+  fused: true
+
+loss:
+  _component_: torchtune.modules.loss.LinearCrossEntropyLoss
+
+# ── Distributed / FSDP (top-level wrap, reshard-after-forward) ────────────────
+enable_activation_checkpointing: true
+enable_activation_offloading: false
+fsdp_cpu_offload: false
+fsdp_reshard_after_forward: true
+data_parallel_replicate_dim: 1
+data_parallel_shard_dim: -1   # infers from NPROC (run at NPROC=8 to match MoE EP=8)
+tensor_parallel_dim: 1
+
+# ── XPU ──────────────────────────────────────────────────────────────────────
+device: xpu
+dtype: bf16
+compile: false   # A/B separately per the seq1536 precedent; not assumed here
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+log_level: INFO
+log_every_n_steps: 1
+log_peak_memory_stats: true
+
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: false
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: true
+  cuda: false
+  profile_memory: false
+  with_stack: false
+  record_shapes: false
+  with_flops: false
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1

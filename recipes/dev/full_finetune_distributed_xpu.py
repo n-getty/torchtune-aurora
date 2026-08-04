@@ -314,6 +314,7 @@ class FullFinetuneRecipeDistributedXPU(FTRecipeInterface):
         self._gradient_accumulation_steps = cfg.gradient_accumulation_steps
         self._optimizer_in_bwd = cfg.get("optimizer_in_bwd", False)
         self._clip_grad_norm = cfg.get("clip_grad_norm", None)
+        self._skip_checkpointing = cfg.get("skip_checkpointing", False)
         # XPU multi-node: each rank sees only its tile as xpu:0 under
         # ZE_AFFINITY_MASK=$LOCAL_RANK (set by the per-rank mpiexec wrapper).
         # torchtune's utils._setup_device validates `local_rank < device_count()`,
@@ -1103,6 +1104,12 @@ class FullFinetuneRecipeDistributedXPU(FTRecipeInterface):
         return log_dict
 
     def save_checkpoint(self, *, epoch: int, full_tensors: bool):
+        if self._skip_checkpointing:
+            utils.log_rank_zero(
+                self._logger,
+                "Skipping checkpoint write because skip_checkpointing=true",
+            )
+            return
         training_progress_epoch = epoch
         if self.global_step % self._steps_per_epoch == 0:
             training_progress_epoch += 1

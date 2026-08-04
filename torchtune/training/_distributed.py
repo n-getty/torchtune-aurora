@@ -66,28 +66,30 @@ class ParallelDims:
     cp: int
     world_size: int
     ep: int = 1
+    pp: int = 1
 
     def __post_init__(self):
         self._validate()
 
     def _validate(self):
-        dp_replicate, dp_shard, tp, cp = (
+        dp_replicate, dp_shard, tp, cp, pp = (
             self.dp_replicate,
             self.dp_shard,
             self.tp,
             self.cp,
+            self.pp,
         )
-        for d in (dp_replicate, tp, cp):
+        for d in (dp_replicate, tp, cp, pp):
             assert d >= 1, "Parallelism degree should be >= 1, except for dp_shard"
 
         assert dp_shard == -1 or dp_shard >= 1, " dp_shard must -1 or >=1."
         if dp_shard < 0:
-            self.dp_shard = dp_shard = self.world_size // (dp_replicate * tp * cp)
+            self.dp_shard = dp_shard = self.world_size // (dp_replicate * tp * cp * pp)
         assert dp_shard >= 1
 
-        assert dp_replicate * dp_shard * tp * cp == self.world_size, (
+        assert dp_replicate * dp_shard * tp * cp * pp == self.world_size, (
             f"Invalid parallel dims: dp_replicate({dp_replicate}) * dp_shard({dp_shard}) * "
-            f"tp({tp}) != WORLD_SIZE({self.world_size})"
+            f"tp({tp}) * cp({cp}) * pp({pp}) != WORLD_SIZE({self.world_size})"
         )
 
         assert self.ep >= 1, "ep must be >= 1"
@@ -102,8 +104,8 @@ class ParallelDims:
         dims = []
         names = []
         for d, name in zip(
-            [self.dp_replicate, self.dp_shard, self.cp, self.tp],
-            ["dp_replicate", "dp_shard", "cp", "tp"],
+            [self.pp, self.dp_replicate, self.dp_shard, self.cp, self.tp],
+            ["pp", "dp_replicate", "dp_shard", "cp", "tp"],
         ):
             if d > 1:
                 dims.append(d)
@@ -184,10 +186,14 @@ class ParallelDims:
     def ep_enabled(self):
         return self.ep > 1
 
+    @property
+    def pp_enabled(self):
+        return self.pp > 1
+
     @cached_property
     def non_data_parallel_size(self):
         # update below as more parallelism options are implemented
-        return self.tp * self.cp
+        return self.tp * self.cp * self.pp
 
     @cached_property
     def min_seq_len_divisor(self):
@@ -486,7 +492,10 @@ def load_from_full_model_state_dict(
                 if mesh.ndim > 1:
                     # HSDP 2D mesh: placements=(Replicate(), Shard(dim)).
                     # Compute local shard on CPU without communication, then move to device.
-                    from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
+                    from torch.distributed.tensor._utils import (
+                        compute_local_shape_and_global_offset,
+                    )
+
                     local_shape, global_offset = compute_local_shape_and_global_offset(
                         full_tensor.shape, mesh, placements
                     )
@@ -514,7 +523,10 @@ def load_from_full_model_state_dict(
                     # distribute_tensor uses scatter collectives that deadlock
                     # XCCL on multi-node Aurora. Since all ranks load the full
                     # checkpoint, we can shard locally without communication.
-                    from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
+                    from torch.distributed.tensor._utils import (
+                        compute_local_shape_and_global_offset,
+                    )
+
                     local_shape, global_offset = compute_local_shape_and_global_offset(
                         full_tensor.shape, mesh, placements
                     )
@@ -752,6 +764,7 @@ def shard_model(
     reshard_after_forward: bool = True,
     dp_mesh: Optional[DeviceMesh] = None,
     disable_prefetch: bool = False,
+    ignored_params: Optional[set[nn.Parameter]] = None,
 ) -> None:
     """
     Utility to shard a model with FSDP using the PyTorch Distributed fully_shard API.
@@ -775,11 +788,17 @@ def shard_model(
         disable_prefetch (bool): If True, disable AllGather prefetch at root level by using
             reshard_after_forward=True instead of None. Reduces peak memory at cost of
             potentially less compute-comms overlap. Default False.
+        ignored_params (Optional[set[nn.Parameter]]): Parameters that FSDP should leave
+            materialized and unmanaged. The same set is passed to every nested FSDP unit.
 
     Raises:
         ValueError: If no layer modules were sharded, indicating that no shard_condition was triggered.
     """
-    fsdp_kwargs = {"reshard_after_forward": reshard_after_forward, "mesh": dp_mesh}
+    fsdp_kwargs = {
+        "reshard_after_forward": reshard_after_forward,
+        "mesh": dp_mesh,
+        "ignored_params": ignored_params,
+    }
     if cpu_offload:
         fsdp_kwargs["offload_policy"] = CPUOffloadPolicy()
 
@@ -845,7 +864,10 @@ def shard_experts_for_ep(
     """
     from torchtune.modules.moe.experts import GroupedExperts
 
-    fsdp_kwargs: dict = {"reshard_after_forward": reshard_after_forward, "mesh": ep_mesh}
+    fsdp_kwargs: dict = {
+        "reshard_after_forward": reshard_after_forward,
+        "mesh": ep_mesh,
+    }
     if cpu_offload:
         fsdp_kwargs["offload_policy"] = CPUOffloadPolicy()
 
@@ -920,8 +942,10 @@ def disable_fsdp2_backward_prefetch(model: nn.Module) -> int:
         Number of FSDPParamGroup instances patched.
     """
     try:
+        from torch.distributed.fsdp._fully_shard._fsdp_state import (
+            _get_module_fsdp_state,
+        )
         from torch.distributed.fsdp._fully_shard._fully_shard import FSDPModule
-        from torch.distributed.fsdp._fully_shard._fsdp_state import _get_module_fsdp_state
     except ImportError:
         _log.warning(
             "disable_fsdp2_backward_prefetch: cannot import FSDP2 internals, skipping."
@@ -956,7 +980,10 @@ def disable_fsdp2_backward_prefetch(model: nn.Module) -> int:
 def _get_fsdp_state(module: nn.Module):
     """Get the FSDPState for an FSDP2-wrapped module, or None."""
     try:
-        from torch.distributed.fsdp._fully_shard._fsdp_state import _get_module_fsdp_state
+        from torch.distributed.fsdp._fully_shard._fsdp_state import (
+            _get_module_fsdp_state,
+        )
+
         return _get_module_fsdp_state(module)
     except ImportError:
         pass
@@ -972,6 +999,7 @@ def _is_fsdp_module(module: nn.Module) -> bool:
     """Check if a module is wrapped by FSDP2's fully_shard()."""
     try:
         from torch.distributed.fsdp._fully_shard._fully_shard import FSDPModule
+
         return isinstance(module, FSDPModule)
     except ImportError:
         pass
@@ -1017,9 +1045,9 @@ def log_fsdp_structure(model: nn.Module, log: Optional[logging.Logger] = None) -
             if m is not module
         )
 
-        param_mib = num_params * 2 / (1024 ** 2)  # BF16
+        param_mib = num_params * 2 / (1024**2)  # BF16
         total_params += num_params
-        depth = name.count('.')
+        depth = name.count(".")
         indent = "  " * min(depth, 4)
         lines.append(
             f"  {indent}[FSDP#{fsdp_unit_count}] {name or 'ROOT'}: "
@@ -1054,16 +1082,16 @@ def log_fsdp_memory_per_phase(
     """
     if device.type == "xpu":
         torch.xpu.synchronize()
-        allocated = torch.xpu.memory_allocated(device) / (1024 ** 3)
-        reserved = torch.xpu.memory_reserved(device) / (1024 ** 3)
-        max_allocated = torch.xpu.max_memory_allocated(device) / (1024 ** 3)
-        max_reserved = torch.xpu.max_memory_reserved(device) / (1024 ** 3)
+        allocated = torch.xpu.memory_allocated(device) / (1024**3)
+        reserved = torch.xpu.memory_reserved(device) / (1024**3)
+        max_allocated = torch.xpu.max_memory_allocated(device) / (1024**3)
+        max_reserved = torch.xpu.max_memory_reserved(device) / (1024**3)
     elif device.type == "cuda":
         torch.cuda.synchronize()
-        allocated = torch.cuda.memory_allocated(device) / (1024 ** 3)
-        reserved = torch.cuda.memory_reserved(device) / (1024 ** 3)
-        max_allocated = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
-        max_reserved = torch.cuda.max_memory_reserved(device) / (1024 ** 3)
+        allocated = torch.cuda.memory_allocated(device) / (1024**3)
+        reserved = torch.cuda.memory_reserved(device) / (1024**3)
+        max_allocated = torch.cuda.max_memory_allocated(device) / (1024**3)
+        max_reserved = torch.cuda.max_memory_reserved(device) / (1024**3)
     else:
         return {}
 
@@ -1127,9 +1155,13 @@ def verify_activation_checkpointing(
 
     if log:
         if ac_count == total and total > 0:
-            log.info(f"[AC_CHECK] All {total} transformer layers have activation checkpointing")
+            log.info(
+                f"[AC_CHECK] All {total} transformer layers have activation checkpointing"
+            )
         elif ac_count == 0:
-            log.warning(f"[AC_CHECK] NO transformer layers have activation checkpointing! ({total} layers found)")
+            log.warning(
+                f"[AC_CHECK] NO transformer layers have activation checkpointing! ({total} layers found)"
+            )
         else:
             log.warning(
                 f"[AC_CHECK] Only {ac_count}/{total} layers have AC. "
@@ -1207,6 +1239,7 @@ def register_per_layer_memory_hooks(
                 log.info(
                     f"[LAYER_FWD {lid:3d}/{total}] alloc={alloc:.2f} resv={resv:.2f} GiB  ({lname})"
                 )
+
             return hook
 
         def make_bwd_hook(lname, lid, total):
@@ -1215,10 +1248,13 @@ def register_per_layer_memory_hooks(
                 log.info(
                     f"[LAYER_BWD {lid:3d}/{total}] alloc={alloc:.2f} resv={resv:.2f} GiB  ({lname})"
                 )
+
             return hook
 
         h1 = module.register_forward_hook(make_fwd_hook(name, layer_id, num_layers))
-        h2 = module.register_full_backward_hook(make_bwd_hook(name, layer_id, num_layers))
+        h2 = module.register_full_backward_hook(
+            make_bwd_hook(name, layer_id, num_layers)
+        )
         hooks.extend([h1, h2])
 
     sampled = sorted(sample_indices)

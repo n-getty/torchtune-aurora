@@ -68,12 +68,51 @@ def scale_grads_(
     _scale_grad_(parameters, scaler, foreach)
 
 
+@_no_grad
+def scale_grads_for_native_ep_(
+    parameters: _tensor_or_tensors,
+    native_expert_parameter_ids: set[int],
+    distributed_scaler: torch.Tensor,
+    native_expert_scaler: torch.Tensor,
+    foreach: Optional[bool] = None,
+) -> None:
+    if isinstance(parameters, torch.Tensor):
+        parameters = [parameters]
+    else:
+        parameters = list(parameters)
+    distributed_parameters = [
+        parameter
+        for parameter in parameters
+        if id(parameter) not in native_expert_parameter_ids
+    ]
+    native_expert_parameters = [
+        parameter
+        for parameter in parameters
+        if id(parameter) in native_expert_parameter_ids
+    ]
+    if not distributed_parameters or not native_expert_parameters:
+        raise RuntimeError(
+            "native EP gradient scaling requires distributed and expert parameters"
+        )
+    _scale_grad_(distributed_parameters, distributed_scaler, foreach)
+    _scale_grad_(native_expert_parameters, native_expert_scaler, foreach)
+
+
 def _group_tensors_by_device(
     tensors: list[torch.Tensor],
-) -> dict[torch.device, list[Tensor]]:
+) -> dict[tuple, list[Tensor]]:
+    # Key on (device, mesh id) rather than just device: DTensors sharing a
+    # physical device but living on DIFFERENT DTensor meshes (e.g. Expert
+    # Parallelism's solo 1-rank FSDP2 mesh for expert params vs the root
+    # dp_shard mesh for everything else) cannot be passed to torch._foreach_mul_
+    # together -- "Could not run pointwise computation across different mesh".
+    # Grouping by mesh id keeps foreach batching within a single mesh while
+    # remaining a no-op (single group per device) for the non-DTensor/
+    # single-mesh case every other recipe uses.
     ret = defaultdict(list)
-    for i, tensor in enumerate(tensors):
-        ret[tensor.device].append(tensor)
+    for tensor in tensors:
+        mesh = tensor.device_mesh if isinstance(tensor, DTensor) else None
+        ret[(tensor.device, id(mesh))].append(tensor)
 
     return ret
 
@@ -91,7 +130,7 @@ def _scale_grad_(
         return
     grouped_grads = _group_tensors_by_device(grads)
 
-    for device, device_grads in grouped_grads.items():
+    for (device, _mesh_id), device_grads in grouped_grads.items():
         if (foreach is None and _has_foreach_support(device_grads, device)) or (
             foreach and _device_has_foreach_support(device)
         ):

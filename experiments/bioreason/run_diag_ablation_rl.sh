@@ -38,6 +38,27 @@ run () {
 }
 
 echo "=== diag start $(date) ==="
+# 0) MANDATORY generation-health gate — fail fast, before spending real eval compute,
+# if either checkpoint has degenerated (see probe_generation_health.py's docstring for
+# why: two ablations in this same investigation silently broke generation and were only
+# caught after the fact via the F_max empty-response rate).
+echo "----- PROBE (generation health) sft_textablate -----"
+python experiments/bioreason/probe_generation_health.py \
+    --ckpt_dir $SFT --local_parquet $PARQUET --esm3_cache_path $CACHE \
+    --max_protein_len 2048 --num_go_tokens 200 --num_proteins 3 \
+    --no-interpro_in_prompt --no-ppi_in_prompt --no-include_protein_function_summary \
+    --out $TT/experiments/bioreason/eval_out/_probe_diag_sft_textablate
+probe_sft_rc=$?
+echo "----- PROBE (generation health) rl_faithful -----"
+python experiments/bioreason/probe_generation_health.py \
+    --ckpt_dir $RL --local_parquet $PARQUET --esm3_cache_path $CACHE \
+    --max_protein_len 2048 --num_go_tokens 200 --num_proteins 3 \
+    --out $TT/experiments/bioreason/eval_out/_probe_diag_rl_faithful
+probe_rl_rc=$?
+if [ $probe_sft_rc -ne 0 ] || [ $probe_rl_rc -ne 0 ]; then
+    echo "=== ABORTING: generation-health probe failed (sft_rc=$probe_sft_rc rl_rc=$probe_rl_rc) — do NOT trust an F_max eval on a collapsed checkpoint. ==="
+    exit 1
+fi
 # 1) text-ablation: faithful embeddings, NO interpro/ppi/function text
 run sft_textablate $SFT --no-interpro_in_prompt --no-ppi_in_prompt --no-include_protein_function_summary
 # 2) RL baseline: full faithful (text ON, as the paper evaluates)

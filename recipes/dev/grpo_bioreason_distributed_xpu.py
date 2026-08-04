@@ -722,10 +722,13 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
                 self._training_pg = torch.distributed.new_group(_training_ranks, backend="xccl")
                 self._wsync_pg = None
             _pre_wrap = self._model
-            # Freeze the embed copy — replicated convenience tensor (not backbone's
-            # embed_tokens), so FSDP should NOT shard it. With requires_grad=False,
-            # FSDP excludes it from the flat param and keeps it replicated on each rank.
-            # This lets build_full_embeds() work correctly outside the FSDP forward context.
+            # _embed is already frozen unconditionally in BioReasonModel.__init__
+            # (_freeze_embed_copy) regardless of LoRA/full-FT. Re-assert it here
+            # for the FSDP-specific reason: it's a replicated convenience tensor
+            # (not backbone's embed_tokens), so FSDP should NOT shard it. With
+            # requires_grad=False, FSDP excludes it from the flat param and keeps
+            # it replicated on each rank, letting build_full_embeds() work
+            # correctly outside the FSDP forward context.
             _pre_wrap._embed.requires_grad_(False)
             _mp_policy = MixedPrecision(
                 param_dtype=torch.bfloat16,

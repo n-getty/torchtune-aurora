@@ -61,23 +61,42 @@ def main() -> int:
     p.add_argument("--load-real-weights", action="store_true",
                    help="load the REAL Qwen3-4B HF-named safetensors into the engine (faithful; "
                         "the self-named round-trip is rejected by vLLM's fused param naming)")
-    p.add_argument("--fix", default="none", choices=["none", "barrier", "sleep", "cedrain"],
+    p.add_argument("--fix", default="none",
+                   choices=["none", "barrier", "sleep", "cedrain", "storageswap"],
                    help="candidate mitigation wrapped around the load_weights publish (tonight's "
                         "fast fix harness): barrier (QUIESCE), sleep (KV-sleep/wake), cedrain "
-                        "(destroy+recreate the XCCL trainer PG around the publish)")
+                        "(destroy+recreate the XCCL trainer PG around the publish), storageswap "
+                        "(post-load .set_() onto a freshly-allocated storage for whole, "
+                        "non-view parameters only — external-review claim #3)")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--prompt-len", type=int, default=256)
     p.add_argument("--no-vllm", action="store_true",
                    help="control: skip in-process vLLM (XCCL-only) to test whether the cross-rank "
                         "collectives fault WITHOUT the co-resident engine")
+    p.add_argument("--stage-before-xccl", action="store_true",
+                   help="external-review ordering Variant B: construct the trainer model and "
+                        "move it onto the XPU device BEFORE the XCCL world PG is created "
+                        "(current baseline builds it after). FSDP-wrap still happens after XCCL "
+                        "init as today; only the raw .to(device) staging point moves earlier.")
+    p.add_argument("--pre-establish-trainer", action="store_true",
+                   help="external-review ordering Variant C: before vLLM is constructed at all, "
+                        "stand up a THROWAWAY real trainer (XCCL PG + FSDP model + one real "
+                        "fwd/bwd/optimizer.step() + one adapter all-reduce), synchronize, then "
+                        "destroy_process_group() and discard it before vLLM init proceeds as "
+                        "normal. Tests whether prior genuine XCCL/FSDP establishment (not just "
+                        "import) changes the outcome vs. the baseline vLLM-first order.")
     args = p.parse_args()
+    if args.stage_before_xccl and args.pre_establish_trainer:
+        raise SystemExit("--stage-before-xccl and --pre-establish-trainer are separate "
+                          "single-variable experiments; do not combine them in one run.")
 
     rank = int(os.environ.get("RANK", os.environ.get("PMI_RANK", "0")))
     world = int(os.environ.get("WORLD_SIZE", os.environ.get("PMI_SIZE", "1")))
     local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("PMI_LOCAL_RANK", "0")))
     host = socket.gethostname()
     _log(rank, f"host={host} world={world} local_rank={local_rank} model={args.model} "
-               f"no_vllm={args.no_vllm}")
+               f"no_vllm={args.no_vllm} stage_before_xccl={args.stage_before_xccl} "
+               f"pre_establish_trainer={args.pre_establish_trainer}")
 
     # --- env priming (mirror vllm_backend.py for the in-process engine) ---
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
@@ -101,6 +120,76 @@ def main() -> int:
     device = torch.device("xpu:0")
     torch.xpu.set_device(device)
     torch.manual_seed(args.seed)
+
+    # =====================================================================
+    # Trainer model definition — moved above vLLM/XCCL init (rather than living
+    # inline in section 2, as in the original script) so ordering Variants B
+    # (--stage-before-xccl) and C (--pre-establish-trainer) can construct/stage
+    # a REAL trainer at different points relative to vLLM and XCCL PG creation.
+    # Structurally identical to the original inline definition — no behavior
+    # change for the baseline (--fix none, no ordering flags) path.
+    # =====================================================================
+    import torch.nn.functional as F
+    H, FF, L, NH = 2560, 9728, 18, 20  # hidden, ffn, layers, heads (Qwen3-4B-ish)
+    HD = H // NH
+
+    class Block(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.qkv = torch.nn.Linear(H, 3 * H, bias=False, dtype=torch.bfloat16)
+            self.o = torch.nn.Linear(H, H, bias=False, dtype=torch.bfloat16)
+            self.w1 = torch.nn.Linear(H, FF, bias=False, dtype=torch.bfloat16)
+            self.w2 = torch.nn.Linear(FF, H, bias=False, dtype=torch.bfloat16)
+
+        def forward(self, x):  # x: [B, S, H]
+            B, S, _ = x.shape
+            qkv = self.qkv(x).view(B, S, 3, NH, HD).permute(2, 0, 3, 1, 4)
+            q, k, v = qkv[0], qkv[1], qkv[2]  # [B, NH, S, HD]
+            a = F.scaled_dot_product_attention(q, k, v, is_causal=True)  # SDPA kernel
+            a = a.transpose(1, 2).reshape(B, S, H)
+            x = x + self.o(a)
+            x = x + self.w2(F.gelu(self.w1(x)))
+            return x
+
+    if args.pre_establish_trainer:
+        # =================================================================
+        # Variant C (external-review ordering test): fully establish a REAL
+        # throwaway trainer — XCCL PG + FSDP model + one genuine fwd/bwd/
+        # optimizer.step() + one adapter all-reduce, all torch.xpu.synchronize
+        # -gated like every other phase marker in this script — BEFORE vLLM
+        # is ever constructed. Then tear it all down and let vLLM init and
+        # the real (section 2) trainer proceed exactly as the baseline does.
+        # Tests whether prior genuine XCCL/FSDP establishment (not just
+        # import) changes the outcome vs. the baseline vLLM-first order.
+        # =================================================================
+        from torch.distributed.fsdp import FullyShardedDataParallel as _FSDP0, ShardingStrategy as _SS0
+        os.environ.setdefault("MASTER_ADDR", os.environ.get("MASTER_ADDR", "127.0.0.1"))
+        _orig_master_port = os.environ.get("MASTER_PORT")
+        os.environ["MASTER_PORT"] = os.environ.get("TRAIN_MASTER_PORT", "29400")
+        from mpi4py import MPI as _MPI0
+        _MPI0.COMM_WORLD.Barrier()
+        torch.distributed.init_process_group(backend="xccl", world_size=world, rank=rank)
+        _log(rank, f"MTREPRO_PHASE phase=variant_c_throwaway_xccl_pg_up world={world}")
+        _tw_model = torch.nn.Sequential(*[Block() for _ in range(L)]).to(device)
+        _tw_model = _FSDP0(_tw_model, sharding_strategy=_SS0.FULL_SHARD, device_id=device)
+        _tw_opt = torch.optim.SGD(_tw_model.parameters(), lr=1e-6)
+        _tw_adapter = torch.randn(64 * 1024 * 1024 // 2, dtype=torch.bfloat16, device=device)
+        _tw_opt.zero_grad(set_to_none=True)
+        _tw_xb = torch.randn(4, 256, H, dtype=torch.bfloat16, device=device)
+        _tw_loss = _tw_model(_tw_xb).float().pow(2).mean()
+        _tw_loss.backward()
+        _tw_opt.step()
+        torch.distributed.all_reduce(_tw_adapter, op=torch.distributed.ReduceOp.SUM)
+        torch.xpu.synchronize(device)
+        _log(rank, "MTREPRO_PHASE phase=trainer_established_before_vllm")
+        torch.distributed.destroy_process_group()
+        del _tw_model, _tw_opt, _tw_adapter, _tw_xb, _tw_loss
+        if _orig_master_port is not None:
+            os.environ["MASTER_PORT"] = _orig_master_port
+        elif "MASTER_PORT" in os.environ:
+            del os.environ["MASTER_PORT"]
+        torch.xpu.synchronize(device)
+        _log(rank, "MTREPRO_PHASE phase=throwaway_trainer_torn_down")
 
     # =====================================================================
     # 1. Build in-process vLLM TP=1 (verbatim init from vllm_backend.py).
@@ -177,6 +266,17 @@ def main() -> int:
     # 2. Build the REAL multi-rank XCCL world PG (this is what the recipe's
     #    FSDP + adapter all-reduce run on, co-resident with vLLM above).
     # =====================================================================
+    # Variant B (--stage-before-xccl): construct the trainer model and move it
+    # onto the XPU device BEFORE the XCCL world PG below is created (baseline
+    # does this after, at "model = ...to(device)" further down). FSDP-wrap
+    # still happens after XCCL init either way — only the raw device-staging
+    # point moves earlier here.
+    _staged_model = None
+    if args.stage_before_xccl:
+        _staged_model = torch.nn.Sequential(*[Block() for _ in range(L)]).to(device)
+        torch.xpu.synchronize(device)
+        _log(rank, "MTREPRO_PHASE phase=variant_b_model_staged_before_xccl")
+
     os.environ.setdefault("MASTER_ADDR", os.environ.get("MASTER_ADDR", "127.0.0.1"))
     os.environ["MASTER_PORT"] = os.environ.get("TRAIN_MASTER_PORT", "29400")
     from mpi4py import MPI
@@ -189,29 +289,9 @@ def main() -> int:
     # trainer's SDPA kernels co-resident with vLLM's paged-attention on one tile is the suspected
     # missing co-residence ingredient (both contend for L0 attention scratch/resources).
     from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, ShardingStrategy
-    import torch.nn.functional as F
-    H, FF, L, NH = 2560, 9728, 18, 20  # hidden, ffn, layers, heads (Qwen3-4B-ish)
-    HD = H // NH
 
-    class Block(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.qkv = torch.nn.Linear(H, 3 * H, bias=False, dtype=torch.bfloat16)
-            self.o = torch.nn.Linear(H, H, bias=False, dtype=torch.bfloat16)
-            self.w1 = torch.nn.Linear(H, FF, bias=False, dtype=torch.bfloat16)
-            self.w2 = torch.nn.Linear(FF, H, bias=False, dtype=torch.bfloat16)
-
-        def forward(self, x):  # x: [B, S, H]
-            B, S, _ = x.shape
-            qkv = self.qkv(x).view(B, S, 3, NH, HD).permute(2, 0, 3, 1, 4)
-            q, k, v = qkv[0], qkv[1], qkv[2]  # [B, NH, S, HD]
-            a = F.scaled_dot_product_attention(q, k, v, is_causal=True)  # SDPA kernel
-            a = a.transpose(1, 2).reshape(B, S, H)
-            x = x + self.o(a)
-            x = x + self.w2(F.gelu(self.w1(x)))
-            return x
-
-    model = torch.nn.Sequential(*[Block() for _ in range(L)]).to(device)
+    model = _staged_model if _staged_model is not None else \
+        torch.nn.Sequential(*[Block() for _ in range(L)]).to(device)
     model = FSDP(model, sharding_strategy=ShardingStrategy.FULL_SHARD, device_id=device)
     opt = torch.optim.SGD(model.parameters(), lr=1e-6)
     # A replicated "adapter" tensor that we all_reduce each step (mirrors ADAPTER_AR — the XCCL
@@ -271,6 +351,7 @@ def main() -> int:
             llm.generate(prompts=prompts, sampling_params=sp, use_tqdm=False)
             torch.xpu.set_device(device); torch.xpu.synchronize(device)
             gen_s = time.perf_counter() - g0
+            _log(rank, f"MTREPRO_PHASE step={step} phase=generate_done gen_s={gen_s:.1f}")
 
         # --- load_weights into the LIVE vLLM engine (the recipe's per-step colocate publish) ---
         if vllm_model is not None and (args.load_weights == "each"
@@ -299,9 +380,38 @@ def main() -> int:
                         torch.distributed.destroy_process_group()
                     torch.xpu.synchronize(device)
 
+                if args.fix == "storageswap":
+                    # External-review claim #3: give every top-level parameter a FRESH
+                    # storage (allocated via the normal caching allocator) BEFORE
+                    # load_weights() runs its in-place copy_() into it, instead of letting
+                    # copy_() mutate the same resident tensor that has been live (and
+                    # possibly touched by fused eager kernels / co-resident XCCL) since
+                    # engine init. The fault fires DURING/immediately after load_weights's
+                    # own copy_ (confirmed: v6 crashes "at step 0, right after load_weights"
+                    # with zero MTREPRO_STEP ever logged — NOT mid-training), so the swap
+                    # must happen pre-copy, not post-copy, to have any chance of mattering.
+                    # Every top-level nn.Parameter returned by named_parameters() is a
+                    # whole, non-view tensor (weight_loader's .narrow() views are transient,
+                    # used only inside the load call, never stored) so this is value-safe
+                    # and does not desync fused QKV/gate_up shards. NOTE: this assumes no
+                    # fused kernel elsewhere cached a raw data_ptr() from model-build time
+                    # (a residual risk with enforce_eager=True custom ops); flagged as a
+                    # caveat if this passes.
+                    _n_swapped = 0
+                    with torch.no_grad():
+                        for _n, _p in vllm_model.named_parameters():
+                            _p.data = _p.data.clone()
+                            _n_swapped += 1
+                    torch.xpu.synchronize(device)
+                    _log(rank, f"MTREPRO_PHASE step={step} phase=storageswap_done "
+                               f"n_swapped={_n_swapped}")
+
                 vllm_model.load_weights(_names)
+                torch.xpu.synchronize(device)
+                _log(rank, f"MTREPRO_PHASE step={step} phase=load_weights_done")
                 llm.llm_engine.reset_prefix_cache()
                 torch.xpu.synchronize(device)
+                _log(rank, f"MTREPRO_PHASE step={step} phase=reset_prefix_done")
 
                 if args.fix == "sleep":
                     try: llm.wake_up()

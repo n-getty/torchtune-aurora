@@ -212,3 +212,57 @@ consecutive-same-shape reuse.
 - `experiments/colocate/README_repro.md` (Intel handoff package).
 - Recipe: env-gated `TORCHTUNE_COLOCATE_SKIP_RESET_PREFIX` guard +
   `tests/torchtune/dev/rl/test_colocate_skip_reset_prefix.py` (CPU, green).
+
+## Addendum 2026-07-22 — two more external-review claims tested, both refuted; fault-site window narrowed
+
+An external code review of this report proposed a "shared zeContext" fix (vLLM and the
+trainer allegedly create separate L0 contexts) and a `.set_()` storage-swap fix (avoid
+mutating the live resident tensor in `load_weights()`'s `copy_()`). Both were tested on
+hardware (6 allocations); see `memory/project_colocate_external_review_claims_tested_20260722.md`
+for full detail. Summary:
+
+- **Storage-swap REFUTED, and the fault-site window narrows**: 3/3 runs of
+  `--fix storageswap` faulted before ANY of {`generate()` returning, the swap running,
+  `load_weights()` running} logged completion in step 0 — earlier than this doc's Result 4
+  attribution ("at step 0, right after load_weights"). The fault is somewhere between the
+  end of one-time HF-weight `.to(device)` staging and the first of those three step-0
+  operations; not pinned to one specific call among them.
+- **Shared-zeContext REFUTED by direct evidence**: `SYCL_UR_TRACE=2` full UR-call tracing
+  (after a custom LD_PRELOAD shim attempt crashed uninformatively) shows **zero
+  `urContextCreate` calls** across all 12 ranks, and exactly one `platform->initialize()`
+  per rank covering both vLLM's device setup and the trainer's later FSDP+XCCL setup. vLLM
+  and the trainer already share one implicit UR context per process — there is no
+  separate-context condition to fix.
+- **Unconfirmed side observation**: the `SYCL_UR_TRACE=2` run's ~21x tracing overhead
+  (vLLM boot 25s→525s) coincided with the run surviving well past every prior crash point
+  (through `load_weights()` genuinely executing on rank 0, confirmed via raw
+  `urUSMGetMemAllocInfo`/`urEnqueueUSMMemcpy` calls) with zero fault, until walltime killed
+  it. N=1, not a validated mitigation — flagged as a possible timing-sensitivity signal
+  worth a longer-walltime repeat, not a fix.
+
+## Addendum 2026-07-22 (2) — init-order hypothesis tested (3 variants), all refuted
+
+A follow-up external review argued the investigation was missing the "lifecycle/
+initialization-order axis": does the fault depend on *when* vLLM attaches relative to when the
+trainer's XCCL PG and FSDP model are established, rather than on the weight-copy operation
+itself? It proposed a 7-cell ordering matrix and flagged the reproducer's logging as "too
+coarse." Before running anything, direct code inspection confirmed (a) the real recipe's
+actual order (`grpo_full_finetune_distributed_xpu.py:319-357`+`setup()`) is exactly the
+review's own "Variant A" — not a strawman — and (b) the reproducer's phase markers were
+already `torch.xpu.synchronize()`-gated before every log line, so no new instrumentation was
+needed, only new orderings. Tested overnight on hardware (3 jobs + 1 free control; full detail
+in `memory/project_colocate_ordering_variants_tested_20260722.md`):
+
+| Experiment | Result |
+|---|---|
+| **No-vLLM control** (real FSDP+XCCL+SDPA-attention+all-reduce, zero vLLM) | **CLEAN** 12/12, all 8 steps — direct hardware confirmation vLLM is a *necessary* factor, not merely correlated |
+| **Variant B** — trainer model staged on-device BEFORE XCCL PG init (vs. baseline: after) | **CRASH**, byte-identical `banned:1` signature, same fault-site window as baseline |
+| **Variant C** — REAL throwaway trainer (XCCL PG + FSDP + genuine fwd/bwd/opt.step()+all-reduce, fully synchronized) established and cleanly torn down BEFORE vLLM is even constructed, then baseline order resumes | **CRASH**, byte-identical signature; no PG-lifecycle confound (clean teardown, vLLM booted normally afterward) |
+
+All 3 ordering/no-vLLM variants implied by this review are now tested. None change the
+outcome — reordering when the trainer model is staged, or fully establishing and tearing down
+the trainer's real XCCL/FSDP state before vLLM exists at all, does not prevent the fault.
+Combined with the prior addendum's refutation of shared-zeContext and storage-swap, the
+driver-level co-residence mechanism (Result 4 / Conclusion above) has now survived every
+alternative mechanism proposed by two independent external reviews. No new mitigation to add;
+`vllm_mode=server`/`dedicated` remains the only validated fix.

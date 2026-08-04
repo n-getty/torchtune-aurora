@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from typing import Optional
 
 import torch
@@ -88,7 +89,32 @@ class BioReasonSFTDataset(Dataset):
         go_pred_dropout_seed (int): seed for the per-sample dropout decision. Default: 0.
         exhaustive_target (bool): append the full GT GO-term list (go_bp/mf/cc) to the SFT
             target so the model learns breadth (CAFA F_max is ancestor-propagated). Default:
-            False (curated reasoning+final_answer trace only). See Exp 1.
+            False (curated reasoning+final_answer trace only). See Exp 1. LEAKS ground truth
+            into the target (two independent Exp-1-style attempts BROKE generation: 21-45%
+            empty outputs) — prefer append_gopred_target below.
+        append_gopred_target (bool): append the GO terms already PRESENT IN THE PROMPT's
+            go_pred field to the SFT target (verbatim, extracted via the same GO:\\d{7}
+            regex the eval scorer uses), instead of the full GT list. NOT a leak — go_pred is
+            already visible to the model in the prompt; this only teaches the model to
+            reproduce that in-context breadth in its own OUTPUT (which the frozen-backbone
+            model does not do on its own — a post-hoc union of model-output + go_pred
+            recovered +0.067 F_max on held-out eval with ZERO training, see
+            memory/project_bioreason_32b_capability_push_20260718.md). The curated
+            reasoning+final_answer trace is kept BEFORE the appended list (coherence +
+            reasoning-derived terms not in go_pred are preserved). Mutually exclusive with
+            exhaustive_target (only one may be True). Default: False.
+        bp_oversample_factor (float): duplicate examples whose ``go_bp`` column is
+            non-empty this many times in ``self.examples`` (e.g. 2.0 = each BP-containing
+            row appears twice, giving it ~2x its natural per-epoch sampling frequency).
+            Targets a persistent weak point: across every BioReason checkpoint evaluated
+            to date, the "biological_process" CAFA namespace scores lowest of the three
+            (BP/CC/MF) and regresses first under overfitting (see
+            docs/reports/bioreason_ablations_headline_findings_20260730.md, gap #8).
+            Namespace membership is read directly from the existing ``go_bp`` column — no
+            new data processing. Applied AFTER ``_filter_over_length`` (duplicates are
+            plain dict references, so length/bucket computation and packing all see them
+            as ordinary additional examples — no new sampler class needed). Default: 1.0
+            (off; must be >= 1.0).
     """
 
     def __init__(
@@ -106,7 +132,20 @@ class BioReasonSFTDataset(Dataset):
         go_pred_dropout: float = 0.0,
         go_pred_dropout_seed: int = 0,
         exhaustive_target: bool = False,
+        append_gopred_target: bool = False,
+        bp_oversample_factor: float = 1.0,
     ):
+        if exhaustive_target and append_gopred_target:
+            raise ValueError(
+                "exhaustive_target and append_gopred_target are mutually exclusive "
+                "(both append a term list to the target; pick one)."
+            )
+        if bp_oversample_factor < 1.0:
+            raise ValueError(
+                f"bp_oversample_factor must be >= 1.0 (1.0 = off); got "
+                f"{bp_oversample_factor}."
+            )
+        self.bp_oversample_factor = float(bp_oversample_factor)
         self.tokenizer = tokenizer
         self.max_seq_len = max_seq_len
         self.max_protein_len = max_protein_len
@@ -127,12 +166,53 @@ class BioReasonSFTDataset(Dataset):
         # so the model learns breadth (F_max is ancestor-propagated). Default off = the
         # curated reasoning+final_answer trace only (byte-identical to prior behavior).
         self.exhaustive_target = bool(exhaustive_target)
+        # Approach B: append the IN-PROMPT go_pred terms (no GT leak) to the target so the
+        # model learns to natively preserve go_pred's breadth on top of its own reasoning.
+        self.append_gopred_target = bool(append_gopred_target)
         self.examples = self._load(data_files)
         logger.info(
             "Loaded %d BioReason SFT examples from %s", len(self.examples), data_files
         )
         if self.drop_over_length:
             self._filter_over_length()
+        if self.bp_oversample_factor > 1.0:
+            self._oversample_bp()
+
+    def _oversample_bp(self) -> None:
+        """Duplicate BP-containing rows to give them ~bp_oversample_factor x their
+        natural per-epoch sampling frequency.
+
+        Runs AFTER _filter_over_length so duplicated rows are guaranteed already
+        length-valid. Duplicates are plain references to the same dict (examples are
+        read-only downstream), so the length-grouped bucketing sampler and the packed-
+        dataset path both see them as ordinary additional rows with no special-casing —
+        this deliberately reuses the existing sampling machinery instead of adding a new
+        sampler class. A fractional factor (e.g. 1.5) duplicates a deterministic prefix
+        of the BP rows (by original index) so the run is reproducible across resumes.
+        """
+        bp_idxs = [i for i, ex in enumerate(self.examples) if _nonempty(ex.get("go_bp"))]
+        if not bp_idxs:
+            logger.warning(
+                "bp_oversample_factor=%.2f set but no examples have a non-empty go_bp "
+                "column — oversampling is a no-op.", self.bp_oversample_factor,
+            )
+            return
+        full_copies = int(self.bp_oversample_factor) - 1  # -1: the row already counts once
+        frac = self.bp_oversample_factor - int(self.bp_oversample_factor)
+        n_frac = round(frac * len(bp_idxs))
+
+        extra = []
+        for _ in range(full_copies):
+            extra.extend(self.examples[i] for i in bp_idxs)
+        extra.extend(self.examples[i] for i in bp_idxs[:n_frac])
+
+        logger.info(
+            "bp_oversample_factor=%.2f: %d/%d examples have non-empty go_bp; added %d "
+            "duplicate rows (total %d -> %d).",
+            self.bp_oversample_factor, len(bp_idxs), len(self.examples), len(extra),
+            len(self.examples), len(self.examples) + len(extra),
+        )
+        self.examples.extend(extra)
 
     def _filter_over_length(self) -> None:
         """Drop examples whose PROMPT alone exceeds max_seq_len.
@@ -223,12 +303,25 @@ class BioReasonSFTDataset(Dataset):
             lengths.append(min(prompt_len + target_len, self.max_seq_len))
         return lengths
 
-    def _build_prompt_text(self, ex: dict) -> str:
+    def _build_prompt_text(
+        self, ex: dict, interpro_in_prompt: bool = True, ppi_in_prompt: bool = True,
+    ) -> str:
         """Paper-faithful go_pred prompt (system+user folded into one text block).
-        Mirrors BioReasonRLDataset._build_go_pred_prompt_text exactly (pinned by test)."""
+        Mirrors BioReasonRLDataset._build_go_pred_prompt_text exactly (pinned by test).
+
+        interpro_in_prompt / ppi_in_prompt: eval-time-only text ablation (mirrors
+        eval_cafa_fmax.py's flags of the same name, which only applied to the
+        non-native _format_reasoning_prompt path — this checkpoint's native
+        BioReasonSFTDataset._build_prompt_text had no equivalent knob until now,
+        closing gap #6 in docs/reports/bioreason_ablations_headline_findings_20260730.md).
+        Default True = unchanged prior behavior. There is no
+        include_protein_function_summary equivalent here — this prompt format
+        never includes a protein_function/UniProt-summary field at all, unlike the
+        published paper's format_cafa5_for_protein_llm.
+        """
         org = ex.get("organism", "") or "Unknown"
-        interpro_data = ex.get("interpro_formatted", "") or ""
-        ppi_data = ex.get("ppi_formatted", "") or ""
+        interpro_data = (ex.get("interpro_formatted", "") or "") if interpro_in_prompt else ""
+        ppi_data = (ex.get("ppi_formatted", "") or "") if ppi_in_prompt else ""
         go_spec = ex.get("go_pred", "") or ""
 
         aspects = []
@@ -279,7 +372,11 @@ class BioReasonSFTDataset(Dataset):
         """
         tok = self.tokenizer
         bos = tok.bos_id
-        text = self._build_prompt_text(ex)
+        text = self._build_prompt_text(
+            ex,
+            interpro_in_prompt=getattr(self, "interpro_in_prompt", True),
+            ppi_in_prompt=getattr(self, "ppi_in_prompt", True),
+        )
 
         ids: list[int] = list(tok.encode(text, add_bos=True, add_eos=False))
         ids += self._strip_bos(
@@ -316,6 +413,22 @@ class BioReasonSFTDataset(Dataset):
                     out.append(t)
         return out
 
+    _GO_ID_RE = re.compile(r"GO:\d{7}")
+
+    @classmethod
+    def _gopred_terms(cls, ex: dict) -> list[str]:
+        """GO terms already present in the prompt's go_pred field (dedup, first-seen order).
+        NOT ground truth — this is in-context text the model can already see; appending it
+        to the target teaches native reproduction, it does not leak unseen information."""
+        go_pred = ex.get("go_pred", "") or ""
+        seen: set[str] = set()
+        out: list[str] = []
+        for t in cls._GO_ID_RE.findall(str(go_pred)):
+            if t not in seen:
+                seen.add(t)
+                out.append(t)
+        return out
+
     def _build_target_ids(self, ex: dict) -> list[int]:
         reasoning = ex.get("reasoning", "") or ""
         final = ex.get("final_answer", "") or ""
@@ -330,6 +443,15 @@ class BioReasonSFTDataset(Dataset):
         # reasoning trace is kept (coherence + interpretability); the list is appended.
         if self.exhaustive_target:
             terms = self._gt_terms(ex)
+            if terms:
+                target = f"{target}\n\nGO terms: " + ", ".join(terms)
+        # Approach B (append_gopred_target): append the go_pred terms ALREADY IN THE PROMPT
+        # (not GT) so the model learns to natively preserve that breadth in its own output,
+        # on top of the curated reasoning trace's own (partly novel) terms. See
+        # memory/project_bioreason_32b_capability_push_20260718.md for the post-hoc-union
+        # diagnostic (+0.067 F_max, zero training) that motivated this.
+        elif self.append_gopred_target:
+            terms = self._gopred_terms(ex)
             if terms:
                 target = f"{target}\n\nGO terms: " + ", ".join(terms)
         ids = self.tokenizer.encode(target, add_bos=False, add_eos=True)
@@ -772,6 +894,8 @@ def bioreason_sft_dataset(
     go_pred_dropout: float = 0.0,
     go_pred_dropout_seed: int = 0,
     exhaustive_target: bool = False,
+    append_gopred_target: bool = False,
+    bp_oversample_factor: float = 1.0,
 ) -> BioReasonSFTDataset:
     """TorchTune component factory (YAML config entry point)."""
     return BioReasonSFTDataset(
@@ -788,4 +912,6 @@ def bioreason_sft_dataset(
         go_pred_dropout=go_pred_dropout,
         go_pred_dropout_seed=go_pred_dropout_seed,
         exhaustive_target=exhaustive_target,
+        append_gopred_target=append_gopred_target,
+        bp_oversample_factor=bp_oversample_factor,
     )

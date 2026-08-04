@@ -47,6 +47,17 @@ Run (single XPU tile; greedy; faithful inputs):
       --esm3_cache_path /lus/flare/.../datasets/bioreason_rl/esm3_cache.pt \
       --out experiments/bioreason/eval_out/sft \
       --max_protein_len 2048 --num_go_tokens 200 --max_new_tokens 2048
+
+REGRESSION GATE: after ANY change to prompt-construction logic in this file
+(inject_go_pred / interpro_in_prompt / ppi_in_prompt / include_protein_function_
+summary and their call sites), run
+    bash experiments/bioreason/check_eval_harness_sanity.sh
+before trusting a new F_max number. It re-scores the published SFT checkpoint at
+default (faithful) flags and fails loudly if the result falls outside its known-
+good band — the same bug class (a silently-cold prompt corrupting F_max by ~0.3)
+recurred twice in a sibling BioReason project for lack of exactly this check. The
+CLI defaults themselves are pinned at the unit-test layer by
+tests/torchtune/dev/rl/test_eval_cafa_fmax_flag_defaults.py.
 """
 from __future__ import annotations
 
@@ -143,7 +154,8 @@ def build_prompt_string(sample, tokenizer, enable_thinking: bool = True) -> str:
 
 
 def build_native_input_ids(row, protein_seq, tokenizer, protein_token_id, go_token_id,
-                           num_go_tokens, inject_go_pred=True):
+                           num_go_tokens, inject_go_pred=True,
+                           interpro_in_prompt=True, ppi_in_prompt=True):
     """Build prompt input_ids EXACTLY as the native SFT trained (dataset_sft).
 
     Reuses BioReasonSFTDataset._build_prompt_ids verbatim (via __new__, no data load) so
@@ -151,6 +163,11 @@ def build_native_input_ids(row, protein_seq, tokenizer, protein_token_id, go_tok
     + [protein_token_id]*(len(seq)+2) + "\nGO graph: " + [go_token_id]*num_go_tokens +
     "\nReasoning:\n". This is what makes the F_max number valid for our checkpoint (the
     chat-template/<|protein_pad|> path is for the published HF model, NOT our native ckpt).
+
+    interpro_in_prompt / ppi_in_prompt: text ablation (default True = unchanged prior
+    behavior), forwarded to BioReasonSFTDataset._build_prompt_text. Unlike the non-native
+    path, there is no include_protein_function_summary equivalent — the native prompt
+    format never includes that field.
     """
     import torch
     from torchtune.dev.bioreason.dataset_sft import BioReasonSFTDataset
@@ -160,6 +177,8 @@ def build_native_input_ids(row, protein_seq, tokenizer, protein_token_id, go_tok
     ds.go_token_id = int(go_token_id)
     ds.num_go_tokens = int(num_go_tokens)
     ds.inject_go_pred = bool(inject_go_pred)
+    ds.interpro_in_prompt = bool(interpro_in_prompt)
+    ds.ppi_in_prompt = bool(ppi_in_prompt)
     ids = ds._build_prompt_ids(row, protein_seq)
     return torch.tensor(ids, dtype=torch.long)
 
@@ -282,6 +301,15 @@ def load_local_parquet_samples(args):
         # interpro/ppi and selects the matching WITH_CONTEXT template). _format_reasoning_
         # prompt reads dict-like rows; pass the row as a plain dict.
         row_d = {k: row[k] for k in row.index}
+        # _format_reasoning_prompt does plain `if example.get("go_mf"):` truthy checks —
+        # correct for HF `datasets` examples (native Python lists) but our rows come from
+        # pandas.iloc, where go_mf/go_cc/go_bp are numpy arrays: `if array:` raises
+        # "truth value of an array... is ambiguous". Coerce via the same _as_list already
+        # used for the aspect-presence check above (a data-shape adapter, not a change to
+        # the paper's logic — same fix already landed in a sibling eval driver, see
+        # memory/project_bioreason_gopred_eval_fix_20260724.md).
+        for _col in ("go_mf", "go_cc", "go_bp"):
+            row_d[_col] = _as_list(row_d.get(_col))
         if getattr(args, "inject_go_pred", True):
             fr = _format_reasoning_prompt(
                 row_d,
@@ -450,6 +478,10 @@ def build_model(args):
         projector_output_norm=_proj_norm,
         disable_protein_splice=bool(getattr(args, "disable_protein_splice", False)),
         disable_go_splice=bool(getattr(args, "disable_go_splice", False)),
+        # vLLM-HTTP client mode: a separate vLLM server owns the transformer, so the
+        # client only needs _embed + projections for build_prompt_embeds — skip the
+        # ~65 GiB backbone load (lets 6 client shards co-reside with the servers).
+        load_backbone=not bool(getattr(args, "vllm_http_url", None)),
     )
     if args.disable_protein_splice:
         print("[eval] ABLATION: protein splice DISABLED (placeholder embeds kept)", flush=True)
@@ -483,7 +515,14 @@ def build_model(args):
     return model, device
 
 
-def main() -> int:
+def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI parser. Factored out of main() so tests can inspect flag
+    defaults (e.g. that the go_pred/InterPro/PPI/function-summary injection
+    flags default True) WITHOUT running the eval pipeline itself. A sibling
+    BioReason eval script silently regressed to a cold, un-injected prompt
+    when these defaulted the wrong way — see the flags' own help text below —
+    and there was no automated check to catch it before a real training run
+    consumed the broken prompt. tests/torchtune/dev/rl pins these defaults."""
     ap = argparse.ArgumentParser()
     ap.add_argument("--inject_go_pred", action=argparse.BooleanOptionalAction, default=True,
                     help="Inject the go_pred (GO-GPT predictions) column into the prompt as "
@@ -538,6 +577,20 @@ def main() -> int:
                     help="generate via native HF backbone.generate(inputs_embeds=...) + KV "
                          "cache instead of in-process vLLM. REQUIRED for 32B (vLLM TP=1 "
                          "OOMs: 62 GiB weights > one tile budget). Slower but fits.")
+    ap.add_argument("--vllm_http_url", default=None,
+                    help="Generate via a vLLM OpenAI HTTP server (e.g. http://localhost:8001) "
+                         "using prompt_embeds over /v1/completions. This is the 32B vLLM path: "
+                         "the server (launch_vllm_http_32b_tp2.sh, TP=2 --enable-prompt-embeds) "
+                         "hosts the sharded backbone; the client builds prompt_embeds "
+                         "(backbone-free) and POSTs them. Mutually exclusive with --no_vllm and "
+                         "the in-process LLM() path. Uses VLLMClient.generate_from_embeds.")
+    ap.add_argument("--vllm_max_model_len", type=int, default=4808,
+                    help="MUST match --max-model-len on the vLLM server (launch_vllm_http_32b_"
+                         "tp2.sh default 4808). Used to clamp the per-request max_tokens to "
+                         "(max_model_len - actual_prompt_len) — a fixed max_new_tokens overflows "
+                         "vLLM's own budget check on long prompts (protein+text+GO exceeding the "
+                         "assumed 2048+512+200 split), producing 'max_tokens must be at least 1, "
+                         "got <negative>' 400s that silently drop that shard's remaining samples.")
     ap.add_argument("--backbone_device_map", default=None,
                     help="HF device_map for the backbone (e.g. 'auto'). Shards the 32B "
                          "across the tiles VISIBLE to this process (set via ZE_AFFINITY_MASK "
@@ -557,13 +610,27 @@ def main() -> int:
                          "training config (Qwen3 reserved-gap id).")
     ap.add_argument("--go_token_id", type=int, default=151644,
                     help="integer GO placeholder id (native_prompt). Must match training.")
+    return ap
+
+
+def main() -> int:
+    ap = build_arg_parser()
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
     import torch
 
     LLM = SamplingParams = None
-    if not args.no_vllm:
+    _http_client = None
+    if args.vllm_http_url:
+        # vLLM-HTTP client mode: a separate OpenAI api_server (TP=2, --enable-prompt-embeds)
+        # owns the transformer. We only build prompt_embeds locally (backbone-free) and POST
+        # them via VLLMClient.generate_from_embeds. No in-process vLLM, no LLM import here.
+        from torchtune.dev.rl.vllm_client import VLLMClient
+        _http_client = VLLMClient(base_url=args.vllm_http_url, connection_timeout=1800.0)
+        print(f"[eval] vLLM-HTTP client connected to {args.vllm_http_url} "
+              f"(api={_http_client._api_type}, model={_http_client._model_name})", flush=True)
+    elif not args.no_vllm:
         # XPU-required vLLM env, mirroring torchtune.dev.rl.vllm_backend._init_vllm_tp1:
         # ZE_AFFINITY_MASK already selects one tile, so vLLM must NOT spawn a V1
         # EngineCore subprocess (it would hang on the already-initialized XPU), and
@@ -581,7 +648,13 @@ def main() -> int:
     # + KV cache, so we generate directly on it — no vLLM, no TP, no enable_prompt_embeds
     # risk. Slower per-sample than vLLM but the only path that fits a 32B at TP=1 on XPU.
     # KEEP model.backbone (do NOT free it — it does the generation here).
-    if args.no_vllm:
+    if args.vllm_http_url:
+        # vLLM-HTTP client mode: no in-process backbone (load_backbone=False) and no
+        # in-process LLM — the server owns the transformer. Just carry the client through.
+        llm = None
+        sp = None
+        backbone = None
+    elif args.no_vllm:
         llm = None
         sp = None
         backbone = model.backbone
@@ -613,7 +686,7 @@ def main() -> int:
             enable_prompt_embeds=True,
             trust_remote_code=True,
         )
-    sp = None if args.no_vllm else SamplingParams(
+    sp = None if (args.no_vllm or args.vllm_http_url) else SamplingParams(
         max_tokens=args.max_new_tokens,
         temperature=args.temperature,      # 0 → greedy
         top_k=-1,
@@ -645,55 +718,96 @@ def main() -> int:
         if os.path.exists(os.path.join(args.out, _fn)):
             n += 1
             continue
-        if getattr(args, "native_prompt", False):
-            # Bit-identical to training: native text + integer-id placeholder layout.
-            prompt_string = None
-            input_ids = build_native_input_ids(
-                s["row"], seq[:args.max_protein_len], _tt_tok,
-                args.protein_token_id, args.go_token_id, args.num_go_tokens,
-                inject_go_pred=getattr(args, "inject_go_pred", True),
-            ).to(device).unsqueeze(0)
-        else:
-            # BioReasonModel.tokenizer is the raw HF tokenizer (apply_chat_template + encode).
-            prompt_string = build_prompt_string(s, model.tokenizer, args.enable_thinking)
-            input_ids = build_input_ids(
-                prompt_string, seq[:args.max_protein_len], model.tokenizer, args.num_go_tokens,
-            ).to(device).unsqueeze(0)
-        with torch.no_grad():
-            # go_aspects=["all"]: the ckpt ships a single go_embedding.pt("all"); the
-            # asked aspect is conveyed in the prompt text, not the GO embedding.
-            pe = model.build_prompt_embeds(input_ids, [seq[:args.max_protein_len]],
-                                           go_aspects=["all"])
-        if args.no_vllm:
-            # Native HF greedy decode on the (KV-cached) backbone. pe is [1, P, H] on
-            # device; HF generate accepts inputs_embeds directly. Greedy (do_sample=False),
-            # decode only the NEW tokens (HF returns only generated ids for inputs_embeds).
-            # With device_map sharding, the input embedding layer may live on a specific
-            # tile — move pe to wherever the backbone expects its input (its embed device),
-            # not blindly to `device`. get_input_embeddings().weight.device is authoritative.
-            _in_dev = backbone.get_input_embeddings().weight.device
+        # Per-sample try: one bad protein (malformed prompt, transient HTTP error, a budget
+        # edge case) must NOT kill the whole shard — that dropped ~47 samples per crash in job
+        # 8680415 (N=280, 2 shards died on one bad protein each via an unhandled 400 from
+        # vLLM). Log + skip; keep the process, and the shard, alive for the rest.
+        try:
+            if getattr(args, "native_prompt", False):
+                # Bit-identical to training: native text + integer-id placeholder layout.
+                prompt_string = None
+                input_ids = build_native_input_ids(
+                    s["row"], seq[:args.max_protein_len], _tt_tok,
+                    args.protein_token_id, args.go_token_id, args.num_go_tokens,
+                    inject_go_pred=getattr(args, "inject_go_pred", True),
+                    interpro_in_prompt=getattr(args, "interpro_in_prompt", True),
+                    ppi_in_prompt=getattr(args, "ppi_in_prompt", True),
+                ).to(device).unsqueeze(0)
+            else:
+                # BioReasonModel.tokenizer is the raw HF tokenizer (apply_chat_template + encode).
+                prompt_string = build_prompt_string(s, model.tokenizer, args.enable_thinking)
+                input_ids = build_input_ids(
+                    prompt_string, seq[:args.max_protein_len], model.tokenizer, args.num_go_tokens,
+                ).to(device).unsqueeze(0)
             with torch.no_grad():
-                gen_ids = backbone.generate(
-                    inputs_embeds=pe.to(device=_in_dev, dtype=next(backbone.parameters()).dtype),
-                    max_new_tokens=args.max_new_tokens,
-                    do_sample=False,
-                    num_beams=1,
-                    pad_token_id=model.tokenizer.pad_token_id
-                        if model.tokenizer.pad_token_id is not None
-                        else model.tokenizer.eos_token_id,
-                    use_cache=True,
-                )
-            # With inputs_embeds (no input_ids), HF returns ONLY the generated token ids.
-            resp = model.tokenizer.decode(gen_ids[0], skip_special_tokens=True)
-        else:
-            out = llm.generate([{"prompt_embeds": pe[0]}], sampling_params=sp)
-            resp = out[0].outputs[0].text if out and out[0].outputs else ""
+                # go_aspects=["all"]: the ckpt ships a single go_embedding.pt("all"); the
+                # asked aspect is conveyed in the prompt text, not the GO embedding.
+                pe = model.build_prompt_embeds(input_ids, [seq[:args.max_protein_len]],
+                                               go_aspects=["all"])
+            if args.no_vllm:
+                # Native HF greedy decode on the (KV-cached) backbone. pe is [1, P, H] on
+                # device; HF generate accepts inputs_embeds directly. Greedy (do_sample=False),
+                # decode only the NEW tokens (HF returns only generated ids for inputs_embeds).
+                # With device_map sharding, the input embedding layer may live on a specific
+                # tile — move pe to wherever the backbone expects its input (its embed device),
+                # not blindly to `device`. get_input_embeddings().weight.device is authoritative.
+                _in_dev = backbone.get_input_embeddings().weight.device
+                with torch.no_grad():
+                    gen_ids = backbone.generate(
+                        inputs_embeds=pe.to(device=_in_dev, dtype=next(backbone.parameters()).dtype),
+                        max_new_tokens=args.max_new_tokens,
+                        do_sample=False,
+                        num_beams=1,
+                        pad_token_id=model.tokenizer.pad_token_id
+                            if model.tokenizer.pad_token_id is not None
+                            else model.tokenizer.eos_token_id,
+                        use_cache=True,
+                    )
+                # With inputs_embeds (no input_ids), HF returns ONLY the generated token ids.
+                resp = model.tokenizer.decode(gen_ids[0], skip_special_tokens=True)
+            elif args.vllm_http_url:
+                # vLLM-HTTP: POST prompt_embeds ([P, H] on CPU) to the OpenAI server, get back
+                # completion token IDs, decode with the HF tokenizer (same as the no_vllm path).
+                # Greedy (temperature=0) to match device_map parity; stop at EOS server-side.
+                # CLAMP max_tokens to the server's actual remaining budget: a fixed max_new_tokens
+                # overflows vLLM's (max_model_len - prompt_len) check on long prompts, producing a
+                # 400 ("max_tokens must be at least 1, got <negative>") that used to kill the
+                # whole shard (job 8680415, N=280 — some proteins' protein+text+GO prompt exceeds
+                # the assumed split). Mirror the no_vllm path's effective cap instead of trusting
+                # a constant.
+                _eos = (model.tokenizer.eos_token_id
+                        if model.tokenizer.eos_token_id is not None else None)
+                _prompt_len = int(pe[0].shape[0])
+                _budget = args.vllm_max_model_len - _prompt_len - 8  # small safety margin
+                _req_max_tokens = max(1, min(args.max_new_tokens, _budget))
+                if _budget < 1:
+                    print(f"[eval] WARNING: prompt_len={_prompt_len} >= vllm_max_model_len="
+                          f"{args.vllm_max_model_len} for {s['protein_id']} — skipping (no "
+                          f"budget for any generation)", flush=True)
+                    resp = ""
+                else:
+                    comp_ids = _http_client.generate_from_embeds(
+                        [pe[0]],
+                        max_tokens=_req_max_tokens,
+                        temperature=args.temperature,      # 0 → greedy
+                        top_k=0,
+                        stop_token_ids=[_eos] if _eos is not None else None,
+                    )
+                    resp = model.tokenizer.decode(comp_ids[0], skip_special_tokens=True) \
+                        if comp_ids and comp_ids[0] else ""
+            else:
+                out = llm.generate([{"prompt_embeds": pe[0]}], sampling_params=sp)
+                resp = out[0].outputs[0].text if out and out[0].outputs else ""
 
-        rec = make_record(s, resp)
-        rec["input_prompt"] = prompt_string
-        fn = f"{s['protein_id']}_{aspect_code(s['go_aspect'])}_k00.json"
-        with open(os.path.join(args.out, fn), "w") as f:
-            json.dump(rec, f, indent=2)
+            rec = make_record(s, resp)
+            rec["input_prompt"] = prompt_string
+            fn = f"{s['protein_id']}_{aspect_code(s['go_aspect'])}_k00.json"
+            with open(os.path.join(args.out, fn), "w") as f:
+                json.dump(rec, f, indent=2)
+        except Exception as e:  # noqa: BLE001
+            print(f"[eval] SAMPLE FAILED protein_id={s.get('protein_id')}: "
+                  f"{type(e).__name__}: {e}", flush=True)
+            continue
         n += 1
         if n % 50 == 0:
             print(f"[eval] {n} samples, {n/(time.perf_counter()-t0):.2f}/s", flush=True)

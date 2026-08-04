@@ -36,6 +36,10 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
+from torchtune.dev.bioreason.hf_qwen35_backbone import (
+    HF_QWEN35_LORA_TARGET_MODULES,
+    HFQwen35Backbone,
+)
 from torchtune.models.gemma4 import gemma4_31b, lora_gemma4_31b
 from torchtune.models.qwen3 import qwen3_32b, lora_qwen3_32b
 
@@ -45,10 +49,18 @@ from torchtune.models.qwen3 import qwen3_32b, lora_qwen3_32b
 # embedding scale inside tok_embeddings (GemmaNormEmbeddings); Qwen3 uses a plain
 # nn.Embedding (no scale). Either way the splice uses the SAME embedding the decoder
 # would, so text/target tokens enter at the correct magnitude for that backbone.
+#
+# The HF-wrapper backbone ("qwen3_5_27b_hf", Qwen3.6-27B / Qwen3.5-family hybrid
+# linear-attention architecture) is deliberately NOT in this registry — its
+# zero-arg (dense_builder, lora_builder) shape assumes native-torchtune factories,
+# but HFQwen35Backbone needs a config path at construction and applies LoRA via
+# PEFT post-construction (see the `backbone_builder == "qwen3_5_27b_hf"` branch
+# below). Same plain nn.Embedding convention as Qwen3, so the splice is unaffected.
 _BACKBONES = {
     "gemma4_31b": (gemma4_31b, lora_gemma4_31b),
     "qwen3_32b": (qwen3_32b, lora_qwen3_32b),
 }
+_HF_BACKBONES = {"qwen3_5_27b_hf"}
 
 
 class _LazySafetensorsCache:
@@ -138,6 +150,15 @@ class BioReasonNativeModel(nn.Module):
         lora_dropout (float): LoRA dropout. Default: 0.0.
         lora_attn_modules (list[str]): attention projections to adapt.
         apply_lora_to_mlp (bool): adapt the MLP too. Default: True.
+        hf_backbone_config_path (Optional[str]): required when
+            ``backbone_builder == "qwen3_5_27b_hf"`` — path to the checkpoint's
+            ``config.json`` (see :class:`~torchtune.dev.bioreason.hf_qwen35_backbone.HFQwen35Backbone`).
+        include_conv1d_lora (bool): HF backbone only — also LoRA-adapt the
+            Gated-DeltaNet ``conv1d`` (fully depthwise, ``groups==channels``).
+            Default False: PEFT's Conv1d LoRA layer requires ``rank % groups == 0``,
+            which no practical low rank satisfies against this module's
+            groups=128 — verified directly (Step 0 of the Qwen3.6-27B integration
+            plan), not merely a fallback. Leave off; the module stays frozen.
     """
 
     GO_DIM = 2560  # GO graph encoder output dim (fixed, matches go_embedding.pt)
@@ -166,6 +187,8 @@ class BioReasonNativeModel(nn.Module):
         apply_lora_to_mlp: bool = True,
         disable_protein_splice: bool = False,
         disable_go_splice: bool = False,
+        hf_backbone_config_path: Optional[str] = None,
+        include_conv1d_lora: bool = False,
         # Test-injection hooks (production passes paths/None for all three):
         backbone: Optional[nn.Module] = None,
         protein_hidden_override: Optional[int] = None,
@@ -179,6 +202,7 @@ class BioReasonNativeModel(nn.Module):
         self.protein_token_id = protein_token_id
         self.go_token_id = go_token_id
         self._has_lora = bool(enable_lora)
+        self._is_hf_backbone = backbone_builder in _HF_BACKBONES
         self._freeze_backbone = bool(freeze_backbone)
         self._freeze_projector = bool(freeze_projector)
         self._projector_output_norm = bool(projector_output_norm)
@@ -204,10 +228,42 @@ class BioReasonNativeModel(nn.Module):
                 )
             else:
                 self.backbone = dense_builder()
+        elif backbone_builder in _HF_BACKBONES:
+            if hf_backbone_config_path is None:
+                raise ValueError(
+                    "hf_backbone_config_path is required when "
+                    f"backbone_builder={backbone_builder!r}."
+                )
+            self.backbone = HFQwen35Backbone(
+                config_path=hf_backbone_config_path, dtype=dtype
+            )
+            if enable_lora:
+                # Stage 2: LoRA-adapt the real HF Qwen3_5ForCausalLM directly (not
+                # the adapter wrapper) — mirrors the existing HF+PEFT pattern in
+                # model.py:205-259. conv1d is deliberately excluded by default (see
+                # include_conv1d_lora's docstring above).
+                from peft import LoraConfig, get_peft_model
+
+                target_modules = list(HF_QWEN35_LORA_TARGET_MODULES)
+                if include_conv1d_lora:
+                    target_modules.append("conv1d")
+                lora_config = LoraConfig(
+                    r=lora_rank,
+                    lora_alpha=lora_alpha,
+                    lora_dropout=lora_dropout,
+                    target_modules=target_modules,
+                    init_lora_weights="gaussian",
+                    bias="none",
+                    task_type="CAUSAL_LM",
+                )
+                self.backbone.model = get_peft_model(
+                    self.backbone.model, lora_config, autocast_adapter_dtype=False
+                )
+                self.backbone.model.enable_input_require_grads()
         else:
             raise ValueError(
                 f"Unknown backbone_builder: {backbone_builder!r} "
-                f"(known: {sorted(_BACKBONES)})"
+                f"(known: {sorted(_BACKBONES)} + {sorted(_HF_BACKBONES)})"
             )
 
         # Reuse the backbone's own tok_embeddings for the splice. Feeding input_embeds
@@ -295,7 +351,13 @@ class BioReasonNativeModel(nn.Module):
         #     Stage-1-aligned projections (loaded via proj_resume_dir). Base frozen
         #     except adapters; projections continue training.
         #   Full-FT (neither): everything trainable (legacy; not the published path).
-        if self._has_lora:
+        if self._has_lora and backbone_builder in _HF_BACKBONES:
+            # Stage 2, HF backbone: get_peft_model() already set requires_grad
+            # correctly (True only on lora_A/lora_B) at construction above — PEFT's
+            # own naming isn't recognized by torchtune's get_adapter_params, and no
+            # manual freeze loop is needed on top of what PEFT already did.
+            pass
+        elif self._has_lora:
             # Stage 2: freeze base, keep LoRA adapters + projections trainable. The
             # lora_gemma4 builder does NOT freeze the base (the standard torchtune LoRA
             # recipe does it via set_trainable_params). The projections live OUTSIDE

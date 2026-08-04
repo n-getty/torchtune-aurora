@@ -1,0 +1,115 @@
+# Qwen3-30B-A3B FULL SFT baseline — Aurora (XPU), NO Expert Parallelism.
+#
+# Phase 1a of the MoE-SFT-isolation project: prove the new
+# full_finetune_moe_distributed_xpu.py recipe is a correct, inert superset of
+# the dense SFT recipe when expert_parallel_degree is absent/1 — every
+# GroupedExpertsHF param is then just another FSDP2-sharded param, no EP
+# mesh/plan/solo-FSDP2 code paths engage. This also gives a pre-EP-tax
+# reference number (world=1 tile group, plain FULL_SHARD FSDP2).
+#
+# Data/optimizer/loss mirror qwen3_4b_sft_throughput_aurora_xpu.yaml exactly
+# (packed alpaca @ seq2048, bs=2, ga=1, fused AdamW, LinearCrossEntropyLoss)
+# so the only deltas vs the dense baseline are model architecture + tokenizer
+# + checkpointer (QWEN3_MOE).
+#
+# Recipe:   recipes/dev/full_finetune_moe_distributed_xpu.py
+# Launcher: recipes/dev/run_qwen3_30b_sft_ep8_xpu.sh (expert_parallel_degree
+#           override is unnecessary here since EP=1 is the config default)
+
+name: qwen3_30b_a3b_sft_ep1
+output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/experiments/qwen3_moe/runs/${name}
+base_model_path: /lus/flare/projects/ModCon/ngetty/models/Qwen3-30B-A3B
+
+# ── Model ────────────────────────────────────────────────────────────────────
+model:
+  _component_: torchtune.models.qwen3_moe.qwen3_30b_a3b
+
+# No expert_parallel_degree set → recipe's EP branch never triggers (EP=1
+# default). Every expert param is plain FSDP2-sharded like any other param.
+
+# ── Tokenizer ────────────────────────────────────────────────────────────────
+tokenizer:
+  _component_: torchtune.models.qwen3_moe.qwen3_moe_tokenizer
+  path: ${base_model_path}/vocab.json
+  merges_file: ${base_model_path}/merges.txt
+  max_seq_len: 2048
+
+# ── Checkpointer ─────────────────────────────────────────────────────────────
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files:
+    filename_format: model-{}-of-{}.safetensors
+    max_filename: "00016"
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: QWEN3_MOE
+
+resume_from_checkpoint: false
+
+# ── Dataset (packed alpaca @ seq2048 → constant token volume per step) ────────
+dataset:
+  _component_: torchtune.datasets.alpaca_dataset
+  source: tatsu-lab/alpaca
+  train_on_input: true
+  packed: true
+seed: 1234
+shuffle: true
+dataloader_num_workers: 4
+
+# ── Training envelope (small — Phase 1a smoke on PBS debug queue) ────────────
+epochs: 1
+max_steps_per_epoch: 15
+batch_size: 2
+gradient_accumulation_steps: 1
+# Diagnostic (Phase 1a loss-divergence investigation): 'inf' logs grad_norm
+# without actually clipping (never triggers, since real grad norms are finite).
+# Revert to null once the loss-climb root cause is confirmed non-code.
+clip_grad_norm: 'inf'
+
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 1.0e-5
+  weight_decay: 0.0
+  fused: true
+
+loss:
+  _component_: torchtune.modules.loss.LinearCrossEntropyLoss
+
+# ── Distributed / FSDP (top-level wrap, reshard-after-forward) ────────────────
+enable_activation_checkpointing: true
+enable_activation_offloading: false
+fsdp_cpu_offload: false
+fsdp_reshard_after_forward: true
+data_parallel_replicate_dim: 1
+data_parallel_shard_dim: -1
+tensor_parallel_dim: 1
+
+# ── XPU ──────────────────────────────────────────────────────────────────────
+device: xpu
+dtype: bf16
+compile: false
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+log_level: INFO
+log_every_n_steps: 1
+log_peak_memory_stats: true
+
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: false
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: true
+  cuda: false
+  profile_memory: false
+  with_stack: false
+  record_shapes: false
+  with_flops: false
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1

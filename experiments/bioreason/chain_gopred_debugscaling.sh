@@ -6,9 +6,20 @@
 # (which never got scheduled) with a sequence of schedulable 1h jobs.
 #
 # Submit the FIRST link with:
-#   qsub -v CHAIN_TARGET=120,CHAIN_STEPS=24,SAVE_EVERY=8,LINK=1 \
+#   qsub -v CHAIN_TARGET=180,CHAIN_STEPS=24,SAVE_EVERY=8,LINK=1 \
 #        experiments/bioreason/chain_gopred_debugscaling.sh
 # Each link auto-submits the next; the chain stops when cumulative steps >= CHAIN_TARGET.
+#
+# CHAIN_TARGET default raised 120->180 (2026-07-31, closes gap #7 in
+# docs/reports/bioreason_ablations_headline_findings_20260730.md): the only prior
+# go_pred-matched RL run scaled to a real budget (job 8556915, COLD prompt though) ran
+# ~178 steps before compute was reallocated; the go_pred-FIXED prompt's longest run only
+# reached 18 steps (+0.0025 F_max, noise-level per
+# project_bioreason_eval_fixed_rl_flat_vs_sft_20260626) — never matched to the scale
+# needed to compare against the published RL's reported +0.018 F_max over SFT. 180
+# targets that same ~178-200-step envelope. Each checkpoint save now also runs
+# eval_checkpoint_ledger.sh (see below) so the F_max trajectory is visible without a
+# separate manual eval pass at the end.
 #
 # Resume semantics: the LoRA adapter (+ trained projections) carries the learning across
 # links; the AdamW optimizer state resets each link (adapter-only resume). For GRPO with a
@@ -28,7 +39,10 @@ TT=/lus/flare/projects/ModCon/ngetty/torchtune
 cd "$TT"
 
 # ---- chain params (env-injected via qsub -v) ----
-CHAIN_TARGET=${CHAIN_TARGET:-120}   # cumulative go_pred RL steps to reach across all links
+CHAIN_TARGET=${CHAIN_TARGET:-180}   # cumulative go_pred RL steps to reach across all links
+                                    # (raised from 120 -> matches the ~178-200 step scale
+                                    # needed to compare against the published RL's +0.018
+                                    # F_max claim — see the header note above)
 CHAIN_STEPS=${CHAIN_STEPS:-24}      # steps per 1h link (~10min boot + ~50min @ ~113s/step)
 SAVE_EVERY=${SAVE_EVERY:-8}         # checkpoint cadence (a walltime kill loses <= SAVE_EVERY)
 LINK=${LINK:-1}                     # 1-based link index
@@ -159,12 +173,32 @@ if [ "$LAST_STEP" -eq 0 ]; then
     exit $RC
 fi
 
-# Submit the next link, resuming the adapter this link wrote. depend=afterany so it queues
-# now and starts whenever debug-scaling frees (max_run=1 means at most one of ours runs).
+# Submit the next link BEFORE the (potentially slow) ledger eval below — a link whose
+# training used most of the 1h walltime left too little headroom for a synchronous eval,
+# and the whole job (including this resubmit) got walltime-killed before it ever ran
+# (job 8723148, link 3: train finished, ledger eval was mid-vLLM-init when PBS killed the
+# job at exactly 1h — no link 4 was ever queued, silently stalling the chain at 36/180).
+# depend=afterany so it queues now and starts whenever debug-scaling frees.
 NEXT=$(( LINK + 1 ))
 echo "$NEW_DONE" > "$CHAIN_STATE/cumulative_steps"
 nextjob=$(qsub -W depend=afterany:${PBS_JOBID} \
      -v CHAIN_TARGET=$CHAIN_TARGET,CHAIN_STEPS=$CHAIN_STEPS,SAVE_EVERY=$SAVE_EVERY,LINK=$NEXT,DONE_STEPS=$NEW_DONE,CHAIN_OUT=$CHAIN_OUT,GRPO_SAMPLES=$GRPO_SAMPLES,BATCH_SIZE=$BATCH_SIZE,FORWARD_BATCH_SIZE=$FORWARD_BATCH_SIZE,MAX_GEN_TOKENS=$MAX_GEN_TOKENS,USE_ASYNC=$USE_ASYNC \
      "$TT/experiments/bioreason/chain_gopred_debugscaling.sh" 2>&1)
 echo "=== submitted next link=$NEXT: $nextjob ===" | tee -a "$CHAIN_STATE/chain.log"
+
+# ---- periodic held-out F_max checkpointing (do NOT rely on training loss alone) ----
+# A sibling BioReason project found training loss can be flat while F_max climbs, or
+# still dropping while F_max REGRESSES from overfitting — either divergence would go
+# unnoticed here without an explicit per-link eval. Runs AFTER the next link is already
+# queued (see note above) so a slow eval can never block/kill the chain's own progress.
+# Best-effort: failures here must not affect this job's exit code.
+if [ -f "$CHAIN_OUT/epoch_0/adapter/adapter_model.safetensors" ]; then
+    LEDGER_SFT=${LEDGER_SFT:-/lus/flare/projects/ModCon/ngetty/models/bioreason-pro-sft}
+    bash "$TT/experiments/bioreason/eval_checkpoint_ledger.sh" \
+        "$LEDGER_SFT" "$CHAIN_OUT/fmax_ledger.tsv" "$(basename "$CHAIN_OUT")" "$NEW_DONE" \
+        "$CHAIN_OUT/epoch_0/adapter" "$CHAIN_OUT/epoch_0" 30 \
+        2>&1 | tee -a "$CHAIN_STATE/chain.log" || \
+        echo "    [ledger] eval_checkpoint_ledger.sh failed (non-fatal, chain continues)" \
+            | tee -a "$CHAIN_STATE/chain.log"
+fi
 exit $RC

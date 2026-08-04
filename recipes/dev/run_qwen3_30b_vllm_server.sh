@@ -22,6 +22,14 @@ unset VIRTUAL_ENV
 
 export ZE_FLAT_DEVICE_HIERARCHY=FLAT
 unset PYTORCH_ALLOC_CONF
+# WS10 (TORCHTUNE_EP_WSYNC_SHARDED=1) opens per-EP-rank gloo cross-PGs from
+# this vLLM node back to the training node. Gloo picks an interface per
+# process; without this set here too (mirroring the training-side launcher),
+# the vLLM-side end of the PG silently defaults to the mgmt NIC (or fails to
+# route), hanging the broadcast at 0.0 GB/s until HTTP timeout (job 8682162,
+# 2026-07-21). Harmless when WS10 is off — these PGs are gated by the sender
+# and simply never open.
+export GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-hsn0}
 # WS3 (2026-05-01): VLLM_SERVER_DEV_MODE=1 unlocks /collective_rpc HTTP route
 # (vllm/entrypoints/serve/rpc/api_router.py:59 returns early without it).
 # Without this the worker extension is loaded but the recipe hits 404 when

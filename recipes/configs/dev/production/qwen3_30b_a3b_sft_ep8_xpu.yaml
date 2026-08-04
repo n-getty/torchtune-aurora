@@ -1,0 +1,210 @@
+# Qwen3-30B-A3B FULL SFT with Expert Parallelism EP=8 — Aurora (XPU), single node.
+#
+# Phase 1b of the MoE-SFT-isolation project: real, undiluted MoE training
+# throughput (no generation/ref-forward/weight-sync) at the EP=8 topology this
+# project has already validated in the GRPO context. Single-node scoped
+# deliberately — with no vLLM, EP=8 SFT has no reason to be multi-node (the
+# GRPO 2-node variant's second node was for the vLLM server, not EP scale).
+#
+# Topology: dp_replicate=1, dp_shard=8=expert_parallel_degree, 8 of 12 tiles
+# used (ZE_AFFINITY_MASK in the launcher selects which 8). Each tile owns
+# 128 / 8 = 16 experts (interleaved assignment).
+#
+# Data/optimizer/loss mirror qwen3_4b_sft_throughput_aurora_xpu.yaml (packed
+# alpaca @ seq2048, bs=2, ga=1, fused AdamW, LinearCrossEntropyLoss) so the
+# MoE-vs-dense comparison is apples-to-apples on everything except model
+# architecture + parallelism. See qwen3_30b_a3b_sft_ep1_xpu.yaml for the
+# EP=1 baseline variant.
+#
+# GRPO-proven env-flag defaults (set by the launcher, override via env):
+#   TORCHTUNE_EP_GRAD_RELEASE_XCCL=1     (dominant EP lever, -34.5% grad-release;
+#                                         re-confirmed 2026-07-24/25: bandwidth-bound,
+#                                         XCCL already optimal transport, CLOSED)
+#   TORCHTUNE_MOE_SEQUENTIAL_EXPERTS=1   (REQUIRED — HW-TESTED 2026-07-25 across
+#                                         batch_size=2/ga=1, batch_size=1/ga=2, AND
+#                                         batch_size=1/ga=4: padded-BMM
+#                                         (SEQUENTIAL_EXPERTS=0) CRASHES in all three
+#                                         (UR_RESULT_ERROR_OUT_OF_RESOURCES). ROOT-
+#                                         CAUSED (not an L0 handle-table bug, not
+#                                         GRPO's fbs>=4 mechanism): MoE layers are
+#                                         excluded from activation checkpointing
+#                                         (v158 correctness fix), so all 48 layers'
+#                                         padded-BMM activations stay resident
+#                                         simultaneously until one .backward() — real
+#                                         per-layer tokens (~27.5K avg, routing-
+#                                         imbalanced up to 4.6x padding waste) blow
+#                                         past the 64GB tile. `gradient_accumulation_
+#                                         steps` was tried as a zero-new-code fix
+#                                         (CPU-correctness-proven bit-identical via
+#                                         tests/torchtune/dev/rl/
+#                                         test_moe_gradient_accumulation_equivalence.py)
+#                                         and PARTIALLY worked: ga=2 got 2x further
+#                                         (96 vs ~30 padded-BMM calls) because
+#                                         mem_alloc correctly resets between
+#                                         microbatches — but still crashed at ~66GB
+#                                         because mem_reserved (XPU can't
+#                                         empty_cache()) ratchets up across
+#                                         microbatches regardless. ga=4 was tried
+#                                         expecting more headroom and is CONFIRMED
+#                                         NOT TO HELP — it crashed at the IDENTICAL
+#                                         point with IDENTICAL total/max_count
+#                                         values, because `batch_size` (already at
+#                                         its floor of 1), not
+#                                         `gradient_accumulation_steps`, controls
+#                                         per-microbatch token volume. The
+#                                         gradient_accumulation_steps axis is now
+#                                         CLOSED. The mem_reserved ratchet mechanism
+#                                         was ALSO investigated directly and CLOSED
+#                                         (2026-07-25, MFU-20% push, TORCHTUNE_
+#                                         MOE_MEM_RATCHET_DEBUG=1 memory_stats()
+#                                         bracketing): the crash is PAYLOAD-DRIVEN,
+#                                         not an allocator artifact — microbatch 1
+#                                         crashed during its OWN .backward() (before
+#                                         even reaching its grad-release checkpoint),
+#                                         proving each microbatch's padded-BMM
+#                                         activation peak (not a grad-release
+#                                         transient) is what exceeds the tile, and
+#                                         that peak cannot shrink via chunking since
+#                                         XPU can never empty_cache() the reserved
+#                                         floor it stacks on top of. PADDED-BMM IS
+#                                         THEREFORE PERMANENTLY UNSAFE at this scale
+#                                         with SEQUENTIAL_EXPERTS=1 as the permanent
+#                                         (not conservative-placeholder) default — do
+#                                         not retry padded-BMM without either
+#                                         reducing tokenizer.max_seq_len or building a
+#                                         padding-free expert kernel (see the
+#                                         MFU-20%-push plan's Phase 2/P4 for the
+#                                         latter, not yet attempted). See memory/
+#                                         project_moe_sft_profiling_gradrelease_
+#                                         bottleneck_20260724.md for the full trail
+#                                         (includes the memory_stats() snapshots) —
+#                                         NOTE an earlier layer-dimension chunking
+#                                         attempt in that file's history was ALSO
+#                                         invalid, kept only as a documented dead
+#                                         end.)
+#   TORCHTUNE_EP_ALL2ALL=0               (CODE DEFAULT here is AG+RS, but every
+#                                         validated MoE SFT throughput number this
+#                                         project has (199.18 tok/s/gpu, the grad-
+#                                         release investigation, this file's own
+#                                         "best known" runs) used an EXPLICIT
+#                                         TORCHTUNE_EP_ALL2ALL=1 override — the
+#                                         launcher does NOT default to the validated
+#                                         path. Always pass =1 explicitly when
+#                                         reproducing prior results.)
+#
+# Recipe:   recipes/dev/full_finetune_moe_distributed_xpu.py
+# Launcher: recipes/dev/run_qwen3_30b_sft_ep8_xpu.sh
+
+name: qwen3_30b_a3b_sft_ep8
+output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/experiments/qwen3_moe/runs/${name}
+base_model_path: /lus/flare/projects/ModCon/ngetty/models/Qwen3-30B-A3B
+
+# ── Model ────────────────────────────────────────────────────────────────────
+model:
+  _component_: torchtune.models.qwen3_moe.qwen3_30b_a3b
+
+# ── Expert Parallelism ────────────────────────────────────────────────────────
+expert_parallel_degree: 8
+expert_cpu_offload: false
+
+# ── Tokenizer ────────────────────────────────────────────────────────────────
+tokenizer:
+  _component_: torchtune.models.qwen3_moe.qwen3_moe_tokenizer
+  path: ${base_model_path}/vocab.json
+  merges_file: ${base_model_path}/merges.txt
+  max_seq_len: 2048
+
+# ── Checkpointer ─────────────────────────────────────────────────────────────
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files:
+    filename_format: model-{}-of-{}.safetensors
+    max_filename: "00016"
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: QWEN3_MOE
+
+resume_from_checkpoint: false
+
+# ── Dataset (packed alpaca @ seq2048 → constant token volume per step) ────────
+dataset:
+  _component_: torchtune.datasets.alpaca_dataset
+  source: tatsu-lab/alpaca
+  train_on_input: true
+  packed: true
+seed: 1234
+shuffle: true
+dataloader_num_workers: 4
+
+# ── Training envelope ─────────────────────────────────────────────────────────
+epochs: 1
+max_steps_per_epoch: 55      # ~10 warmup + ~45 measured, matches dense baseline convention
+batch_size: 2
+gradient_accumulation_steps: 1
+clip_grad_norm: null
+
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 1.0e-5
+  weight_decay: 0.0
+  fused: true
+
+loss:
+  _component_: torchtune.modules.loss.LinearCrossEntropyLoss
+
+# ── Distributed / FSDP ────────────────────────────────────────────────────────
+# EP single-replica: data_parallel_replicate_dim MUST be 1 (world ==
+# expert_parallel_degree == dp_shard). fsdp_reshard_after_forward is ignored
+# when EP is active — the recipe forces ZeRO-2 (reshard_after_forward=False)
+# on the non-expert FSDP2 mesh to avoid an XCCL/OFI conflict with the EP
+# collective's backward.
+enable_activation_checkpointing: true
+enable_activation_offloading: false
+fsdp_cpu_offload: false
+fsdp_reshard_after_forward: true
+data_parallel_replicate_dim: 1
+data_parallel_shard_dim: -1   # infers to 8 = world_size (8 tiles used)
+tensor_parallel_dim: 1
+
+# ── XPU ──────────────────────────────────────────────────────────────────────
+device: xpu
+dtype: bf16
+# HW-validated 2026-07-25 (MFU-20% push, task #54): per-layer torch.compile
+# gives a small but real, health-gated, A/B'd win in THIS EP/SEQUENTIAL_EXPERTS
+# context (unlike the earlier plain-dense-4B result, which was a small LOSS).
+# GroupedExpertsHF's forward is @torch.compiler.disable-guarded on both the
+# padded-BMM and sequential-experts branches, so compile cannot touch expert
+# compute itself -- the win comes from compile fusing attention/router/EP-glue
+# ops around that graph break. 8-step A/B, same node, back-to-back:
+# eager steady-state (steps 4-8) 14.571s/step median vs compile 14.272s/step
+# (~2.05% faster); check_run_health.sh --compare confirmed same code
+# path/transport both legs; loss trajectories track within 0.03-0.05%
+# relative difference across all 8 steps (expected bf16 kernel-fusion
+# numerical drift, not divergence). See memory/
+# project_moe_sft_profiling_gradrelease_bottleneck_20260724.md.
+compile: true
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+log_level: INFO
+log_every_n_steps: 1
+log_peak_memory_stats: true
+
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: false
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: true
+  cuda: false
+  profile_memory: false
+  with_stack: false
+  record_shapes: false
+  with_flops: false
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1

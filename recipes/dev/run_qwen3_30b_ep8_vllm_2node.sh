@@ -49,6 +49,19 @@ export CCL_ALLTOALL=naive
 unset XPU_USM_ALLOC_SO
 export PYTORCH_ALLOC_CONF=garbage_collection_threshold:0.99
 
+# Cross-node gloo route: the EP=8 collective itself stays on-node (comment
+# above), but TORCHTUNE_EP_WSYNC_SHARDED=1 (WS10) opens gloo cross-PGs
+# straight to the SEPARATE dedicated vLLM node — genuine cross-node traffic
+# that needs Slingshot, unlike the intra-node _shard_pg gloo this launcher
+# used before. Without this, gloo silently defaults to the 1 Gbps mgmt NIC
+# (or fails to route at all) and the WS10 broadcast hangs at 0.0 GB/s until
+# the 1800s HTTP timeout (job 8682162, cellB, 2026-07-21) even though the
+# sender-side gather worked perfectly (6.75 GiB/rank in 9.1s, vs 56.87 GiB/
+# 25s on the legacy full-reship path). Every OTHER multi-node EP launcher
+# (ep16, ep8_3node, ep4_3node, 32b) already sets this; this one was the one
+# omission because it never needed cross-node gloo before WS10.
+export GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-hsn0}
+
 FW_SITE=/opt/aurora/25.190.0/frameworks/aurora_frameworks-2025.3.1/lib/python3.12/site-packages
 LOCAL_SITE=/home/ngetty/.local/aurora/frameworks/2025.3.1/lib/python3.12/site-packages
 export PYTHONNOUSERSITE=1
@@ -110,6 +123,54 @@ echo "All 3 vLLM replicas ready on ${VLLM_ADDR}"
 # must equal world size; 8 tiles → dp_replicate=1, dp_shard=8). The yaml is
 # parameterized for dp_replicate=3 in the 3-node 24-tile case.
 EXTRA="data_parallel_replicate_dim=1 ${EXTRA_OVERRIDES:-}"
+
+# GroupedExpertsHF's padded-BMM forward allocates a fresh [E, max_count, dim]
+# tensor every call (48 layers/step); at forward_batch_size>=4 this exhausts
+# the XPU L0 handle table (UR_RESULT_ERROR_OUT_OF_RESOURCES / banned:1).
+# HW-validated fix (job 8681553, 2026-07-21): TORCHTUNE_MOE_SEQUENTIAL_EXPERTS=1
+# (no padded allocation) clears G=4/fbs=4 AND G=8/fbs=4, 4/4 steps each. Only
+# auto-enable at fbs>=4 — the padded-BMM path is a proven 6.3x speedup and
+# stays default at fbs<=2 where it doesn't crash. Caller can still force
+# either way by exporting TORCHTUNE_MOE_SEQUENTIAL_EXPERTS before invoking
+# this script. See memory/project_qwen3_moe_padded_bmm_l0_exhaustion_fix_20260721.md.
+if [ -z "${TORCHTUNE_MOE_SEQUENTIAL_EXPERTS+x}" ]; then
+    _FBS=$(echo "${EXTRA}" | grep -oE 'forward_batch_size=[0-9]+' | tail -1 | grep -oE '[0-9]+')
+    if [ -n "${_FBS}" ] && [ "${_FBS}" -ge 4 ]; then
+        export TORCHTUNE_MOE_SEQUENTIAL_EXPERTS=1
+        echo "forward_batch_size=${_FBS} >= 4: auto-enabling TORCHTUNE_MOE_SEQUENTIAL_EXPERTS=1"
+    fi
+fi
+
+# HSN IP for XCCL weight sync: vLLM (on a DIFFERENT node) connects to this
+# address. --master_addr=localhost below is fine for torchrun's own
+# single-node rendezvous, but _init_xccl_weight_sync falls back to
+# MASTER_ADDR when TORCHTUNE_XCCL_HOST is unset — "localhost" would tell
+# the vLLM workers to dial themselves, hanging for 120s then failing
+# (see feedback_ab_harness_bugs_not_infra.md point 3/reproduced 2026-07-21).
+MASTER_HSN_IP=$(ip -4 addr show hsn0 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d'/' -f1 | head -1)
+if [ -z "${MASTER_HSN_IP}" ]; then
+    echo "WARNING: could not get hsn0 IP; falling back to hostname for XCCL"
+    MASTER_HSN_IP=$(hostname)
+fi
+export TORCHTUNE_XCCL_HOST="${MASTER_HSN_IP}"
+echo "TORCHTUNE_XCCL_HOST=${TORCHTUNE_XCCL_HOST} (for cross-node XCCL weight sync)"
+
+# WSYNC_TOPOLOGY/WSYNC_CROSS_METHOD: TESTED node_fanout+gloo here 2026-07-21
+# (A/B job 8681387, 4/4 clean steps each leg, both GREEN, same path/transport)
+# and it's a ~15% REGRESSION at this topology (3 replicas, 1 vLLM node):
+# baseline (unset -> replica_fanout+xccl_sendrecv) steady-state 77.9-78.0s/step
+# (wsync ~48.6s, XCCL RDMA send/recv 3 replicas in parallel at 2.4-2.6 GB/s
+# each) vs node_fanout+gloo 90.0-90.2s/step (wsync ~62s, single gloo TCP
+# cross-node hop degrading 24.0s->30.0s->37.4s->37.6s across steps at
+# 2.4->1.5 GB/s, THEN a serialized intra-node XCCL fanout to replicas 1-2).
+# BioReason's DP=12 win doesn't transfer here — with only 3 replicas the
+# serialization cost of the two-hop path outweighs cutting cross-NIC fanout,
+# and gloo TCP itself is slower per-byte than XCCL RDMA on this fabric.
+# Leave UNSET (replica_fanout+xccl_sendrecv, the code default) for this
+# launcher. See memory/project_wsync_node_fanout_regression_ep8_20260721.md.
+export WSYNC_TOPOLOGY=${WSYNC_TOPOLOGY:-replica_fanout}
+export WSYNC_CROSS_METHOD=${WSYNC_CROSS_METHOD:-xccl_sendrecv}
+echo "WSYNC_TOPOLOGY=${WSYNC_TOPOLOGY} WSYNC_CROSS_METHOD=${WSYNC_CROSS_METHOD}"
 
 echo "Starting EP=8 Qwen3 training on 8 tiles..."
 torchrun \

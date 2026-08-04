@@ -10,6 +10,7 @@ from torchtune.training._activation_offloading import (
 )
 from torchtune.training._compile import compile_loss, compile_model
 from torchtune.training._distributed import (
+    disable_fsdp2_backward_prefetch,
     gather_cpu_state_dict,
     get_context_parallel_manager,
     get_distributed_backend,
@@ -23,18 +24,21 @@ from torchtune.training._distributed import (
     load_from_full_optimizer_state_dict,
     log_fsdp_memory_per_phase,
     log_fsdp_structure,
-    register_per_layer_memory_hooks,
-    verify_activation_checkpointing,
     ParallelDims,
     prepare_mha_for_tp,
+    register_per_layer_memory_hooks,
     set_torch_num_threads,
-    disable_fsdp2_backward_prefetch,
     shard_experts_for_ep,
     shard_model,
     VALID_BACKENDS_FOR_MEMORY_STATS,
     validate_no_params_on_meta_device,
+    verify_activation_checkpointing,
 )
-from torchtune.training._grad_scaler import scale_grads, scale_grads_
+from torchtune.training._grad_scaler import (
+    scale_grads,
+    scale_grads_,
+    scale_grads_for_native_ep_,
+)
 from torchtune.training._model_util import disable_dropout
 from torchtune.training._profiler import (
     DEFAULT_PROFILE_DIR,
@@ -161,6 +165,7 @@ __all__ = [
     "FormattedCheckpointFiles",
     "scale_grads",
     "scale_grads_",
+    "scale_grads_for_native_ep_",
     "get_distributed_backend",
     "disable_dropout",
     "DATALOADER_KEY",

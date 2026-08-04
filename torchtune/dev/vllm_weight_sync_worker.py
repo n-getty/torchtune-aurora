@@ -750,52 +750,95 @@ class WeightSyncFromFileExtension:
         on R=0's PG, after that rank's expert batches.  R=0's thread handles
         both expert and non-expert entries in manifest order.
 
+        Each thread packs its OWN batches directly into ``pre_recv`` as flat
+        bf16 CPU tensors keyed by GLOBAL ``tensors_meta`` index, instead of
+        writing per-param tensors into an intermediate ``all_shards`` dict
+        that a separate single-threaded pass later re-packs into per-batch
+        tensors. This is safe because the sender's canonical manifest order
+        (``_ws10_sort_key_by_rank`` in weight_sync.py) groups every rank's
+        entries contiguously, so a rank's LOCAL greedy batch boundaries
+        (computed here from just that rank's ``entries`` slice) are
+        byte-identical to the GLOBAL rebuild plan's batches filtered to that
+        rank — there is no cross-rank dependency to wait for. Removed
+        2026-07-22 in favor of this: a ~21-23s single-threaded post-join
+        rebuild pass (HW-measured, job 8683110) that was pure serialized
+        overhead sitting between "last rank's broadcast lands" and "first
+        intra-node TP fanout batch posts" — confirmed via a standalone
+        equivalence check that it always recomputed exactly what this
+        function already knew per-thread. See
+        memory/project_ws10_ep8_hang_20260721.md.
+
         Args:
             tensors_meta: full manifest entry list (same as serial path)
             batch_max_numel: greedy batch size cap (elements, same on both sides)
             sharded_cross_pgs: {R: gloo_pg} from self._xccl_sharded_cross_pgs
 
         Returns:
-            (all_shards, nonexpert_weights, recv_times, t_parallel)
-            - all_shards: {layer_idx: {"w13": {R: cpu_tensor}, "w2": {R: cpu_tensor},
-                                        "ep_degree": int, "n_local_trainer": int}}
-            - nonexpert_weights: [(param_name, cpu_tensor), ...]
+            (pre_recv, recv_times, t_parallel)
+            - pre_recv: {global_batch_start_idx: flat_bf16_cpu_tensor} — ready
+              for the intra-node TP fanout loop to consume directly via
+              ``cpu_recv.copy_(pre_recv[batch_start])``, no further packing.
             - recv_times: {R: elapsed_s}  (per-thread)
             - t_parallel: wall time from first thread start to last thread join
         """
         import threading
         import torch
 
-        _fused_re = re.compile(
-            r"model\.layers\.(\d+)\.mlp\.experts\.(w13|w2)_weight"
-        )
-
-        # Group manifest entries by effective EP rank.
+        # Group manifest entries by effective EP rank, carrying the GLOBAL
+        # index alongside each entry so this thread can key pre_recv by the
+        # same batch_start the intra-fanout loop (and the old rebuild pass)
+        # used — a plain per-rank local index would collide across ranks.
         # Non-expert entries (no trainer_ep_rank) are sent by trainer rank 0
         # on PG[0] after expert batches — fold them into R=0's group.
         rank_groups: dict = {}
-        for entry in tensors_meta:
+        for global_idx, entry in enumerate(tensors_meta):
             R = entry.get("trainer_ep_rank")
             eff_R = int(R) if R is not None else 0
-            rank_groups.setdefault(eff_R, []).append(entry)
+            rank_groups.setdefault(eff_R, []).append((global_idx, entry))
 
-        all_shards: dict = {}       # {layer_idx: {"w13": {R: t}, "w2": {R: t}, ...}}
-        all_shards_lock = threading.Lock()
-        nonexpert_weights: list = []  # [(name, tensor)] — only R=0 thread writes
+        pre_recv: dict = {}         # {global_batch_start_idx: flat_cpu_tensor}
+        pre_recv_lock = threading.Lock()  # writes are to disjoint keys per thread
         recv_times: dict = {}
         errors: dict = {}
 
-        def recv_rank_thread(ep_rank: int, entries: list, pg) -> None:
+        def recv_rank_thread(ep_rank: int, indexed_entries: list, pg) -> None:
             t0 = time.perf_counter()
             local_buf = None
             try:
                 i = 0
-                while i < len(entries):
-                    # Greedy batch: same algorithm as sender (_ws10_build_local_payload)
+                n = len(indexed_entries)
+                while i < n:
+                    # Greedy batch: same algorithm as sender
+                    # (_ws10_build_local_payload for the expert region) PLUS
+                    # the forced expert->non-expert boundary the sender
+                    # always inserts for rank 0's tail (weight_sync.py's
+                    # non-expert packing loop unconditionally starts a NEW
+                    # batch at _cur_n=0, even if the last expert batch had
+                    # leftover room under batch_max_numel). Must mirror that
+                    # forced break here via the same trainer_ep_rank
+                    # presence/absence check the diagnostic counter loop
+                    # below also uses (entries without the key are
+                    # non-expert -> None != int forces a break). Without
+                    # this, rank 0's actual per-batch byte counts on the
+                    # wire can diverge from what this loop expects whenever
+                    # the last expert entry doesn't land exactly on a
+                    # batch_max_numel boundary -- gloo doesn't raise cleanly
+                    # on the mismatch, it just hangs the broadcast until the
+                    # 30-min timeout (root-caused 2026-07-22 after jobs
+                    # 8683165/8683288 both hung/crashed at larger batch
+                    # sizes; the earlier "int32 preamble overflow" diagnosis
+                    # was the wrong mechanism — this boundary bug is real and
+                    # was already latent at the 1 GiB default, just not
+                    # triggered by these particular tensor sizes).
                     batch_numel = 0
                     batch_start = i
-                    while i < len(entries):
-                        pn = entries[i]["numel"]
+                    global_batch_start = indexed_entries[batch_start][0]
+                    batch_R = indexed_entries[batch_start][1].get("trainer_ep_rank")
+                    while i < n:
+                        pn = indexed_entries[i][1]["numel"]
+                        R_now = indexed_entries[i][1].get("trainer_ep_rank")
+                        if batch_numel > 0 and R_now != batch_R:
+                            break
                         if batch_numel > 0 and batch_numel + pn > batch_max_numel:
                             break
                         batch_numel += pn
@@ -806,27 +849,13 @@ class WeightSyncFromFileExtension:
                     cpu_recv = local_buf[:batch_numel]
                     pg.broadcast(cpu_recv, root=0).wait()
 
-                    offset = 0
-                    for entry in entries[batch_start:i]:
-                        n = entry["numel"]
-                        tensor = cpu_recv[offset:offset + n].reshape(entry["shape"]).clone()
-                        offset += n
-                        m = _fused_re.match(entry["name"])
-                        if m:
-                            layer_idx = int(m.group(1))
-                            kind = m.group(2)
-                            ep_degree = int(entry.get("ep_degree", 1))
-                            n_local = int(entry.get("n_local", entry["shape"][0]))
-                            with all_shards_lock:
-                                lyr = all_shards.setdefault(layer_idx, {
-                                    "w13": {}, "w2": {},
-                                    "ep_degree": ep_degree,
-                                    "n_local_trainer": n_local,
-                                })
-                                lyr[kind][ep_rank] = tensor
-                        else:
-                            # Non-expert entry — only R=0 thread reaches here
-                            nonexpert_weights.append((entry["name"], tensor))
+                    # Pack this batch's flat tensor directly — this thread
+                    # already has the raw received bytes in the exact
+                    # concatenated order the intra-fanout loop expects, so
+                    # no per-param split + later re-concat is needed (that
+                    # was the removed rebuild pass's job).
+                    with pre_recv_lock:
+                        pre_recv[global_batch_start] = cpu_recv.clone()
             except Exception as e:
                 errors[ep_rank] = e
             recv_times[ep_rank] = time.perf_counter() - t0
@@ -852,7 +881,7 @@ class WeightSyncFromFileExtension:
         if errors:
             raise RuntimeError(f"WS10 parallel recv errors: {errors}")
 
-        return all_shards, nonexpert_weights, recv_times, t_parallel
+        return pre_recv, recv_times, t_parallel
 
     # ------------------------------------------------------------------
     # XCCL broadcast weight sync
@@ -1322,66 +1351,29 @@ class WeightSyncFromFileExtension:
                 _ws10_serial_fanout = False
                 _ws10_pre_recv: dict = {}   # {batch_start → flat_cpu_tensor}
                 if _ws10_sharded_cross_pgs:
-                    _p_shards, _p_ne, _p_rtimes, _p_wall = self._ws10_parallel_recv(
+                    # _ws10_parallel_recv packs each batch's flat tensor
+                    # directly (keyed by global tensors_meta index) as each
+                    # rank's thread receives it — no separate post-join
+                    # rebuild pass. Removed 2026-07-22: that pass measured
+                    # ~21-23s single-threaded (job 8683110) and was proven
+                    # fully redundant (every batch it recomputed was already
+                    # known, per-thread, at receive time — see docstring on
+                    # _ws10_parallel_recv). Fall through straight to the
+                    # serial loop for the intra-TP fanout so TP1/2/3 also
+                    # get updates (without it they'd wait on
+                    # _xccl_intra_pg.broadcast() that TP0 never calls,
+                    # 120s DistStoreError timeout, 2026-05-05).
+                    _ws10_pre_recv, _p_rtimes, _p_wall = self._ws10_parallel_recv(
                         tensors_meta, batch_max_numel, _ws10_sharded_cross_pgs,
                     )
                     t_bcast_total = _p_wall
                     logger.info(
-                        "WS10 parallel recv done: %d expert layers + %d non-expert "
-                        "recv_wall=%.1fs per_rank=%s (intra fanout pending)",
-                        len(_p_shards), len(_p_ne), _p_wall,
+                        "WS10 parallel recv done: %d batches recv_wall=%.1fs "
+                        "per_rank=%s (intra fanout pending, no rebuild pass)",
+                        len(_ws10_pre_recv), _p_wall,
                         {R: f"{t:.2f}s" for R, t in sorted(_p_rtimes.items())},
                     )
-                    # Build batch-indexed lookup so the serial loop can skip the
-                    # gloo cross-recv (data already received) and go straight to
-                    # the intra-TP broadcast that feeds TP1/2/3.
-                    _ws10_ntf: dict = {}    # name/key → flat cpu tensor
-                    for _ws10_n, _ws10_t in _p_ne:
-                        _ws10_ntf[_ws10_n] = _ws10_t.view(-1)
-                    _ws10_ere = re.compile(
-                        r"model\.layers\.(\d+)\.mlp\.experts\.(w13|w2)_weight"
-                    )
-                    for _ws10_li, _ws10_lyr in _p_shards.items():
-                        for _ws10_R, _ws10_s in _ws10_lyr.get("w13", {}).items():
-                            _ws10_ntf[(_ws10_li, "w13", _ws10_R)] = _ws10_s.view(-1)
-                        for _ws10_R, _ws10_s in _ws10_lyr.get("w2", {}).items():
-                            _ws10_ntf[(_ws10_li, "w2", _ws10_R)] = _ws10_s.view(-1)
-                    _ws10_j = 0
-                    while _ws10_j < n_params:
-                        _ws10_bs = _ws10_j
-                        _ws10_bn = 0
-                        _ws10_Rr = tensors_meta[_ws10_j].get("trainer_ep_rank")
-                        while _ws10_j < n_params:
-                            _ws10_pn = tensors_meta[_ws10_j]["numel"]
-                            _ws10_Rn = tensors_meta[_ws10_j].get("trainer_ep_rank")
-                            if _ws10_bn > 0 and _ws10_Rn != _ws10_Rr:
-                                break
-                            if _ws10_bn > 0 and _ws10_bn + _ws10_pn > batch_max_numel:
-                                break
-                            _ws10_bn += _ws10_pn
-                            _ws10_j += 1
-                        _ws10_pack = torch.empty(_ws10_bn, dtype=torch.bfloat16)
-                        _ws10_off = 0
-                        for _ws10_e in tensors_meta[_ws10_bs:_ws10_j]:
-                            _ws10_en = _ws10_e["numel"]
-                            _ws10_em = _ws10_ere.match(_ws10_e["name"])
-                            if _ws10_em:
-                                _ws10_k = (
-                                    int(_ws10_em.group(1)),
-                                    _ws10_em.group(2),
-                                    int(_ws10_e.get("trainer_ep_rank", 0)),
-                                )
-                            else:
-                                _ws10_k = _ws10_e["name"]
-                            _ws10_src = _ws10_ntf.get(_ws10_k)
-                            if _ws10_src is not None:
-                                _ws10_pack[_ws10_off:_ws10_off + _ws10_en].copy_(
-                                    _ws10_src[:_ws10_en]
-                                )
-                            _ws10_off += _ws10_en
-                        _ws10_pre_recv[_ws10_bs] = _ws10_pack
                     _ws10_serial_fanout = True
-                    # Fall through: serial loop does intra-bcast + load on all workers.
 
                 while i < n_params:
                     batch_start = i
@@ -1705,6 +1697,22 @@ class WeightSyncFromFileExtension:
                 t_bcast_total, gb / t_bcast_total if t_bcast_total > 0 else 0,
                 t_load_total,
             )
+            # DIAGNOSTIC + mitigation (2026-07-22, WS10 hang investigation,
+            # job 8682797): the WS10 path stalls by the 3rd consecutive call
+            # to this method with no exception logged in the prior 2 calls,
+            # and vLLM's own EngineCore starts missing its shm heartbeat
+            # during the stall. Neither the trainer nor the receiver frees
+            # any large CPU staging tensor between calls (the batched-mode
+            # locals like _ws10_pre_recv, _ws10_ntf, fused_pending,
+            # sharded_pending all go out of scope naturally at return, but
+            # CPython's cyclic GC does not run eagerly for large tensor
+            # graphs referenced only by local vars that already dropped to
+            # refcount 0 -- an explicit gc.collect() is cheap here (called
+            # once per wsync round, not per batch) and rules out "torch
+            # tensor arena fragmentation across rounds" as a contributor
+            # before chasing more exotic PG-level explanations.
+            import gc
+            gc.collect()
             return {
                 "status": "ok", "num_params": n_params,
                 "bcast_s": round(t_bcast_total, 2), "load_s": round(t_load_total, 2),

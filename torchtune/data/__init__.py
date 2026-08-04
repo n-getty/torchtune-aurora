@@ -13,6 +13,10 @@ from torchtune.data._collate import (
     padded_collate_tiled_images_and_mask,
 )
 from torchtune.data._common import CROSS_ENTROPY_IGNORE_IDX
+from torchtune.data._length_grouped_sampler import (
+    compute_dataset_lengths,
+    LengthGroupedDistributedBatchSampler,
+)
 from torchtune.data._messages import (
     AlpacaToMessages,
     ChosenRejectedToMessages,
@@ -60,4 +64,6 @@ __all__ = [
     "padded_collate_tiled_images_and_mask",
     "padded_collate_packed",
     "load_image",
+    "compute_dataset_lengths",
+    "LengthGroupedDistributedBatchSampler",
 ]

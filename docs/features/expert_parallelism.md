@@ -142,11 +142,12 @@ After 153 versions, with gloo CPU-bounce for all EP collectives and `use_reentra
 **v154 (router non-determinism in AC recompute)**:
 Switching to `use_reentrant=False` eliminated the collective desync (op #259 never triggered). New failure: `ScatterAddBackward0` shape mismatch (`±1` off on scatter dimension). `ExpertParallel._token_dispatch` saves `_ag_gather_idx`/`_ag_s_local` as instance attributes; non-reentrant AC re-runs forward during backward, overwriting those attributes. If the router (sigmoid + argsort) produces even bitwise-different `scores`, top-k assignments at tie boundaries flip → `bincount` differs by ±1 → saved `routed_output` shape mismatches recomputed `idx_exp`.
 
-**Three fix options** (none implemented; pick before next compute spend):
+**Three historical Gemma4 fix options** (the Qwen3 measurement path does not
+depend on these options):
 
-1. **Cache instance attributes per AC region** (~30 LOC in `_parallelism.py`): save `_ag_gather_idx`/`_ag_s_local` before AC recompute; restore after. Doesn't fix router determinism but ensures both sides agree on the original answer. Cheapest.
+1. **Cache instance attributes per AC region** (~30 LOC in `_parallelism.py`): save `_ag_gather_idx`/`_ag_s_local` before AC recompute; restore after. Doesn't fix router determinism but ensures both sides agree on the original answer. Cheapest. The current implementation already caches these values for the Qwen3 dispatch/combine path.
 2. **Save router outputs as tensors**: force AC to keep `(scores, selected_experts, num_tokens_per_expert)` from original FWD. Fixes at source but adds O(T·num_experts·layers) memory.
-3. **Move EP dispatch outside autograd**: restructure dispatch/combine as side-effecting ops with manual gradient handling. Cleanest, reusable for any MoE+AC; largest diff.
+3. **Move EP dispatch outside autograd**: restructure dispatch/combine as side-effecting ops with manual gradient handling. Cleanest, reusable for any MoE+AC; largest diff. Qwen3 currently avoids this requirement by placing MoE outside activation checkpointing.
 
 **Note for Qwen3**: Qwen3MoE avoids both blockers — `Qwen3MoeTransformerLayer` puts MoE **outside** AC, so there is no router recompute. The v153/v154 blockers are Gemma4-specific. Qwen3 EP blocked differently (v1-v8 train-fwd IPC crash, resolved by v8i topology change).
 
@@ -159,12 +160,15 @@ Switching to `use_reentrant=False` eliminated the collective desync (op #259 nev
 | `TORCHTUNE_EP_DEBUG=1` | off | EP forensic prints in `_parallelism.py` and `experts.py` (NTPE-AG / EP-DISPATCH / EP-COMBINE / PRE-RS-BWD / `_ep_mem_probe`). SLOW-threshold prints remain unconditional. | Use for diagnosis only |
 | `TORCHTUNE_EP_USE_XCCL=1` | off | Routes `_ep_all_gather` and `_ep_reduce_scatter` through native XCCL instead of gloo CPU-bounce | Iter1: 3.9% win on v10f production. Pair with GRAD_RELEASE for stacked effect. **RISK**: v141–v150 hit OFI CQ deadlock at op #259 on this path; verify clean before any production envelope run |
 | `TORCHTUNE_EP_GRAD_RELEASE_XCCL=1` | off | Routes `_ep_release_fsdp_unsharded_grads` per-FSDPParam all-reduce through native XCCL on dp_shard PG instead of gloo CPU-bounce | Iter2: **dominant lever** — per-chunk all_reduce 25s→7.6s (3.3×); v10f wall −32% vs gloo, −34.5% vs gloo baseline |
+| `TORCHTUNE_EP_CPU_METADATA_TRANSFER=0` | on | Keeps the gloo routing-count exchange on CPU and copies through a separately allocated device buffer before device-side metadata construction | Measurement launchers default on; use `0` only for a matched metadata-transfer A/B |
+| `TORCHTUNE_EP_DIRECT_CPU_COPY=0` | on | Uses the preallocated device destination for CPU-bounce AG/RS results instead of creating a temporary device tensor with `.to(device)` | Measurement launchers default on; use `0` only for a matched copy-path A/B |
 | `TORCHTUNE_EP_WSYNC_LAYER_BATCH=1` | off | Batch 3 expert projections per layer into 1 AllGather on `_shard_pg` (144 → 48 collectives for EP=16) | **0% win** — bandwidth-bound. Off-path byte-identical |
 | `TORCHTUNE_EP_WSYNC_GATHER_ROOT=1` | off | Replace AllGather with gather(dst=rank 0) on `_shard_pg` | **5% regression** — XCCL gather likely implements as allgather+extract. Off-path byte-identical |
 | `TORCHTUNE_EP_WSYNC_FP8_WIRE=1` | off | Cast expert shards to E4M3 before AllGather; decompress back to bf16 on active rank. ~2× fewer wire bytes on `_shard_pg` | **Negative result** — adds quant/dequant, doubles collectives, same bytes to vLLM. NOT bit-exact. Mutually exclusive with LAYER_BATCH and GATHER_ROOT |
-| `TORCHTUNE_EP_WSYNC_SHARDED=1` | off | **RESERVED** — skip `_shard_pg` entirely; each EP rank broadcasts local shard (WS10 Phase B/C). Receiver landed; sender not implemented. Currently emits warning and falls through | Target: wsync_gather 75s→5s |
+| `TORCHTUNE_EP_WSYNC_SHARDED=1` | off | **WS10 — sender+receiver both implemented and HW-validated** (stale as of an earlier revision of this doc, which said the sender was unimplemented — see CLAUDE.md's WS10 entry for the current state). Each EP rank ships only its own local expert shard directly to vLLM (gloo cross-PGs, threaded receive) instead of AllGathering the full model first. Real progress but **still not a net win** vs the legacy full-reship path at production scale — see CLAUDE.md for the detailed narrowing-but-not-closing gap history. Default off, do not enable in production. | Best measured: ~141.6s/step vs ~166.9s/step legacy AG baseline (−15%), but still ~1.7× slower than the ~82.7s/step legacy full-reship path |
 
-**Recommended production config** (EP=16, current best):
+**Historical EP=16 GRPO reference config** (not a current Qwen3 dense-parity
+promotion profile; fresh-node validation is required before reuse):
 ```bash
 export TORCHTUNE_EP_USE_XCCL=1
 export TORCHTUNE_EP_GRAD_RELEASE_XCCL=1

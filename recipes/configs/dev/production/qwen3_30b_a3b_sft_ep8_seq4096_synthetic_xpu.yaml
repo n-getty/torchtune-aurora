@@ -1,0 +1,148 @@
+# Qwen3-30B-A3B FULL SFT with Expert Parallelism EP=8 — seq_len=4096, SYNTHETIC
+# data — Aurora (XPU), single node.
+#
+# Sibling of qwen3_30b_a3b_sft_ep8_xpu.yaml (packed alpaca @ seq2048/seq1536,
+# the PERMANENT short-sequence data point — do not edit that file or treat
+# this one as superseding it). This is the isoFLOPs-style, LONGER/REALISTIC-
+# sequence-length variant of the MoE-vs-dense MFU comparison (memory/
+# project_moe_sft_profiling_gradrelease_bottleneck_20260724.md, "MFU-20% push"
+# 2026-07-25 entries), built because the alpaca/packed comparison's short
+# (~85-token median) and highly variable length structurally blocked flash
+# attention for BOTH models. See qwen3_4b_sft_seq4096_synthetic_xpu.yaml for
+# the paired dense-4B config and the same synthetic-dataset rationale.
+#
+# Uses torchtune.datasets.synthetic_fixed_length_dataset — every sample is
+# EXACTLY tokenizer.max_seq_len tokens, so the standard (non-packed) SFT
+# collate never pads and never constructs a mask key (CPU-proven,
+# tests/torchtune/datasets/test_synthetic_fixed_length_dataset.py). dataset.packed
+# is intentionally ABSENT for the same reason as the dense sibling config.
+#
+# Topology: dp_replicate=1, dp_shard=8=expert_parallel_degree, 8 of 12 tiles.
+#
+# Validated EP levers carried over unchanged from the seq1536 config (all
+# scale-independent per the 2026-07-25 mem_reserved investigation — see that
+# file's header comment for the full trail):
+#   TORCHTUNE_EP_GRAD_RELEASE_XCCL=1     (launcher default; bandwidth-bound,
+#                                         payload-size-independent, CLOSED)
+#   TORCHTUNE_MOE_SEQUENTIAL_EXPERTS=1   (REQUIRED — padded-BMM's per-layer
+#                                         [E, max_count, dim] allocation grows
+#                                         proportionally LARGER at seq4096 than
+#                                         at seq1536, making it MORE likely to
+#                                         OOM, not less. Do not attempt
+#                                         padded-BMM at this seq_len without
+#                                         new evidence.)
+#   TORCHTUNE_EP_ALL2ALL=1               (must be passed explicitly — launcher
+#                                         code default is 0/AG+RS)
+#   compile=true                         (validated +2.05% at seq1536; RE-A/B
+#                                         at seq4096, the compile-fusable
+#                                         surface-area proportions shift at a
+#                                         different seq_len — do not assume
+#                                         the same delta transfers unverified)
+#
+# NEW at this seq_len (not applicable at seq1536, where packing structurally
+# blocked it): TORCHTUNE_USE_XPU_FLASH=1 is a first-class lever to A/B here —
+# this is the first genuine opportunity to test flash on the MoE side at all.
+#
+# Recipe:   recipes/dev/full_finetune_moe_distributed_xpu.py
+# Launcher: recipes/dev/run_qwen3_30b_sft_ep8_xpu.sh (point CONFIG at this file)
+
+name: qwen3_30b_a3b_sft_ep8_seq4096_synthetic
+output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/experiments/qwen3_moe/runs/${name}
+base_model_path: /lus/flare/projects/ModCon/ngetty/models/Qwen3-30B-A3B
+
+# ── Model ────────────────────────────────────────────────────────────────────
+model:
+  _component_: torchtune.models.qwen3_moe.qwen3_30b_a3b
+
+# ── Expert Parallelism ────────────────────────────────────────────────────────
+expert_parallel_degree: 8
+expert_cpu_offload: false
+native_ep_sharded_experts: false
+native_fsdp_grad_reduce: false
+
+# ── Tokenizer ────────────────────────────────────────────────────────────────
+tokenizer:
+  _component_: torchtune.models.qwen3_moe.qwen3_moe_tokenizer
+  path: ${base_model_path}/vocab.json
+  merges_file: ${base_model_path}/merges.txt
+  max_seq_len: 4096
+
+# ── Checkpointer ─────────────────────────────────────────────────────────────
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files:
+    filename_format: model-{}-of-{}.safetensors
+    max_filename: "00016"
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: QWEN3_MOE
+
+resume_from_checkpoint: false
+
+# ── Dataset (synthetic, fixed-length @ tokenizer.max_seq_len, no padding) ─────
+dataset:
+  _component_: torchtune.datasets.synthetic_fixed_length_dataset
+  seq_len: 4096
+  vocab_size: 151936   # Qwen3 vocab size; set explicitly (see the paired
+                       # dense-4B config's comment for why).
+  num_samples: 10000
+seed: 1234
+shuffle: true
+dataloader_num_workers: 4
+
+# ── Training envelope ─────────────────────────────────────────────────────────
+epochs: 1
+max_steps_per_epoch: 8
+batch_size: 2
+gradient_accumulation_steps: 1
+clip_grad_norm: null
+
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 1.0e-5
+  weight_decay: 0.0
+  fused: true
+
+loss:
+  _component_: torchtune.modules.loss.LinearCrossEntropyLoss
+
+# ── Distributed / FSDP ────────────────────────────────────────────────────────
+enable_activation_checkpointing: true
+attention_checkpoint_every: 1  # safe EP-selective AC; raise only after memory A/B
+checkpoint_experts: true
+enable_activation_offloading: false
+fsdp_cpu_offload: false
+fsdp_reshard_after_forward: true
+data_parallel_replicate_dim: 1
+data_parallel_shard_dim: -1   # infers to 8 = world_size (8 tiles used)
+tensor_parallel_dim: 1
+
+# ── XPU ──────────────────────────────────────────────────────────────────────
+device: xpu
+dtype: bf16
+compile: true   # validated at seq1536; RE-A/B at seq4096, do not assume
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+log_level: INFO
+log_every_n_steps: 1
+log_peak_memory_stats: true
+
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: false
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: true
+  cuda: false
+  profile_memory: false
+  with_stack: false
+  record_shapes: false
+  with_flops: false
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1

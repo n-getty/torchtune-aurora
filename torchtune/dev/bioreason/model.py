@@ -125,6 +125,7 @@ class BioReasonModel(nn.Module):
         projector_output_norm: bool = False,
         disable_protein_splice: bool = False,
         disable_go_splice: bool = False,
+        load_backbone: bool = True,
     ):
         super().__init__()
         _ensure_paths()
@@ -166,8 +167,15 @@ class BioReasonModel(nn.Module):
         self.vocab_size = cfg.vocab_size
 
         # ── LLM backbone ──────────────────────────────────────────────────────
-        logger.info("Loading Qwen3 LLM backbone...")
-        if self._backbone_device_map is not None:
+        # load_backbone=False: the vLLM-HTTP eval client only needs _embed +
+        # projections + ESM3/GO caches for build_prompt_embeds() — vLLM (in a
+        # separate server process) owns the transformer forward. Skipping the
+        # ~65 GiB 32B backbone load makes the client lightweight enough to
+        # co-reside with the servers on the same node. self.backbone stays None.
+        self.backbone = None
+        if not load_backbone:
+            logger.info("Skipping LLM backbone load (load_backbone=False; vLLM-HTTP client mode)")
+        elif self._backbone_device_map is not None:
             # Sharded multi-device load (HF naive MP). Do NOT call .to(device) after —
             # device_map already placed the layers; .to() would collapse them onto one
             # device and re-OOM. The embedding/first layer lands on the "lowest" device
@@ -194,7 +202,7 @@ class BioReasonModel(nn.Module):
         # retrofit an HF module). get_peft_model freezes the base and marks only
         # the adapters trainable; the projectors (built below) stay trainable.
         # Config matches bioreason2/utils/save_grpo_ckpt.py.
-        if self._has_lora:
+        if self._has_lora and self.backbone is not None:
             from peft import LoraConfig, get_peft_model
 
             lora_config = LoraConfig(
@@ -263,6 +271,14 @@ class BioReasonModel(nn.Module):
         # Local embedding layer for computing prompt_embeds outside vLLM.
         # Loaded from checkpoint safetensors — same weights as backbone.embed_tokens.
         self._embed = self._load_embed_layer(ckpt_dir, cfg)
+        # Always frozen: this is a standalone completion-token-lookup copy, not a
+        # trainable parameter set (mirrors model_native.py's tok_embeddings-alias
+        # semantics, which is frozen-by-construction there). Independent of
+        # enable_lora — do NOT rely on a caller's FSDP-wrap step to freeze this;
+        # a bug in a sibling HF/PEFT BioReason stack left this exact tensor
+        # unfrozen under LoRA (get_peft_model only knows about self.backbone),
+        # silently training ~778M extra params at 32B scale.
+        self._freeze_embed_copy()
 
         # ── Protein encoder (ESM3) OR its pre-encoded cache ───────────────────
         if self._esm3_cache_path is not None:
@@ -446,6 +462,15 @@ class BioReasonModel(nn.Module):
             )
             self._go_embed_cache["all"] = emb
             logger.info(f"Loaded cached GO embedding from {go_emb_path}")
+
+    def _freeze_embed_copy(self):
+        # self._embed is a standalone completion-token-lookup copy (loaded
+        # independently from checkpoint safetensors, not a reference into
+        # self.backbone), so PEFT's get_peft_model has no visibility into it and
+        # never marks it trainable/frozen. Freeze it unconditionally here rather
+        # than depending on a caller (e.g. an FSDP wrap step) to do it as a
+        # side effect.
+        self._embed.requires_grad_(False)
 
     def _freeze_encoders(self):
         # protein_encoder is None when the ESM3 pre-encode cache is used (encoder

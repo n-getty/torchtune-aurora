@@ -63,6 +63,15 @@ class TestExperts:
         assert out.shape == (16, dim)
         assert_expected(out.mean().item(), 120.8260, atol=1e-3, rtol=1e-3)
 
+    def test_forward_handles_ragged_and_zero_token_experts(self, dim):
+        experts = GroupedExperts(dim=dim, hidden_dim=64, num_experts=8)
+        fixed_init_model(experts, min_val=-0.1, max_val=0.1)
+        counts = torch.tensor([0, 3, 0, 2, 1, 0, 0, 2], dtype=torch.float32)
+        inputs = torch.randn(int(counts.sum().item()), dim)
+        output = experts(inputs, counts)
+        assert output.shape == inputs.shape
+        assert torch.isfinite(output).all()
+
 
 class TestLoRAGroupedExperts:
     @pytest.fixture

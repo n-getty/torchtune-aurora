@@ -11,9 +11,13 @@ MoE model support on Aurora HPC (Intel Max Series GPUs / XPU). Two workstreams:
 
 ### Architecture
 
-Qwen3-30B-A3B: 36 transformer layers, 48 MoE layers (every even layer is MoE).
-Each MoE layer: 128 experts (top-8 active), `gate_proj` + `up_proj` + `down_proj`
-per expert. Total model size: 56.87 GiB (BF16).
+Qwen3-30B-A3B: 48 transformer layers, every layer is a MoE layer
+(`torchtune/models/qwen3_moe/_model_builders.py::qwen3_30b_a3b` sets
+`num_layers=48`; this repo's `qwen3_moe()` builder does not implement a
+dense/MoE layer split — every `Qwen3MoeTransformerLayer` it constructs has
+a MoE block, unlike some upstream Qwen3-MoE configs that interleave dense
+and MoE layers). Each MoE layer: 128 experts (top-8 active), `gate_proj` +
+`up_proj` + `down_proj` per expert. Total model size: 56.87 GiB (BF16).
 
 **Training layout**: 10 tiles FSDP2 (XCCL) + 2 vLLM tiles (TP=2), single Aurora node.
 SHM weight sync via `/dev/shm/torchtune/weight_update.raw`.

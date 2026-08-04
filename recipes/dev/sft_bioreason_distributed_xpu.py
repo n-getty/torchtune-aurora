@@ -43,8 +43,25 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 
 from torchtune import config, training, utils
 from torchtune.config._utils import _get_component_from_path
-from torchtune.dev.bioreason.model_native import BioReasonNativeModel
+from torchtune.dev.bioreason.model_native import _HF_BACKBONES, BioReasonNativeModel
 from torchtune.modules.loss import SFTLoss
+
+
+class _NullBaseCheckpointer:
+    """Stub injected as ``CheckpointClient._checkpointer`` for the HF-wrapper backbone
+    (Qwen3.6-27B / ``qwen3_5_27b_hf``), so ``CheckpointClient._get_checkpointer()``'s
+    ``if not self._checkpointer:`` guard never constructs the real, config-driven
+    ``FullModelHFCheckpointer`` — its ``model_type`` enum has no entry for this hybrid
+    linear-attention architecture and its HF->torchtune conversion logic does not apply
+    here. Base weights are loaded directly in ``_setup_model`` via
+    ``load_qwen35_safetensors`` + ``remap_qwen35_checkpoint_keys`` instead; this stub
+    only needs to satisfy ``load_base_checkpoint()``'s ``{MODEL_KEY: state_dict}``
+    contract with an empty model dict (nothing else in the parent's ``setup()`` touches
+    the returned dict for this recipe: resume-recipe-state is handled separately by
+    ``bioreason_resume``, and ``save_checkpoint`` is fully overridden below)."""
+
+    def load_checkpoint(self) -> dict:
+        return {training.MODEL_KEY: {}}
 
 
 class _SideInputDataLoader:
@@ -132,6 +149,20 @@ class BioReasonSFTRecipeDistributedXPU(FullFinetuneRecipeDistributedXPU):
         _m = cfg.get("model", {})
         self._lora_rank = int(_m.get("lora_rank", 32))
         self._lora_alpha = float(_m.get("lora_alpha", 64.0))
+        self._lora_dropout = float(_m.get("lora_dropout", 0.0))
+        self._include_conv1d_lora = bool(_m.get("include_conv1d_lora", False))
+        self._hf_backbone_config_path = _m.get("hf_backbone_config_path", None)
+        # The HF-wrapper backbone (Qwen3.6-27B / qwen3_5_27b_hf) has no entry in
+        # FullModelHFCheckpointer's model_type enum and that checkpointer's conversion
+        # logic is architecturally wrong for this hybrid linear-attention arch (see the
+        # Qwen3.6-27B integration plan §3b). Base weights are instead loaded directly in
+        # _setup_model via load_qwen35_safetensors + remap_qwen35_checkpoint_keys. Inject
+        # a stub checkpointer NOW (before setup() ever calls load_base_checkpoint via
+        # CheckpointClient._get_checkpointer()'s `if not self._checkpointer:` guard) so
+        # the parent's cfg.checkpointer-configured checkpointer is never constructed.
+        self._is_hf_backbone = _m.get("backbone_builder", None) in _HF_BACKBONES
+        if self._is_hf_backbone:
+            self._checkpoint_client._checkpointer = _NullBaseCheckpointer()
         # Placeholder ids (used to keep token padding from colliding with them — see _setup_data).
         self._protein_token_id = int(_m.get("protein_token_id", 151643))
         self._go_token_id = int(_m.get("go_token_id", 151644))
@@ -264,6 +295,16 @@ class BioReasonSFTRecipeDistributedXPU(FullFinetuneRecipeDistributedXPU):
         #     ac_option=N|"op"): checkpoint every Nth layer / selective-op — trades the
         #     memory headroom we have for less recompute. Mirrors the parent recipe.
         if (not enable_activation_checkpointing) and (ac_mode is not None):
+            if self._is_hf_backbone:
+                # apply_selective_activation_checkpointing does `enumerate(model.layers)`
+                # internally — HFQwen35Backbone has no .layers (the real decoder stack
+                # sits under backbone._causal_lm.model.layers, wrapped/possibly re-wrapped
+                # by PEFT). Fail loud rather than silently no-op-ing AC.
+                raise NotImplementedError(
+                    "selective activation checkpointing (ac_mode) is not supported for "
+                    "the HF-wrapper backbone (qwen3_5_27b_hf) — use "
+                    "enable_activation_checkpointing=true (full AC) instead."
+                )
             from torchtune.training.activations import (
                 apply_selective_activation_checkpointing,
             )
@@ -272,9 +313,16 @@ class BioReasonSFTRecipeDistributedXPU(FullFinetuneRecipeDistributedXPU):
                 model.backbone, ac_mode, ac_option
             )
         elif enable_activation_checkpointing and ac_mode is None:
+            if self._is_hf_backbone:
+                from transformers.models.qwen3_5.modeling_qwen3_5 import (
+                    Qwen3_5DecoderLayer,
+                )
+
+                _ac_wrap_policy = {Qwen3_5DecoderLayer}
+            else:
+                _ac_wrap_policy = {_parent_mod.modules.TransformerSelfAttentionLayer}
             training.set_activation_checkpointing(
-                model.backbone,
-                auto_wrap_policy={_parent_mod.modules.TransformerSelfAttentionLayer},
+                model.backbone, auto_wrap_policy=_ac_wrap_policy
             )
 
         # Optional: swap eager RMSNorm -> fused Triton RMSNorm on XPU (gated by
@@ -329,24 +377,129 @@ class BioReasonSFTRecipeDistributedXPU(FullFinetuneRecipeDistributedXPU):
         # base weights once loaded; here base is still meta so order also matters).
         from torchtune.modules.peft import AdapterModule
 
+        # HF backbone + LoRA: PEFT's own get_peft_model() call (model_native.py's
+        # __init__) runs INSIDE this method's meta-device instantiate() above, so its
+        # freshly-constructed lora_A/lora_B nn.Linear modules — and PEFT's own
+        # reset_lora_parameters() init calls against them — landed on the meta device
+        # and did nothing (confirmed from PEFT source: lora/layer.py's update_layer()
+        # constructs plain nn.Linear under the ambient default-device context;
+        # reset_lora_parameters() then nn.init.normal_'s lora_A (gaussian, std=1/r) and
+        # UNCONDITIONALLY nn.init.zeros_'s lora_B — the zero-init on lora_B is load-
+        # bearing: it's what makes a freshly-applied LoRA adapter a numerical no-op
+        # against the frozen base). Re-run that init here, after to_empty(), exactly
+        # like the torchtune-native AdapterModule branch below does for its own adapters.
+        _peft_lora_layer_cls = None
+        if self._is_hf_backbone and model._has_lora:
+            from peft.tuners.lora.layer import LoraLayer as _peft_lora_layer_cls
+
         with training.set_default_dtype(self._dtype), self._device:
             for m in model.modules():
                 if isinstance(m, AdapterModule):
                     m.to_empty(device=self._device)
                     m.initialize_parameters()
+                if _peft_lora_layer_cls is not None and isinstance(m, _peft_lora_layer_cls):
+                    m.to_empty(device=self._device)
+                    for adapter_name in m.lora_A:
+                        nn.init.normal_(
+                            m.lora_A[adapter_name].weight, std=1.0 / m.r[adapter_name]
+                        )
+                        nn.init.zeros_(m.lora_B[adapter_name].weight)
                 if hasattr(m, "rope_init"):
                     m.rope_init()
+                elif (
+                    hasattr(m, "inv_freq")
+                    and torch.is_tensor(m.inv_freq)
+                    and m.inv_freq.is_meta
+                ):
+                    # HF Qwen3.5 rotary embedding (Qwen3_5TextRotaryEmbedding /
+                    # Qwen3_5VisionRotaryEmbedding): inv_freq/original_inv_freq are
+                    # non-persistent buffers computed from config at __init__ time, so
+                    # they're never in the checkpoint and load_from_full_model_state_dict
+                    # never touches them — left on meta device forever without this.
+                    m.to_empty(device=self._device)
+                    rope_type = getattr(m, "rope_type", "default")
+                    if rope_type == "default" and hasattr(
+                        m, "compute_default_rope_parameters"
+                    ):
+                        rope_init_fn = m.compute_default_rope_parameters
+                    else:
+                        from transformers.modeling_rope_utils import (
+                            ROPE_INIT_FUNCTIONS,
+                        )
+
+                        rope_init_fn = ROPE_INIT_FUNCTIONS[rope_type]
+                    inv_freq, _attn_scaling = rope_init_fn(m.config, self._device)
+                    m.inv_freq.copy_(inv_freq)
+                    if hasattr(m, "attention_scaling"):
+                        m.attention_scaling = _attn_scaling
+                    if hasattr(m, "original_inv_freq"):
+                        m.original_inv_freq.copy_(inv_freq)
             for proj in (model.protein_projection, model.go_projection):
                 proj.to_empty(device=self._device)
                 for layer in proj:
                     if hasattr(layer, "reset_parameters"):
                         layer.reset_parameters()
 
-        # Load the GEMMA4 base weights into the sharded model via the FSDP2-aware loader
-        # (full CPU state dict -> sharded DTensors per rank, no full materialization).
+        # Load the base weights into the sharded model via the FSDP2-aware loader (full
+        # CPU state dict -> sharded DTensors per rank, no full materialization).
         # strict=False: adapters/projections are not in the base checkpoint (already
-        # initialized above); keys are backbone.* in the wrapper, so prefix them.
-        _prefixed = {f"backbone.{k}": v for k, v in model_state_dict.items()}
+        # initialized above).
+        #
+        # HF backbone (qwen3_5_27b_hf): the parent's cfg.checkpointer-driven
+        # FullModelHFCheckpointer conversion is bypassed entirely (see _NullBaseCheckpointer
+        # in __init__ — model_state_dict is {} here), so load the real checkpoint directly
+        # via the same helpers Step 1/2 validated. Keys land under
+        # backbone.model.<...> (HFQwen35Backbone stores the real Qwen3_5ForCausalLM as
+        # self.model — one level deeper than the native-backbone case below, where
+        # BioReasonNativeModel.backbone IS the TransformerDecoder directly).
+        if self._is_hf_backbone:
+            from torchtune.dev.bioreason.hf_qwen35_backbone import (
+                load_qwen35_safetensors,
+                remap_qwen35_checkpoint_keys,
+            )
+
+            if not self._hf_backbone_config_path:
+                raise ValueError(
+                    "model.hf_backbone_config_path is required for backbone_builder="
+                    "qwen3_5_27b_hf."
+                )
+            checkpoint_dir = os.path.dirname(self._hf_backbone_config_path)
+            raw_sd = load_qwen35_safetensors(checkpoint_dir)
+            remapped_sd = remap_qwen35_checkpoint_keys(raw_sd)
+            # Stage 2 (LoRA): get_peft_model() wraps the real Qwen3_5ForCausalLM in PEFT's
+            # standard PeftModel(base_model=LoraModel(model=<real model>)) nesting, so every
+            # real param name gains a "base_model.model." prefix on top of the adapter's own
+            # "backbone.model." (2026-08-03, job 8729326: base checkpoint load asserted
+            # "backbone.model.lm_head.weight not found in model" because this extra PEFT
+            # prefix wasn't accounted for). Stage 1 (no LoRA) has no such wrapper.
+            if getattr(model, "_has_lora", False):
+                # Additionally, every LoRA-targeted nn.Linear (q_proj, down_proj, etc.) is
+                # itself replaced by a peft.tuners.lora.Linear wrapper whose original weight
+                # moves from "<name>.weight" to "<name>.base_layer.weight" (2026-08-03, job
+                # 8729326: "...mlp.down_proj.weight not found in model" once the outer
+                # base_model.model prefix above was already fixed). Non-targeted modules
+                # (e.g. embed_tokens) keep their plain "<name>.weight" naming.
+                from torchtune.dev.bioreason.hf_qwen35_backbone import (
+                    HF_QWEN35_LORA_TARGET_MODULES,
+                )
+
+                _hf_prefix = "backbone.model.base_model.model."
+                _prefixed = {}
+                for k, v in remapped_sd.items():
+                    _parts = k.rsplit(".", 2)
+                    if len(_parts) == 3 and _parts[1] in HF_QWEN35_LORA_TARGET_MODULES:
+                        k = f"{_parts[0]}.{_parts[1]}.base_layer.{_parts[2]}"
+                    _prefixed[f"{_hf_prefix}{k}"] = v
+            else:
+                _hf_prefix = "backbone.model."
+                _prefixed = {f"{_hf_prefix}{k}": v for k, v in remapped_sd.items()}
+            _n_base_tensors = len(remapped_sd)
+            del raw_sd, remapped_sd
+            _base_label = "Qwen3.6-27B (HF)"
+        else:
+            _prefixed = {f"backbone.{k}": v for k, v in model_state_dict.items()}
+            _n_base_tensors = len(model_state_dict)
+            _base_label = "GEMMA4"
         base_missing, base_unexpected = training.load_from_full_model_state_dict(
             model,
             _prefixed,
@@ -362,7 +515,7 @@ class BioReasonSFTRecipeDistributedXPU(FullFinetuneRecipeDistributedXPU):
             )
         utils.log_rank_zero(
             self._logger,
-            f"Loaded GEMMA4 base ({len(model_state_dict)} tensors) into sharded backbone.",
+            f"Loaded {_base_label} base ({_n_base_tensors} tensors) into sharded backbone.",
         )
 
         # RESUME: overwrite the freshly-initialized adapters + projections with the saved
@@ -450,15 +603,30 @@ class BioReasonSFTRecipeDistributedXPU(FullFinetuneRecipeDistributedXPU):
         # (compile:false -> _compile_model=False -> no-op; all prior runs unaffected).
         # dynamic follows the parent's _compile_dynamic (default True on XPU).
         if getattr(self, "_compile_model", False):
-            utils.log_rank_zero(
-                self._logger,
-                "Compiling backbone decoder layers (per-layer torch.compile, dynamic=%s)."
-                % getattr(self, "_compile_dynamic", True),
-            )
-            training.compile_model(
-                model, verbose=self._is_rank_zero,
-                dynamic=getattr(self, "_compile_dynamic", True),
-            )
+            if self._is_hf_backbone:
+                # compile_model / maybe_swap_rmsnorm_for_fused / maybe_swap_rope_for_fused
+                # (above) all class-match against torchtune-native module types
+                # (TransformerSelfAttentionLayer, RMSNorm, RotaryPositionalEmbeddings) —
+                # none of which appear anywhere in the HF Qwen3_5ForCausalLM tree, so
+                # they already safely no-op for this backbone. Log it explicitly rather
+                # than silently doing nothing, per the integration plan §3d.
+                utils.log_rank_zero(
+                    self._logger,
+                    "compile=true but backbone is the HF-wrapper (qwen3_5_27b_hf): "
+                    "torch.compile/fused-RMSNorm/fused-RoPE all target torchtune-native "
+                    "module classes and do not engage on this backbone (documented "
+                    "no-op, not a bug).",
+                )
+            else:
+                utils.log_rank_zero(
+                    self._logger,
+                    "Compiling backbone decoder layers (per-layer torch.compile, dynamic=%s)."
+                    % getattr(self, "_compile_dynamic", True),
+                )
+                training.compile_model(
+                    model, verbose=self._is_rank_zero,
+                    dynamic=getattr(self, "_compile_dynamic", True),
+                )
 
         self.activations_handling_ctx = training.get_act_offloading_ctx_manager(
             model, enable_activation_offloading, activation_offloading_use_streams
@@ -640,15 +808,17 @@ class BioReasonSFTRecipeDistributedXPU(FullFinetuneRecipeDistributedXPU):
 
     @staticmethod
     def _trainable_keys(sd: dict) -> dict:
-        """Adapter (lora_a/lora_b/magnitude) + projection params, stripped of FSDP/AC
-        wrapper prefixes. These are exactly the params with requires_grad=True."""
+        """Adapter (torchtune lora_a/lora_b/magnitude, or PEFT lora_A/lora_B for the
+        HF backbone) + projection params, stripped of FSDP/AC wrapper prefixes.
+        These are exactly the params with requires_grad=True."""
         def strip(name):
             return (name.replace("_fsdp_wrapped_module.", "")
                         .replace("_checkpoint_wrapped_module.", ""))
         out = {}
         for k, v in sd.items():
             ck = strip(k)
-            if (("lora_a" in ck) or ("lora_b" in ck) or ("magnitude" in ck)
+            ck_lower = ck.lower()
+            if (("lora_a" in ck_lower) or ("lora_b" in ck_lower) or ("magnitude" in ck_lower)
                     or ck.startswith("protein_projection.")
                     or ck.startswith("go_projection.")):
                 out[ck] = v
@@ -696,14 +866,17 @@ class BioReasonSFTRecipeDistributedXPU(FullFinetuneRecipeDistributedXPU):
         self._save_eval_checkpoint(epoch=epoch, full_tensors=full_tensors)
 
     def _save_eval_checkpoint(self, *, epoch: int, full_tensors: bool) -> None:
-        """Save a self-contained Gemma4 checkpoint for eval.
+        """Save a self-contained checkpoint for eval.
 
         The parent's CheckpointClient path assumes a bare TransformerDecoder; our
         wrapper has backbone.* + projection.* and (under LoRA) lora_a/lora_b. So we
         gather the full state dict, MERGE LoRA into the backbone (W_eff), and write:
-          - the merged backbone via the configured GEMMA4 checkpointer (-> HF
-            safetensors, loadable by the vLLM eval), and
-          - protein_projection.pt / go_projection.pt alongside it.
+          - for native backbones (Gemma4/Qwen3): the merged backbone via the
+            configured checkpointer (-> HF safetensors, loadable by the vLLM eval);
+          - for the HF-wrapper backbone (qwen3_5_27b_hf): the merged (or plain, for
+            Stage-1) Qwen3_5ForCausalLM via its own save_pretrained (bypasses
+            CheckpointClient entirely — see plan §3b/§3c);
+          - protein_projection.pt / go_projection.pt alongside it either way.
         """
         from torchtune.dev.bioreason.model_native import BioReasonNativeModel
 
@@ -715,27 +888,82 @@ class BioReasonSFTRecipeDistributedXPU(FullFinetuneRecipeDistributedXPU):
                 torch.distributed.barrier()
             return
 
-        # Merge LoRA -> bare backbone tune-format state dict.
-        if self._model._has_lora:
-            backbone_sd = self._model.merged_backbone_for_save(
-                full_sd, lora_rank=self._lora_rank, lora_alpha=self._lora_alpha
-            )
-        else:
-            backbone_sd = BioReasonNativeModel.merge_backbone_state_dict(full_sd)
-
-        checkpointer = self._checkpoint_client._get_checkpointer()
-        checkpointer.save_checkpoint(
-            {training.MODEL_KEY: backbone_sd},
-            epoch=epoch,
-        )
-
-        # Projections (stripped) alongside the HF backbone output dir.
-        out_dir = os.path.join(checkpointer._output_dir, f"epoch_{epoch}") \
-            if hasattr(checkpointer, "_output_dir") else self._output_dir
-
         def _strip(name):
             return (name.replace("_fsdp_wrapped_module.", "")
                         .replace("_checkpoint_wrapped_module.", ""))
+
+        if self._is_hf_backbone:
+            # HFQwen35Backbone: no CheckpointClient/GEMMA4-checkpointer involvement
+            # at all (its HF<->tune conversion is architecturally wrong for this
+            # backbone — see plan §3b/§3c). Reconstruct a plain (or PEFT-wrapped,
+            # for the merge) Qwen3_5ForCausalLM directly from the gathered dict and
+            # save via HF's own save_pretrained, matching the base-load side's
+            # bespoke path.
+            from torchtune.dev.bioreason.hf_qwen35_backbone import (
+                HF_QWEN35_LORA_TARGET_MODULES,
+                HFQwen35Backbone,
+                merge_peft_lora_state_dict,
+                save_qwen35_checkpoint,
+            )
+
+            prefix = "backbone.model."
+            backbone_model_sd = {}
+            for k, v in full_sd.items():
+                ck = _strip(k)
+                if ck.startswith(prefix):
+                    backbone_model_sd[ck[len(prefix):]] = v
+
+            out_dir = os.path.join(self._output_dir, f"epoch_{epoch}")
+            os.makedirs(out_dir, exist_ok=True)
+
+            if self._model._has_lora:
+                target_modules = list(HF_QWEN35_LORA_TARGET_MODULES)
+                if self._include_conv1d_lora:
+                    target_modules.append("conv1d")
+                merged = merge_peft_lora_state_dict(
+                    backbone_model_sd,
+                    self._hf_backbone_config_path,
+                    lora_rank=self._lora_rank,
+                    lora_alpha=self._lora_alpha,
+                    lora_dropout=self._lora_dropout,
+                    target_modules=target_modules,
+                    dtype=self._dtype,
+                )
+                merged.save_pretrained(out_dir, safe_serialization=True)
+            else:
+                backbone_for_save = HFQwen35Backbone(
+                    config_path=self._hf_backbone_config_path,
+                    dtype=self._dtype,
+                    skip_init_weights=True,
+                )
+                missing, unexpected = backbone_for_save.model.load_state_dict(
+                    backbone_model_sd, strict=False
+                )
+                if unexpected:
+                    raise RuntimeError(
+                        f"Stage-1 HF backbone eval-checkpoint save: {len(unexpected)} "
+                        f"unexpected keys (first: {list(unexpected)[:5]}) — prefix "
+                        "mismatch against the reconstructed Qwen3_5ForCausalLM."
+                    )
+                save_qwen35_checkpoint(backbone_for_save, out_dir)
+        else:
+            # Merge LoRA -> bare backbone tune-format state dict.
+            if self._model._has_lora:
+                backbone_sd = self._model.merged_backbone_for_save(
+                    full_sd, lora_rank=self._lora_rank, lora_alpha=self._lora_alpha
+                )
+            else:
+                backbone_sd = BioReasonNativeModel.merge_backbone_state_dict(full_sd)
+
+            checkpointer = self._checkpoint_client._get_checkpointer()
+            checkpointer.save_checkpoint(
+                {training.MODEL_KEY: backbone_sd},
+                epoch=epoch,
+            )
+
+            # Projections (stripped) alongside the HF backbone output dir.
+            out_dir = os.path.join(checkpointer._output_dir, f"epoch_{epoch}") \
+                if hasattr(checkpointer, "_output_dir") else self._output_dir
 
         os.makedirs(out_dir, exist_ok=True)
         for pname in ("protein_projection", "go_projection"):

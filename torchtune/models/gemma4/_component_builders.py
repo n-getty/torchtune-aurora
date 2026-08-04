@@ -27,6 +27,7 @@ from torchtune.modules import (
 )
 from torchtune.modules.attention_utils import _MaskType
 from torchtune.modules.moe import MoE
+from torchtune.modules.moe._step_timing import timed as _moe_timed
 from torchtune.modules.moe.experts import GroupedExperts
 from torchtune.modules.peft import DoRALinear, LORA_ATTN_MODULES, LoRALinear
 
@@ -90,12 +91,15 @@ class Gemma4TransformerLayer(TransformerSelfAttentionLayer):
         if self.mask_mod is not None:
             bsz, seq_len, *_ = h.shape
             mask = self.mask_mod(mask=mask, bsz=bsz, seq_len=seq_len)
-        attn_out = self.attn(h, h, mask=mask, input_pos=input_pos)
+        with _moe_timed("attention"):
+            attn_out = self.attn(h, h, mask=mask, input_pos=input_pos)
         h = self.sa_scale(attn_out) + x
         if self.moe_block is not None:
-            dense_part = self.post_mlp_norm(self.mlp(self.mlp_norm(h)))
+            with _moe_timed("non_expert"):
+                dense_part = self.post_mlp_norm(self.mlp(self.mlp_norm(h)))
         else:
-            dense_part = self.mlp(self.mlp_norm(h))
+            with _moe_timed("non_expert"):
+                dense_part = self.mlp(self.mlp_norm(h))
         return h, dense_part
 
     def forward(

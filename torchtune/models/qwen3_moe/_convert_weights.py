@@ -1,3 +1,10 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+import os
 import re
 from collections import defaultdict
 
@@ -26,6 +33,19 @@ _QWEN3_MOE_FROM_HF = {
 _EXPERT_KEY_RE = re.compile(
     r"model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight"
 )
+_LAYER_KEY_RE = re.compile(r"model\.layers\.(\d+)\.")
+
+
+def _pipeline_stage_owns_hf_key(key: str, *, stage: int, split_layer: int) -> bool:
+    layer_match = _LAYER_KEY_RE.match(key)
+    if layer_match is not None:
+        layer = int(layer_match.group(1))
+        return layer < split_layer if stage == 0 else layer >= split_layer
+    if key == "model.embed_tokens.weight":
+        return stage == 0
+    if key in {"model.norm.weight", "lm_head.weight"}:
+        return stage == 1
+    return True
 
 
 def qwen3_moe_hf_to_tune(
@@ -53,8 +73,32 @@ def qwen3_moe_hf_to_tune(
     experts_data: dict[int, dict[str, dict[int, torch.Tensor]]] = defaultdict(
         lambda: defaultdict(dict)
     )
+    ep_degree = int(os.environ.get("TORCHTUNE_MOE_CHECKPOINT_EP_DEGREE", "1"))
+    ep_rank = int(os.environ.get("TORCHTUNE_MOE_CHECKPOINT_EP_RANK", "0"))
+    if num_experts % ep_degree != 0 or not 0 <= ep_rank < ep_degree:
+        raise ValueError(
+            f"Invalid checkpoint EP topology: num_experts={num_experts}, "
+            f"ep_degree={ep_degree}, ep_rank={ep_rank}"
+        )
+    owned_experts = range(ep_rank, num_experts, ep_degree)
+    pipeline_degree = int(
+        os.environ.get("TORCHTUNE_MOE_CHECKPOINT_PIPELINE_DEGREE", "1")
+    )
+    pipeline_stage = int(os.environ.get("TORCHTUNE_MOE_CHECKPOINT_PIPELINE_STAGE", "0"))
+    pipeline_split_layer = int(
+        os.environ.get("TORCHTUNE_MOE_CHECKPOINT_PIPELINE_SPLIT_LAYER", "24")
+    )
+    if pipeline_degree not in (1, 2) or not 0 <= pipeline_stage < pipeline_degree:
+        raise ValueError(
+            f"Invalid checkpoint pipeline topology: degree={pipeline_degree}, "
+            f"stage={pipeline_stage}"
+        )
 
     for key, value in state_dict.items():
+        if pipeline_degree == 2 and not _pipeline_stage_owns_hf_key(
+            key, stage=pipeline_stage, split_layer=pipeline_split_layer
+        ):
+            continue
         if "rotary_emb.inv_freq" in key:
             continue
         if tie_word_embeddings and key == "lm_head.weight":
@@ -65,7 +109,8 @@ def qwen3_moe_hf_to_tune(
             layer_idx = int(m.group(1))
             expert_idx = int(m.group(2))
             proj_name = m.group(3)
-            experts_data[layer_idx][proj_name][expert_idx] = value
+            if expert_idx % ep_degree == ep_rank:
+                experts_data[layer_idx][proj_name][expert_idx] = value
         else:
             new_key = get_mapped_key(key, _QWEN3_MOE_FROM_HF)
             converted[new_key] = value
@@ -74,9 +119,7 @@ def qwen3_moe_hf_to_tune(
     for layer_idx in sorted(experts_data.keys()):
         for proj_name in ("gate_proj", "up_proj", "down_proj"):
             expert_dict = experts_data[layer_idx][proj_name]
-            stacked = torch.stack(
-                [expert_dict[e] for e in range(num_experts)], dim=0
-            )
+            stacked = torch.stack([expert_dict[e] for e in owned_experts], dim=0)
             # HF layout [E, out_features, in_features] matches GroupedExpertsHF
             # directly — no transpose needed
             tune_key = f"layers.{layer_idx}.mlp.experts.{proj_name}"

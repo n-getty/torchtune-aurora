@@ -1,0 +1,234 @@
+#!/bin/bash
+#PBS -l select=2
+#PBS -l walltime=02:00:00
+#PBS -q debug
+#PBS -A AuroraGPT
+#PBS -l filesystems=home:flare
+#PBS -o /lus/flare/projects/ModCon/ngetty/torchtune/experiments/qwen3_moe/capacity_gemma4_31b_dense.pbs.out
+#PBS -e /lus/flare/projects/ModCon/ngetty/torchtune/experiments/qwen3_moe/capacity_gemma4_31b_dense.pbs.err
+#PBS -N dense_gemma4_31b_capacity
+
+set -eo pipefail
+
+reject_health_signature() {
+    local log_path=$1
+    if grep -Eqi 'banned[[:space:]]*:[[:space:]]*1|NotPresent|OFI[/[:space:]]*EPERM|OFI.*(error|fail)|EPERM|UR_RESULT_ERROR|device[^[:space:]]*[[:space:]]+(not present|banned)' "${log_path}"; then
+        echo "GEMMA4_31B_DENSE_GATE_FAIL device_or_transport_signature log=${log_path}" >&2
+        exit 1
+    fi
+}
+
+PROJDIR=/lus/flare/projects/ModCon/ngetty/torchtune
+MODEL_PATH=/lus/flare/projects/ModCon/ngetty/models/gemma-4-31B
+LOCAL_MODEL=/tmp/torchtune/gemma-4-31B
+CONFIG=${PROJDIR}/recipes/configs/dev/production/gemma4_31b_sft_seq4096_synthetic_xpu.yaml
+RECIPE=${PROJDIR}/recipes/dev/full_finetune_distributed_xpu.py
+WRAPPER=${PROJDIR}/experiments/qwen3_moe/_native_ep16_sft_rank_wrapper.sh
+JOB_TAG=${PBS_JOBID%%.*}
+HOSTFILE=${PROJDIR}/experiments/qwen3_moe/gemma4_31b_dense_nodes_${JOB_TAG}.txt
+RUNDIR=${PROJDIR}/experiments/qwen3_moe/runs/gemma4_31b_dense_${JOB_TAG}
+DENSE_ARTIFACT=${PROJDIR}/experiments/qwen3_moe/measurements/gemma4_31b_dense_${PBS_JOBID}.json
+
+sort -u "${PBS_NODEFILE}" > "${HOSTFILE}"
+if [[ "$(wc -l < "${HOSTFILE}")" -ne 2 ]]; then
+    echo "GEMMA4_31B_DENSE_PREFLIGHT_FAIL expected_two_nodes hostfile=${HOSTFILE}" >&2
+    exit 1
+fi
+for required_path in "${CONFIG}" "${MODEL_PATH}/config.json" \
+    "${MODEL_PATH}/model-00001-of-00002.safetensors" \
+    "${MODEL_PATH}/model-00002-of-00002.safetensors"; do
+    if [[ ! -e "${required_path}" ]]; then
+        echo "GEMMA4_31B_DENSE_PREFLIGHT_FAIL missing=${required_path}" >&2
+        exit 1
+    fi
+done
+
+cd "${PROJDIR}"
+module load frameworks/2025.3.1 2>/dev/null || true
+export PATH=$(echo "${PATH}" | tr ':' '\n' | grep -v myenv | tr '\n' ':' | sed 's/:$//')
+unset VIRTUAL_ENV
+export PYTHONNOUSERSITE=1 PYTHONPATH=${PROJDIR}
+python3 - <<'PY'
+from pathlib import Path
+import yaml
+from torchtune.modules.moe.measurement_schema import validate_evaluation_manifest
+
+path = Path("experiments/qwen3_moe/evaluation_tracks_manifest.yaml")
+validate_evaluation_manifest(yaml.safe_load(path.read_text()), manifest_path=path)
+print("GEMMA4_31B_DENSE_MANIFEST_PREFLIGHT_PASS")
+PY
+export HF_DATASETS_OFFLINE=1 HF_HUB_OFFLINE=1 no_proxy='*' NO_PROXY='*'
+export CCL_PROCESS_LAUNCHER=pmix CCL_ATL_TRANSPORT=mpi CCL_KVS_MODE=mpi
+export CCL_KVS_USE_MPI_RANKS=1 CCL_CONFIGURATION=cpu_gpu_dpcpp
+export CCL_KVS_CONNECTION_TIMEOUT=600 CCL_OP_SYNC=1 CCL_WORKER_COUNT=1
+export CCL_ALLREDUCE=ring CCL_CHUNK_SIZE=16777216 FI_PROVIDER=cxi
+export ZE_FLAT_DEVICE_HIERARCHY=FLAT GLOO_SOCKET_IFNAME=hsn0
+export TORCH_COMPILE_DISABLE=1 TORCHTUNE_USE_XPU_FLASH=1
+export TORCHTUNE_MOE_BATCH_SIZE=${TORCHTUNE_MOE_BATCH_SIZE:-1}
+export TORCHTUNE_MOE_MICROBATCH_SIZE=${TORCHTUNE_MOE_MICROBATCH_SIZE:-${TORCHTUNE_MOE_BATCH_SIZE}}
+export TORCHTUNE_MOE_GRADIENT_ACCUMULATION_STEPS=${TORCHTUNE_MOE_GRADIENT_ACCUMULATION_STEPS:-1}
+export TORCHTUNE_MOE_STEPS=${TORCHTUNE_MOE_STEPS:-12}
+export TORCHTUNE_MOE_WARMUP_STEPS=${TORCHTUNE_MOE_WARMUP_STEPS:-4}
+export TORCHTUNE_MOE_MEASUREMENT_STEPS=${TORCHTUNE_MOE_MEASUREMENT_STEPS:-8}
+export TORCHTUNE_MOE_STEADY_STATE_STEPS=${TORCHTUNE_MOE_STEADY_STATE_STEPS:-4}
+export TORCHTUNE_MOE_SOURCE_REVISION=$(git rev-parse HEAD)
+if test -n "$(git status --porcelain)"; then export TORCHTUNE_MOE_UNCOMMITTED=dirty; else export TORCHTUNE_MOE_UNCOMMITTED=clean; fi
+export MASTER_ADDR=$(ssh -o BatchMode=yes "$(head -1 "${HOSTFILE}")" hostname -i | awk 'NR == 1 {print $1; exit}')
+LAST4=$(echo "${JOB_TAG}" | tr -dc '0-9' | tail -c 4)
+export MASTER_PORT=$((29500 + (10#${LAST4:-0} % 400)))
+for name in TORCHTUNE_MOE_BATCH_SIZE TORCHTUNE_MOE_MICROBATCH_SIZE \
+    TORCHTUNE_MOE_GRADIENT_ACCUMULATION_STEPS TORCHTUNE_MOE_STEPS \
+    TORCHTUNE_MOE_WARMUP_STEPS TORCHTUNE_MOE_MEASUREMENT_STEPS \
+    TORCHTUNE_MOE_STEADY_STATE_STEPS; do
+    value=${!name}
+    if [[ ! "${value}" =~ ^[0-9]+$ ]] || (( value < 1 )); then
+        echo "GEMMA4_31B_DENSE_PREFLIGHT_FAIL invalid_${name}=${value}" >&2
+        exit 1
+    fi
+done
+if (( TORCHTUNE_MOE_BATCH_SIZE % TORCHTUNE_MOE_MICROBATCH_SIZE != 0 )); then
+    echo "GEMMA4_31B_DENSE_PREFLIGHT_FAIL batch_not_divisible_by_microbatch" >&2
+    exit 1
+fi
+if (( TORCHTUNE_MOE_BATCH_SIZE != TORCHTUNE_MOE_MICROBATCH_SIZE )); then
+    echo "GEMMA4_31B_DENSE_PREFLIGHT_FAIL dense_control_has_no_pipeline_microbatching" >&2
+    exit 1
+fi
+if (( TORCHTUNE_MOE_GRADIENT_ACCUMULATION_STEPS != 1 )); then
+    echo "GEMMA4_31B_DENSE_PREFLIGHT_FAIL gradient_accumulation_is_not_token_volume" >&2
+    exit 1
+fi
+if (( TORCHTUNE_MOE_WARMUP_STEPS + TORCHTUNE_MOE_MEASUREMENT_STEPS > TORCHTUNE_MOE_STEPS )); then
+    echo "GEMMA4_31B_DENSE_PREFLIGHT_FAIL measurement_window_exceeds_steps" >&2
+    exit 1
+fi
+mkdir -p /tmp/torchtune "${RUNDIR}"
+mpiexec --pmi=pmix -n 2 -ppn 1 --hostfile "${HOSTFILE}" bash -lc \
+    "if [ ! -f '${LOCAL_MODEL}/config.json' ]; then rm -rf '${LOCAL_MODEL}'; cp -r '${MODEL_PATH}' '${LOCAL_MODEL}'; fi"
+
+PREFLIGHT_LOG="${RUNDIR}/collective_preflight.log"
+echo "GEMMA4_31B_DENSE_COLLECTIVE_PREFLIGHT_START timestamp=$(date -u +%FT%TZ)"
+mpiexec --pmi=pmix -n 16 -ppn 8 --hostfile "${HOSTFILE}" --cpu-bind depth --depth 8 \
+    bash "${WRAPPER}" "${PROJDIR}/experiments/qwen3_moe/_ep16_allreduce_gate.py" 2>&1 | tee "${PREFLIGHT_LOG}"
+reject_health_signature "${PREFLIGHT_LOG}"
+echo "GEMMA4_31B_DENSE_COLLECTIVE_PREFLIGHT_PASS timestamp=$(date -u +%FT%TZ)"
+
+run_dense() {
+    local steps=$1
+    local log=$2
+    mpiexec --pmi=pmix -n 16 -ppn 8 --hostfile "${HOSTFILE}" --cpu-bind depth --depth 8 \
+        bash "${WRAPPER}" "${RECIPE}" --config "${CONFIG}" \
+        base_model_path="${LOCAL_MODEL}" output_dir="${RUNDIR}/run_out" \
+        metric_logger.log_dir="${RUNDIR}/run_out/logs" max_steps_per_epoch="${steps}" \
+        batch_size="${TORCHTUNE_MOE_BATCH_SIZE}" \
+        gradient_accumulation_steps="${TORCHTUNE_MOE_GRADIENT_ACCUMULATION_STEPS}" \
+        skip_checkpointing=true dataloader_num_workers=0 2>&1 | tee "${log}"
+    reject_health_signature "${log}"
+}
+
+SMOKE_LOG="${RUNDIR}/smoke.log"
+echo "GEMMA4_31B_DENSE_SMOKE_START steps=2 timestamp=$(date -u +%FT%TZ)"
+run_dense 2 "${SMOKE_LOG}"
+SMOKE_LOG="${SMOKE_LOG}" python3 - <<'PY'
+import math, os, re
+losses = []
+for line in open(os.environ["SMOKE_LOG"], encoding="utf-8"):
+    match = re.search(r"loss[:=]([0-9.eE+-]+)", line, re.IGNORECASE)
+    if match and math.isfinite(float(match.group(1))) and 0 < float(match.group(1)) < 100:
+        losses.append(float(match.group(1)))
+if len(losses) < 2:
+    raise SystemExit(f"GEMMA4_31B_DENSE_SMOKE_GATE_FAIL finite_losses={losses}")
+print(f"GEMMA4_31B_DENSE_SMOKE_GATE_PASS finite_losses={losses[-2:]}")
+PY
+echo "GEMMA4_31B_DENSE_SMOKE_PASS timestamp=$(date -u +%FT%TZ)"
+
+MEASUREMENT_LOG="${RUNDIR}/measurement.log"
+export DENSE_ARTIFACT LOCAL_MODEL
+echo "GEMMA4_31B_DENSE_MEASUREMENT_START steps=${TORCHTUNE_MOE_STEPS} batch_size=${TORCHTUNE_MOE_BATCH_SIZE} timestamp=$(date -u +%FT%TZ)"
+run_dense "${TORCHTUNE_MOE_STEPS}" "${MEASUREMENT_LOG}"
+MEASUREMENT_LOG="${MEASUREMENT_LOG}" \
+WARMUP_STEPS="${TORCHTUNE_MOE_WARMUP_STEPS:-4}" \
+MEASUREMENT_STEPS="${TORCHTUNE_MOE_MEASUREMENT_STEPS:-8}" python3 - <<'PY'
+import math
+import os
+import re
+
+pattern = re.compile(
+    r"Step\s+(?P<step>\d+).*?loss:(?P<loss>[0-9.eE+-]+).*?"
+    r"time_per_step_s:(?P<time>[0-9.eE+-]+).*?"
+    r"tokens_per_second_per_gpu:(?P<throughput>[0-9.eE+-]+).*?"
+    r"peak_memory_reserved:(?P<memory>[0-9.eE+-]+)",
+    re.IGNORECASE,
+)
+records = []
+with open(os.environ["MEASUREMENT_LOG"], encoding="utf-8") as log:
+    for line in log:
+        match = pattern.search(line)
+        if not match:
+            continue
+        values = {name: float(value) for name, value in match.groupdict().items() if name != "step"}
+        if all(math.isfinite(value) for value in values.values()):
+            records.append({"step": int(match.group("step")), **values})
+records.sort(key=lambda item: item["step"])
+warmup = int(os.environ["WARMUP_STEPS"])
+required = int(os.environ["MEASUREMENT_STEPS"])
+retained = records[warmup:]
+if len(retained) < required:
+    raise SystemExit(
+        "GEMMA4_31B_DENSE_MEASUREMENT_GATE_FAIL "
+        f"finite_records={len(records)} post_warmup={len(retained)} required={required}"
+    )
+if any(
+    item["loss"] <= 0
+    or item["time"] <= 0
+    or item["throughput"] < 0
+    or item["memory"] < 0
+    for item in retained[:required]
+):
+    raise SystemExit("GEMMA4_31B_DENSE_MEASUREMENT_GATE_FAIL invalid_metric")
+print(
+    "GEMMA4_31B_DENSE_MEASUREMENT_GATE_PASS "
+    f"records={len(records)} retained={required} "
+    f"step_start={retained[0]['step']} step_end={retained[required - 1]['step']}"
+)
+import json
+from pathlib import Path
+
+artifact = {
+    "result_class": "capacity_value_dense_control",
+    "model": "Gemma4-31B",
+    "checkpoint": os.environ["LOCAL_MODEL"],
+    "total_parameters": 31.0,
+    "active_parameters_per_token": 31.0,
+    "topology": {"nodes": 2, "world_size": 16, "pp": 1, "tp": 1},
+    "sequence_length": 4096,
+    "batch_size": int(os.environ["TORCHTUNE_MOE_BATCH_SIZE"]),
+    "microbatch_size": int(os.environ["TORCHTUNE_MOE_MICROBATCH_SIZE"]),
+    "gradient_accumulation_steps": int(os.environ["TORCHTUNE_MOE_GRADIENT_ACCUMULATION_STEPS"]),
+    "optimizer": "torch.optim.AdamW",
+    "environment_overrides": {
+        "TORCH_COMPILE_DISABLE": os.environ.get("TORCH_COMPILE_DISABLE", "1"),
+        "TORCHTUNE_USE_XPU_FLASH": os.environ.get("TORCHTUNE_USE_XPU_FLASH", "1"),
+        "TORCHTUNE_MOE_CHECKPOINT_WRITES": "0",
+    },
+    "source_revision": os.environ["TORCHTUNE_MOE_SOURCE_REVISION"],
+    "uncommitted_change_state": os.environ["TORCHTUNE_MOE_UNCOMMITTED"],
+    "measurement_window": {
+        "warmup_steps": warmup,
+        "measurement_steps": required,
+        "retained_step_start": retained[0]["step"],
+        "retained_step_end": retained[required - 1]["step"],
+    },
+    "measurement_log": os.environ["MEASUREMENT_LOG"],
+    "records": retained[:required],
+    "device_health": "green",
+    "gate_status": "passed",
+    "semantic_completion": "passed",
+    "measurement_completion": "passed",
+}
+destination = Path(os.environ["DENSE_ARTIFACT"])
+destination.parent.mkdir(parents=True, exist_ok=True)
+destination.write_text(json.dumps(artifact, indent=2, sort_keys=True) + "\n")
+print(f"GEMMA4_31B_DENSE_ARTIFACT_WRITTEN path={destination}")
+PY
+echo "GEMMA4_31B_DENSE_MEASUREMENT_PASS timestamp=$(date -u +%FT%TZ)"

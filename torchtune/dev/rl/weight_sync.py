@@ -2259,6 +2259,35 @@ def _xccl_gather_and_stage_fsdp2(self, is_active, pool, _xccl_accept_and_rename,
     import threading as _threading
 
     _BATCH_MAX_NUMEL = 512 * 1024 * 1024  # 512M bf16 elements = 1 GiB
+    # WS10 override (2026-07-22): the legacy full-reship path's ~49s wsync
+    # is bandwidth-bound on the CROSS-NODE XCCL send (2.5 GB/s), so 1 GiB
+    # batches are a reasonable pacing unit there. WS10's bottleneck is
+    # different: the vLLM-side INTRA-node fanout (XeLink) pays a fixed
+    # Python/collective-call overhead per batch (60 batches/round measured
+    # at ~75-87s total_recv despite each individual gloo recv completing in
+    # <1s — see project_ws10_ep8_hang_20260721.md). Raising the batch size
+    # for WS10 specifically cuts call count without touching the validated
+    # legacy path's batch size. Independent env var so a regression here
+    # can't silently change the legacy path's behavior.
+    _WS10_BATCH_MAX_NUMEL = int(os.environ.get(
+        "TORCHTUNE_EP_WSYNC_SHARDED_BATCH_NUMEL", str(_BATCH_MAX_NUMEL)))
+    # HARD CEILING (2026-07-22, found via job 8683165 crash): gloo's TCP
+    # transport preamble uses a 32-bit signed length field for the byte
+    # count of each broadcast (see gloo/transport/tcp/pair.cc). A batch of
+    # exactly 2**31 bf16 ELEMENTS = 2**32 BYTES overflows it, corrupting the
+    # wire preamble and crashing the vLLM worker with
+    # "gloo::EnforceNotMet ... op.preamble.length <= op.nbytes" instead of a
+    # clean error. Enforce elements*2 < 2**31 bytes (INT32_MAX) with margin.
+    _WS10_MAX_SAFE_ELEMENTS = (2**31 - 1) // 2  # ~1.07B elements = ~2 GiB bf16
+    if _WS10_BATCH_MAX_NUMEL >= _WS10_MAX_SAFE_ELEMENTS:
+        raise ValueError(
+            f"TORCHTUNE_EP_WSYNC_SHARDED_BATCH_NUMEL={_WS10_BATCH_MAX_NUMEL} "
+            f"would produce broadcast batches >= {_WS10_MAX_SAFE_ELEMENTS} "
+            "bf16 elements (~2 GiB bytes), overflowing gloo's 32-bit TCP "
+            "preamble length field and crashing the vLLM worker with a "
+            "garbled 'preamble.length <= nbytes' EnforceNotMet error rather "
+            "than a clean failure. Use a smaller value."
+        )
 
     sharded_sd = self._model.state_dict()
 
@@ -2664,10 +2693,12 @@ def _xccl_gather_and_stage_fsdp2(self, is_active, pool, _xccl_accept_and_rename,
                     f"{sorted(_ws10_pending_proj.keys())[:8]}"
                 )
 
-            # Build per-rank payload via the shared helper.
+            # Build per-rank payload via the shared helper. Uses the WS10-
+            # specific batch size override (see comment at _BATCH_MAX_NUMEL
+            # definition above) — independent of the legacy path's batching.
             _local_cpu_batches, _local_meta = _ws10_build_local_payload(
                 _local_experts, _ws10_R, int(_ep_deg),
-                batch_max_numel=_BATCH_MAX_NUMEL,
+                batch_max_numel=_WS10_BATCH_MAX_NUMEL,
             )
             del _local_experts
 
@@ -2700,7 +2731,7 @@ def _xccl_gather_and_stage_fsdp2(self, is_active, pool, _xccl_accept_and_rename,
                 _ne_offset = 0
                 for _ne_e in _ws10_non_expert_meta:
                     _n = int(_ne_e["numel"])
-                    if _cur_n > 0 and _cur_n + _n > _BATCH_MAX_NUMEL:
+                    if _cur_n > 0 and _cur_n + _n > _WS10_BATCH_MAX_NUMEL:
                         _local_cpu_batches.append(torch.cat(_cur_parts))
                         _cur_parts = []
                         _cur_n = 0
@@ -2745,7 +2776,7 @@ def _xccl_gather_and_stage_fsdp2(self, is_active, pool, _xccl_accept_and_rename,
                 pool_index = pool.index(self.rank) if pool else 0
                 _meta_json = json.dumps({
                     "tensors": _unified,
-                    "batch_max_numel": _BATCH_MAX_NUMEL,
+                    "batch_max_numel": _WS10_BATCH_MAX_NUMEL,
                     "sender_index": pool_index,
                 })
 
@@ -2762,10 +2793,27 @@ def _xccl_gather_and_stage_fsdp2(self, is_active, pool, _xccl_accept_and_rename,
             _my_pgs = _ws10_pgs_dict[_ws10_R]
             if not isinstance(_my_pgs, list):
                 _my_pgs = [_my_pgs]
+            # _local_meta only holds the expert-shard entries; rank 0 also
+            # ships _ws10_non_expert_meta (the tail) over the wire but it
+            # was never merged in here, so the deferred-broadcast thread's
+            # "XCCL deferred broadcast done: X GiB" log undercounted rank
+            # 0's true payload by the non-expert tail (~2.87 GiB in the
+            # EP=8 30B-A3B production config), making its logged GB/s
+            # figure wrong (found 2026-07-22 while diagnosing why rank 0's
+            # sync time is disproportionate to its send bytes — the real
+            # answer is rank 0 uniquely waits on vLLM's full receive+load
+            # pipeline via the HTTP POST thread, not this byte-accounting
+            # bug, but the wrong number was actively misleading while
+            # investigating that).
+            _local_meta_for_accounting = (
+                _local_meta + _ws10_non_expert_meta
+                if _ws10_R == 0 and _ws10_non_expert_meta
+                else _local_meta
+            )
             self._deferred_broadcast_args = (
                 _local_cpu_batches,        # cpu_batches
                 _meta_json,                # rank 0 only; other ranks None
-                _local_meta,               # used for byte accounting
+                _local_meta_for_accounting,  # used for byte accounting
                 _ws10_t0,                  # t0
                 self._device,              # device
                 _my_pgs,                   # pgs (one per replica)

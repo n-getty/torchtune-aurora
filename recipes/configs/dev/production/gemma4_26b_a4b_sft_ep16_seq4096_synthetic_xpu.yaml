@@ -1,0 +1,98 @@
+# Gemma4-26B-A4B capacity/value SFT control — two-node Aurora XPU.
+#
+# This is deliberately a capacity/value workload, not a strict dense-parity
+# control: the available dense control is recorded separately in the capacity
+# manifest and must not be used to claim matched active-compute parity.
+
+name: gemma4_26b_a4b_sft_ep16_seq4096_synthetic
+output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/experiments/qwen3_moe/runs/${name}
+base_model_path: /lus/flare/projects/ModCon/ngetty/models/gemma-4-26B-A4B
+
+model:
+  _component_: torchtune.models.gemma4.gemma4_26b_a4b
+
+expert_parallel_degree: 16
+native_ep_sharded_experts: true
+native_fsdp_grad_reduce: false
+expert_cpu_offload: false
+
+tokenizer:
+  _component_: torchtune.models.gemma4.gemma4_tokenizer
+  tokenizer_json_path: ${base_model_path}/tokenizer.json
+  tokenizer_config_json_path: ${base_model_path}/tokenizer_config.json
+  max_seq_len: 4096
+
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files:
+    - model-00001-of-00002.safetensors
+    - model-00002-of-00002.safetensors
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: GEMMA4
+
+resume_from_checkpoint: false
+skip_checkpointing: true
+checkpoint_experts: false
+
+dataset:
+  _component_: torchtune.datasets.synthetic_fixed_length_dataset
+  seq_len: 4096
+  vocab_size: 262144
+  num_samples: 10000
+seed: 1234
+shuffle: true
+dataloader_num_workers: 4
+
+epochs: 1
+max_steps_per_epoch: 12
+batch_size: 1
+pipeline_microbatch_size: 1
+gradient_accumulation_steps: 1
+clip_grad_norm: null
+
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 1.0e-5
+  weight_decay: 0.0
+  fused: true
+
+loss:
+  _component_: torchtune.modules.loss.LinearCrossEntropyLoss
+
+enable_activation_checkpointing: true
+attention_checkpoint_every: 1
+enable_activation_offloading: false
+fsdp_cpu_offload: false
+fsdp_reshard_after_forward: true
+data_parallel_replicate_dim: 1
+data_parallel_shard_dim: 16
+tensor_parallel_dim: 1
+
+device: xpu
+dtype: bf16
+compile: false
+
+log_level: INFO
+log_every_n_steps: 1
+log_peak_memory_stats: true
+
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: false
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: true
+  cuda: false
+  profile_memory: false
+  with_stack: false
+  record_shapes: false
+  with_flops: false
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1

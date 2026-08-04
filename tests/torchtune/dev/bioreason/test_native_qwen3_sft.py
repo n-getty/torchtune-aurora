@@ -343,6 +343,115 @@ def _ds_exhaustive(monkeypatch, rows, exhaustive):
     )
 
 
+# ── bp_oversample_factor (gap #8: BP is the persistently weakest CAFA namespace) ─
+def _ds_bp_oversample(monkeypatch, rows, factor):
+    from torchtune.dev.bioreason import dataset_sft as sft
+    monkeypatch.setattr(sft.BioReasonSFTDataset, "_load", lambda self, df: list(rows))
+    return sft.BioReasonSFTDataset(
+        data_files="unused", tokenizer=_StubTok(), max_seq_len=4096,
+        max_protein_len=2048, num_go_tokens=5, protein_token_id=_PROT_ID,
+        go_token_id=_GO_ID, train_on_reasoning=True, inject_go_pred=True,
+        drop_over_length=False, bp_oversample_factor=factor,
+    )
+
+
+def test_bp_oversample_factor_default_is_noop(monkeypatch):
+    rows = [_row(3), _row(3)]
+    rows[0]["go_bp"] = ["GO:0000001"]
+    rows[1]["go_bp"] = []
+    ds = _ds_bp_oversample(monkeypatch, rows, factor=1.0)
+    assert len(ds) == 2  # 1.0 = off, no duplication
+
+
+def test_bp_oversample_factor_2x_duplicates_only_bp_rows(monkeypatch):
+    bp_row = _row(3)
+    bp_row["go_bp"] = ["GO:0000001"]
+    non_bp_row = _row(3)
+    non_bp_row["go_bp"] = []
+    rows = [bp_row, non_bp_row]
+    ds = _ds_bp_oversample(monkeypatch, rows, factor=2.0)
+    # 2.0 = each BP row appears twice; non-BP rows untouched.
+    assert len(ds) == 3
+    bp_count = sum(1 for ex in ds.examples if _sft_nonempty(ex.get("go_bp")))
+    assert bp_count == 2
+    non_bp_count = sum(1 for ex in ds.examples if not _sft_nonempty(ex.get("go_bp")))
+    assert non_bp_count == 1
+
+
+def test_bp_oversample_factor_fractional_duplicates_a_prefix(monkeypatch):
+    bp_rows = [_row(3) for _ in range(4)]
+    for i, r in enumerate(bp_rows):
+        r["go_bp"] = [f"GO:000000{i}"]
+    ds = _ds_bp_oversample(monkeypatch, bp_rows, factor=1.5)
+    # 1.5x of 4 BP rows -> 2 extra duplicate rows (round(0.5*4)).
+    assert len(ds) == 6
+
+
+def test_bp_oversample_factor_noop_when_no_bp_rows(monkeypatch):
+    rows = [_row(3), _row(3)]
+    for r in rows:
+        r["go_bp"] = []
+    ds = _ds_bp_oversample(monkeypatch, rows, factor=3.0)
+    assert len(ds) == 2  # nothing to oversample; logs a warning, doesn't crash
+
+
+def test_bp_oversample_factor_rejects_below_one():
+    from torchtune.dev.bioreason import dataset_sft as sft
+    with pytest.raises(ValueError):
+        sft.BioReasonSFTDataset.__init__(
+            object.__new__(sft.BioReasonSFTDataset),
+            data_files="unused", tokenizer=_StubTok(), bp_oversample_factor=0.5,
+        )
+
+
+def _sft_nonempty(v):
+    from torchtune.dev.bioreason.dataset_sft import _nonempty
+    return _nonempty(v)
+
+
+# ── interpro_in_prompt / ppi_in_prompt (gap #6: text-ablation on the native path) ──
+def _build_native_prompt_text(interpro_in_prompt=True, ppi_in_prompt=True):
+    from torchtune.dev.bioreason import dataset_sft as sft
+    ex = {
+        "organism": "Homo sapiens",
+        "interpro_formatted": "IPR000001: domain A",
+        "ppi_formatted": "P12345; Q67890",
+        "go_pred": "GO:0005524",
+        "go_mf": ["GO:0005524"], "go_cc": [], "go_bp": [],
+    }
+    return sft.BioReasonSFTDataset._build_prompt_text(
+        sft.BioReasonSFTDataset.__new__(sft.BioReasonSFTDataset), ex,
+        interpro_in_prompt=interpro_in_prompt, ppi_in_prompt=ppi_in_prompt,
+    )
+
+
+def test_interpro_ppi_in_prompt_default_true_unchanged():
+    """Default (no args) must be byte-identical to the pre-existing behavior pinned
+    by test_H_dataset_prompt_matches_rl_dataset."""
+    text = _build_native_prompt_text()
+    assert "IPR000001: domain A" in text
+    assert "P12345; Q67890" in text
+
+
+def test_interpro_in_prompt_false_strips_interpro_only():
+    text = _build_native_prompt_text(interpro_in_prompt=False)
+    assert "IPR000001: domain A" not in text
+    assert "P12345; Q67890" in text  # ppi unaffected
+
+
+def test_ppi_in_prompt_false_strips_ppi_only():
+    text = _build_native_prompt_text(ppi_in_prompt=False)
+    assert "P12345; Q67890" not in text
+    assert "IPR000001: domain A" in text  # interpro unaffected
+
+
+def test_both_off_strips_both():
+    text = _build_native_prompt_text(interpro_in_prompt=False, ppi_in_prompt=False)
+    assert "IPR000001: domain A" not in text
+    assert "P12345; Q67890" not in text
+    assert "GO:0005524" in text  # go_pred (the third context field) untouched
+
+
 def _row_gt(mf=None, cc=None, bp=None):
     r = _row(3)
     r["go_mf"] = mf or []
@@ -421,6 +530,98 @@ def test_exhaustive_target_labels_mask_only_prompt(monkeypatch):
     assert int((labels != IGN).sum()) > 0
     # placeholder counts unchanged (prompt not touched by the target change)
     assert int((item["tokens"] == _PROT_ID).sum()) == 3 + 2  # _row protein seq "MKT"->3, +2
+    assert int((item["tokens"] == _GO_ID).sum()) == 5
+
+
+# ── append_gopred_target (Approach B: append IN-PROMPT go_pred terms, no GT leak) ──
+def _ds_gopred(monkeypatch, rows, append):
+    from torchtune.dev.bioreason import dataset_sft as sft
+    monkeypatch.setattr(sft.BioReasonSFTDataset, "_load", lambda self, df: list(rows))
+    return sft.BioReasonSFTDataset(
+        data_files="unused", tokenizer=_StubTok(), max_seq_len=4096,
+        max_protein_len=2048, num_go_tokens=5, protein_token_id=_PROT_ID,
+        go_token_id=_GO_ID, train_on_reasoning=True, inject_go_pred=True,
+        drop_over_length=False, append_gopred_target=append,
+    )
+
+
+def _row_gopred(go_pred_text, reasoning="because", final="GO:1"):
+    r = _row(3)
+    r["go_pred"] = go_pred_text
+    r["reasoning"] = reasoning
+    r["final_answer"] = final
+    return r
+
+
+def test_exhaustive_and_append_gopred_are_mutually_exclusive():
+    from torchtune.dev.bioreason.dataset_sft import BioReasonSFTDataset as DS
+    with pytest.raises(ValueError):
+        DS(
+            data_files="unused", tokenizer=_StubTok(), exhaustive_target=True,
+            append_gopred_target=True,
+        )
+
+
+def test_gopred_terms_extracts_dedup_first_seen_order():
+    from torchtune.dev.bioreason.dataset_sft import BioReasonSFTDataset as DS
+    ex = {"go_pred": "MF: GO:0000002, GO:0000001, GO:0000002 (dup)"}
+    assert DS._gopred_terms(ex) == ["GO:0000002", "GO:0000001"]
+    assert DS._gopred_terms({"go_pred": ""}) == []
+    assert DS._gopred_terms({}) == []
+
+
+def test_append_gopred_target_off_is_parity(monkeypatch):
+    """append_gopred_target=False ⇒ target byte-identical to the default builder."""
+    rows = [_row_gopred("GO:0000001, GO:0000002") for _ in range(4)]
+    off = _ds_gopred(monkeypatch, rows, append=False)
+    ref = _ds_with(monkeypatch, rows, max_seq_len=4096, drop=False)
+    for i in range(len(rows)):
+        assert torch.equal(off[i]["tokens"], ref[i]["tokens"]), f"idx {i} diverged"
+
+
+def test_append_gopred_target_grows_target_and_preserves_reasoning_terms(monkeypatch):
+    """append_gopred_target=True ⇒ target is LONGER (go_pred list appended) and contains
+    BOTH the curated reasoning/final_answer terms AND every go_pred term verbatim — the
+    reasoning-derived breadth is preserved, not replaced."""
+    rows = [_row_gopred(
+        "Speculations: GO:0000123, GO:0000456", reasoning="uses GO:0000999", final="GO:0000789",
+    )]
+    on = _ds_gopred(monkeypatch, rows, append=True)
+    off = _ds_gopred(monkeypatch, rows, append=False)
+    assert on[0]["tokens"].shape[0] > off[0]["tokens"].shape[0]
+    from torchtune.dev.bioreason.dataset_sft import BioReasonSFTDataset as DS
+    ex = rows[0]
+    base = f"{ex['reasoning']}\n{ex['final_answer']}"
+    terms = DS._gopred_terms(ex)
+    rendered = f"{base}\n\nGO terms: " + ", ".join(terms)
+    # curated reasoning term (not in go_pred) survives
+    assert "GO:0000999" in rendered
+    # curated final_answer term survives
+    assert "GO:0000789" in rendered
+    # appended go_pred terms present verbatim
+    for t in ("GO:0000123", "GO:0000456"):
+        assert t in rendered
+
+
+def test_append_gopred_target_empty_gopred_is_noop(monkeypatch):
+    """No go_pred terms to append ⇒ target unchanged (no dangling 'GO terms: ' header)."""
+    rows = [_row_gopred("")]
+    on = _ds_gopred(monkeypatch, rows, append=True)
+    off = _ds_gopred(monkeypatch, rows, append=False)
+    assert torch.equal(on[0]["tokens"], off[0]["tokens"])
+
+
+def test_append_gopred_target_labels_mask_only_prompt(monkeypatch):
+    """The appended go_pred list is SUPERVISED; only the prompt span is masked."""
+    from torchtune.data import CROSS_ENTROPY_IGNORE_IDX as IGN
+    rows = [_row_gopred("GO:0000123, GO:0000456")]
+    ds = _ds_gopred(monkeypatch, rows, append=True)
+    item = ds[0]
+    labels = item["labels"]
+    n_prompt = int((labels == IGN).sum())
+    assert n_prompt > 0
+    assert int((labels != IGN).sum()) > 0
+    assert int((item["tokens"] == _PROT_ID).sum()) == 3 + 2
     assert int((item["tokens"] == _GO_ID).sum()) == 5
 
 

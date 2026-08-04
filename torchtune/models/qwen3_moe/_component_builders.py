@@ -1,3 +1,4 @@
+import os
 from typing import Optional
 
 import torch
@@ -13,6 +14,7 @@ from torchtune.models.qwen3_moe._router import Qwen3MoeRouter
 from torchtune.modules import RMSNorm, TiedLinear, TransformerSelfAttentionLayer
 from torchtune.modules.attention_utils import _MaskType
 from torchtune.modules.moe.moe import MoE
+from torchtune.modules.moe._step_timing import timed as _moe_timed
 from torchtune.modules.transformer import TransformerDecoder
 
 
@@ -46,7 +48,8 @@ class Qwen3MoeTransformerLayer(TransformerSelfAttentionLayer):
         if self.mask_mod is not None:
             bsz, seq_len, *_ = h.shape
             mask = self.mask_mod(mask=mask, bsz=bsz, seq_len=seq_len)
-        attn_out = self.attn(h, h, mask=mask, input_pos=input_pos)
+        with _moe_timed("attention"):
+            attn_out = self.attn(h, h, mask=mask, input_pos=input_pos)
         return self.sa_scale(attn_out) + x
 
     def forward(
@@ -63,7 +66,7 @@ class Qwen3MoeTransformerLayer(TransformerSelfAttentionLayer):
                 x,
                 mask,
                 input_pos,
-                use_reentrant=False,
+                use_reentrant=os.environ.get("TORCHTUNE_AC_USE_REENTRANT", "0") == "1",
                 preserve_rng_state=False,
             )
         else:
@@ -71,7 +74,9 @@ class Qwen3MoeTransformerLayer(TransformerSelfAttentionLayer):
 
         # MoE always runs OUTSIDE the AC region — router executes exactly once,
         # so num_tokens_per_expert and gather_idx are stable across FWD/BWD.
-        mlp_out = self.mlp(self.mlp_norm(h))
+        with _moe_timed("non_expert"):
+            mlp_input = self.mlp_norm(h)
+        mlp_out = self.mlp(mlp_input)
         return h + self.mlp_scale(mlp_out)
 
 

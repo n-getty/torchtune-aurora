@@ -1,0 +1,386 @@
+name: qwen3_moe_reframed_evaluation
+schema_version: 1
+result_classes: [kernel_parity, ep_scaling, capacity_value]
+decision_categories: [highest_repeatable_moe_per_gpu_mfu, highest_aggregate_throughput, best_ep_scaling_point, closest_strict_dense_parity, best_capacity_value_result]
+gap_categories: [communication, expert_compute, attention, optimizer, pipeline_bubble]
+reference_tier:
+  result_class: kernel_parity
+  moe: Qwen3-30B-A3B
+  dense: Qwen3-4B
+  sequence_length: 4096
+  promotion_threshold_percent: 95
+  validated_moe_baseline:
+    ep: 8
+    pp: 1
+    local_batch: 1
+    throughput_tokens_per_second_per_gpu: 729.53
+    mfu_percent: 3.52
+  notes: EP16 and PP2 remain rejected for this workload; EP8 batch 2 is approximately 803.13 tok/s/GPU but below matched parity.
+tracks:
+  kernel_parity:
+    manifest: experiments/qwen3_moe/native_ep8_seq4096_baseline_manifest.yaml
+    standalone_manifest: experiments/qwen3_moe/kernel_parity_manifest.yaml
+    primary_metrics: [throughput_tokens_per_second_per_gpu, mfu_percent]
+    promotion_evaluator: experiments/qwen3_moe/report_kernel_parity.py
+    optimization_ab_report: experiments/qwen3_moe/report_optimization_ab.py
+    controls: [qwen3_30b_a3b_ep8, qwen3_4b_dense]
+  ep_scaling:
+    status: launchers_ready_pending_hardware_measurement
+    standalone_manifest: experiments/qwen3_moe/ep_scaling_manifest.yaml
+    measurement_launchers:
+      ep8_node_local: experiments/qwen3_moe/run_native_ep8_measurement.pbs
+      ep16_two_node: experiments/qwen3_moe/run_native_ep16_measurement.pbs
+    measurement_artifact:
+      output_template: experiments/qwen3_moe/measurements/<ep>_<jobid>.rank<rank>.json
+      enable_env: TORCHTUNE_MOE_MEASURE=1
+      output_env: TORCHTUNE_MOE_MEASURE_OUTPUT
+      promotion_run_uses_measurement: false
+      aggregation: torchtune.modules.moe.measurement.aggregate_measurement_files
+      scaling_summary: torchtune.modules.moe.measurement.summarize_ep_scaling_artifact
+      comparison_report: experiments/qwen3_moe/report_ep_scaling.py
+      timing_summary: torchtune.modules.moe.measurement.summarize_step_timings
+      required_metadata: [source_revision, uncommitted_change_state, model, checkpoint, world_size, topology, sequence_length, batch_size, gradient_accumulation_steps, optimizer, environment_overrides, optimization_profile, routing_index_mode, router_semantics, expert_execution_path, pipeline_stage, device_health, gate_status, semantic_completion, measurement_completion]
+      optional_step_timing: TORCHTUNE_MOE_STEP_TIMING=1; reports attention, non_expert, model_fwd_total, backward_total, manual_grad_release_total, optimizer_step_total, pipeline_bubble, activation_transfer_forward/backward, and time_per_step_s once per optimizer step without affecting promotion runs
+      pipeline_aggregation: stage-aware; single-stage artifacts retain the legacy records mapping, while PP artifacts are grouped under records_by_pipeline_stage
+      completion_seal: required; rank artifacts are sealed only after the measured window exits successfully
+      provenance_seal: canonical EP8/EP16 and capacity MoE launchers call mark_measurement_artifacts_complete with require_provenance=true; model, checkpoint, source_revision, and clean-or-dirty worktree state are mandatory
+      complete_rank_set: required by report_ep_scaling.py; ranks 0..world_size-1 must all be present
+      attribution_validation: optimization_profile and routing_index_mode must be non-empty; TORCHTUNE_EP_ALL2ALL, when recorded, must be 0 or 1; collective locality must be valid and agree with event records; aggregation rejects violations
+      scaling_control_validation: EP8 and EP16 summaries must match model, checkpoint, sequence length, batch, optimizer, expert execution, routing, transport, and recorded optimization overrides; only EP degree, world size, topology, and expected locality may differ
+      strict_report_validation: report_ep_scaling.py requires complete control metadata before producing a comparison
+      optimization_ab_validation: report_optimization_ab.py requires same-topology metadata and an explicit varying-control list
+      optimizer_validation: when TORCHTUNE_MOE_OPTIMIZER_COMPONENT is recorded, it must equal resolved optimizer metadata; aggregation rejects mismatches
+      metadata_profile_validation: canonical Qwen EP launchers include cpu_vector_routing_metadata_on/off in optimization_profile so matched metadata A/B results remain attributable
+      launcher_override_policy: canonical launchers use ${VAR:-default} for optimization flags so matched A/B overrides remain effective and are recorded in environment_overrides; canonical EP8/EP16 measurements default to the validated grouped_mm and AllToAll path; sequential and padded_bmm remain explicit diagnostic controls; default optimization profiles include sequential/padded_bmm/grouped_mm execution, index_add_combine_on/off, index_add_final_scatter_on/off, rowwise_alltoall_unpermute_on/off, uninitialized_alltoall_buffers_on/off, and topk_router_on/off
+      controlled_overrides: [TORCHTUNE_EP_ALL2ALL, TORCHTUNE_MOE_COLLECTIVE_LOCALITY, TORCHTUNE_EP_INPLACE_AG_ANCHOR, TORCHTUNE_EP_SINGLE_ROW_AG_ANCHOR, TORCHTUNE_EP_ZERO_COST_AG_ANCHOR, TORCHTUNE_EP_UNINITIALIZED_COLLECTIVE_BUFFERS, TORCHTUNE_EP_UNINITIALIZED_ALLTOALL_BUFFERS, TORCHTUNE_EP_ROWWISE_ALLTOALL_UNPERMUTE, TORCHTUNE_EP_CPU_METADATA_TRANSFER, TORCHTUNE_EP_DIRECT_CPU_COPY, TORCHTUNE_EP_INDEX_ADD_COMBINE, TORCHTUNE_EP_DEVICE_ROUTING_METADATA, TORCHTUNE_EP_CPU_VECTOR_ROUTING_METADATA, TORCHTUNE_EP_PACK_ROUTING_METADATA_TRANSFER, TORCHTUNE_EP_GRAD_RELEASE_XCCL, TORCHTUNE_MOE_SEQUENTIAL_EXPERTS, TORCHTUNE_MOE_GROUPED_EXPERTS, TORCHTUNE_MOE_GROUPED_RECOMPUTE_PREACT, TORCHTUNE_MOE_TOPK_ROUTING, TORCHTUNE_MOE_UNSTABLE_EXPERT_GROUPING, TORCHTUNE_MOE_INDEX_SELECT_PACKING, TORCHTUNE_MOE_INDEX_ADD_FINAL_SCATTER, TORCHTUNE_MOE_VECTOR_PACKING, TORCHTUNE_MOE_ALLTOALL_CONDITIONAL_CONTIGUOUS]
+    controls:
+      - qwen3_30b_a3b_ep8_node_local
+      - qwen3_30b_a3b_ep16_two_node
+    required_metrics: [local_tokens, global_tokens, per_gpu_throughput, aggregate_throughput, tokens_per_local_expert, expert_imbalance, expert_execution_path, expert_compute_timing, grouped_gemm_gate, grouped_gemm_up, grouped_gemm_down, router, attention, non_expert, expert_forward, final_scatter, dispatch_alltoall, combine_alltoall, dispatch_backward_alltoall, combine_backward_alltoall, routing_metadata_allgather, routing_metadata_materialization, routing_metadata_permutation, dispatch_pack, dispatch_unpack, dispatch_backward_pack, dispatch_backward_unpack, combine_pack, combine_unpack, combine_backward_pack, combine_backward_unpack, collective_communication, routing_pack_unpack, allgather_forward_optional, reduce_scatter_forward_optional, reduce_scatter_backward_optional, allgather_backward_optional, collective_locality, model_fwd_total, backward_total, manual_grad_release_total, optimizer_step_total, total_step_s, peak_memory, steady_state_memory, device_health]
+    grouped_gemm_projection_timings: [grouped_gemm_gate, grouped_gemm_up, grouped_gemm_down]
+    expert_compute_timing_policy: "sequential_expert_compute for expert_execution_path=sequential; grouped_gemm_gate/up/down for expert_execution_path=grouped_mm; padded_bmm for expert_execution_path=padded_bmm; TORCHTUNE_MOE_MEASURE=1; excluded from promotion windows"
+    collective_metric_policy: canonical_ep_is_alltoall; allgather_reduce_scatter_remains_an_explicit_control; locality_field_records_node_local_or_cross_node
+    batch_sweep: [1, 2]
+    default_compile: false
+    compile_ab_requires_matched_override: true
+    larger_token_volume: true
+    gradient_accumulation_is_proxy: false
+    next_ab:
+      hypothesis: removing expert recomputation will recover throughput while the factored optimizer preserves the batch-2 memory envelope
+      fixed_controls: [batch_size, ep, sequence_length, flash, compile, alltoall, metadata_off, routing_index_mode, index_select_packing, single_row_ag_anchor, inplace_ag_anchor, uninitialized_collective_buffers, metadata_transport, direct_cpu_copy, inplace_route_weighting, inplace_final_scatter, inplace_swiglu, optimizer]
+      required_gates: [fresh_node_collective_health, two_optimizer_step_memory_smoke, twelve_step_semantic_completion]
+      gate_order: [collective_preflight, two_step_smoke, measured_window]
+      promotion_status: rejected
+      rejection:
+        job_id: 8710874
+        result: step_1_timeout_before_second_forward
+        first_step_seconds: 561.98
+        peak_reserved_gib: 63.447
+        reason: retaining expert activations exhausts the XPU memory envelope even with factored optimizer state
+      do_not_repeat: true
+    next_candidate:
+      status: implementation_required
+      hypothesis: fuse routed-token packing, AllToAll, and expert-major unpack/combine to remove per-layer temporary and launch overhead
+      promotion_status: not_a_candidate_until_cpu_equivalence_and_fresh_node_smoke
+    incremental_changes:
+      status: implemented_cpu_verified_pending_hardware_ab
+      candidates:
+        - change: vectorized_ag_dispatch_metadata
+          files: [torchtune/modules/moe/_parallelism.py, tests/torchtune/dev/rl/test_ep_all2all_dispatch_equivalence.py]
+          promotion_status: not_claimed
+          cpu_equivalence: passed_reference_comparison_including_zero_and_uneven_counts
+          fixed_controls: [routing_index_mode]
+          note: Uses device-side integer metadata after the existing token-count exchange; it does not enable device routing metadata or change collective transport.
+        - change: reuse_integer_ag_dispatch_metadata
+          files: [torchtune/modules/moe/_parallelism.py, tests/torchtune/dev/rl/test_ep_all2all_dispatch_equivalence.py]
+          promotion_status: not_claimed
+          cpu_equivalence: covered_by_vectorized_metadata_reference_tests
+          fixed_controls: [routing_index_mode, metadata_transport]
+          note: Reuses the canonical int64 routing-count tensor and performs prefix subtraction in the cumulative buffers in the vectorized AG/RS metadata builder; legacy integer widths still normalize safely without mutating caller metadata.
+        - change: inplace_ag_rank_offset_metadata
+          files: [torchtune/modules/moe/_parallelism.py, tests/torchtune/dev/rl/test_ep_all2all_dispatch_equivalence.py]
+          promotion_status: not_claimed
+          cpu_equivalence: covered_by_vectorized_metadata_reference_tests
+          fixed_controls: [metadata_transport, routing_index_mode]
+          note: Constructs rank token offsets in place before broadcasting them across owned experts, avoiding a temporary multiply result without changing dispatch indices.
+        - change: direct_grouped_alltoall_permutations
+          files: [torchtune/modules/moe/_parallelism.py, tests/torchtune/dev/rl/test_ep_all2all_dispatch_equivalence.py]
+          promotion_status: not_claimed
+          cpu_equivalence: passed_distributed_forward_backward_and_metadata_reference_tests_including_zero_and_uneven_counts
+          fixed_controls: [routing_index_mode, metadata_transport]
+          note: Builds send and expert permutations from grouped count ranges instead of materializing per-token expert IDs and stable-sorting them; collective split lists and token order remain unchanged.
+        - change: cpu_vectorized_alltoall_metadata
+          files: [torchtune/modules/moe/_parallelism.py, tests/torchtune/dev/rl/test_ep_all2all_dispatch_equivalence.py]
+          promotion_status: not_claimed
+          cpu_equivalence: passed_reference_comparison_including_zero_and_uneven_counts
+          hardware_evidence: pending_fresh_node_matched_metadata_ab
+          ab_override: TORCHTUNE_EP_CPU_VECTOR_ROUTING_METADATA=0
+          fixed_controls: [TORCHTUNE_EP_DEVICE_ROUTING_METADATA, metadata_transport, routing_index_mode]
+          note: Uses vectorized contiguous-range expansion on CPU routing counts, avoiding Python list/range expansion per layer while preserving the established CPU collective and accelerator materialization path.
+        - change: packed_cpu_routing_metadata_transfer
+          files: [torchtune/modules/moe/_parallelism.py, tests/torchtune/dev/rl/test_ep_all2all_dispatch_equivalence.py]
+          promotion_status: not_claimed
+          cpu_equivalence: passed_packed_metadata_helper_test
+          hardware_evidence: pending_fresh_node_matched_metadata_transfer_ab
+          ab_override: TORCHTUNE_EP_PACK_ROUTING_METADATA_TRANSFER=0
+          fixed_controls: [TORCHTUNE_EP_CPU_VECTOR_ROUTING_METADATA, TORCHTUNE_EP_DEVICE_ROUTING_METADATA, metadata_transport, routing_index_mode]
+          note: Concatenates CPU permutation/count metadata before one accelerator materialization and slices the result into the original tensors; only active when CPU-vectorized metadata is enabled.
+        - change: expand_grouped_metadata_ranges_without_group_ids
+          files: [torchtune/modules/moe/_parallelism.py, tests/torchtune/dev/rl/test_ep_all2all_dispatch_equivalence.py]
+          promotion_status: not_claimed
+          cpu_equivalence: passed_direct_zero_and_uneven_group_cases_and_metadata_reference_tests
+          fixed_controls: [routing_index_mode, metadata_transport]
+          note: Expands contiguous permutation ranges from group bases and counts, avoiding the per-token group-ID tensor and its second indexing operation; the final range offsets are added in place to the newly allocated expansion buffer. Applies to AG/RS and diagnostic AllToAll metadata construction; unbenchmarked on XPU.
+        - change: direct_topology_index_construction
+          files: [torchtune/modules/moe/_parallelism.py, tests/torchtune/dev/rl/test_ep_all2all_dispatch_equivalence.py]
+          promotion_status: not_claimed
+          cpu_equivalence: passed_reference_comparison_including_zero_and_uneven_counts
+          hardware_evidence: pending_fresh_node_matched_metadata_ab
+          fixed_controls: [routing_index_mode, metadata_transport]
+          note: Constructs interleaved send and owned-expert indices directly from arange views instead of repeat-interleave/multiply/add chains; routing order and expert ownership are unchanged.
+        - change: per_expert_parallel_topology_index_cache
+          files: [torchtune/modules/moe/_parallelism.py, tests/torchtune/dev/rl/test_ep_all2all_dispatch_equivalence.py]
+          promotion_status: not_claimed
+          cpu_equivalence: passed_cached_uncached_and_rank_separation_checks
+          hardware_evidence: pending_fresh_node_matched_metadata_ab
+          fixed_controls: [ep_degree, num_experts, ep_rank, device, routing_index_mode, metadata_transport]
+          note: Reuses immutable send and owned-expert topology indices per ExpertParallel instance; count-dependent offsets, permutations, and splits remain rebuilt for each routed token volume.
+        - change: opt_in_tie_safe_topk_router
+          files: [torchtune/models/qwen3_moe/_router.py, tests/torchtune/models/qwen3_moe/test_router_topk_equivalence.py]
+          promotion_status: not_claimed
+          cpu_equivalence: passed_untied_tie_all_expert_selection_route_pairing_input_gate_gradient_and_rowwise_boundary_repair_tests
+          ab_override: TORCHTUNE_MOE_TOPK_ROUTING=1
+          fixed_controls: [router, routing_index_mode]
+          note: Uses sorted topk over the activation-dtype probability tensor and applies stable full sorting only to rows whose kth and (k+1)th scores tie, preserving BF16/FP16 near-tie ownership. It retains the full softmax allocation; its potential win is selector work only. Its expert-grouping sort uses unspecified intra-expert order because final scatter restores token positions. Canonical launchers default to 0 until a fresh-node matched A/B validates XPU behavior.
+        - change: opt_in_unstable_expert_grouping
+          files: [torchtune/models/qwen3_moe/_router.py, tests/torchtune/models/qwen3_moe/test_router_topk_equivalence.py]
+          promotion_status: not_claimed
+          cpu_equivalence: passed_route_pairing_and_gradient_tests
+          ab_override: TORCHTUNE_MOE_UNSTABLE_EXPERT_GROUPING=1
+          fixed_controls: [router_selection, routing_index_mode]
+          note: Independently disables stable ordering within expert groups; final scatter preserves route semantics. Canonical launchers default to 0 and profile names record both topk and grouping states.
+        - change: reuse_flattened_router_selection_view
+          files: [torchtune/models/qwen3_moe/_router.py, torchtune/modules/moe/moe.py, tests/torchtune/models/qwen3_moe/test_router_topk_equivalence.py]
+          promotion_status: not_claimed
+          cpu_equivalence: covered_by_existing_router_route_pairing_and_gradient_tests
+          hardware_evidence: pending_fresh_node_matched_router_ab
+          fixed_controls: [router_selection, stable_tie_breaking, routing_index_mode]
+          note: Reuses the flattened selected-expert view for bincount and grouping sort instead of reconstructing the same view at each consumer; routing values and tie behavior are unchanged.
+        - change: defer_wide_routing_index_expansion
+          files: [torchtune/modules/moe/moe.py, tests/torchtune/modules/moe/test_measurement.py]
+          promotion_status: not_claimed
+          cpu_equivalence: passed_weighted_duplicate_route_test
+          ab_override: TORCHTUNE_MOE_WIDE_ROUTING_INDICES=1
+          fixed_controls: [routing_index_mode]
+          note: Keeps token ownership indices one-dimensional through dispatch and grouped-MM padding; only the final scatter uses a broadcast index view. The override restores the pre-optimization wide-index path for matched hardware A/B runs.
+        - change: index_select_routed_token_packing
+          files: [torchtune/modules/moe/moe.py, tests/torchtune/modules/moe/test_measurement.py]
+          promotion_status: not_claimed
+          cpu_equivalence: passed_compact_and_wide_zero_padding_gradient_test
+          ab_override: TORCHTUNE_MOE_INDEX_SELECT_PACKING=0
+          fixed_controls: [index_select_packing]
+          note: Avoids copying the full routed-token and index buffers to append an alignment sentinel; clamps invalid permutation entries and masks only padded output rows, with the prior concatenation path retained for A/B comparison.
+        - change: inplace_padded_expert_row_range_expansion
+          files: [torchtune/models/qwen3_moe/_experts.py, tests/torchtune/models/qwen3_moe/test_experts_vector_packing.py]
+          promotion_status: not_claimed
+          cpu_equivalence: passed_existing_zero_uneven_and_forward_backward_packing_tests
+          hardware_evidence: pending_fresh_node_matched_padded_bmm_ab
+          fixed_controls: [vector_packing, padded_bmm, routing_index_mode]
+          note: Expands padded expert row offsets into one repeat-interleave buffer and adds token positions in place, avoiding a second full routed-token index allocation; expert-count prefix and base arithmetic also reuse buffers in place.
+        - change: inplace_final_scatter_without_shared_expert
+          files: [torchtune/modules/moe/moe.py, tests/torchtune/modules/moe/test_measurement.py]
+          promotion_status: not_claimed
+          cpu_equivalence: passed_forward_and_gradient_test
+          fixed_controls: [shared_expert, inplace_final_scatter]
+          ab_override: TORCHTUNE_MOE_INPLACE_FINAL_SCATTER=0
+          note: Uses scatter_add_ into the already-zero output buffer only when no shared expert contributes; shared-expert paths retain out-of-place scatter_add.
+        - change: index_add_final_scatter_without_shared_expert
+          files: [torchtune/modules/moe/moe.py, tests/torchtune/modules/moe/test_measurement.py]
+          promotion_status: not_claimed
+          cpu_equivalence: passed_forward_and_gradient_test_with_shared_expert_fallback
+          ab_override: TORCHTUNE_MOE_INDEX_ADD_FINAL_SCATTER=0
+          fixed_controls: [shared_expert, inplace_final_scatter, routing_index_mode]
+          note: Uses row-wise index_add_ for compact routed indices and no shared expert, avoiding a hidden-width index expansion; wide-index and shared-expert paths retain the legacy scatter implementation.
+        - change: inplace_ag_autograd_anchor
+          files: [torchtune/modules/moe/_parallelism.py, tests/torchtune/modules/moe/test_measurement.py]
+          promotion_status: not_claimed
+          cpu_equivalence: passed_direct_autograd_probe
+          ab_override: TORCHTUNE_EP_INPLACE_AG_ANCHOR=0
+          fixed_controls: [inplace_ag_anchor]
+          note: Adds the zero-valued AllGather autograd anchor in place on the existing partial-output buffer, avoiding a second full combine allocation in AG/RS mode; the legacy out-of-place anchor remains available for A/B comparison.
+        - change: single_row_ag_autograd_anchor
+          files: [torchtune/modules/moe/_parallelism.py, tests/torchtune/modules/moe/test_measurement.py]
+          promotion_status: not_claimed
+          cpu_equivalence: passed_scalar_and_legacy_autograd_probe_including_empty_input
+          ab_override: TORCHTUNE_EP_SINGLE_ROW_AG_ANCHOR=0
+          fixed_controls: [single_row_ag_anchor]
+          note: Uses one AG scalar to create the zero-valued autograd edge instead of reducing every gathered token or broadcasting a hidden-width row; gradients remain zero while the anchor dependency is preserved.
+        - change: zero_cost_ag_autograd_anchor
+          files: [torchtune/modules/moe/_parallelism.py, tests/torchtune/modules/moe/test_measurement.py]
+          promotion_status: not_claimed
+          cpu_equivalence: passed_identity_and_zero_gradient_probe
+          ab_override: TORCHTUNE_EP_ZERO_COST_AG_ANCHOR=0
+          fixed_controls: [single_row_ag_anchor, inplace_ag_anchor]
+          note: Uses a custom autograd identity to retain the AllGather dependency without a forward add or zero-anchor allocation; the prior scalar anchor remains available for matched A/B comparison.
+        - change: uninitialized_collective_output_buffers
+          files: [torchtune/modules/moe/_parallelism.py, tests/torchtune/modules/moe/test_measurement.py]
+          promotion_status: not_claimed
+          cpu_equivalence: collective_outputs_are_fully_overwritten
+          ab_override: TORCHTUNE_EP_UNINITIALIZED_COLLECTIVE_BUFFERS=0
+          fixed_controls: [uninitialized_collective_buffers]
+          note: Uses empty rather than zero-filled receive buffers for AG/RS and routing-metadata collectives; every buffer is fully populated by the collective or copy before use.
+        - change: avoid_device_routing_metadata_copy
+          files: [torchtune/modules/moe/_parallelism.py, tests/torchtune/dev/rl/test_ep_all2all_dispatch_equivalence.py]
+          promotion_status: not_claimed
+          cpu_equivalence: passed_materialization_helper_equivalence
+          ab_override: TORCHTUNE_EP_CPU_METADATA_TRANSFER=0
+          fixed_controls: [metadata_transport]
+          note: In the production AG/RS gloo path, retains routing counts on CPU through the collective and transfers them once for device-side metadata construction instead of copying into a separate device flat buffer.
+        - change: direct_cpu_collective_output_copy
+          files: [torchtune/modules/moe/_parallelism.py, tests/torchtune/modules/moe/test_measurement.py]
+          promotion_status: not_claimed
+          cpu_equivalence: passed_destination_copy_helper_equivalence
+          ab_override: TORCHTUNE_EP_DIRECT_CPU_COPY=0
+          fixed_controls: [direct_cpu_copy]
+          note: Copies CPU-bounce AG/RS results directly into their preallocated device destinations, avoiding temporary device tensors from `.to(input.device)`; the legacy transfer path remains available for A/B comparison.
+        - change: one_shot_generic_expert_count_transfer
+          files: [torchtune/modules/moe/experts.py, tests/torchtune/modules/moe/test_experts.py]
+          promotion_status: not_claimed
+          cpu_equivalence: passed_ragged_zero_token_test
+          note: Converts generic sequential expert counts to a host list once before the expert loop instead of synchronizing once per expert.
+        - change: inplace_route_score_weighting
+          files: [torchtune/modules/moe/moe.py, tests/torchtune/modules/moe/test_measurement.py]
+          promotion_status: not_claimed
+          cpu_equivalence: passed_router_and_input_gradient_test
+          ab_override: TORCHTUNE_MOE_INPLACE_ROUTE_WEIGHTING=0
+          fixed_controls: [inplace_route_weighting]
+          note: Scales the fresh index_select output in place, preserving gradients while avoiding a second routed-token activation allocation.
+        - change: inplace_grouped_swiglu_activation_product
+          files: [torchtune/models/qwen3_moe/_experts.py, tests/torchtune/dev/rl/test_qwen3_moe_grouped_recompute_equivalence.py]
+          promotion_status: not_claimed
+          cpu_equivalence: passed_grouped_swiglu_forward_and_backward_test
+          ab_override: TORCHTUNE_MOE_INPLACE_SWIGLU=0
+          fixed_controls: [inplace_swiglu]
+          note: Reuses the activation buffer for the SwiGLU product in grouped-MM and sequential expert paths; grouped-MM transport and expert shapes are unchanged.
+        - change: sequential_expert_projection_timing
+          files: [torchtune/models/qwen3_moe/_experts.py, tests/torchtune/modules/moe/test_measurement.py]
+          promotion_status: instrumentation_only
+          cpu_equivalence: passed_sequential_forward_backward_and_measurement_tests
+          hardware_evidence: pending_fresh_node_measurement_artifact
+          fixed_controls: [TORCHTUNE_MOE_MEASURE, expert_execution_path]
+          note: Adds opt-in gate/up/down projection timing inside the aggregate sequential expert timing bucket; measurement remains disabled for promotion windows.
+        - change: preserve_integer_expert_counts
+          files: [torchtune/models/qwen3_moe/_experts.py, torchtune/modules/moe/experts.py, tests/torchtune/dev/rl/test_qwen3_moe_grouped_recompute_equivalence.py]
+          promotion_status: not_claimed
+          cpu_equivalence: passed_integer_count_path_test
+          note: Skips the redundant round-and-cast for integer routed-token counts; floating legacy count inputs retain the prior normalization.
+        - change: defer_padded_bmm_count_host_materialization
+          files: [torchtune/models/qwen3_moe/_experts.py, tests/torchtune/models/qwen3_moe/test_experts_vector_packing.py]
+          promotion_status: not_claimed
+          cpu_equivalence: passed_vectorized_packing_forward_and_backward_test
+          hardware_evidence: pending_fresh_node_matched_padded_bmm_ab
+          ab_override: TORCHTUNE_MOE_VECTOR_PACKING=1
+          fixed_controls: [TORCHTUNE_MOE_VECTOR_PACKING=0]
+          note: The vectorized padded-BMM path avoids converting expert counts to a Python list unless measurement or debug output is explicitly enabled; the legacy padded-BMM path remains unchanged and is the fixed control.
+        - change: single_expand_vectorized_padded_bmm_row_map
+          files: [torchtune/models/qwen3_moe/_experts.py, tests/torchtune/models/qwen3_moe/test_experts_vector_packing.py]
+          promotion_status: not_claimed
+          cpu_equivalence: passed_zero_and_uneven_row_map_test
+          hardware_evidence: pending_fresh_node_matched_padded_bmm_ab
+          ab_override: TORCHTUNE_MOE_VECTOR_PACKING=1
+          fixed_controls: [TORCHTUNE_MOE_VECTOR_PACKING=0]
+          note: Builds the vectorized padded-BMM row map with one repeat_interleave instead of separately expanding expert starts and expert bases; ordering and gradient semantics are unchanged.
+        - change: preserve_int64_padded_bmm_counts
+          files: [torchtune/models/qwen3_moe/_experts.py, tests/torchtune/models/qwen3_moe/test_experts_vector_packing.py]
+          promotion_status: not_claimed
+          cpu_equivalence: passed_int32_and_int64_row_map_test
+          hardware_evidence: pending_fresh_node_matched_padded_bmm_ab
+          ab_override: TORCHTUNE_MOE_VECTOR_PACKING=1
+          fixed_controls: [TORCHTUNE_MOE_VECTOR_PACKING=0]
+          note: Preserves the int64 routing-count tensor produced by bincount in the vectorized row-map helper and converts only non-int64 diagnostic callers, avoiding a redundant device copy on the hot path.
+        - change: rowwise_alltoall_combine_unpermute
+          files: [torchtune/modules/moe/_parallelism.py, tests/torchtune/dev/rl/test_ep_all2all_dispatch_equivalence.py]
+          promotion_status: not_claimed
+          cpu_equivalence: passed_alltoall_forward_backward_equivalence
+          hardware_evidence: pending_fresh_node_alltoall_matched_ab
+          ab_override: TORCHTUNE_EP_ROWWISE_ALLTOALL_UNPERMUTE=0
+          fixed_controls: [expanded_index_scatter_unpermute]
+          note: Uses row-wise index_copy_ for the bijective AllToAll combine permutations instead of expanding one-dimensional indices across hidden width for scatter_; collective ordering, token order, and gradient semantics are unchanged.
+        - change: uninitialized_alltoall_combine_buffers
+          files: [torchtune/modules/moe/_parallelism.py, tests/torchtune/dev/rl/test_ep_all2all_dispatch_equivalence.py]
+          promotion_status: not_claimed
+          cpu_equivalence: passed_permutation_bijection_and_alltoall_forward_backward_equivalence
+          hardware_evidence: pending_fresh_node_alltoall_matched_ab
+          ab_override: TORCHTUNE_EP_UNINITIALIZED_ALLTOALL_BUFFERS=0
+          fixed_controls: [zero_initialized_alltoall_combine_buffers]
+          note: Uses new_empty for source-major and final combine buffers because both row permutations are proven bijective and index_copy_ fully overwrites every row; avoids two full hidden-width zero-fill allocations per MoE layer.
+        - change: conditional_alltoall_contiguous_inputs
+          files: [torchtune/modules/moe/_parallelism.py, tests/torchtune/dev/rl/test_ep_all2all_dispatch_equivalence.py]
+          promotion_status: not_claimed
+          cpu_equivalence: passed_contiguous_and_non_contiguous_copy_contract_test
+          hardware_evidence: pending_fresh_node_matched_alltoall_ab
+          ab_override: TORCHTUNE_MOE_ALLTOALL_CONDITIONAL_CONTIGUOUS=0
+          fixed_controls: [unconditional_alltoall_contiguous_inputs]
+          note: Reuses already-contiguous dispatch and transposed-backward buffers at the collective boundary, materializing a contiguous copy only for non-contiguous inputs; collective ordering, split metadata, and autograd semantics are unchanged.
+        - change: compile_only_grouped_token_shape_scalar
+          files: [torchtune/modules/moe/moe.py]
+          promotion_status: not_claimed
+          cpu_equivalence: covered_by_focused_moe_suite
+          note: Defers the grouped-token sum/item conversion until torch.compiler.is_compiling(), removing an eager device-host synchronization from promotion runs.
+        - change: layout_aware_grouped_gemm_measurement_dimensions
+          files: [torchtune/modules/moe/moe.py, tests/torchtune/modules/moe/test_measurement.py]
+          promotion_status: not_claimed
+          cpu_equivalence: passed_hf_layout_dimension_test
+          note: Reports Qwen3 HF-native [expert, hidden, model] weights with the correct hidden dimension while retaining native grouped-expert layout support.
+        - change: factored_optimizer_inplace_normalization
+          files: [torchtune/dev/bioreason/optim.py, tests/torchtune/dev/bioreason/test_device_adamw_bf16.py]
+          promotion_status: not_claimed
+          cpu_equivalence: passed_reference_update_and_state_shape_tests
+          hardware_evidence: experimental_alltoall_batch2_runs_show_optimizer_step_is_material_but_do_not_isolate_this_change
+          fixed_controls: [optimizer]
+          note: Reuses the gradient buffer for the factored optimizer update and avoids a separate normalized-gradient allocation while preserving normalized-denominator epsilon-clamp order; no optimizer formula or checkpoint state format change.
+  capacity_value:
+    status: candidate_adapter_identified_pending_capacity_gate
+    standalone_manifest: experiments/qwen3_moe/capacity_value_gemma4_manifest.yaml
+    comparison_report: experiments/qwen3_moe/report_capacity_value.py
+    dense_measurement_launcher: experiments/qwen3_moe/run_capacity_gemma4_31b_dense_measurement.pbs
+    dense_result_export: "report_capacity_value.py --dense-artifact; MoE input accepts --moe-ep-artifact or --moe-ep-scaling-report; explicit active-FLOP and MFU inputs remain required while communication/expert fractions derive from sealed timing when available"
+    canonical_report_inputs:
+      moe: "--moe-ep-artifact experiments/qwen3_moe/measurements/gemma4_ep16_<jobid>.rank*.json --moe-ep-degree 16 --moe-nodes 2"
+      dense: "--dense-artifact experiments/qwen3_moe/measurements/gemma4_31b_dense_<jobid>.json"
+      note: "Expand rank globs into repeated --moe-ep-artifact arguments; supply explicit model-size, active-FLOP, and MFU values for the MoE and explicit dense fractions for the dense control."
+    candidate:
+      model: Gemma4-26B-A4B
+      config: recipes/configs/dev/production/gemma4_26b_a4b_grpo_novllm_xpu.yaml
+      implementation: torchtune.models.gemma4.gemma4_26b_a4b
+      native_expert_structure: grouped_experts_top8_of_128
+      active_parameters_per_token_approximate: 3.8B
+      qualification: adapter_candidate_only
+      qualification_reason: additive_dense_mlp_plus_moe_active_path_is_not_yet_a_proven_dense_one_node_capacity_control
+    controls: [larger_moe, comparable_dense_multinode]
+    selection_gates:
+      - public_or_local_checkpoint_and_config
+      - native_grouped_gemm_and_ep_compatibility
+      - dense_control_active_parameters_and_sequence_length_are_recorded
+      - dense_control_does_not_fit_one_node_or_comparison_is_explicitly_capacity_only
+      - both_controls_fit_two_node_allocation_or_capacity_label_is_explicit
+      - native_ep_and_pipeline_checkpoint_reconstruction_smoke_passes
+    checkpoint_writes: disabled
+    parity_claim_allowed: false
+    required_metrics: [per_gpu_throughput, aggregate_throughput, mfu_percent, active_flop_efficiency, total_parameters, peak_memory, steady_state_memory, communication_fraction, expert_compute_fraction, stability]
+rejected_variants:
+  - inverse_permutation_combine
+  - device_routing_metadata
+  - save_all_activation_policy
+  - simple_async_alltoall
+  - separate_stream_alltoall
+  - unsupported_xccl_p2p_overlap
+canonical_metadata:
+  source_revision: required
+  uncommitted_change_state: required
+  hardware_topology: required
+  environment_overrides: required
+  router_semantics: required_for_new_router_ab_artifacts; Qwen3=probability_topk_v2; Gemma4=sigmoid_argsort_v1
+  warmup_and_measurement_steps: required
+  completion_marker: required
+  device_health: required

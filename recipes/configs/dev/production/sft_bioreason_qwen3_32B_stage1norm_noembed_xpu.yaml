@@ -1,0 +1,169 @@
+# BioReason multimodal SFT — STAGE1NORM + PROTEIN-EMBED OFF (natural-target embed-on/off
+# ablation, Qwen3-32B, XPU)
+#
+# ★ Closes gap #2 from docs/reports/bioreason_ablations_headline_findings_20260730.md:
+# "finish the protein embedding on/off held-out F_max verdict — on the NATURAL (curated)
+# target, not the exhaustive one." The only prior embed-on/off retrain A/B
+# (sft_bioreason_qwen3_32B_stage1norm_exhaustive_xpu.yaml vs
+# ..._exhaustive_noembed_xpu.yaml) ran on the EXHAUSTIVE target, which
+# project_bioreason_exhaustive_target_negative_20260703 showed BROKE GENERATION for
+# BOTH legs (45% empty responses) — so that A/B's ΔF_max sits in a degraded regime and
+# was never treated as decisive. This config is the missing clean leg: IDENTICAL to the
+# validated 0.6008 stage1norm baseline (sft_bioreason_qwen3_32B_stage1norm_xpu.yaml —
+# 0% empty generations, coherent protein-conditioned reasoning) with ONLY
+# model.disable_protein_splice=true changed.
+#
+# model.disable_protein_splice=true: keep the protein PLACEHOLDER tokens (identical
+# seqlen/format/attention structure) but do NOT write projected ESM3 features — the
+# plain placeholder embedding stays. Trained from scratch this way (NOT eval-time
+# yanked), so it is NOT out-of-distribution — the model learns WITHOUT the embedding
+# from step 0. Compare held-out F_max against the stage1norm baseline's 0.6008 (and its
+# per-namespace BP/CC/MF breakdown) using the SAME eval command
+# (docs/reports/bioreason_ablations_headline_findings_20260730.md's reproduction
+# pointers) — if embed-OFF matches embed-ON F_max, the ESM3 embedding is redundant with
+# go_pred (already GO-GPT/ESM2 sequence-derived, per the multimodality-thesis report);
+# if embed-OFF is meaningfully worse, the embedding genuinely contributes signal beyond
+# go_pred on the metric the paper itself is scored on.
+#
+# MANDATORY per-checkpoint gate: run experiments/bioreason/probe_generation_health.py
+# on the resulting checkpoint BEFORE trusting any F_max number from it (the two prior
+# target-edit ablations in this investigation both silently degraded generation).
+#
+# Differences from sft_bioreason_qwen3_32B_stage1norm_xpu.yaml: model.disable_protein_
+# splice=true, separate name/output_dir. Everything else (curated/natural target — NOT
+# exhaustive_target, seq6144, bucketed batching, compile, layer-37 cache, ids) is
+# identical, so the embedding is the ONLY variable.
+#
+# Recipe: recipes/dev/sft_bioreason_distributed_xpu.py
+
+name: sft_bioreason_qwen3_32b_stage1norm_noembed_xpu
+output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/experiments/bioreason/runs/${name}
+base_model_path: /lus/flare/projects/ModCon/ngetty/models/Qwen3-32B
+sft_data_dir: /lus/flare/projects/ModCon/ngetty/datasets/bioreason_sft_reasoning/data
+esm3_cache_path: /lus/flare/projects/ModCon/ngetty/datasets/bioreason_sft_reasoning/esm3_cache_2048_l37.safetensors
+go_embedding_path: /lus/flare/projects/ModCon/ngetty/models/bioreason-pro-sft/go_embedding.pt
+
+# ── Tokenizer (Qwen3) ─────────────────────────────────────────────────────────
+tokenizer:
+  _component_: torchtune.models.qwen3.qwen3_tokenizer
+  path: ${base_model_path}/vocab.json
+  merges_file: ${base_model_path}/merges.txt
+  max_seq_len: 6144
+
+# ── Model — STAGE 1: frozen backbone, no LoRA, train projections only ──────────
+# protein/go ids are RESERVED Qwen vocab gap ids (151643/151644; gap 151643-151935 is free).
+model:
+  _component_: torchtune.dev.bioreason.model_native.BioReasonNativeModel
+  backbone_builder: qwen3_32b
+  hidden_size: 5120
+  protein_token_id: 151643
+  go_token_id: 151644
+  enable_lora: false              # NO LoRA — backbone fully frozen (sidesteps LoRA splice bug)
+  freeze_backbone: true           # train ONLY protein_projection + go_projection
+  projector_output_norm: true     # LayerNorm on projector output -> BOUNDED magnitude
+  disable_protein_splice: true    # ★ THE ABLATION: placeholder tokens kept, ESM3 features
+                                  # NOT written. The ONLY diff vs stage1norm_xpu.yaml.
+  esm3_cache_path: ${esm3_cache_path}
+  go_embedding_path: ${go_embedding_path}
+
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [
+    model-00001-of-00017.safetensors, model-00002-of-00017.safetensors,
+    model-00003-of-00017.safetensors, model-00004-of-00017.safetensors,
+    model-00005-of-00017.safetensors, model-00006-of-00017.safetensors,
+    model-00007-of-00017.safetensors, model-00008-of-00017.safetensors,
+    model-00009-of-00017.safetensors, model-00010-of-00017.safetensors,
+    model-00011-of-00017.safetensors, model-00012-of-00017.safetensors,
+    model-00013-of-00017.safetensors, model-00014-of-00017.safetensors,
+    model-00015-of-00017.safetensors, model-00016-of-00017.safetensors,
+    model-00017-of-00017.safetensors,
+  ]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: QWEN2   # Qwen3 uses the QWEN2 weight-conversion path
+
+resume_from_checkpoint: false
+save_every_n_epochs: 1
+
+# ── Dataset (NATURAL/curated target — NOT exhaustive_target — identical to the
+# stage1norm baseline; disable_protein_splice above is the only variable) ──────────
+dataset:
+  _component_: torchtune.dev.bioreason.dataset_sft.bioreason_sft_dataset
+  data_files: ${sft_data_dir}
+  max_seq_len: 6144
+  max_protein_len: 2048
+  num_go_tokens: 200
+  protein_token_id: 151643
+  go_token_id: 151644
+  train_on_reasoning: true
+  inject_go_pred: true
+seed: 1234
+shuffle: true
+collate_fn: torchtune.dev.bioreason.dataset_sft.bioreason_sft_collate_fn
+dataloader_num_workers: 0
+
+# ── Training envelope — Stage 1: 1 epoch, lr 1e-4 (published Stage 1) ────────────
+epochs: 1
+max_steps_per_epoch: null
+batch_size: 1
+gradient_accumulation_steps: 4
+clip_grad_norm: 1.0
+
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 1.0e-4
+  weight_decay: 0.0
+  fused: true
+
+loss:
+  _component_: torchtune.modules.loss.LinearCrossEntropyLoss
+
+# ── Distributed / FSDP — full 12-way shard (HW-VALIDATED 2026-06-27) ─────────────
+enable_activation_checkpointing: true
+enable_activation_offloading: false
+fsdp_cpu_offload: false
+fsdp_reshard_after_forward: true    # MUST stay true for 32B (see stage1norm_xpu.yaml note)
+data_parallel_replicate_dim: 1
+data_parallel_shard_dim: -1
+tensor_parallel_dim: 1
+pad_to_fixed: true
+
+# ── Throughput: bucketed per-bucket batch sizing (identical to stage1norm baseline) ──
+pad_buckets: [4096, 6144]
+bucket_batch_sizes: [2, 1]
+
+# ── XPU ───────────────────────────────────────────────────────────────────────
+device: xpu
+dtype: bf16
+# Per-layer backbone torch.compile (dynamic). Requires TORCHTUNE_USE_XPU_FLASH=1
+# (launcher default) — identical to the stage1norm baseline.
+compile:
+  model: true
+  loss: false
+  optimizer_step: false
+  scale_grads: false
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+log_level: INFO
+log_every_n_steps: 1
+log_peak_memory_stats: true
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: false
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: true
+  cuda: false
+  profile_memory: false
+  with_stack: false
+  record_shapes: false
+  with_flops: false
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1
