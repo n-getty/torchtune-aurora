@@ -66,7 +66,7 @@ HIDDEN = 1024
 NUM_LAYERS = 4
 NUM_EXPERTS = 32
 TOPK = 16
-NUM_HEADS = 8
+NUM_HEADS = 32
 KDA_HEAD_DIM = 128          # keep real head_dim: A_log padding depends on it
 MOE_INTERMEDIATE = 256
 DENSE_INTERMEDIATE = 512
@@ -111,10 +111,10 @@ VOCAB = 151936  # Qwen3-0.6B
 # Values below are the LAST TESTED state (startup OK, decode fails). Resolving
 # this needs one of the two geometries above, or a KDA/MLA layer-count split
 # that avoids hybrid page unification. See the plan for the decision.
-KV_LORA_RANK = 64
+KV_LORA_RANK = 256
 Q_LORA_RANK = 192
 QK_NOPE_HEAD_DIM = 64
-QK_ROPE_HEAD_DIM = 16
+QK_ROPE_HEAD_DIM = 64
 V_HEAD_DIM = 64
 CONV_KERNEL = 4
 ATTN_RES_BLOCK_SIZE = 2     # smaller than real 12, so 4 layers still exercise it
