@@ -1,0 +1,50 @@
+[
+  {
+    "bridge_token": "token_id:28202",
+    "cross_path_argmax_match": true,
+    "cross_path_max_abs_diff": 0.1640157699584961,
+    "cross_path_mean_abs_diff": 0.04532184600830078,
+    "cross_path_topk_jaccard": 1.0,
+    "diverged": false,
+    "effective_noise": 1.0625,
+    "flat_band": 4.9374998807907104,
+    "flat_distribution": false,
+    "prefill_token": "token_id:13",
+    "prompt": "The capital of France is Paris and the capital of Germany is",
+    "same_path_noise_max": 0.0,
+    "threshold": 4.25,
+    "top1_gap": 1.0625
+  },
+  {
+    "bridge_token": "token_id:12845",
+    "cross_path_argmax_match": true,
+    "cross_path_max_abs_diff": 0.12244892120361328,
+    "cross_path_mean_abs_diff": 0.03514034301042557,
+    "cross_path_topk_jaccard": 1.0,
+    "diverged": false,
+    "effective_noise": 3.75,
+    "flat_band": 6.40625,
+    "flat_distribution": false,
+    "prefill_token": "token_id:18558",
+    "prompt": "One two three four five six seven",
+    "same_path_noise_max": 0.0,
+    "threshold": 15.0,
+    "top1_gap": 3.75
+  },
+  {
+    "bridge_token": "token_id:291",
+    "cross_path_argmax_match": true,
+    "cross_path_max_abs_diff": 0.0625462532043457,
+    "cross_path_mean_abs_diff": 0.009411768615245819,
+    "cross_path_topk_jaccard": 1.0,
+    "diverged": false,
+    "effective_noise": 2.874999985098839,
+    "flat_band": 10.312500223517418,
+    "flat_distribution": false,
+    "prefill_token": "token_id:382",
+    "prompt": "def add(a, b):\n    return a +",
+    "same_path_noise_max": 0.0,
+    "threshold": 11.499999940395355,
+    "top1_gap": 2.874999985098839
+  }
+]
