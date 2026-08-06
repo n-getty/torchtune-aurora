@@ -72,11 +72,49 @@ MOE_INTERMEDIATE = 256
 DENSE_INTERMEDIATE = 512
 SHARED_INTERMEDIATE = 512
 ROUTED_HIDDEN = 512         # latent MoE: must be < HIDDEN
-VOCAB = 2048
-KV_LORA_RANK = 128
+# Must match the tokenizer we copy in (--tokenizer-src). The real K3 ships a
+# custom tiktoken tokenizer (tokenization_kimi.py) whose class is unknown to
+# AutoTokenizer without trust_remote_code, and whose 163840-token vocab would
+# dominate this model's size. Borrowing a small standard tokenizer keeps the
+# server path realistic -- it still tokenizes, schedules and detokenizes real
+# text -- without pulling in K3's tokenizer machinery, which is not under test.
+VOCAB = 151936  # Qwen3-0.6B
+# KV_LORA_RANK / QK_ROPE_HEAD_DIM are CONSTRAINED, not free choices. vLLM must
+# unify the KDA (MambaSpec) and MLA page sizes, and can only do so by scaling
+# block_size -- so the MLA page must divide the mamba page exactly:
+#
+#   mamba_page = 3*(heads*head_dim*(conv_k-1))*2  +  heads*head_dim^2*4
+#              = 542720 B at heads=8, head_dim=128, conv_k=4  (HW-verified)
+#   mla_page   = block_size * (kv_lora_rank + qk_rope_head_dim) * 2
+#
+# and block_size is additionally rounded up to a multiple of the 64-token XPU
+# kernel alignment. kv_lora=128/qk_rope=32 needs block_size 1696, which is not
+# a multiple of 64; it got rounded to 1728, overshooting to 552960 and failing
+# with "page size of the layer is not divisible by the maximum page size"
+# (552960 % 542720 = 10240). kv_lora=64/qk_rope=16 gives exactly 3392 = 53*64.
+#
+# Changing heads/head_dim/conv_k or these two REQUIRES re-solving; only two
+# geometries in a wide search satisfy every constraint at once.
+#
+# ⚠ SECOND CONSTRAINT, discovered after the first was solved: MLA only accepts
+# head_dim (= kv_lora_rank + qk_rope_head_dim) in {320, 576}
+# (mla_attention.py:1234, enforced at :1348). kv_lora=64/qk_rope=16 gives 80 and
+# fails at the FIRST DECODE, not at startup: "Head dimension 80 is not supported
+# by MLA." So kv_lora_rank cannot be shrunk freely -- the real K3's 512+64=576
+# is one of only two legal values.
+#
+# Combining both constraints (mamba page divisible by 2*head_dim, quotient a
+# multiple of 64, head_dim in {320,576}) leaves only TWO geometries in a wide
+# search, and both are much larger than a useful reduction:
+#   heads=32 head_dim=128 conv_k=4 mla_head_dim=320 -> block_size=3392
+#   heads=16 head_dim=256 conv_k=2 mla_head_dim=320 -> block_size=6592
+# Values below are the LAST TESTED state (startup OK, decode fails). Resolving
+# this needs one of the two geometries above, or a KDA/MLA layer-count split
+# that avoids hybrid page unification. See the plan for the decision.
+KV_LORA_RANK = 64
 Q_LORA_RANK = 192
 QK_NOPE_HEAD_DIM = 64
-QK_ROPE_HEAD_DIM = 32
+QK_ROPE_HEAD_DIM = 16
 V_HEAD_DIM = 64
 CONV_KERNEL = 4
 ATTN_RES_BLOCK_SIZE = 2     # smaller than real 12, so 4 layers still exercise it
@@ -372,6 +410,13 @@ def main():
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
+        "--tokenizer-src",
+        type=Path,
+        default=Path("/flare/ModCon/ngetty/models/Qwen3-0.6B"),
+        help="checkpoint to copy tokenizer files from; its vocab_size must "
+        "equal VOCAB in this script",
+    )
+    parser.add_argument(
         "--verify",
         action="store_true",
         help="after writing, construct the model on meta device and run "
@@ -387,6 +432,30 @@ def main():
 
     args.out.mkdir(parents=True, exist_ok=True)
     generator = torch.Generator().manual_seed(args.seed)
+
+    # Copy the tokenizer BEFORE writing weights, and fail loudly on a vocab
+    # mismatch: a tokenizer that can emit ids past vocab_size produces an
+    # index error deep in the sampler, which is a confusing way to learn this.
+    src_config = json.loads((args.tokenizer_src / "config.json").read_text())
+    if src_config["vocab_size"] != VOCAB:
+        print(
+            f"FATAL: tokenizer vocab {src_config['vocab_size']} != VOCAB {VOCAB}. "
+            f"Set VOCAB to match {args.tokenizer_src}.",
+            file=sys.stderr,
+        )
+        return 2
+    copied = []
+    for name in (
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "vocab.json",
+        "merges.txt",
+        "special_tokens_map.json",
+    ):
+        source = args.tokenizer_src / name
+        if source.exists():
+            (args.out / name).write_bytes(source.read_bytes())
+            copied.append(name)
 
     config = build_config()
     (args.out / "config.json").write_text(json.dumps(config, indent=2) + "\n")
@@ -412,6 +481,7 @@ def main():
     print(f"  size         : {total_bytes / 2**30:.3f} GiB")
     print(f"  layers       : {NUM_LAYERS} (KDA {kda_layers}, MLA {mla_layers})")
     print(f"  experts      : {NUM_EXPERTS}, topk {TOPK}, MXFP4 latent {ROUTED_HIDDEN}")
+    print(f"  tokenizer    : {args.tokenizer_src.name} ({', '.join(copied)})")
     print(f"\nserve: vllm serve {args.out} --tp 8 --trust-remote-code --enforce-eager")
 
     if args.verify:
