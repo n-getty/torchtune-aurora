@@ -94,7 +94,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--tokens", type=int, default=8, help="N for the batched call")
     parser.add_argument("--experts", type=int, default=8)
-    parser.add_argument("--topk", type=int, default=16)
+    # Default 8, NOT K3's nominal 16: the kernel rejects topk=16 outright with
+    # "Unsupported TopK value" (verified on hardware). That restriction is
+    # exactly why xpu_moe.py splits TopK=16 into 2x8, so 8 is what the kernel
+    # actually sees in production and is the right thing to probe.
+    parser.add_argument("--topk", type=int, default=8)
     parser.add_argument("--hidden", type=int, default=512)
     parser.add_argument("--inter", type=int, default=256)
     parser.add_argument("--mxfp4", action="store_true", help="use MXFP4 weights")
@@ -108,6 +112,12 @@ def main():
         return 2
 
     try:
+        # fused_moe_interface imports _C and _xpu_C but NOT _moe_C, yet it calls
+        # torch.ops._moe_C.remap_hidden_states. Importing the extension module
+        # is what registers that op namespace, so without this the first call
+        # dies with "_OpNamespace '_moe_C' object has no attribute
+        # remap_hidden_states". The server path gets it via another import.
+        import vllm_xpu_kernels._moe_C  # noqa: F401
         from vllm_xpu_kernels.fused_moe_interface import xpu_fused_moe
     except ImportError as error:
         print(f"FATAL: cannot import xpu_fused_moe: {error}", file=sys.stderr)
@@ -139,12 +149,18 @@ def main():
             args.experts, args.inter, args.hidden, device, generator
         )
     else:
+        # NOTE: for the unquantized path the kernel wants [E, K, N], i.e.
+        # w13=[E, hidden, 2*inter] and w2=[E, inter, hidden] -- the TRANSPOSE of
+        # what fused_moe_interface's own docstring claims. Verified on hardware:
+        # the docstring layout fails with "ptr_A.size(1) must match
+        # ptr_B.size(1)". (The docstring's "4bits [E,N,K] / other [E,K,N]"
+        # comment is the accurate part; the per-arg lines below it are not.)
         w13 = torch.randn(
-            args.experts, 2 * args.inter, args.hidden, dtype=torch.bfloat16,
+            args.experts, args.hidden, 2 * args.inter, dtype=torch.bfloat16,
             device=device, generator=generator,
         ) * 0.05
         w2 = torch.randn(
-            args.experts, args.hidden, args.inter, dtype=torch.bfloat16,
+            args.experts, args.inter, args.hidden, dtype=torch.bfloat16,
             device=device, generator=generator,
         ) * 0.05
         w13_s = w2_s = None
