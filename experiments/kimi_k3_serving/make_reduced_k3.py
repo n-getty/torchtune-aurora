@@ -155,6 +155,13 @@ def build_config():
         "activation_situ_beta": 4.0,
         "activation_situ_linear_beta": 25.0,
         # --- MLA ---
+        # mla_use_nope=True is REQUIRED, not cosmetic: KimiMLAAttention asserts
+        # `self.use_nope is True` (kimi_linear.py:344) and the config default is
+        # False, so omitting it aborts construction. The real K3 sets it True.
+        # Note qk_rope_head_dim stays NONZERO under NoPE -- verified against the
+        # checkpoint: kv_a_proj_with_mqa is [kv_lora_rank + qk_rope_head_dim,
+        # hidden] = [512+64, 7168] = [576, 7168], matching the real file.
+        "mla_use_nope": True,
         "kv_lora_rank": KV_LORA_RANK,
         "q_lora_rank": Q_LORA_RANK,
         "qk_nope_head_dim": QK_NOPE_HEAD_DIM,
@@ -168,6 +175,10 @@ def build_config():
             "num_heads": NUM_HEADS,
             "short_conv_kernel_size": CONV_KERNEL,
             "gate_lower_bound": -5.0,
+            # Real K3 sets this True, which selects the single g_proj gate
+            # (kda.py) over the low-rank g_a_proj/g_b_proj pair. The emitted
+            # KDA tensors below assume the full-rank form, so these must agree.
+            "use_full_rank_gate": True,
         },
         "vocab_size": VOCAB,
         "rms_norm_eps": 1e-5,
