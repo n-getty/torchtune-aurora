@@ -55,7 +55,8 @@ run r_tp4   4
 run r_tp4ep 4 --enable-expert-parallel
 run r_tp8   8
 run r_tp8ep 8 --enable-expert-parallel
-run r_tp12  12
+# TP=12 REMOVED: vocab 163840 not divisible by 12 (embedding cannot shard).
+# Valid TP for K3: 1, 2, 4, 8, 16, 32.
 
 echo
 echo "=== re-run done $(date -Is) ==="

@@ -57,10 +57,10 @@ run tp4   4
 run tp4ep 4 --enable-expert-parallel
 run tp8   8
 run tp8ep 8 --enable-expert-parallel
-# TP=12 spans all tiles on the node. Heads divide (96/12=8) but the slice's
-# 8 experts do NOT (8/12), so this row runs WITHOUT --enable-expert-parallel;
-# adding EP here would fail on expert sharding, not tell us anything about K3.
-run tp12  12
+# TP=12 REMOVED: vocab_size 163840 is not divisible by 12, so the
+# vocab-parallel embedding cannot shard ("AssertionError: 163840 is not
+# divisible by 12"). It was never a valid topology for this model -- not a
+# failure and not a datapoint. Valid TP for K3: 1, 2, 4, 8, 16, 32.
 
 echo
 echo "=== overnight sweep done $(date -Is) ==="
