@@ -46,6 +46,13 @@ source /flare/ModCon/ngetty/venvs/kimi-k3-xpu-framework/bin/activate 2>/dev/null
 export PYTHONPATH=/flare/ModCon/ngetty/vllm-xpu-src:${PYTHONPATH:-}
 export ZE_FLAT_DEVICE_HIERARCHY=FLAT VLLM_TARGET_DEVICE=xpu
 export CCL_PROCESS_LAUNCHER=none CCL_ATL_TRANSPORT=ofi
+# CCL_KVS_IFACE=lo for single-node, matching serve_k3.sh:528. Omitting it let
+# TP=4 hang: all four workers spun in all_reduce inside init_device
+# (xpu_worker.py:97) for 8+ minutes at 100% CPU while CCL logged "could not get
+# local_idx/count from environment variables, trying to get them from ATL".
+# TP=1 and TP=2 happened to survive without it, which is exactly what makes this
+# kind of omission dangerous -- it looks fine until the rank count grows.
+export CCL_KVS_IFACE=${CCL_KVS_IFACE:-lo}
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export VLLM_XPU_DETERMINISTIC_ROUTING=1
 # VLLM_XPU_DETERMINISTIC_MOE_GATHER defaults OFF here, deliberately.
