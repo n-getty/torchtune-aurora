@@ -161,6 +161,20 @@ verdict "tp=$TP SERVER_OK"
 
 # NOTE: `cmd | tail` makes $? the exit of TAIL, not of cmd -- which would
 # record success for every crashed probe. Use PIPESTATUS[0].
+# Run the request-count test FIRST, on a fresh engine.
+#
+# Three topologies (tp1, tp2, tp8ep) each died after exactly 29 successful
+# completions, and doubling the KV cache did not move the number -- so the
+# cache-starvation explanation is refuted. This fires 60 identical trivial
+# requests before anything else touches the server, which distinguishes
+# "the engine degrades with request count" from "the depth ladder's request is
+# the trigger". It must go first or the other probes consume the budget it is
+# trying to measure.
+echo; echo "--- request-count limit (fresh engine, 60 trivial requests) ---"
+timeout 900 python3 "$ROOT/probe_request_count_limit.py" \
+  "http://127.0.0.1:$PORT" k3slice 60 2>&1 | tail -25
+verdict "tp=$TP request_count exit=${PIPESTATUS[0]}"
+
 echo; echo "--- single-step prefill-vs-decode ---"
 timeout 900 python3 "$ROOT/probe_prefill_vs_decode.py" \
   --base-url "http://127.0.0.1:$PORT" --model k3slice \
