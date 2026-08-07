@@ -21,7 +21,11 @@
 #  * TP>1 on one node needs the interactive row of the launcher table
 #    (ofi/none, no ZE_AFFINITY_MASK) -- CCL must see every device UUID.
 
-set -uo pipefail
+# NOTE: NOT `set -u`. Lmod's `module` shell function dereferences unbound
+# variables internally, so under `set -u` the script dies SILENTLY at
+# `module load frameworks` -- no error, just no further output. That is
+# what produced 7 suite directories containing only a header line.
+set -o pipefail
 
 TAG="${1:?usage: run_slice_suite.sh <tag> <tp> [extra args...]}"
 TP="${2:?usage: run_slice_suite.sh <tag> <tp> [extra args...]}"
