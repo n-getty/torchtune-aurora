@@ -41,7 +41,7 @@
 set -o pipefail
 REPO=/lus/flare/projects/ModCon/ngetty/torchtune
 ROOT=$REPO/experiments/kimi_k3_serving
-SLICE=/lus/flare/projects/ModCon/ngetty/k3-slice-4L8E
+SLICE=/lus/flare/projects/ModCon/ngetty/k3-slice-4L32E
 PYTHON=/flare/ModCon/ngetty/venvs/kimi-k3-xpu-framework/bin/python
 # JOB_DIR, not LOG_DIR: we EXPORT LOG_DIR=$SERVER_LOG below for
 # serve_k3.sh's own interface, which shadowed the outer value and sent
@@ -52,6 +52,20 @@ mkdir -p "$JOB_DIR"
 exec > >(tee "$JOB_DIR/job.log") 2>&1
 
 echo "=== job=$PBS_JOBID nodes=$(sort -u "$PBS_NODEFILE" | tr '\n' ' ') start=$(date -Is) ==="
+
+# Build a 32-EXPERT slice if absent. The 8-expert slice CANNOT run TP=16 with
+# EP: experts_per_rank = 8//16 = 0, and the fused MoE kernel then divides by
+# zero -- job 8741767 died with "Fatal Python error: Floating-point exception"
+# inside xpu_fused_moe, six workers at once, before any legible error. Every
+# single-node topology that worked had experts >= ranks (8/8=1 at TP=8).
+# 32 experts costs ~11.3 GiB vs 10.1, and covers TP=16 and TP=32.
+if [ ! -f "$SLICE/model.safetensors" ]; then
+  echo "--- building 32-expert slice (one-off, ~2 min warm / ~60 min cold) ---"
+  module load frameworks >/dev/null 2>&1
+  source /flare/ModCon/ngetty/venvs/kimi-k3-xpu-framework/bin/activate 2>/dev/null
+  python3 "$ROOT/slice_real_k3.py" --out "$SLICE" --layers 4 --experts 32 \
+    || { echo "SLICE BUILD FAILED"; echo "tp16x2node SLICE_BUILD_FAILED" > "$JOB_DIR/VERDICT.txt"; exit 1; }
+fi
 
 # Same environment contract as the production 3-node K3 job.
 export PYTHONPATH=/flare/ModCon/ngetty/vllm-xpu-src${PYTHONPATH:+:$PYTHONPATH}
