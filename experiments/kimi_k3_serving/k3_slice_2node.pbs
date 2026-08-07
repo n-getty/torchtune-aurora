@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+#PBS -N k3_slice_2node
+#PBS -l walltime=02:00:00
+#PBS -A AuroraGPT
+#PBS -q capacity
+#PBS -l select=2
+#PBS -l place=scatter
+#PBS -l filesystems=flare:home
+#PBS -o /lus/flare/projects/ModCon/ngetty/torchtune/experiments/kimi_k3_serving/logs/slice2n.out
+#PBS -e /lus/flare/projects/ModCon/ngetty/torchtune/experiments/kimi_k3_serving/logs/slice2n.err
+
+# CROSS-NODE prefill-vs-decode test on the real-weight K3 slice.
+#
+# WHY THIS IS THE EXPERIMENT THAT MATTERS NOW
+# -------------------------------------------
+# The degenerate production runs were TP=32 over THREE nodes (12+12+8 ranks),
+# so some rank boundaries are on-package and some cross the Slingshot fabric.
+# Everything tested so far -- every component, and every single-node topology
+# up to TP=8+EP on REAL weights -- agrees. Cross-node collectives are the one
+# part of the failing configuration a single node structurally cannot reach.
+#
+# TP=16 over 2 nodes (8 tiles/node) is the cheapest configuration that crosses
+# the fabric: 96 heads / 16 = 6 per rank, and the slice is ~10 GiB, versus a
+# 3-node 1.5 TiB capacity load.
+#
+# A CLEAN result is still informative: it would mean the defect needs TP=32
+# specifically, or the full 93-layer depth, and the next step would be ONE
+# instrumented real-K3 load with VLLM_KIMI_XPU_DIAGNOSTIC_LAYERS=all -- not
+# another guess.
+#
+# This deliberately reuses serve_k3.sh rather than hand-rolling Ray startup.
+# That launcher already handles the things that are easy to get wrong and hard
+# to notice: --num-gpus=12 per node, proxy unsetting on workers, CCL_KVS_IFACE,
+# a per-job ray temp-dir, and stale-process cleanup. A bespoke Ray setup here
+# would risk manufacturing a "bug" that is really a launcher difference.
+
+set -uo pipefail
+REPO=/lus/flare/projects/ModCon/ngetty/torchtune
+ROOT=$REPO/experiments/kimi_k3_serving
+SLICE=/lus/flare/projects/ModCon/ngetty/k3-slice-4L8E
+PYTHON=/flare/ModCon/ngetty/venvs/kimi-k3-xpu-framework/bin/python
+LOG_DIR=$ROOT/logs/slice2n_${PBS_JOBID%%.*}
+mkdir -p "$LOG_DIR"
+exec > >(tee "$LOG_DIR/job.log") 2>&1
+
+echo "=== job=$PBS_JOBID nodes=$(sort -u "$PBS_NODEFILE" | tr '\n' ' ') start=$(date -Is) ==="
+
+# Same environment contract as the production 3-node K3 job.
+export PYTHONPATH=/flare/ModCon/ngetty/vllm-xpu-src${PYTHONPATH:+:$PYTHONPATH}
+export TORCHDYNAMO_DISABLE=1 TORCH_COMPILE_DISABLE=1
+export CCL_PROCESS_LAUNCHER=none CCL_ATL_TRANSPORT=ofi FI_PROVIDER=cxi
+export CCL_KVS_IFACE=hsn0 ZE_FLAT_DEVICE_HIERARCHY=FLAT
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export VLLM_XPU_DETERMINISTIC_ROUTING=1 VLLM_XPU_DETERMINISTIC_MOE_GATHER=1
+export NO_PROXY=localhost,127.0.0.1
+export no_proxy=$NO_PROXY
+
+SERVER_LOG=$LOG_DIR/server
+mkdir -p "$SERVER_LOG"
+PORT=8000
+export MODEL="$SLICE" TP=16 PP=1 MAX_MODEL_LEN=512 MAX_NUM_SEQS=1 MAX_BATCHED_TOKENS=512
+export PORT LOG_DIR="$SERVER_LOG" PYTHON VLLM_SRC=/flare/ModCon/ngetty/vllm-xpu-src
+export SERVED_MODEL_NAME=k3slice
+
+bash "$ROOT/serve_k3.sh" --model "$SLICE" --tp 16 --ep \
+  --max-model-len 512 --max-num-seqs 1 --max-num-batched-tokens 512 \
+  --served-model-name k3slice >"$SERVER_LOG/launcher.log" 2>&1 &
+SERVER_PID=$!
+echo "server_pid=$SERVER_PID"
+cleanup() { kill "$SERVER_PID" 2>/dev/null || true; wait "$SERVER_PID" 2>/dev/null || true; }
+trap cleanup EXIT
+
+health_rc=1
+for _ in $(seq 1 120); do
+    # --noproxy '*' is mandatory: no_proxy covers localhost but not 127.0.0.1,
+    # so without it curl gets an HTML 503 from the ALCF proxy that looks
+    # exactly like a dead server.
+    if curl --noproxy '*' --fail --silent "http://127.0.0.1:$PORT/health" >/dev/null; then
+        health_rc=0; echo "SLICE_2N_HEALTH_PASS $(date -Is)"; break
+    fi
+    if ! kill -0 "$SERVER_PID" 2>/dev/null; then echo "SERVER_EXITED_BEFORE_HEALTH"; break; fi
+    sleep 10
+done
+if [[ $health_rc -ne 0 ]]; then
+    echo "SLICE_2N_HEALTH_FAIL"
+    grep -iE "error|assert|Traceback" "$SERVER_LOG"/*.log 2>/dev/null | grep -viE "INFO|Route:" | tail -20
+    echo "tp16x2node SERVER_FAILED" > "$LOG_DIR/VERDICT.txt"
+    exit 1
+fi
+
+echo; echo "--- single-step prefill-vs-decode (CROSS-NODE) ---"
+timeout 900 "$PYTHON" "$ROOT/probe_prefill_vs_decode.py" \
+  --base-url "http://127.0.0.1:$PORT" --model k3slice \
+  --output-dir "$LOG_DIR/single_step" 2>&1 | tail -40
+echo "tp16x2node single_step exit=${PIPESTATUS[0]}" >> "$LOG_DIR/VERDICT.txt"
+
+echo; echo "--- decode-depth ladder (CROSS-NODE) ---"
+timeout 1800 "$PYTHON" "$ROOT/probe_depth_ladder.py" \
+  "http://127.0.0.1:$PORT" k3slice "$LOG_DIR/ladder" 2>&1 | tail -20
+echo "tp16x2node ladder exit=${PIPESTATUS[0]}" >> "$LOG_DIR/VERDICT.txt"
+
+echo; echo "=== done $(date -Is) ==="
+cat "$LOG_DIR/VERDICT.txt"
