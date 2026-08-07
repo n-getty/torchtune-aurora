@@ -47,9 +47,26 @@ export VLLM_XPU_DETERMINISTIC_ROUTING=1 VLLM_XPU_DETERMINISTIC_MOE_GATHER=1
 [ "$TP" = "1" ] && export ZE_AFFINITY_MASK=0
 
 verdict() { echo "$1" >> "$OUT/VERDICT.txt"; }
+
+# Kill ONLY the server this script started, by PID.
+#
+# The first version used `pkill -f "[a]pi_server"`. That pattern matches this
+# script's own command line (which contains the string when invoked over ssh),
+# so the cleanup killed the caller: every suite died ~20s in, before the server
+# even launched, and the whole overnight sweep self-terminated in 3 minutes
+# having produced nothing. The [a] bracket trick only protects against matching
+# the *pkill* process itself -- it does nothing about other processes whose
+# arguments happen to contain the pattern.
+#
+# PID-scoped teardown cannot make that mistake. SERVER is set after launch;
+# guard on it being non-empty so an early failure does not `kill ""`.
+SERVER=""
 cleanup() {
-  pkill -f "[a]pi_server.*port $PORT" 2>/dev/null
-  pkill -f "[a]pi_server" 2>/dev/null
+  if [ -n "$SERVER" ]; then
+    kill "$SERVER" 2>/dev/null
+    for _ in $(seq 1 10); do kill -0 "$SERVER" 2>/dev/null || break; sleep 1; done
+    kill -9 "$SERVER" 2>/dev/null
+  fi
   sleep 3
 }
 trap cleanup EXIT

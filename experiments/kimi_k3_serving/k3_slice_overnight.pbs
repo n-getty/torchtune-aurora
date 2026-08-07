@@ -40,7 +40,10 @@ run () {
   # Never let one topology kill the sweep.
   timeout 3000 bash "$ROOT/run_slice_suite.sh" "$tag" "$@" || \
     echo "SUITE $tag FAILED (exit $?) -- continuing"
-  pkill -f "[a]pi_server" 2>/dev/null
+  # NO pkill here. `pkill -f api_server` also matches this job's own command
+  # line and killed the sweep in 3 minutes flat. run_slice_suite.sh now tears
+  # down its own server by PID; a belt-and-braces sweep here is not worth
+  # re-introducing a self-kill.
   sleep 20
 }
 
