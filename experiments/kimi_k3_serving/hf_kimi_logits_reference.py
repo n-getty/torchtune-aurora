@@ -62,6 +62,11 @@ def install_cpu_reference_shims() -> None:
         use_qk_l2norm_in_kernel=False,
         use_beta_sigmoid_in_kernel=False,
         allow_neg_eigval=False,
+        use_gate_in_kernel=False,
+        A_log=None,
+        dt_bias=None,
+        lower_bound=None,
+        safe_gate=None,
         **kwargs,
     ):
         dtype = v.dtype
@@ -72,6 +77,24 @@ def install_cpu_reference_shims() -> None:
             beta = beta.sigmoid()
             if allow_neg_eigval:
                 beta = beta * 2
+        if use_gate_in_kernel:
+            # K3 calls chunk_kda/fused_recurrent_kda with the RAW f_b_proj(f_a_proj(...))
+            # output as `g` and use_gate_in_kernel=True -- the actual per-head
+            # log-decay used by the recurrence (`b_gk` in fused_recurrent.py) is
+            # computed INSIDE the kernel from g/A_log/dt_bias, not by the caller
+            # (fused_kda_gate is a separate, unused code path when this flag is
+            # set). K3's config sets gate_lower_bound=-5.0 (not None), so this is
+            # always the lower-bound variant: lower_bound * sigmoid(exp(A_log) *
+            # (g + dt_bias)) -- matches fla.ops.kda.gate.naive_kda_lowerbound_gate
+            # exactly, cross-checked directly rather than re-derived.
+            g = g.float()
+            if dt_bias is not None:
+                g = g + dt_bias.view(g.shape[-2], -1)
+            a_exp = A_log.view(g.shape[-2], 1).float().exp()
+            if lower_bound is not None:
+                g = lower_bound * torch.sigmoid(a_exp * g)
+            else:
+                g = -a_exp * F.softplus(g)
         q, k, v, g, beta = [x.transpose(1, 2).float() for x in (q, k, v, g, beta)]
         batch, heads, tokens, key_dim = q.shape
         value_dim = v.shape[-1]
@@ -382,6 +405,33 @@ def main() -> None:
             if hasattr(module, "config") and hasattr(module.config, "_attn_implementation"):
                 module.config._attn_implementation = "eager"
     model.eval()
+
+    # Match vLLM's KIMI_XPU_DIAGNOSTIC fingerprint points exactly
+    # (kimi_linear.py:613-633, _forward_attn_residual path) so per-layer
+    # hidden-state sums can be diffed directly against a
+    # VLLM_KIMI_XPU_DIAGNOSTIC_LAYERS=all run on the same slice/prompt. vLLM
+    # logs phase=layer_input right after input_layernorm (before self_attn)
+    # and phase=attention_output right after self_attn returns (before the
+    # residual add) -- hook the same two points here via forward hooks on
+    # each layer's own input_layernorm/self_attn submodules.
+    import os as _dbg_os
+    import sys as _dbg_sys
+
+    if _dbg_os.environ.get("KIMI_XPU_DIAGNOSTIC") == "1":
+        for layer_idx, layer in enumerate(model.language_model.model.layers):
+            def _make_hook(name, idx):
+                def _hook(module, inputs, output):
+                    out = output[0] if isinstance(output, tuple) else output
+                    print(
+                        f"HF_XPU_DIAGNOSTIC phase={name} layer={idx} "
+                        f"tokens={out.shape[-2]} sum={out.float().sum().item()}",
+                        file=_dbg_sys.stderr,
+                    )
+                return _hook
+
+            layer.input_layernorm.register_forward_hook(_make_hook("attn_res_layer_input", layer_idx))
+            layer.self_attn.register_forward_hook(_make_hook("attn_res_attention_output", layer_idx))
+
     input_ids = tokenizer(args.prompt, return_tensors="pt").input_ids
     with torch.inference_mode():
         logits = model(input_ids=input_ids, use_cache=False).logits[0, -1].float()
