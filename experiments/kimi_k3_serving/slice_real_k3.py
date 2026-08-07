@@ -95,10 +95,20 @@ def main():
         by_shard.setdefault(weight_map[name], []).append(name)
     print(f"selecting {len(wanted)} tensors from {len(by_shard)} shards")
 
-    # Read shards in parallel. safe_open issues one scattered read per tensor,
-    # so a serial pass is latency-bound, not bandwidth-bound: measured ~84
-    # MiB/min serially against a filesystem that streams at 445 MB/s. Threads
-    # help because the work is I/O wait, not Python compute.
+    # Read shards in parallel.
+    #
+    # MEASURED CAVEAT: this did NOT speed things up. Serial and threaded both
+    # materialize tensors at ~84 MiB/min, so ~10 GiB takes ~1 hour either way.
+    # The hypothesis behind the threads -- that safe_open's per-tensor scattered
+    # reads make this latency-bound -- is REFUTED: the filesystem streams at
+    # 445 MB/s (dd, 100 MiB) and threading changed nothing, so the cost is
+    # per-tensor materialization (dtype handling / copy into a fresh tensor),
+    # which is serialized by the GIL. The threads are harmless; keeping them
+    # only because the "done <shard>" lines make progress legible.
+    #
+    # If this ever needs to be faster, attack the copy, not the I/O: mmap the
+    # source and write slices straight through without materializing torch
+    # tensors, or shard the work across processes rather than threads.
     def read_shard(item):
         shard, names = item
         print(f"  reading {shard} ({len(names)} tensors)", flush=True)
