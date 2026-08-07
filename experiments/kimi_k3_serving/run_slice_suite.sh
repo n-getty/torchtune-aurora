@@ -122,19 +122,25 @@ python3 -m vllm.entrypoints.openai.api_server \
   --port "$PORT" --host 127.0.0.1 \
   --enforce-eager --trust-remote-code --model-impl vllm --dtype bfloat16 \
   --max-model-len 512 --max-num-seqs 1 --max-num-batched-tokens 512 \
-  --no-enable-prefix-caching ${BLOCKS_OVERRIDE:+--num-gpu-blocks-override $BLOCKS_OVERRIDE} \
+  --no-enable-prefix-caching --num-gpu-blocks-override "${BLOCKS_OVERRIDE:-16}" \
   --gpu-memory-utilization 0.70 > "$OUT/server.log" 2>&1 &
-# NOTE on --num-gpu-blocks-override: it is now OPT-IN via BLOCKS_OVERRIDE, not
-# hard-coded to 8. The 8 was copied from the RANDOM-WEIGHT config, where 2.17 MB
-# KV pages made default sizing request 29.51 GiB and OOM. The real-weight slice
-# has different page geometry and does not need it.
+# --num-gpu-blocks-override is REQUIRED here, and 16 is measured, not guessed.
+# Both extremes fail and they bracket the answer:
 #
-# Leaving it at 8 starved the cache to 1024 tokens / 2.00x concurrency, and both
-# tp1 and tp2 then died on EXACTLY request #30 -- the depth ladder's first call
-# -- after 29 successes. Identical count across two topologies is the signature
-# of a deterministic resource limit, not a numerics bug. Worth stating plainly
-# because "engine wedges partway through a probe" reads like a model defect and
-# is not one.
+#   blocks=8     ->     1,024 tokens  -> starved: tp1 AND tp2 both died on
+#                                        EXACTLY request #30 after 29 successes.
+#                                        An identical count across two
+#                                        topologies is a deterministic resource
+#                                        limit, not a numerics bug.
+#   no override  -> 3,304,832 tokens  -> OOM, "tried to allocate 36.25 GiB" on
+#                                        the first request (tp4ep).
+#
+# Block size here is 128 tokens (8 blocks gave exactly 1024), so 16 blocks =
+# 2048 tokens = 4x max_model_len. With max_num_seqs=1 and 128-token
+# generations that is ample headroom, and twice what starved.
+#
+# Both failures LOOK like model defects -- an engine that wedges partway
+# through a probe, an engine that dies on request one -- and neither is.
 SERVER=$!
 
 echo "waiting for health on :$PORT (server pid $SERVER)"
