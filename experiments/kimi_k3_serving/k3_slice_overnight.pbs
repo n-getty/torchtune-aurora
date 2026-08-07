@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+#PBS -N k3_slice_overnight
+#PBS -l walltime=03:00:00
+#PBS -A AuroraGPT
+#PBS -q capacity
+#PBS -l select=1
+#PBS -l place=scatter
+#PBS -l filesystems=flare:home
+#PBS -o /lus/flare/projects/ModCon/ngetty/torchtune/experiments/kimi_k3_serving/logs/overnight.out
+#PBS -e /lus/flare/projects/ModCon/ngetty/torchtune/experiments/kimi_k3_serving/logs/overnight.err
+
+# Unattended overnight sweep of the real-weight K3 slice across TP degrees.
+#
+# Runs to completion with no operator: for each topology it serves the slice,
+# runs the single-step prefill-vs-decode probe, the decode-depth ladder, and a
+# long-decode degeneration check, then tears down and moves on. One topology
+# failing does NOT abort the rest -- each suite is independent, so a wedged
+# server costs one row, not the night.
+#
+# The slice already exists on Lustre (~10 GiB, built once), so there is no
+# build cost here and nothing to stage.
+#
+# WHY THESE TOPOLOGIES: TP=1 and TP=8+EP already agreed interactively; they
+# are repeated here as controls (a differing result would mean the harness,
+# not K3, changed). TP=2 and TP=4 fill in the curve, and TP=12 spans all tiles
+# on the node. If agreement holds across every single-node topology, the
+# surviving hypothesis is genuinely multi-NODE TP=32, where collectives cross
+# the fabric.
+
+set -uo pipefail
+ROOT=/lus/flare/projects/ModCon/ngetty/torchtune/experiments/kimi_k3_serving
+cd "$ROOT" || exit 1
+
+echo "=== overnight sweep job=$PBS_JOBID node=$(hostname) start=$(date -Is) ==="
+
+run () {
+  local tag="$1"; shift
+  echo
+  echo "############ $tag ############"
+  # Never let one topology kill the sweep.
+  timeout 3000 bash "$ROOT/run_slice_suite.sh" "$tag" "$@" || \
+    echo "SUITE $tag FAILED (exit $?) -- continuing"
+  pkill -f "[a]pi_server" 2>/dev/null
+  sleep 20
+}
+
+run tp1   1
+run tp2   2
+run tp4   4
+run tp4ep 4 --enable-expert-parallel
+run tp8   8
+run tp8ep 8 --enable-expert-parallel
+# TP=12 spans all tiles on the node. Heads divide (96/12=8) but the slice's
+# 8 experts do NOT (8/12), so this row runs WITHOUT --enable-expert-parallel;
+# adding EP here would fail on expert sharding, not tell us anything about K3.
+run tp12  12
+
+echo
+echo "=== overnight sweep done $(date -Is) ==="
+echo "--- all verdicts ---"
+cat "$ROOT"/logs/suite_*/VERDICT.txt 2>/dev/null
