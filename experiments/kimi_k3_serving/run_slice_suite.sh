@@ -123,7 +123,18 @@ python3 -m vllm.entrypoints.openai.api_server \
   --enforce-eager --trust-remote-code --model-impl vllm --dtype bfloat16 \
   --max-model-len 512 --max-num-seqs 1 --max-num-batched-tokens 512 \
   --no-enable-prefix-caching --num-gpu-blocks-override "${BLOCKS_OVERRIDE:-16}" \
+  "$([ -n "${ASYNC_SCHED:-}" ] && echo --async-scheduling || echo --no-async-scheduling)" \
   --gpu-memory-utilization 0.70 > "$OUT/server.log" 2>&1 &
+# --no-async-scheduling by default. Async scheduling is auto-enabled
+# (config/vllm.py:838) and selects step_with_batch_queue, whose
+# `future.result()` at core.py:521 has NO TIMEOUT. When the executor future is
+# never fulfilled the engine blocks forever: observed EngineCore idle in `Sl`
+# with the busy loop parked on that line and NO worker process alive to
+# complete it. /health kept returning 200 the whole time.
+#
+# That is a permanent, silent hang rather than an error, and it is what has
+# killed the depth ladder in every single run so far -- the ladder has never
+# once completed. Set ASYNC_SCHED=1 to restore the default for comparison.
 # --num-gpu-blocks-override is REQUIRED here, and 16 is measured, not guessed.
 # Both extremes fail and they bracket the answer:
 #
