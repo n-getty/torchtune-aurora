@@ -92,6 +92,26 @@ cleanup() {
     for _ in $(seq 1 10); do kill -0 "$SERVER" 2>/dev/null || break; sleep 1; done
     kill -9 "$SERVER" 2>/dev/null
   fi
+  # Killing the API server is NOT enough at TP>1. Its VLLM::Worker_TPn children
+  # survive, get reparented to init (PPID=1), and keep SPINNING at 100% CPU
+  # while holding their tiles -- observed: two orphaned TP=2 workers still
+  # running 17 minutes after their parent was killed, starving the next
+  # topology. Reap any worker whose process group is ours.
+  #
+  # Matching on the "VLLM::Worker" comm is safe here in a way that
+  # `pkill -f api_server` was not: this script's own command line does not
+  # contain that string, so it cannot self-match. Restricted to our own
+  # process group so a concurrent job on the node is never touched.
+  # Resolve the real process group rather than assuming $$ == pgid; that
+  # holds for a normally-started script but not when invoked as `bash script`
+  # from a driver. Verified on-node that workers inherit the server's pgid and
+  # keep it after being reparented to init, so this reaches orphans.
+  MY_PGID=$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')
+  if [ -n "$MY_PGID" ]; then
+    for pid in $(pgrep -g "$MY_PGID" -f "VLLM::Worker" 2>/dev/null); do
+      kill -9 "$pid" 2>/dev/null
+    done
+  fi
   sleep 3
 }
 trap cleanup EXIT
