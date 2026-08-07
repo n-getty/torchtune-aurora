@@ -1,0 +1,47 @@
+[
+  {
+    "depth": 1,
+    "argmax_match": true,
+    "jaccard": 0.3333333333333333,
+    "max_abs_diff": 0.4476141929626465,
+    "top1_gap": 0.53125,
+    "flat_band": 1.46875,
+    "verdict": "agree"
+  },
+  {
+    "depth": 2,
+    "argmax_match": false,
+    "jaccard": 0.5384615384615384,
+    "max_abs_diff": 0.6100645065307617,
+    "top1_gap": 0.0625,
+    "flat_band": 1.6875,
+    "verdict": "DIVERGE"
+  },
+  {
+    "depth": 4,
+    "argmax_match": true,
+    "jaccard": 0.6,
+    "max_abs_diff": 0.6064252853393555,
+    "top1_gap": 0.09375,
+    "flat_band": 0.875,
+    "verdict": "INCONCL"
+  },
+  {
+    "depth": 8,
+    "argmax_match": true,
+    "jaccard": 0.6,
+    "max_abs_diff": 1.0277721881866455,
+    "top1_gap": 1.562500238418579,
+    "flat_band": 3.375000238418579,
+    "verdict": "DIVERGE"
+  },
+  {
+    "depth": 16,
+    "argmax_match": true,
+    "jaccard": 0.3793103448275862,
+    "max_abs_diff": 0.6421904563903809,
+    "top1_gap": 0.625,
+    "flat_band": 1.84375,
+    "verdict": "agree"
+  }
+]
