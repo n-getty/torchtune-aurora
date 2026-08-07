@@ -47,7 +47,21 @@ export PYTHONPATH=/flare/ModCon/ngetty/vllm-xpu-src:${PYTHONPATH:-}
 export ZE_FLAT_DEVICE_HIERARCHY=FLAT VLLM_TARGET_DEVICE=xpu
 export CCL_PROCESS_LAUNCHER=none CCL_ATL_TRANSPORT=ofi
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
-export VLLM_XPU_DETERMINISTIC_ROUTING=1 VLLM_XPU_DETERMINISTIC_MOE_GATHER=1
+export VLLM_XPU_DETERMINISTIC_ROUTING=1
+# VLLM_XPU_DETERMINISTIC_MOE_GATHER defaults OFF here, deliberately.
+#
+# =1 replaces the fused moe_gather with a Python double loop over
+# (num_tokens x topk) where every iteration does 2-3 `.item()` XPU device
+# syncs (vllm_xpu_kernels/fused_moe_interface.py:299-308). Cost scales with
+# generated length, per MoE layer, per step. At TP=1 the depth ladder's first
+# 33-token request wedged EngineCore for 10+ minutes at 100% CPU -- py-spy
+# pinned it to that exact line -- while /health kept returning 200 OK.
+#
+# The probes here compare prefill against decode on the SAME server, so both
+# sides see the same gather either way; determinism is not what this
+# experiment needs, and the runtime cost destroys the long-generation stages.
+# Override to 1 explicitly if reproducing a production-flag configuration.
+export VLLM_XPU_DETERMINISTIC_MOE_GATHER=${VLLM_XPU_DETERMINISTIC_MOE_GATHER:-0}
 [ "$TP" = "1" ] && export ZE_AFFINITY_MASK=0
 
 verdict() { echo "$1" >> "$OUT/VERDICT.txt"; }
