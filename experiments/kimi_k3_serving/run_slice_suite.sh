@@ -53,6 +53,13 @@ export CCL_PROCESS_LAUNCHER=none CCL_ATL_TRANSPORT=ofi
 # TP=1 and TP=2 happened to survive without it, which is exactly what makes this
 # kind of omission dangerous -- it looks fine until the rank count grows.
 export CCL_KVS_IFACE=${CCL_KVS_IFACE:-lo}
+# Raise the executor RPC timeout from its 10 s default (envs.py:98). With async
+# scheduling off, r_tp2 got 89 requests deep -- through the whole 60-request
+# probe, all of single_step, and several ladder depths -- then died with
+# "RPC call to execute_model timed out". A single execute_model on this slice
+# is far under 10 s at 22 tok/s, so the default leaves no margin for a slow
+# prefill or a scheduler stall, and turns a hiccup into a dead engine.
+export VLLM_RPC_TIMEOUT=${VLLM_RPC_TIMEOUT:-120000}
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export VLLM_XPU_DETERMINISTIC_ROUTING=1
 # VLLM_XPU_DETERMINISTIC_MOE_GATHER defaults OFF here, deliberately.

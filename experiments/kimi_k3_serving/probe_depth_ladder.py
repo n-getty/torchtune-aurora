@@ -46,15 +46,27 @@ def comp(prompt_ids, n):
 
 
 records = []
-print(f"{'depth':>6} {'argmax':>7} {'jaccard':>8} {'maxdiff':>9} {'top1gap':>8} {'band':>7}  verdict")
+# flush=True on every line. Python buffers stdout when it is a pipe, so when a
+# later depth raises, the buffer is discarded and the depths that ALREADY
+# SUCCEEDED vanish. That happened: one run completed five ladder calls and
+# reported nothing but a traceback.
+print(f"{'depth':>6} {'argmax':>7} {'jaccard':>8} {'maxdiff':>9} {'top1gap':>8} {'band':>7}  verdict",
+      flush=True)
 for depth in (1, 2, 4, 8, 16, 32):
-    run = comp(ids, depth + 1)
-    toks = [int(t.split(":")[-1]) for t in run["choices"][0]["logprobs"]["tokens"]]
-    if len(toks) <= depth:
-        print(f"{depth:>6}  (model stopped early at {len(toks)} tokens)")
+    # Per-depth guard: a failure at depth 8 must not destroy depths 1-4. The
+    # whole point of a ladder is the trend, and a partial trend is still data.
+    try:
+        run = comp(ids, depth + 1)
+        toks = [int(t.split(":")[-1]) for t in run["choices"][0]["logprobs"]["tokens"]]
+        if len(toks) <= depth:
+            print(f"{depth:>6}  (model stopped early at {len(toks)} tokens)", flush=True)
+            break
+        dec = run["choices"][0]["logprobs"]["top_logprobs"][depth]
+        pre = comp(ids + toks[:depth], 1)["choices"][0]["logprobs"]["top_logprobs"][0]
+    except Exception as error:
+        print(f"{depth:>6}  ABORTED {type(error).__name__}: {str(error)[:55]}", flush=True)
+        print("        (rows above this line are valid results)", flush=True)
         break
-    dec = run["choices"][0]["logprobs"]["top_logprobs"][depth]
-    pre = comp(ids + toks[:depth], 1)["choices"][0]["logprobs"]["top_logprobs"][0]
 
     shared, union = set(dec) & set(pre), set(dec) | set(pre)
     md = max((abs(dec[k] - pre[k]) for k in shared), default=float("inf"))
@@ -68,7 +80,8 @@ for depth in (1, 2, 4, 8, 16, 32):
     # coin-flip argmax.
     flat = band <= 1.0
     verdict = "INCONCL" if flat else ("DIVERGE" if (not am or md > 1.0) else "agree")
-    print(f"{depth:>6} {str(am):>7} {jac:>8.3f} {md:>9.4f} {gap:>8.3f} {band:>7.3f}  {verdict}")
+    print(f"{depth:>6} {str(am):>7} {jac:>8.3f} {md:>9.4f} {gap:>8.3f} {band:>7.3f}  {verdict}",
+          flush=True)
     records.append({"depth": depth, "argmax_match": am, "jaccard": jac,
                     "max_abs_diff": md if md != float("inf") else "inf",
                     "top1_gap": gap, "flat_band": band, "verdict": verdict})
