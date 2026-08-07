@@ -54,7 +54,6 @@ USAGE
 import argparse
 import json
 import re
-from concurrent.futures import ThreadPoolExecutor
 import sys
 from pathlib import Path
 
@@ -95,37 +94,41 @@ def main():
         by_shard.setdefault(weight_map[name], []).append(name)
     print(f"selecting {len(wanted)} tensors from {len(by_shard)} shards")
 
-    # Read shards in parallel.
+    # Pull each shard into the page cache with ONE sequential read before
+    # touching it with safe_open.
     #
-    # MEASURED CAVEAT: this did NOT speed things up. Serial and threaded both
-    # materialize tensors at ~84 MiB/min, so ~10 GiB takes ~1 hour either way.
-    # The hypothesis behind the threads -- that safe_open's per-tensor scattered
-    # reads make this latency-bound -- is REFUTED: the filesystem streams at
-    # 445 MB/s (dd, 100 MiB) and threading changed nothing, so the cost is
-    # per-tensor materialization (dtype handling / copy into a fresh tensor),
-    # which is serialized by the GIL. The threads are harmless; keeping them
-    # only because the "done <shard>" lines make progress legible.
+    # This is the whole performance story, and it was measured, not guessed:
+    #   sequential (dd, 4M blocks) : 1.3 GB/s
+    #   random 4K preads           : 17.5 ms EACH
+    # safe_open seeks per tensor, so on Lustre a 250-tensor slice degenerates
+    # into seek-latency-bound I/O -- observed 84 MiB/min, i.e. ~1 hour for
+    # ~10 GiB, with the process at 20 SECONDS of CPU over 39 minutes and parked
+    # in cl_sync_io_wait. Threading it changed nothing (the earlier "parallel"
+    # commit was wrong about this): 8 threads all block on the same slow seeks.
     #
-    # If this ever needs to be faster, attack the copy, not the I/O: mmap the
-    # source and write slices straight through without materializing torch
-    # tensors, or shard the work across processes rather than threads.
-    def read_shard(item):
-        shard, names = item
-        print(f"  reading {shard} ({len(names)} tensors)", flush=True)
-        # NOT named `out`: that is the output directory in the enclosing scope,
-        # and shadowing it here is a rename away from writing the model into
-        # the wrong place.
-        part = {}
-        with safe_open(str(src / shard), framework="pt") as f:
-            for name in names:
-                part[name.removeprefix("language_model.")] = f.get_tensor(name)
-        print(f"  done {shard}", flush=True)
-        return part
+    # Warming the file sequentially first turns every subsequent seek into a
+    # page-cache hit. The node has ~1 TB of RAM and the five shards total
+    # ~54 GiB, so they fit.
+    def warm(shard):
+        path = src / shard
+        size = path.stat().st_size
+        print(f"  warming {shard} ({size / 2**30:.1f} GiB)", flush=True)
+        buffer = bytearray(8 << 20)  # reused; a fresh alloc per block is waste
+        with open(path, "rb", buffering=0) as f:
+            while f.readinto(buffer):
+                pass
+
+    for shard in sorted(by_shard):
+        warm(shard)
 
     tensors = {}
-    with ThreadPoolExecutor(max_workers=min(8, len(by_shard))) as pool:
-        for part in pool.map(read_shard, sorted(by_shard.items())):
-            tensors.update(part)
+    for shard, names in sorted(by_shard.items()):
+        print(f"  reading {shard} ({len(names)} tensors)", flush=True)
+        with safe_open(str(src / shard), framework="pt") as f:
+            for name in names:
+                # NOT `out[...]`: `out` is the output directory in this scope.
+                tensors[name.removeprefix("language_model.")] = f.get_tensor(name)
+        print(f"  done {shard}", flush=True)
 
     # The router gate is [num_experts, hidden]; slicing experts without slicing
     # the gate leaves the router scoring experts that no longer exist.
