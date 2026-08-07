@@ -66,7 +66,18 @@ export MODEL="$SLICE" TP=16 PP=1 MAX_MODEL_LEN=512 MAX_NUM_SEQS=1 MAX_BATCHED_TO
 export PORT LOG_DIR="$SERVER_LOG" PYTHON VLLM_SRC=/flare/ModCon/ngetty/vllm-xpu-src
 export SERVED_MODEL_NAME=k3slice
 
-bash "$ROOT/serve_k3.sh" --model "$SLICE" --tp 16 --ep \
+# --blocks 16 is REQUIRED (maps to --num-gpu-blocks-override, serve_k3.sh:500).
+# Without it the first attempt (job 8741630) died during
+# determine_available_memory: the memory-profiling dummy run tried to size an
+# unbounded KV cache and the Ray workers were killed with no Python traceback,
+# surfacing only as "ActorDiedError: The actor died unexpectedly". Same failure
+# class as tp4ep and tp8 in the single-node sweep, where the equivalent error
+# was legible ("XPU out of memory. Tried to allocate 36.25 GiB").
+#
+# 16 is the measured value from the single-node work: 8 starved the cache and
+# unset OOMs. Block size here is 128 tokens, so 16 blocks = 2048 = 4x
+# max_model_len, ample for max_num_seqs=1.
+bash "$ROOT/serve_k3.sh" --model "$SLICE" --tp 16 --ep --blocks 16 \
   --max-model-len 512 --max-num-seqs 1 --max-num-batched-tokens 512 \
   --served-model-name k3slice >"$SERVER_LOG/launcher.log" 2>&1 &
 SERVER_PID=$!
