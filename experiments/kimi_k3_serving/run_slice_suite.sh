@@ -95,8 +95,19 @@ python3 -m vllm.entrypoints.openai.api_server \
   --port "$PORT" --host 127.0.0.1 \
   --enforce-eager --trust-remote-code --model-impl vllm --dtype bfloat16 \
   --max-model-len 512 --max-num-seqs 1 --max-num-batched-tokens 512 \
-  --no-enable-prefix-caching --num-gpu-blocks-override 8 \
+  --no-enable-prefix-caching ${BLOCKS_OVERRIDE:+--num-gpu-blocks-override $BLOCKS_OVERRIDE} \
   --gpu-memory-utilization 0.70 > "$OUT/server.log" 2>&1 &
+# NOTE on --num-gpu-blocks-override: it is now OPT-IN via BLOCKS_OVERRIDE, not
+# hard-coded to 8. The 8 was copied from the RANDOM-WEIGHT config, where 2.17 MB
+# KV pages made default sizing request 29.51 GiB and OOM. The real-weight slice
+# has different page geometry and does not need it.
+#
+# Leaving it at 8 starved the cache to 1024 tokens / 2.00x concurrency, and both
+# tp1 and tp2 then died on EXACTLY request #30 -- the depth ladder's first call
+# -- after 29 successes. Identical count across two topologies is the signature
+# of a deterministic resource limit, not a numerics bug. Worth stating plainly
+# because "engine wedges partway through a probe" reads like a model defect and
+# is not one.
 SERVER=$!
 
 echo "waiting for health on :$PORT (server pid $SERVER)"
