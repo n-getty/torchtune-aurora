@@ -349,11 +349,16 @@ def main():
         )
         return 1
 
+    # Count CONCLUSIVE prompts, not all prompts. Reporting "3/3 agree" when one
+    # was skipped as flat overstates the evidence -- an inconclusive prompt is
+    # not a prompt that agreed.
+    skipped = len(records) - len(conclusive)
     print(
-        f"\nVERDICT: agree ({len(verdicts)}/{len(verdicts)} prompts). "
-        "NULL RESULT, not an all-clear: this harness is single-node and cannot "
-        "see a TP=32/EP-on defect. Next step is scaling the REDUCED model's "
-        "TP/EP degree, not another 1.5 TiB load."
+        f"\nVERDICT: agree ({len(conclusive)}/{len(records)} prompts conclusive"
+        + (f", {skipped} inconclusive" if skipped else "")
+        + "). NULL RESULT, not an all-clear: this harness is single-node and "
+        "cannot see a TP=32/EP-on defect. Next step is scaling the REDUCED "
+        "model's TP/EP degree, not another 1.5 TiB load."
     )
     return 0
 
