@@ -54,6 +54,7 @@ USAGE
 import argparse
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor
 import sys
 from pathlib import Path
 
@@ -94,12 +95,27 @@ def main():
         by_shard.setdefault(weight_map[name], []).append(name)
     print(f"selecting {len(wanted)} tensors from {len(by_shard)} shards")
 
-    tensors = {}
-    for shard, names in sorted(by_shard.items()):
+    # Read shards in parallel. safe_open issues one scattered read per tensor,
+    # so a serial pass is latency-bound, not bandwidth-bound: measured ~84
+    # MiB/min serially against a filesystem that streams at 445 MB/s. Threads
+    # help because the work is I/O wait, not Python compute.
+    def read_shard(item):
+        shard, names = item
         print(f"  reading {shard} ({len(names)} tensors)", flush=True)
+        # NOT named `out`: that is the output directory in the enclosing scope,
+        # and shadowing it here is a rename away from writing the model into
+        # the wrong place.
+        part = {}
         with safe_open(str(src / shard), framework="pt") as f:
             for name in names:
-                tensors[name.removeprefix("language_model.")] = f.get_tensor(name)
+                part[name.removeprefix("language_model.")] = f.get_tensor(name)
+        print(f"  done {shard}", flush=True)
+        return part
+
+    tensors = {}
+    with ThreadPoolExecutor(max_workers=min(8, len(by_shard))) as pool:
+        for part in pool.map(read_shard, sorted(by_shard.items())):
+            tensors.update(part)
 
     # The router gate is [num_experts, hidden]; slicing experts without slicing
     # the gate leaves the router scoring experts that no longer exist.
