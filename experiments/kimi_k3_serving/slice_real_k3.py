@@ -109,6 +109,17 @@ def main():
     # Warming the file sequentially first turns every subsequent seek into a
     # page-cache hit. The node has ~1 TB of RAM and the five shards total
     # ~54 GiB, so they fit.
+    #
+    # CAVEAT, learned the hard way: the cache does NOT persist between runs.
+    # A run right after a previous one that already read the shards finished in
+    # ~2 minutes and looked like proof the warming worked; a later run on the
+    # same node was back to ~77 MiB/min with `free` showing buff/cache down to
+    # 18 GiB. So expect roughly 60 min from cold and ~2 min warm, and do not
+    # quote the warm number as the cost of the operation.
+    #
+    # Also note the "done <shard>" lines below print when a shard's LAST
+    # get_tensor returns, which is well before the process stops reading -- the
+    # honest progress signal is RSS growth, not those lines.
     def warm(shard):
         path = src / shard
         size = path.stat().st_size
@@ -126,8 +137,14 @@ def main():
         print(f"  reading {shard} ({len(names)} tensors)", flush=True)
         with safe_open(str(src / shard), framework="pt") as f:
             for name in names:
+                # Keep the FULL checkpoint name, prefix included. The slice is
+                # loaded by KimiK3ForConditionalGeneration, whose load_weights
+                # classifies every tensor by prefix and raises "Unexpected
+                # non-text K3 checkpoint tensor" on anything that is neither
+                # `language_model.*` nor a known multimodal prefix. Stripping
+                # `language_model.` here made the loader reject its own weights.
                 # NOT `out[...]`: `out` is the output directory in this scope.
-                tensors[name.removeprefix("language_model.")] = f.get_tensor(name)
+                tensors[name] = f.get_tensor(name)
         print(f"  done {shard}", flush=True)
 
     # The router gate is [num_experts, hidden]; slicing experts without slicing
@@ -152,15 +169,19 @@ def main():
     text["linear_attn_config"]["full_attn_layers"] = [args.layers]
     (out / "config.json").write_text(json.dumps(config, indent=2) + "\n")
 
-    for name in (
+    # K3's tokenizer is remote-code: tokenization_kimi.py imports encoding_k3.py,
+    # so copying the former without the latter fails at server start with a bare
+    # FileNotFoundError. Copy every top-level .py plus the tokenizer data rather
+    # than maintaining a hand list that silently rots.
+    extras = {
         "tokenizer_config.json",
-        "tokenization_kimi.py",
         "tiktoken.model",
         "generation_config.json",
-    ):
-        source = src / name
-        if source.exists():
-            (out / name).write_bytes(source.read_bytes())
+        "special_tokens_map.json",
+    }
+    for source in sorted(src.glob("*.py")) + [src / n for n in sorted(extras)]:
+        if source.exists() and source.is_file():
+            (out / source.name).write_bytes(source.read_bytes())
 
     total = sum(t.numel() * t.element_size() for t in tensors.values())
     save_file(tensors, str(out / "model.safetensors"))
