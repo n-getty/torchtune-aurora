@@ -34,7 +34,11 @@
 # a per-job ray temp-dir, and stale-process cleanup. A bespoke Ray setup here
 # would risk manufacturing a "bug" that is really a launcher difference.
 
-set -uo pipefail
+# NOT `set -u`: Lmod's init dereferences ZSH_EVAL_CONTEXT, so `module load`
+# aborts the script with "ZSH_EVAL_CONTEXT: unbound variable" -- and when
+# the load is redirected to /dev/null it aborts SILENTLY. serve_k3.sh gets
+# away with `set -euo pipefail` only because its module is already loaded.
+set -o pipefail
 REPO=/lus/flare/projects/ModCon/ngetty/torchtune
 ROOT=$REPO/experiments/kimi_k3_serving
 SLICE=/lus/flare/projects/ModCon/ngetty/k3-slice-4L8E
