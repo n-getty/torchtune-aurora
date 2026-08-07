@@ -43,9 +43,13 @@ REPO=/lus/flare/projects/ModCon/ngetty/torchtune
 ROOT=$REPO/experiments/kimi_k3_serving
 SLICE=/lus/flare/projects/ModCon/ngetty/k3-slice-4L8E
 PYTHON=/flare/ModCon/ngetty/venvs/kimi-k3-xpu-framework/bin/python
-LOG_DIR=$ROOT/logs/slice2n_${PBS_JOBID%%.*}
-mkdir -p "$LOG_DIR"
-exec > >(tee "$LOG_DIR/job.log") 2>&1
+# JOB_DIR, not LOG_DIR: we EXPORT LOG_DIR=$SERVER_LOG below for
+# serve_k3.sh's own interface, which shadowed the outer value and sent
+# VERDICT.txt into the server/ subdirectory where the monitor never
+# looked -- the run reported 'no verdict' when it had in fact produced one.
+JOB_DIR=$ROOT/logs/slice2n_${PBS_JOBID%%.*}
+mkdir -p "$JOB_DIR"
+exec > >(tee "$JOB_DIR/job.log") 2>&1
 
 echo "=== job=$PBS_JOBID nodes=$(sort -u "$PBS_NODEFILE" | tr '\n' ' ') start=$(date -Is) ==="
 
@@ -59,7 +63,7 @@ export VLLM_XPU_DETERMINISTIC_ROUTING=1 VLLM_XPU_DETERMINISTIC_MOE_GATHER=1
 export NO_PROXY=localhost,127.0.0.1
 export no_proxy=$NO_PROXY
 
-SERVER_LOG=$LOG_DIR/server
+SERVER_LOG=$JOB_DIR/server
 mkdir -p "$SERVER_LOG"
 PORT=8000
 export MODEL="$SLICE" TP=16 PP=1 MAX_MODEL_LEN=512 MAX_NUM_SEQS=1 MAX_BATCHED_TOKENS=512
@@ -77,7 +81,13 @@ export SERVED_MODEL_NAME=k3slice
 # 16 is the measured value from the single-node work: 8 starved the cache and
 # unset OOMs. Block size here is 128 tokens, so 16 blocks = 2048 = 4x
 # max_model_len, ample for max_num_seqs=1.
+# --gpu-memory-utilization 0.70, NOT serve_k3.sh's 0.90 default. At 0.90 the
+# startup headroom check failed by ~0.4 GiB: "Free memory on device xpu:2
+# (57.22/63.98 GiB) on startup is less than desired GPU memory utilization
+# (0.9, 57.59 GiB)". The slice is ~10 GiB, so 0.70 is ample and leaves room for
+# whatever else is resident on a shared node.
 bash "$ROOT/serve_k3.sh" --model "$SLICE" --tp 16 --ep --blocks 16 \
+  --gpu-memory-utilization 0.70 \
   --max-model-len 512 --max-num-seqs 1 --max-num-batched-tokens 512 \
   --served-model-name k3slice >"$SERVER_LOG/launcher.log" 2>&1 &
 SERVER_PID=$!
@@ -99,20 +109,20 @@ done
 if [[ $health_rc -ne 0 ]]; then
     echo "SLICE_2N_HEALTH_FAIL"
     grep -iE "error|assert|Traceback" "$SERVER_LOG"/*.log 2>/dev/null | grep -viE "INFO|Route:" | tail -20
-    echo "tp16x2node SERVER_FAILED" > "$LOG_DIR/VERDICT.txt"
+    echo "tp16x2node SERVER_FAILED" > "$JOB_DIR/VERDICT.txt"
     exit 1
 fi
 
 echo; echo "--- single-step prefill-vs-decode (CROSS-NODE) ---"
 timeout 900 "$PYTHON" "$ROOT/probe_prefill_vs_decode.py" \
   --base-url "http://127.0.0.1:$PORT" --model k3slice \
-  --output-dir "$LOG_DIR/single_step" 2>&1 | tail -40
-echo "tp16x2node single_step exit=${PIPESTATUS[0]}" >> "$LOG_DIR/VERDICT.txt"
+  --output-dir "$JOB_DIR/single_step" 2>&1 | tail -40
+echo "tp16x2node single_step exit=${PIPESTATUS[0]}" >> "$JOB_DIR/VERDICT.txt"
 
 echo; echo "--- decode-depth ladder (CROSS-NODE) ---"
 timeout 1800 "$PYTHON" "$ROOT/probe_depth_ladder.py" \
-  "http://127.0.0.1:$PORT" k3slice "$LOG_DIR/ladder" 2>&1 | tail -20
-echo "tp16x2node ladder exit=${PIPESTATUS[0]}" >> "$LOG_DIR/VERDICT.txt"
+  "http://127.0.0.1:$PORT" k3slice "$JOB_DIR/ladder" 2>&1 | tail -20
+echo "tp16x2node ladder exit=${PIPESTATUS[0]}" >> "$JOB_DIR/VERDICT.txt"
 
 echo; echo "=== done $(date -Is) ==="
-cat "$LOG_DIR/VERDICT.txt"
+cat "$JOB_DIR/VERDICT.txt"
