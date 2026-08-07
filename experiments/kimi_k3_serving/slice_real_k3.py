@@ -66,6 +66,13 @@ def main():
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--layers", type=int, default=4)
     parser.add_argument("--experts", type=int, default=8)
+    parser.add_argument(
+        "--topk",
+        type=int,
+        default=None,
+        help="override num_experts_per_token (still clamped to --experts). "
+        "K3's real value is 16, which is what triggers the 2xTopK=8 split.",
+    )
     args = parser.parse_args()
 
     from safetensors import safe_open
@@ -161,7 +168,17 @@ def main():
     text["num_experts"] = args.experts
     if "num_experts_per_token" in text:
         # topk cannot exceed the number of experts that survive the slice.
-        text["num_experts_per_token"] = min(text["num_experts_per_token"], args.experts)
+        #
+        # This clamp is load-bearing and was NOT obvious: an 8-expert slice
+        # silently becomes topk=8, while K3's real topk is 16. topk==16 is the
+        # exact trigger for the 2xTopK=8 split in xpu_moe.py
+        # (_split_topk_inputs fires only at 16), so every 8-expert run skipped
+        # that code path entirely. --topk lets a slice pin topk independently
+        # of expert count, which is what separates "topk" from "expert count"
+        # as the explanation for the DIVERGE seen at 32 experts.
+        text["num_experts_per_token"] = min(
+            args.topk or text["num_experts_per_token"], args.experts
+        )
     # 1-INDEXED lists: [1..layers-1] are KDA, [layers] is the MLA layer, which
     # matches the real checkpoint's layer 3 being its first MLA layer.
     text["linear_attn_config"] = dict(text["linear_attn_config"])
