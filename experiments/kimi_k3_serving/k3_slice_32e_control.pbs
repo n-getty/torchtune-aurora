@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+#PBS -N k3_slice_32e_ctl
+#PBS -l walltime=02:00:00
+#PBS -A AuroraGPT
+#PBS -q capacity
+#PBS -l select=1
+#PBS -l place=scatter
+#PBS -l filesystems=flare:home
+#PBS -o /lus/flare/projects/ModCon/ngetty/torchtune/experiments/kimi_k3_serving/logs/ctl32e.out
+#PBS -e /lus/flare/projects/ModCon/ngetty/torchtune/experiments/kimi_k3_serving/logs/ctl32e.err
+
+# SINGLE-NODE control for the cross-node TP=16 result.
+#
+# WHY THIS IS NEEDED
+# ------------------
+# Cross-node TP=16 agreed (argmax 5/5, no drift with depth) but its
+# prefill-vs-decode maxdiff was ~5x the single-node values:
+#
+#   single-node (15 pts, 8-expert slice) : 0.032-0.094, mean 0.053
+#   cross-node  ( 5 pts, 32-expert slice): 0.067-0.425, mean 0.264
+#
+# Same-path repeat noise also rose, but only ~1.7x -- so the cross-path gap
+# grew MORE than reduction-order noise alone accounts for. That is worth
+# understanding rather than waving through.
+#
+# BUT the comparison is CONFOUNDED: the cross-node run used a 32-expert slice
+# (8 experts cannot shard across 16 EP ranks -- experts_per_rank = 0 -> SIGFPE)
+# while every single-node run used 8 experts. Expert count changes the MoE
+# reduction tree and therefore the FP error accumulation, so the 5x could be
+# expert count, the fabric, or both.
+#
+# This runs the SAME 32-expert slice on ONE node at TP=8+EP. Then:
+#   maxdiff stays ~0.05  -> the 5x is the FABRIC. A real cross-node effect,
+#                           and the first evidence pointing at the multi-node
+#                           hypothesis that the K3 symptom needs.
+#   maxdiff rises to ~0.26 -> the 5x is EXPERT COUNT. Cross-node is unremarkable
+#                           and the fabric hypothesis gains nothing.
+#
+# Either answer is worth having and costs one node.
+
+set -o pipefail   # not -u: Lmod's init dereferences ZSH_EVAL_CONTEXT
+ROOT=/lus/flare/projects/ModCon/ngetty/torchtune/experiments/kimi_k3_serving
+cd "$ROOT" || exit 1
+
+echo "=== 32-expert single-node control job=$PBS_JOBID node=$(hostname) $(date -Is) ==="
+
+# SLICE_OVERRIDE points run_slice_suite.sh at the 32-expert slice instead of
+# its default 8-expert one, so this is a like-for-like comparison.
+export SLICE_OVERRIDE=/lus/flare/projects/ModCon/ngetty/k3-slice-4L32E
+
+run () {
+  local tag="$1"; shift
+  echo; echo "############ $tag ############"
+  timeout 3000 bash "$ROOT/run_slice_suite.sh" "$tag" "$@" || \
+    echo "SUITE $tag FAILED (exit $?) -- continuing"
+  sleep 20
+}
+
+# TP=8+EP matches the cross-node run's EP degree per node as closely as a
+# single node allows, on the identical slice.
+run c32_tp8ep 8 --enable-expert-parallel
+run c32_tp4ep 4 --enable-expert-parallel
+
+echo; echo "=== control done $(date -Is) ==="
+grep -H . "$ROOT"/logs/suite_c32_*/VERDICT.txt 2>/dev/null

@@ -33,13 +33,19 @@ shift 2
 EXTRA=("$@")
 
 ROOT=/lus/flare/projects/ModCon/ngetty/torchtune/experiments/kimi_k3_serving
-SLICE=/lus/flare/projects/ModCon/ngetty/k3-slice-4L8E
+# SLICE_OVERRIDE lets a control job point at a different slice (e.g. the
+# 32-expert one) so cross-node vs single-node can be compared like-for-like.
+SLICE=${SLICE_OVERRIDE:-/lus/flare/projects/ModCon/ngetty/k3-slice-4L8E}
 OUT="$ROOT/logs/suite_${TAG}_$(date +%Y%m%d_%H%M%S)"
 PORT=$((8100 + TP))
 mkdir -p "$OUT"
 
 exec > >(tee -a "$OUT/run.log") 2>&1
 echo "=== suite tag=$TAG tp=$TP extra='${EXTRA[*]:-}' node=$(hostname) $(date -Is) ==="
+# Log the slice. Comparing a 32-expert cross-node run against 8-expert
+# single-node runs produced a 5x maxdiff difference that could not be
+# attributed without knowing this, so record it in every run.
+echo "slice=$SLICE"
 
 module load frameworks >/dev/null 2>&1
 source /flare/ModCon/ngetty/venvs/kimi-k3-xpu-framework/bin/activate 2>/dev/null
