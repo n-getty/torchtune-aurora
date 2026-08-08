@@ -14,12 +14,15 @@ MAX_NUM_SEQS=${MAX_NUM_SEQS:-16}
 MAX_BATCHED_TOKENS=${MAX_BATCHED_TOKENS:-4096}
 GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.90}
 BLOCKS=${BLOCKS:-}
+DIAGNOSTIC_BLOCKS=${DIAGNOSTIC_BLOCKS:-0}
 LOAD_FORMAT=${LOAD_FORMAT:-auto}
 SAFETENSORS_LOAD_STRATEGY=${SAFETENSORS_LOAD_STRATEGY:-}
 MULTITHREAD_LOAD=${MULTITHREAD_LOAD:-0}
 LOAD_THREADS=${LOAD_THREADS:-8}
+MODEL_LOADER_EXTRA_CONFIG=${MODEL_LOADER_EXTRA_CONFIG:-'{"enable_weights_track":true}'}
 SERVED_MODEL_NAME=${SERVED_MODEL_NAME:-}
 EP=${EP:-0}
+RAY_V2=${RAY_V2:-0}
 LOG_DIR=${LOG_DIR:-$(pwd)/logs/$(date +%Y%m%d_%H%M%S)_server}
 STAGE_MODEL=${STAGE_MODEL:-0}
 STAGE_ROOT=${STAGE_ROOT:-/tmp/kimi_k3_models}
@@ -32,10 +35,23 @@ CHECKPOINT_VERIFIER=${CHECKPOINT_VERIFIER:-$SCRIPT_DIR/verify_checkpoint.py}
 K3_JOB_ID=${PBS_JOBID:-${K3_JOB_ID:-}}
 [[ -n "$K3_JOB_ID" ]] || { echo "ERROR: PBS_JOBID or K3_JOB_ID is required" >&2; exit 1; }
 export PBS_JOBID="$K3_JOB_ID"
+export DAOS_AGENT_DRPC_DIR=${DAOS_AGENT_DRPC_DIR:-/run/daos_agent_oneScratch}
+export D_AGENT_DRPC_DIR=${D_AGENT_DRPC_DIR:-/run/daos_agent_oneScratch}
+export VLLM_KIMI_XPU_REQUEST_DIAGNOSTIC_LIMIT=${VLLM_KIMI_XPU_REQUEST_DIAGNOSTIC_LIMIT:-4096}
+for ray_env_name in K3_BLOCK_PROFILE_DIR K3_LOADER_ACCOUNTING_DIR VLLM_KIMI_XPU_REQUEST_DIAGNOSTIC_LIMIT; do
+    if [[ ",${VLLM_RAY_EXTRA_ENV_VARS_TO_COPY:-}," != *,${ray_env_name},* ]]; then
+        VLLM_RAY_EXTRA_ENV_VARS_TO_COPY="${VLLM_RAY_EXTRA_ENV_VARS_TO_COPY:+${VLLM_RAY_EXTRA_ENV_VARS_TO_COPY},}${ray_env_name}"
+    fi
+done
+unset ray_env_name
+export VLLM_RAY_EXTRA_ENV_VARS_TO_COPY
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY
 K3_CACHE_ROOT=${K3_CACHE_ROOT:-/tmp/k3_hf_cache_${K3_JOB_ID//[^A-Za-z0-9_.-]/_}}
 K3_CACHE_MARKER="$K3_CACHE_ROOT/.created_by_${K3_JOB_ID//[^A-Za-z0-9_.-]/_}"
+RAY_TEMP_ID=${K3_JOB_ID%%.*}
+RAY_TEMP_ROOT=${RAY_TEMP_ROOT:-/tmp/k3_ray_${RAY_TEMP_ID}}
 
-usage() { echo "Usage: $0 --model PATH --blocks N [--tp N] [--safetensors-load-strategy STRATEGY] [--multithread-load [N]] [--stage-model] [--stage-only] [--ep]"; }
+usage() { echo "Usage: $0 --model PATH [--diagnostic-blocks N] [--tp N] [--safetensors-load-strategy STRATEGY] [--model-loader-extra-config JSON] [--multithread-load [N]] [--stage-model] [--stage-only] [--ep] [--ray-v2]"; }
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --model) MODEL=$2; shift 2 ;;
@@ -46,7 +62,8 @@ while [[ $# -gt 0 ]]; do
         --max-num-seqs) MAX_NUM_SEQS=$2; shift 2 ;;
         --max-num-batched-tokens) MAX_BATCHED_TOKENS=$2; shift 2 ;;
         --gpu-memory-utilization) GPU_MEM_UTIL=$2; shift 2 ;;
-        --blocks) BLOCKS=$2; shift 2 ;;
+        --blocks) BLOCKS=$2; DIAGNOSTIC_BLOCKS=1; shift 2 ;;
+        --diagnostic-blocks) BLOCKS=$2; DIAGNOSTIC_BLOCKS=1; shift 2 ;;
         --load-format) LOAD_FORMAT=$2; shift 2 ;;
         --safetensors-load-strategy) SAFETENSORS_LOAD_STRATEGY=$2; shift 2 ;;
         --multithread-load)
@@ -58,11 +75,13 @@ while [[ $# -gt 0 ]]; do
                 shift
             fi
             ;;
+        --model-loader-extra-config) MODEL_LOADER_EXTRA_CONFIG=$2; shift 2 ;;
         --served-model-name) SERVED_MODEL_NAME=$2; shift 2 ;;
         --python) PYTHON=$2; shift 2 ;;
         --stage-model) STAGE_MODEL=1; shift ;;
         --stage-only) STAGE_MODEL=1; STAGE_ONLY=1; shift ;;
         --ep) EP=1; shift ;;
+        --ray-v2) RAY_V2=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
     esac
@@ -101,8 +120,9 @@ if [[ ! -f "${PBS_NODEFILE:-}" ]]; then
     done
 fi
 [[ -f "${PBS_NODEFILE:-}" ]] || { echo "ERROR: PBS_NODEFILE does not exist: ${PBS_NODEFILE:-unset}" >&2; exit 1; }
-if [[ "$STAGE_ONLY" != 1 ]]; then
-    [[ -n "$BLOCKS" ]] || { echo "ERROR: --blocks is required" >&2; exit 2; }
+if [[ "$STAGE_ONLY" != 1 && -n "$BLOCKS" && "$DIAGNOSTIC_BLOCKS" != 1 ]]; then
+    echo "ERROR: block override is diagnostic-only; use --diagnostic-blocks" >&2
+    exit 2
 fi
 if [[ "$EP" == 1 ]]; then
     [[ -f "$MODEL/config.json" ]] || { echo "ERROR: EP requires a model config: $MODEL/config.json" >&2; exit 2; }
@@ -112,12 +132,34 @@ if [[ "$EP" == 1 ]]; then
     fi
 fi
 if command -v qstat >/dev/null; then
-    qstat_output=$(qstat -f "$PBS_JOBID" 2>/dev/null) || {
+    # -w (wide) disables qstat's ~80-column line wrapping. Without it, a long
+    # exec_host value (>= ~4-5 nodes' worth of hostnames) wraps onto tab-
+    # indented continuation lines that the single-line awk below silently
+    # truncates -- it grabbed only line 1 of exec_host, cutting a hostname
+    # mid-string (observed on an 8-node job: "...x4704c3s2b0n0/" got cut to
+    # "...x43"), which then always fails the host-count/membership check
+    # below even though the allocation is completely valid. 3-node jobs
+    # never wrapped, so this was invisible until scaling past ~4-5 nodes.
+    qstat_output=$(qstat -f -w "$PBS_JOBID" 2>/dev/null) || {
         echo "ERROR: unable to query PBS job $PBS_JOBID" >&2
         exit 1
     }
     job_state=$(awk -F'= ' '/job_state/ {print $2; exit}' <<<"$qstat_output")
     [[ "$job_state" == R ]] || { echo "ERROR: allocation $PBS_JOBID is not running (state=${job_state:-unknown})" >&2; exit 1; }
+    exec_host=$(awk -F'= ' '/^[[:space:]]*exec_host[[:space:]]*=/ {print $2; exit}' <<<"$qstat_output")
+    [[ -n "$exec_host" ]] || { echo "ERROR: running allocation $PBS_JOBID has no exec_host" >&2; exit 1; }
+    mapfile -t allocated_hosts < <(tr '+' '\n' <<<"$exec_host" | sed -E 's#/.*##; s#\..*$##' | sort -u)
+    mapfile -t nodefile_hosts < <(sed -E 's/[[:space:]].*$//; s#\..*$##' "$PBS_NODEFILE" | sort -u)
+    [[ ${#allocated_hosts[@]} -eq ${#nodefile_hosts[@]} ]] || {
+        echo "ERROR: PBS exec_host/nodefile host-count mismatch: exec_host=${allocated_hosts[*]} nodefile=${nodefile_hosts[*]}" >&2
+        exit 1
+    }
+    for host in "${nodefile_hosts[@]}"; do
+        if ! printf '%s\n' "${allocated_hosts[@]}" | grep -Fxq "$host"; then
+            echo "ERROR: PBS exec_host does not match PBS_NODEFILE host $host: $exec_host" >&2
+            exit 1
+        fi
+    done
 fi
 
 mkdir -p "$LOG_DIR"
@@ -154,6 +196,9 @@ fi
 export no_proxy="${no_proxy:+$no_proxy,}localhost,127.0.0.1"
 export NO_PROXY="$no_proxy"
 export VLLM_TARGET_DEVICE=xpu
+export VLLM_BATCH_INVARIANT=${VLLM_BATCH_INVARIANT:-0}
+export VLLM_XPU_DETERMINISTIC_ROUTING=${VLLM_XPU_DETERMINISTIC_ROUTING:-1}
+export VLLM_XPU_DETERMINISTIC_MOE_GATHER=${VLLM_XPU_DETERMINISTIC_MOE_GATHER:-1}
 mapfile -t NODES < <(sort -u "$PBS_NODEFILE")
 [[ ${#NODES[@]} -gt 0 ]] || { echo "ERROR: PBS_NODEFILE has no nodes" >&2; exit 1; }
 if [[ "$TP" == 32 && ${#NODES[@]} -lt 3 ]]; then
@@ -248,21 +293,236 @@ resolve_node_ip() {
 HEAD_IP=$(resolve_node_ip "$HEAD")
 [[ -n "$HEAD_IP" ]] || { echo "ERROR: cannot resolve allocation head node $HEAD" >&2; exit 1; }
 RAY_ADDRESS=${RAY_ADDRESS:-$HEAD_IP:6379}
+capture_device_snapshot() {
+    local output=$1
+    "$PYTHON" - <<'PY' 2>"${output%.json}.err" | awk '/^\{/{json=$0} END {if (json != "") print json}' >"$output"
+import json
+import os
+import socket
+from datetime import datetime, timezone
+
+import torch
+
+snapshot = {
+    "timestamp": datetime.now(timezone.utc).isoformat(),
+    "hostname": socket.gethostname(),
+    "env": {
+        key: os.environ.get(key)
+        for key in ("LOCAL_RANK", "RANK", "WORLD_SIZE", "ZE_AFFINITY_MASK", "VLLM_HOST_IP")
+    },
+    "xpu_available": bool(torch.xpu.is_available()),
+    "xpu_device_count": 0,
+    "devices": [],
+}
+if snapshot["xpu_available"]:
+    snapshot["xpu_device_count"] = torch.xpu.device_count()
+    for device_index in range(snapshot["xpu_device_count"]):
+        try:
+            free_bytes, total_bytes = torch.xpu.mem_get_info(device_index)
+            snapshot["devices"].append(
+                {"index": device_index, "free_bytes": free_bytes, "total_bytes": total_bytes}
+            )
+        except Exception as error:
+            snapshot["devices"].append({"index": device_index, "error": repr(error)})
+print(json.dumps(snapshot, sort_keys=True))
+PY
+}
+capture_device_snapshot "$LOG_DIR/device_snapshot_$(hostname -s).json"
+for node in "${NODES[@]}"; do
+    [[ "${node%%.*}" == "$CURRENT_NODE" ]] && continue
+    ssh -o BatchMode=yes -o ConnectTimeout=15 "$node" \
+        "source '$RAY_ENV' frameworks; $PYTHON -" \
+        < <(cat <<'PY'
+import json
+import os
+import socket
+from datetime import datetime, timezone
+
+import torch
+
+snapshot = {
+    "timestamp": datetime.now(timezone.utc).isoformat(),
+    "hostname": socket.gethostname(),
+    "env": {
+        key: os.environ.get(key)
+        for key in ("LOCAL_RANK", "RANK", "WORLD_SIZE", "ZE_AFFINITY_MASK", "VLLM_HOST_IP")
+    },
+    "xpu_available": bool(torch.xpu.is_available()),
+    "xpu_device_count": 0,
+    "devices": [],
+}
+if snapshot["xpu_available"]:
+    snapshot["xpu_device_count"] = torch.xpu.device_count()
+    for device_index in range(snapshot["xpu_device_count"]):
+        try:
+            free_bytes, total_bytes = torch.xpu.mem_get_info(device_index)
+            snapshot["devices"].append(
+                {"index": device_index, "free_bytes": free_bytes, "total_bytes": total_bytes}
+            )
+        except Exception as error:
+            snapshot["devices"].append({"index": device_index, "error": repr(error)})
+print(json.dumps(snapshot, sort_keys=True))
+PY
+        ) 2>"$LOG_DIR/device_snapshot_${node%%.*}.err" | awk '/^\{/{json=$0} END {if (json != "") print json}' >"$LOG_DIR/device_snapshot_${node%%.*}.json" || {
+            echo "WARNING: device snapshot failed on $node; see $LOG_DIR/device_snapshot_${node%%.*}.err" | tee -a "$LOG_DIR/metadata"
+        }
+done
 echo "model=$MODEL model_for_server=$MODEL_FOR_SERVER tp=$TP pp=$PP nodes=${NODES[*]}" | tee "$LOG_DIR/metadata"
 echo "node=$(hostname) start=$(date -Is)" | tee -a "$LOG_DIR/metadata"
+echo "job_id=$PBS_JOBID ep=$EP diagnostic_blocks=$DIAGNOSTIC_BLOCKS blocks=${BLOCKS:-none} gpu_memory_utilization=$GPU_MEM_UTIL max_model_len=$MAX_MODEL_LEN max_num_seqs=$MAX_NUM_SEQS max_num_batched_tokens=$MAX_BATCHED_TOKENS" | tee -a "$LOG_DIR/metadata"
 echo "k3_cache_root=$K3_CACHE_ROOT hf_home=$HF_HOME hf_modules_cache=$HF_MODULES_CACHE hf_hub_cache=$HF_HUB_CACHE transformers_cache=$TRANSFORMERS_CACHE xdg_cache_home=$XDG_CACHE_HOME" | tee -a "$LOG_DIR/metadata"
-echo "load_format=$LOAD_FORMAT safetensors_load_strategy=${SAFETENSORS_LOAD_STRATEGY:-default} multithread_load=$MULTITHREAD_LOAD load_threads=$LOAD_THREADS" | tee -a "$LOG_DIR/metadata"
+echo "load_format=$LOAD_FORMAT safetensors_load_strategy=${SAFETENSORS_LOAD_STRATEGY:-default} multithread_load=$MULTITHREAD_LOAD load_threads=$LOAD_THREADS model_loader_extra_config=${MODEL_LOADER_EXTRA_CONFIG:-none}" | tee -a "$LOG_DIR/metadata"
+echo "ray_v2=$RAY_V2 ray_temp_root=$RAY_TEMP_ROOT" | tee -a "$LOG_DIR/metadata"
+echo "vllm_batch_invariant=$VLLM_BATCH_INVARIANT" | tee -a "$LOG_DIR/metadata"
+echo "vllm_xpu_deterministic_routing=$VLLM_XPU_DETERMINISTIC_ROUTING" | tee -a "$LOG_DIR/metadata"
+echo "vllm_xpu_deterministic_moe_gather=$VLLM_XPU_DETERMINISTIC_MOE_GATHER" | tee -a "$LOG_DIR/metadata"
+if [[ -d "$VLLM_SRC/.git" ]]; then
+    vllm_commit=$(git -C "$VLLM_SRC" rev-parse HEAD)
+    git -C "$VLLM_SRC" status --porcelain=v1 >"$LOG_DIR/vllm_status.txt"
+    git -C "$VLLM_SRC" diff --binary HEAD >"$LOG_DIR/vllm_dirty.patch"
+    mapfile -t vllm_untracked < <(git -C "$VLLM_SRC" ls-files --others --exclude-standard)
+    if [[ ${#vllm_untracked[@]} -gt 0 ]]; then
+        tar -C "$VLLM_SRC" -cf "$LOG_DIR/vllm_untracked.tar" "${vllm_untracked[@]}"
+    fi
+    vllm_diff_id=$(sha256sum "$LOG_DIR/vllm_dirty.patch" | awk '{print $1}')
+    echo "vllm_commit=$vllm_commit vllm_diff_sha256=$vllm_diff_id vllm_status=$LOG_DIR/vllm_status.txt vllm_dirty_patch=$LOG_DIR/vllm_dirty.patch" | tee -a "$LOG_DIR/metadata"
+fi
+"$PYTHON" - <<'PY' >"$LOG_DIR/framework_versions.json"
+import importlib.metadata
+import json
+
+packages = ("torch", "transformers", "ray", "vllm", "triton")
+versions = {}
+for package in packages:
+    try:
+        versions[package] = importlib.metadata.version(package)
+    except importlib.metadata.PackageNotFoundError:
+        versions[package] = None
+print(json.dumps(versions, sort_keys=True))
+PY
+FRAMEWORK_VERSIONS_FILE="$LOG_DIR/framework_versions.json"
+if [[ -d "$VLLM_SRC/.git" ]]; then
+    VLLM_COMMIT=$(git -C "$VLLM_SRC" rev-parse HEAD)
+    VLLM_DIFF_SHA256=$(sha256sum "$LOG_DIR/vllm_dirty.patch" | awk '{print $1}')
+else
+    VLLM_COMMIT=NA
+    VLLM_DIFF_SHA256=NA
+fi
+DEVICE_SNAPSHOT_DIR="$LOG_DIR"
+BLOCK_PROFILE_DIR="$LOG_DIR/block_profile"
+mkdir -p "$BLOCK_PROFILE_DIR"
+BLOCK_PROFILE="$LOG_DIR/block_profile.json"
+K3_BLOCK_PROFILE_DIR="$BLOCK_PROFILE_DIR"
+LOADER_ACCOUNTING_DIR="$LOG_DIR/loader_accounting"
+mkdir -p "$LOADER_ACCOUNTING_DIR"
+K3_LOADER_ACCOUNTING_DIR="$LOADER_ACCOUNTING_DIR"
+export MODEL MODEL_FOR_SERVER SERVED_MODEL_NAME TP PP EP BLOCKS VLLM_COMMIT VLLM_DIFF_SHA256 FRAMEWORK_VERSIONS_FILE DEVICE_SNAPSHOT_DIR BLOCK_PROFILE_DIR K3_BLOCK_PROFILE_DIR BLOCK_PROFILE LOADER_ACCOUNTING_DIR K3_LOADER_ACCOUNTING_DIR
+echo "framework_versions=$LOG_DIR/framework_versions.json" | tee -a "$LOG_DIR/metadata"
+env | sort | grep -E '^(CCL_|FI_PROVIDER|ZE_|VLLM_|TORCH|PYTORCH_|HF_|TRANSFORMERS_|XDG_|RAY_|PYTHONPATH|LD_LIBRARY_PATH|PBS_JOBID|K3_BLOCK_PROFILE)' >"$LOG_DIR/effective_environment.txt" || true
+echo "effective_environment=$LOG_DIR/effective_environment.txt" | tee -a "$LOG_DIR/metadata"
+"$PYTHON" - "$LOG_DIR/metadata.json" <<'PY'
+import json
+import os
+import sys
+
+metadata = {
+    "job_id": os.environ["PBS_JOBID"],
+    "model": os.environ["MODEL"],
+    "model_source": os.environ["MODEL"],
+    "served_model": os.environ.get("SERVED_MODEL_NAME") or os.environ["MODEL_FOR_SERVER"],
+    "framework_versions": json.dumps(json.load(open(os.environ["FRAMEWORK_VERSIONS_FILE"])), sort_keys=True),
+    "vllm_commit": os.environ["VLLM_COMMIT"],
+    "vllm_diff_sha256": os.environ["VLLM_DIFF_SHA256"],
+    "daos_path": os.environ["MODEL"],
+    "device_snapshot_dir": os.environ["DEVICE_SNAPSHOT_DIR"],
+    "block_profile": os.environ["BLOCK_PROFILE"],
+    "loader_accounting": os.environ["LOADER_ACCOUNTING_DIR"],
+    "strict_weight_tracking": True,
+    "request_diagnostic_limit": int(
+        os.environ["VLLM_KIMI_XPU_REQUEST_DIAGNOSTIC_LIMIT"]
+    ),
+    "nodes": [line.strip() for line in open(os.environ["PBS_NODEFILE"]) if line.strip()],
+    "server": {
+        "tp": int(os.environ["TP"]),
+        "pp": int(os.environ["PP"]),
+        "ep": int(os.environ["EP"]),
+        "blocks": os.environ.get("BLOCKS") or "none",
+    },
+}
+with open(sys.argv[1], "w") as handle:
+    json.dump(metadata, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+PY
+"$PYTHON" - "$LOADER_ACCOUNTING_DIR/expected.json" "$MODEL" <<'PY'
+import hashlib
+import json
+import sys
+
+with open(sys.argv[2] + "/model.safetensors.index.json") as handle:
+    names = sorted(json.load(handle)["weight_map"])
+skipped = [name for name in names if name.startswith(("vision_tower.", "mm_projector."))]
+unexpected = [
+    name for name in names
+    if not name.startswith(("language_model.", "vision_tower.", "mm_projector."))
+]
+record = {
+    "checkpoint_tensor_count": len(names),
+    "skipped_multimodal_count": len(skipped),
+    "skipped_multimodal_sha256": hashlib.sha256("\n".join(skipped).encode()).hexdigest(),
+    "unexpected_count": len(unexpected),
+    "strict_tracking_requested": True,
+}
+with open(sys.argv[1], "w") as handle:
+    json.dump(record, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+PY
+echo "loader_accounting=$LOADER_ACCOUNTING_DIR expected=$LOADER_ACCOUNTING_DIR/expected.json" | tee -a "$LOG_DIR/metadata"
+echo "canonical_metadata=$LOG_DIR/metadata.json" | tee -a "$LOG_DIR/metadata"
+"$PYTHON" - "$BLOCK_PROFILE" "$BLOCK_PROFILE_DIR" <<'PY'
+import json
+import os
+import sys
+from datetime import datetime, timezone
+
+profile = {
+    "schema": "k3-block-profile-v1",
+    "created_at": datetime.now(timezone.utc).isoformat(),
+    "job_id": os.environ["PBS_JOBID"],
+    "records_dir": sys.argv[2],
+    "expected_world_size": int(os.environ["TP"]) * int(os.environ["PP"]),
+    "override_requested": bool(os.environ.get("BLOCKS")),
+    "records": [],
+}
+with open(sys.argv[1], "w") as handle:
+    json.dump(profile, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+PY
+echo "block_profile=$BLOCK_PROFILE block_profile_dir=$BLOCK_PROFILE_DIR" | tee -a "$LOG_DIR/metadata"
 
 ARGS=(--model "$MODEL_FOR_SERVER" --tensor-parallel-size "$TP" --pipeline-parallel-size "$PP"
     --port "$PORT" --host 0.0.0.0 --enforce-eager --trust-remote-code
     --model-impl vllm --dtype bfloat16 --load-format "$LOAD_FORMAT" --gpu-memory-utilization "$GPU_MEM_UTIL"
     --max-model-len "$MAX_MODEL_LEN" --max-num-seqs "$MAX_NUM_SEQS"
-    --max-num-batched-tokens "$MAX_BATCHED_TOKENS" --num-gpu-blocks-override "$BLOCKS")
+    --max-num-batched-tokens "$MAX_BATCHED_TOKENS")
+if [[ -n "$BLOCKS" ]]; then
+    ARGS+=(--num-gpu-blocks-override "$BLOCKS")
+fi
 if [[ -n "$SAFETENSORS_LOAD_STRATEGY" ]]; then
     ARGS+=(--safetensors-load-strategy "$SAFETENSORS_LOAD_STRATEGY")
 fi
-if [[ "$MULTITHREAD_LOAD" == 1 ]]; then
-    ARGS+=(--model-loader-extra-config "{\"enable_multithread_load\":true,\"num_threads\":$LOAD_THREADS}")
+if [[ "$MULTITHREAD_LOAD" == 1 || -n "$MODEL_LOADER_EXTRA_CONFIG" ]]; then
+    loader_config=$($PYTHON - "$MODEL_LOADER_EXTRA_CONFIG" "$MULTITHREAD_LOAD" "$LOAD_THREADS" <<'PY'
+import json
+import sys
+
+raw, multithread, threads = sys.argv[1:]
+config = json.loads(raw) if raw else {}
+if multithread == "1":
+    config.update(enable_multithread_load=True, num_threads=int(threads))
+print(json.dumps(config, separators=(",", ":")))
+PY
+    )
+    ARGS+=(--model-loader-extra-config "$loader_config")
 fi
 if [[ -n "$SERVED_MODEL_NAME" ]]; then
     ARGS+=(--served-model-name "$SERVED_MODEL_NAME")
@@ -304,25 +564,62 @@ else
     export CCL_PROCESS_LAUNCHER=none CCL_ATL_TRANSPORT=ofi FI_PROVIDER=cxi
     export CCL_KVS_IFACE=${CCL_KVS_IFACE:-hsn0}
     export ZE_FLAT_DEVICE_HIERARCHY=FLAT VLLM_WORKER_MULTIPROC_METHOD=spawn
+    export RAY_EXPERIMENTAL_NOSET_ONEAPI_DEVICE_SELECTOR=1
+    export RAY_DEDUP_LOGS=0
+    export VLLM_USE_RAY_V2_EXECUTOR_BACKEND="$RAY_V2"
     export PYTORCH_ALLOC_CONF=
-    ray stop --force >/dev/null 2>&1 || true
+    mkdir -p "$RAY_TEMP_ROOT"
+    stop_owned_ray() {
+        local ray_root=$1 pid
+        mapfile -t owned_pids < <(
+            ps -eo pid=,args= | awk -v root="$ray_root" \
+                'index($0, root) {print $1}'
+        )
+        for pid in "${owned_pids[@]}"; do
+            [[ "$pid" == "$BASHPID" ]] && continue
+            kill -TERM "$pid" 2>/dev/null || true
+        done
+        sleep 2
+        mapfile -t owned_pids < <(
+            ps -eo pid=,args= | awk -v root="$ray_root" \
+                'index($0, root) {print $1}'
+        )
+        for pid in "${owned_pids[@]}"; do
+            [[ "$pid" == "$BASHPID" ]] && continue
+            kill -KILL "$pid" 2>/dev/null || true
+        done
+    }
+    stop_owned_ray "$RAY_TEMP_ROOT"
     ray_pids=()
+    preserve_ray_logs() {
+        local node
+        mkdir -p "$LOG_DIR/ray_sessions/head"
+        cp -a "$RAY_TEMP_ROOT/session_latest/logs" "$LOG_DIR/ray_sessions/head/" 2>/dev/null || true
+        for node in "${NODES[@]}"; do
+            [[ "$node" == "$HEAD" ]] && continue
+            mkdir -p "$LOG_DIR/ray_sessions/${node}"
+            ssh -o BatchMode=yes -o ConnectTimeout=5 "$node" \
+                "if [ -d '$RAY_TEMP_ROOT/session_latest/logs' ]; then tar -C '$RAY_TEMP_ROOT/session_latest' -cf - logs; fi" \
+                >"$LOG_DIR/ray_sessions/${node}/logs.tar" 2>/dev/null || true
+        done
+    }
     cleanup_ray_workers() {
         local pid node
+        preserve_ray_logs
         for pid in "${ray_pids[@]}"; do
             kill "$pid" 2>/dev/null || true
         done
         for node in "${NODES[@]}"; do
             [[ "$node" == "$HEAD" ]] && continue
             ssh -o BatchMode=yes -o ConnectTimeout=5 "$node" \
-                "ray stop --force >/dev/null 2>&1 || true; if [ -f '$K3_CACHE_MARKER' ] && grep -Fxq '$PBS_JOBID' '$K3_CACHE_MARKER'; then rm -rf -- '$K3_CACHE_ROOT'; fi" >/dev/null 2>&1 || true
+                "self=\$\$; mapfile -t pids < <(ps -eo pid=,args= | awk -v root='$RAY_TEMP_ROOT' -v self=\"\$self\" 'index(\$0, root) && \$1 != self {print \$1}'); for pid in \"\${pids[@]}\"; do kill -TERM \"\$pid\" 2>/dev/null || true; done; sleep 2; mapfile -t pids < <(ps -eo pid=,args= | awk -v root='$RAY_TEMP_ROOT' -v self=\"\$self\" 'index(\$0, root) && \$1 != self {print \$1}'); for pid in \"\${pids[@]}\"; do kill -KILL \"\$pid\" 2>/dev/null || true; done; if [ -f '$K3_CACHE_MARKER' ] && grep -Fxq '$PBS_JOBID' '$K3_CACHE_MARKER'; then rm -rf -- '$K3_CACHE_ROOT'; fi" >/dev/null 2>&1 || true
         done
-        ray stop --force >/dev/null 2>&1 || true
+        stop_owned_ray "$RAY_TEMP_ROOT"
         cleanup_cache
     }
     trap cleanup_ray_workers EXIT
     if ! ray start --head --node-ip-address="$HEAD_IP" --port=6379 \
-        --num-gpus="${NUM_GPUS:-12}" --num-cpus=4 --temp-dir=/tmp --include-dashboard=false \
+        --num-gpus="${NUM_GPUS:-12}" --num-cpus=4 --temp-dir="$RAY_TEMP_ROOT" --include-dashboard=false \
         >"$LOG_DIR/ray_head.log" 2>&1; then
         echo "ERROR: Ray head failed to start; see $LOG_DIR/ray_head.log" >&2
         exit 1
@@ -344,10 +641,25 @@ else
     remote_ze_flat_device_hierarchy_q=$(printf '%q' "$ZE_FLAT_DEVICE_HIERARCHY")
     remote_vllm_worker_method_q=$(printf '%q' "$VLLM_WORKER_MULTIPROC_METHOD")
     remote_vllm_target_device_q=$(printf '%q' "$VLLM_TARGET_DEVICE")
+    remote_ray_no_set_oneapi_q=$(printf '%q' "$RAY_EXPERIMENTAL_NOSET_ONEAPI_DEVICE_SELECTOR")
+    remote_ray_dedup_logs_q=$(printf '%q' "$RAY_DEDUP_LOGS")
+    remote_ray_v2_q=$(printf '%q' "$RAY_V2")
+    remote_kda_xpu_diagnostics_q=$(printf '%q' "${VLLM_KDA_XPU_DIAGNOSTICS:-0}")
+    remote_vllm_batch_invariant_q=$(printf '%q' "$VLLM_BATCH_INVARIANT")
+    remote_vllm_xpu_deterministic_routing_q=$(printf '%q' "$VLLM_XPU_DETERMINISTIC_ROUTING")
+    remote_vllm_xpu_deterministic_moe_gather_q=$(printf '%q' "$VLLM_XPU_DETERMINISTIC_MOE_GATHER")
+    remote_kimi_xpu_diagnostics_q=$(printf '%q' "${VLLM_KIMI_XPU_DIAGNOSTICS:-0}")
+    remote_kimi_xpu_request_diagnostic_limit_q=$(printf '%q' "${VLLM_KIMI_XPU_REQUEST_DIAGNOSTIC_LIMIT:-4096}")
+    remote_daos_agent_drpc_q=$(printf '%q' "$DAOS_AGENT_DRPC_DIR")
+    remote_d_agent_drpc_q=$(printf '%q' "$D_AGENT_DRPC_DIR")
+    remote_ray_temp_root_q=$(printf '%q' "$RAY_TEMP_ROOT")
+    remote_k3_block_profile_dir_q=$(printf '%q' "$K3_BLOCK_PROFILE_DIR")
+    remote_k3_loader_accounting_dir_q=$(printf '%q' "$K3_LOADER_ACCOUNTING_DIR")
+    remote_ray_extra_env_vars_q=$(printf '%q' "$VLLM_RAY_EXTRA_ENV_VARS_TO_COPY")
     for node in "${NODES[@]}"; do
         [[ "$node" == "$HEAD" ]] && continue
-        ssh -o BatchMode=yes -o ConnectTimeout=15 "$node" "source '$RAY_ENV' frameworks; export K3_CACHE_ROOT=$remote_cache_root_q K3_CACHE_MARKER=$remote_cache_marker_q HF_HOME=$remote_hf_home_q HF_MODULES_CACHE=$remote_hf_modules_cache_q HF_HUB_CACHE=$remote_hf_hub_cache_q TRANSFORMERS_CACHE=$remote_transformers_cache_q XDG_CACHE_HOME=$remote_xdg_cache_home_q PYTHONPATH=$remote_pythonpath_q LD_LIBRARY_PATH=$remote_ld_library_path_q no_proxy=$remote_no_proxy_q NO_PROXY=$remote_no_proxy_q CCL_PROCESS_LAUNCHER=$remote_ccl_process_launcher_q CCL_ATL_TRANSPORT=$remote_ccl_atl_transport_q CCL_KVS_IFACE=$remote_ccl_kvs_iface_q FI_PROVIDER=$remote_fi_provider_q ZE_FLAT_DEVICE_HIERARCHY=$remote_ze_flat_device_hierarchy_q VLLM_WORKER_MULTIPROC_METHOD=$remote_vllm_worker_method_q VLLM_TARGET_DEVICE=$remote_vllm_target_device_q; if [ -e $remote_cache_root_q ]; then echo 'ERROR: remote K3 cache already exists' >&2; exit 1; fi; mkdir $remote_cache_root_q; printf '%s\\n' '$PBS_JOBID' >$remote_cache_marker_q; ray stop --force >/dev/null 2>&1 || true; ray start --address='$RAY_ADDRESS' --num-gpus='${NUM_GPUS:-12}' --num-cpus=4 --temp-dir=/tmp --block" \
-            >"$LOG_DIR/ray_${node}.log" 2>&1 &
+        ssh -o BatchMode=yes -o ConnectTimeout=15 "$node" "source '$RAY_ENV' frameworks; unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY; export K3_CACHE_ROOT=$remote_cache_root_q K3_CACHE_MARKER=$remote_cache_marker_q HF_HOME=$remote_hf_home_q HF_MODULES_CACHE=$remote_hf_modules_cache_q HF_HUB_CACHE=$remote_hf_hub_cache_q TRANSFORMERS_CACHE=$remote_transformers_cache_q XDG_CACHE_HOME=$remote_xdg_cache_home_q PYTHONPATH=$remote_pythonpath_q LD_LIBRARY_PATH=$remote_ld_library_path_q no_proxy=$remote_no_proxy_q NO_PROXY=$remote_no_proxy_q CCL_PROCESS_LAUNCHER=$remote_ccl_process_launcher_q CCL_ATL_TRANSPORT=$remote_ccl_atl_transport_q CCL_KVS_IFACE=$remote_ccl_kvs_iface_q FI_PROVIDER=$remote_fi_provider_q ZE_FLAT_DEVICE_HIERARCHY=$remote_ze_flat_device_hierarchy_q VLLM_WORKER_MULTIPROC_METHOD=$remote_vllm_worker_method_q VLLM_TARGET_DEVICE=$remote_vllm_target_device_q VLLM_BATCH_INVARIANT=$remote_vllm_batch_invariant_q VLLM_XPU_DETERMINISTIC_ROUTING=$remote_vllm_xpu_deterministic_routing_q VLLM_XPU_DETERMINISTIC_MOE_GATHER=$remote_vllm_xpu_deterministic_moe_gather_q VLLM_KIMI_XPU_DIAGNOSTICS=$remote_kimi_xpu_diagnostics_q VLLM_KIMI_XPU_REQUEST_DIAGNOSTIC_LIMIT=$remote_kimi_xpu_request_diagnostic_limit_q RAY_EXPERIMENTAL_NOSET_ONEAPI_DEVICE_SELECTOR=$remote_ray_no_set_oneapi_q RAY_DEDUP_LOGS=$remote_ray_dedup_logs_q VLLM_USE_RAY_V2_EXECUTOR_BACKEND=$remote_ray_v2_q VLLM_KDA_XPU_DIAGNOSTICS=$remote_kda_xpu_diagnostics_q VLLM_RAY_EXTRA_ENV_VARS_TO_COPY=$remote_ray_extra_env_vars_q DAOS_AGENT_DRPC_DIR=$remote_daos_agent_drpc_q D_AGENT_DRPC_DIR=$remote_d_agent_drpc_q K3_BLOCK_PROFILE_DIR=$remote_k3_block_profile_dir_q K3_LOADER_ACCOUNTING_DIR=$remote_k3_loader_accounting_dir_q; if [ -e $remote_cache_root_q ]; then echo 'ERROR: remote K3 cache already exists' >&2; exit 1; fi; mkdir $remote_cache_root_q; mkdir -p $remote_ray_temp_root_q; printf '%s\\n' '$PBS_JOBID' >$remote_cache_marker_q; self=\$\$; mapfile -t pids < <(ps -eo pid=,args= | awk -v root='$RAY_TEMP_ROOT' -v self=\"\$self\" 'index(\$0, root) && \$1 != self {print \$1}'); for pid in \"\${pids[@]}\"; do kill -TERM \"\$pid\" 2>/dev/null || true; done; sleep 2; mapfile -t pids < <(ps -eo pid=,args= | awk -v root='$RAY_TEMP_ROOT' -v self=\"\$self\" 'index(\$0, root) && \$1 != self {print \$1}'); for pid in \"\${pids[@]}\"; do kill -KILL \"\$pid\" 2>/dev/null || true; done; ray start --address='$RAY_ADDRESS' --num-gpus='${NUM_GPUS:-12}' --num-cpus=4 --temp-dir=$remote_ray_temp_root_q --block" \
+        >"$LOG_DIR/ray_${node}.log" 2>&1 &
         ray_pids+=("$!")
     done
     sleep 10
