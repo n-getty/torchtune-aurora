@@ -237,5 +237,18 @@ json.dump({"runs": runs}, open(f"{out}/long_decode.json", "w"), indent=2)
 PY
 verdict "tp=$TP long_decode exit=${PIPESTATUS[0]}"
 
+echo; echo "--- server health scan (K3 crash signatures) ---"
+# scripts/check_run_health.sh keys on GRPO/SFT training-loop log markers and
+# would falsely call a healthy vLLM serving log DEGRADED (it never emits
+# "TIMING step=" etc). Use the K3-specific scanner instead: it checks the
+# SERVER's own log for banned:1/SIGABRT/ActorDiedError/RayChannelTimeoutError,
+# which a probe's clean exit code alone would not catch (e.g. the server can
+# crash on a later request after earlier ones in the same probe succeeded).
+if "$ROOT/check_k3_serving_health.sh" "$OUT/server.log" 2>&1 | tee "$OUT/health_scan.log"; then
+  verdict "tp=$TP HEALTH_SCAN_GREEN"
+else
+  verdict "tp=$TP HEALTH_SCAN_DEGRADED"
+fi
+
 echo; echo "=== suite done $(date -Is) ==="
 cat "$OUT/VERDICT.txt"

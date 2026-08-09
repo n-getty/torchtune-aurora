@@ -23,6 +23,7 @@ MODEL_LOADER_EXTRA_CONFIG=${MODEL_LOADER_EXTRA_CONFIG:-'{"enable_weights_track":
 SERVED_MODEL_NAME=${SERVED_MODEL_NAME:-}
 EP=${EP:-0}
 RAY_V2=${RAY_V2:-0}
+ASYNC_SCHEDULING=${ASYNC_SCHEDULING:-}
 LOG_DIR=${LOG_DIR:-$(pwd)/logs/$(date +%Y%m%d_%H%M%S)_server}
 STAGE_MODEL=${STAGE_MODEL:-0}
 STAGE_ROOT=${STAGE_ROOT:-/tmp/kimi_k3_models}
@@ -38,6 +39,9 @@ export PBS_JOBID="$K3_JOB_ID"
 export DAOS_AGENT_DRPC_DIR=${DAOS_AGENT_DRPC_DIR:-/run/daos_agent_oneScratch}
 export D_AGENT_DRPC_DIR=${D_AGENT_DRPC_DIR:-/run/daos_agent_oneScratch}
 export VLLM_KIMI_XPU_REQUEST_DIAGNOSTIC_LIMIT=${VLLM_KIMI_XPU_REQUEST_DIAGNOSTIC_LIMIT:-4096}
+export VLLM_KIMI_XPU_KDA_VECTORIZED=${VLLM_KIMI_XPU_KDA_VECTORIZED:-0}
+export VLLM_KIMI_XPU_CONV1D_VECTORIZED=${VLLM_KIMI_XPU_CONV1D_VECTORIZED:-0}
+export VLLM_XPU_ALLOW_TRITON_SAMPLER=${VLLM_XPU_ALLOW_TRITON_SAMPLER:-0}
 for ray_env_name in K3_BLOCK_PROFILE_DIR K3_LOADER_ACCOUNTING_DIR VLLM_KIMI_XPU_REQUEST_DIAGNOSTIC_LIMIT; do
     if [[ ",${VLLM_RAY_EXTRA_ENV_VARS_TO_COPY:-}," != *,${ray_env_name},* ]]; then
         VLLM_RAY_EXTRA_ENV_VARS_TO_COPY="${VLLM_RAY_EXTRA_ENV_VARS_TO_COPY:+${VLLM_RAY_EXTRA_ENV_VARS_TO_COPY},}${ray_env_name}"
@@ -82,6 +86,8 @@ while [[ $# -gt 0 ]]; do
         --stage-only) STAGE_MODEL=1; STAGE_ONLY=1; shift ;;
         --ep) EP=1; shift ;;
         --ray-v2) RAY_V2=1; shift ;;
+        --no-async-scheduling) ASYNC_SCHEDULING=0; shift ;;
+        --async-scheduling) ASYNC_SCHEDULING=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
     esac
@@ -198,7 +204,30 @@ export NO_PROXY="$no_proxy"
 export VLLM_TARGET_DEVICE=xpu
 export VLLM_BATCH_INVARIANT=${VLLM_BATCH_INVARIANT:-0}
 export VLLM_XPU_DETERMINISTIC_ROUTING=${VLLM_XPU_DETERMINISTIC_ROUTING:-1}
-export VLLM_XPU_DETERMINISTIC_MOE_GATHER=${VLLM_XPU_DETERMINISTIC_MOE_GATHER:-1}
+# Default 0: =1 is the slow hand-patched Python row-gather (~4.5x cost) and
+# also alters numerics; the Step-5 correctness pass against HF ground truth
+# used =0. See the K3 investigation plan (Step 1) -- =1 is opt-in only for
+# deliberate A/B, not a safe default.
+export VLLM_XPU_DETERMINISTIC_MOE_GATHER=${VLLM_XPU_DETERMINISTIC_MOE_GATHER:-0}
+# Timeouts as a safety net, not a fix (see plan step 4): these stop a
+# slow-but-progressing run from being killed. ray_executor.py:556 uses
+# os.environ.setdefault for RAY_CGRAPH_get_timeout, so an external export
+# here wins over vLLM's 300s default. Must be exported before `ray.dag` is
+# imported (i.e. before any Ray/vLLM Python process starts), which is
+# everywhere below this point in the script.
+export RAY_CGRAPH_get_timeout=${RAY_CGRAPH_get_timeout:-300}
+export RAY_CGRAPH_submit_timeout=${RAY_CGRAPH_submit_timeout:-300}
+export VLLM_RPC_TIMEOUT=${VLLM_RPC_TIMEOUT:-120000}
+# Separate from all three above: this is the single-node `mp` executor's OWN
+# RPC timeout (multiproc_executor.py's get_response -> "RPC call to
+# sample_tokens timed out"), independent of the Ray-path timeouts. Found via
+# the K3 investigation plan's Step 4 48B ladder: the KDA/causal_conv1d Python
+# fallback exceeded the 300s default on a 64-token prompt (TP=2, single node)
+# and killed the engine with EngineDeadError, orphaning both worker
+# processes. Raise it the same way, as a safety net -- it does not make the
+# fallback path fast, it just stops a slow-but-progressing single-node run
+# from being killed at exactly the boundary this flag's default sits at.
+export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=${VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS:-900}
 mapfile -t NODES < <(sort -u "$PBS_NODEFILE")
 [[ ${#NODES[@]} -gt 0 ]] || { echo "ERROR: PBS_NODEFILE has no nodes" >&2; exit 1; }
 if [[ "$TP" == 32 && ${#NODES[@]} -lt 3 ]]; then
@@ -418,8 +447,6 @@ mkdir -p "$LOADER_ACCOUNTING_DIR"
 K3_LOADER_ACCOUNTING_DIR="$LOADER_ACCOUNTING_DIR"
 export MODEL MODEL_FOR_SERVER SERVED_MODEL_NAME TP PP EP BLOCKS VLLM_COMMIT VLLM_DIFF_SHA256 FRAMEWORK_VERSIONS_FILE DEVICE_SNAPSHOT_DIR BLOCK_PROFILE_DIR K3_BLOCK_PROFILE_DIR BLOCK_PROFILE LOADER_ACCOUNTING_DIR K3_LOADER_ACCOUNTING_DIR
 echo "framework_versions=$LOG_DIR/framework_versions.json" | tee -a "$LOG_DIR/metadata"
-env | sort | grep -E '^(CCL_|FI_PROVIDER|ZE_|VLLM_|TORCH|PYTORCH_|HF_|TRANSFORMERS_|XDG_|RAY_|PYTHONPATH|LD_LIBRARY_PATH|PBS_JOBID|K3_BLOCK_PROFILE)' >"$LOG_DIR/effective_environment.txt" || true
-echo "effective_environment=$LOG_DIR/effective_environment.txt" | tee -a "$LOG_DIR/metadata"
 "$PYTHON" - "$LOG_DIR/metadata.json" <<'PY'
 import json
 import os
@@ -504,6 +531,11 @@ ARGS=(--model "$MODEL_FOR_SERVER" --tensor-parallel-size "$TP" --pipeline-parall
     --model-impl vllm --dtype bfloat16 --load-format "$LOAD_FORMAT" --gpu-memory-utilization "$GPU_MEM_UTIL"
     --max-model-len "$MAX_MODEL_LEN" --max-num-seqs "$MAX_NUM_SEQS"
     --max-num-batched-tokens "$MAX_BATCHED_TOKENS")
+if [[ "$ASYNC_SCHEDULING" == 0 ]]; then
+    ARGS+=(--no-async-scheduling)
+elif [[ "$ASYNC_SCHEDULING" == 1 ]]; then
+    ARGS+=(--async-scheduling)
+fi
 if [[ -n "$BLOCKS" ]]; then
     ARGS+=(--num-gpu-blocks-override "$BLOCKS")
 fi
@@ -634,6 +666,8 @@ else
     remote_pythonpath_q=$(printf '%q' "${PYTHONPATH:-}")
     remote_ld_library_path_q=$(printf '%q' "${LD_LIBRARY_PATH:-}")
     remote_no_proxy_q=$(printf '%q' "$NOPROXY_EXTRA")
+    remote_torchdynamo_disable_q=$(printf '%q' "$TORCHDYNAMO_DISABLE")
+    remote_torch_compile_disable_q=$(printf '%q' "$TORCH_COMPILE_DISABLE")
     remote_ccl_process_launcher_q=$(printf '%q' "$CCL_PROCESS_LAUNCHER")
     remote_ccl_atl_transport_q=$(printf '%q' "$CCL_ATL_TRANSPORT")
     remote_ccl_kvs_iface_q=$(printf '%q' "$CCL_KVS_IFACE")
@@ -650,6 +684,9 @@ else
     remote_vllm_xpu_deterministic_moe_gather_q=$(printf '%q' "$VLLM_XPU_DETERMINISTIC_MOE_GATHER")
     remote_kimi_xpu_diagnostics_q=$(printf '%q' "${VLLM_KIMI_XPU_DIAGNOSTICS:-0}")
     remote_kimi_xpu_request_diagnostic_limit_q=$(printf '%q' "${VLLM_KIMI_XPU_REQUEST_DIAGNOSTIC_LIMIT:-4096}")
+    remote_kda_vectorized_q=$(printf '%q' "$VLLM_KIMI_XPU_KDA_VECTORIZED")
+    remote_conv1d_vectorized_q=$(printf '%q' "$VLLM_KIMI_XPU_CONV1D_VECTORIZED")
+    remote_xpu_triton_sampler_q=$(printf '%q' "$VLLM_XPU_ALLOW_TRITON_SAMPLER")
     remote_daos_agent_drpc_q=$(printf '%q' "$DAOS_AGENT_DRPC_DIR")
     remote_d_agent_drpc_q=$(printf '%q' "$D_AGENT_DRPC_DIR")
     remote_ray_temp_root_q=$(printf '%q' "$RAY_TEMP_ROOT")
@@ -658,7 +695,7 @@ else
     remote_ray_extra_env_vars_q=$(printf '%q' "$VLLM_RAY_EXTRA_ENV_VARS_TO_COPY")
     for node in "${NODES[@]}"; do
         [[ "$node" == "$HEAD" ]] && continue
-        ssh -o BatchMode=yes -o ConnectTimeout=15 "$node" "source '$RAY_ENV' frameworks; unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY; export K3_CACHE_ROOT=$remote_cache_root_q K3_CACHE_MARKER=$remote_cache_marker_q HF_HOME=$remote_hf_home_q HF_MODULES_CACHE=$remote_hf_modules_cache_q HF_HUB_CACHE=$remote_hf_hub_cache_q TRANSFORMERS_CACHE=$remote_transformers_cache_q XDG_CACHE_HOME=$remote_xdg_cache_home_q PYTHONPATH=$remote_pythonpath_q LD_LIBRARY_PATH=$remote_ld_library_path_q no_proxy=$remote_no_proxy_q NO_PROXY=$remote_no_proxy_q CCL_PROCESS_LAUNCHER=$remote_ccl_process_launcher_q CCL_ATL_TRANSPORT=$remote_ccl_atl_transport_q CCL_KVS_IFACE=$remote_ccl_kvs_iface_q FI_PROVIDER=$remote_fi_provider_q ZE_FLAT_DEVICE_HIERARCHY=$remote_ze_flat_device_hierarchy_q VLLM_WORKER_MULTIPROC_METHOD=$remote_vllm_worker_method_q VLLM_TARGET_DEVICE=$remote_vllm_target_device_q VLLM_BATCH_INVARIANT=$remote_vllm_batch_invariant_q VLLM_XPU_DETERMINISTIC_ROUTING=$remote_vllm_xpu_deterministic_routing_q VLLM_XPU_DETERMINISTIC_MOE_GATHER=$remote_vllm_xpu_deterministic_moe_gather_q VLLM_KIMI_XPU_DIAGNOSTICS=$remote_kimi_xpu_diagnostics_q VLLM_KIMI_XPU_REQUEST_DIAGNOSTIC_LIMIT=$remote_kimi_xpu_request_diagnostic_limit_q RAY_EXPERIMENTAL_NOSET_ONEAPI_DEVICE_SELECTOR=$remote_ray_no_set_oneapi_q RAY_DEDUP_LOGS=$remote_ray_dedup_logs_q VLLM_USE_RAY_V2_EXECUTOR_BACKEND=$remote_ray_v2_q VLLM_KDA_XPU_DIAGNOSTICS=$remote_kda_xpu_diagnostics_q VLLM_RAY_EXTRA_ENV_VARS_TO_COPY=$remote_ray_extra_env_vars_q DAOS_AGENT_DRPC_DIR=$remote_daos_agent_drpc_q D_AGENT_DRPC_DIR=$remote_d_agent_drpc_q K3_BLOCK_PROFILE_DIR=$remote_k3_block_profile_dir_q K3_LOADER_ACCOUNTING_DIR=$remote_k3_loader_accounting_dir_q; if [ -e $remote_cache_root_q ]; then echo 'ERROR: remote K3 cache already exists' >&2; exit 1; fi; mkdir $remote_cache_root_q; mkdir -p $remote_ray_temp_root_q; printf '%s\\n' '$PBS_JOBID' >$remote_cache_marker_q; self=\$\$; mapfile -t pids < <(ps -eo pid=,args= | awk -v root='$RAY_TEMP_ROOT' -v self=\"\$self\" 'index(\$0, root) && \$1 != self {print \$1}'); for pid in \"\${pids[@]}\"; do kill -TERM \"\$pid\" 2>/dev/null || true; done; sleep 2; mapfile -t pids < <(ps -eo pid=,args= | awk -v root='$RAY_TEMP_ROOT' -v self=\"\$self\" 'index(\$0, root) && \$1 != self {print \$1}'); for pid in \"\${pids[@]}\"; do kill -KILL \"\$pid\" 2>/dev/null || true; done; ray start --address='$RAY_ADDRESS' --num-gpus='${NUM_GPUS:-12}' --num-cpus=4 --temp-dir=$remote_ray_temp_root_q --block" \
+        ssh -o BatchMode=yes -o ConnectTimeout=15 "$node" "source '$RAY_ENV' frameworks; unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY; export K3_CACHE_ROOT=$remote_cache_root_q K3_CACHE_MARKER=$remote_cache_marker_q HF_HOME=$remote_hf_home_q HF_MODULES_CACHE=$remote_hf_modules_cache_q HF_HUB_CACHE=$remote_hf_hub_cache_q TRANSFORMERS_CACHE=$remote_transformers_cache_q XDG_CACHE_HOME=$remote_xdg_cache_home_q PYTHONPATH=$remote_pythonpath_q LD_LIBRARY_PATH=$remote_ld_library_path_q no_proxy=$remote_no_proxy_q NO_PROXY=$remote_no_proxy_q TORCHDYNAMO_DISABLE=$remote_torchdynamo_disable_q TORCH_COMPILE_DISABLE=$remote_torch_compile_disable_q CCL_PROCESS_LAUNCHER=$remote_ccl_process_launcher_q CCL_ATL_TRANSPORT=$remote_ccl_atl_transport_q CCL_KVS_IFACE=$remote_ccl_kvs_iface_q FI_PROVIDER=$remote_fi_provider_q ZE_FLAT_DEVICE_HIERARCHY=$remote_ze_flat_device_hierarchy_q VLLM_WORKER_MULTIPROC_METHOD=$remote_vllm_worker_method_q VLLM_TARGET_DEVICE=$remote_vllm_target_device_q VLLM_BATCH_INVARIANT=$remote_vllm_batch_invariant_q VLLM_XPU_DETERMINISTIC_ROUTING=$remote_vllm_xpu_deterministic_routing_q VLLM_XPU_DETERMINISTIC_MOE_GATHER=$remote_vllm_xpu_deterministic_moe_gather_q VLLM_KIMI_XPU_DIAGNOSTICS=$remote_kimi_xpu_diagnostics_q VLLM_KIMI_XPU_REQUEST_DIAGNOSTIC_LIMIT=$remote_kimi_xpu_request_diagnostic_limit_q VLLM_KIMI_XPU_KDA_VECTORIZED=$remote_kda_vectorized_q VLLM_KIMI_XPU_CONV1D_VECTORIZED=$remote_conv1d_vectorized_q VLLM_XPU_ALLOW_TRITON_SAMPLER=$remote_xpu_triton_sampler_q RAY_EXPERIMENTAL_NOSET_ONEAPI_DEVICE_SELECTOR=$remote_ray_no_set_oneapi_q RAY_DEDUP_LOGS=$remote_ray_dedup_logs_q VLLM_USE_RAY_V2_EXECUTOR_BACKEND=$remote_ray_v2_q VLLM_KDA_XPU_DIAGNOSTICS=$remote_kda_xpu_diagnostics_q VLLM_RAY_EXTRA_ENV_VARS_TO_COPY=$remote_ray_extra_env_vars_q DAOS_AGENT_DRPC_DIR=$remote_daos_agent_drpc_q D_AGENT_DRPC_DIR=$remote_d_agent_drpc_q K3_BLOCK_PROFILE_DIR=$remote_k3_block_profile_dir_q K3_LOADER_ACCOUNTING_DIR=$remote_k3_loader_accounting_dir_q; if [ -e $remote_cache_root_q ]; then echo 'ERROR: remote K3 cache already exists' >&2; exit 1; fi; mkdir $remote_cache_root_q; mkdir -p $remote_ray_temp_root_q; printf '%s\\n' '$PBS_JOBID' >$remote_cache_marker_q; self=\$\$; mapfile -t pids < <(ps -eo pid=,args= | awk -v root='$RAY_TEMP_ROOT' -v self=\"\$self\" 'index(\$0, root) && \$1 != self {print \$1}'); for pid in \"\${pids[@]}\"; do kill -TERM \"\$pid\" 2>/dev/null || true; done; sleep 2; mapfile -t pids < <(ps -eo pid=,args= | awk -v root='$RAY_TEMP_ROOT' -v self=\"\$self\" 'index(\$0, root) && \$1 != self {print \$1}'); for pid in \"\${pids[@]}\"; do kill -KILL \"\$pid\" 2>/dev/null || true; done; ray start --address='$RAY_ADDRESS' --num-gpus='${NUM_GPUS:-12}' --num-cpus=4 --temp-dir=$remote_ray_temp_root_q --block" \
         >"$LOG_DIR/ray_${node}.log" 2>&1 &
         ray_pids+=("$!")
     done
@@ -671,6 +708,67 @@ else
     done
     echo "executor_ready=ray timestamp=$(date -Is)" | tee -a "$LOG_DIR/metadata"
     ARGS+=(--distributed-executor-backend ray)
+    # In-actor capture: the ssh block above hand-forwards ~25 vars to the
+    # remote shell that runs `ray start`, which is NOT the same process as
+    # a Ray actor (Ray's own env/runtime_env injection happens per-actor).
+    # Capture from inside a real actor so a forwarding gap in the ssh block
+    # (see the TORCHDYNAMO_DISABLE miss fixed above) is caught here instead
+    # of silently producing an unattributed numerics/hang difference.
+    "$PYTHON" - "$RAY_ADDRESS" "$LOG_DIR/effective_environment_actor.txt" <<'PY' || true
+import sys
+
+import ray
+
+address, out_path = sys.argv[1], sys.argv[2]
+ray.init(address=address, ignore_reinit_error=True)
+
+
+@ray.remote(num_gpus=1)
+def _dump_env():
+    import os
+
+    keys = (
+        "CCL_", "FI_PROVIDER", "ZE_", "VLLM_", "TORCH", "PYTORCH_",
+        "HF_", "TRANSFORMERS_", "XDG_", "RAY_", "PYTHONPATH",
+        "LD_LIBRARY_PATH", "PBS_JOBID", "K3_BLOCK_PROFILE",
+    )
+    skip = ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN")
+    return {
+        k: v
+        for k, v in sorted(os.environ.items())
+        if k.startswith(keys) and k not in skip
+    }
+
+
+env = ray.get(_dump_env.remote())
+with open(out_path, "w") as fh:
+    for key, value in env.items():
+        fh.write(f"{key}={value}\n")
+ray.shutdown()
+PY
+    echo "effective_environment_actor=$LOG_DIR/effective_environment_actor.txt" | tee -a "$LOG_DIR/metadata"
+fi
+env | sort | grep -E '^(CCL_|FI_PROVIDER|ZE_|VLLM_|TORCH|PYTORCH_|HF_|TRANSFORMERS_|XDG_|RAY_|PYTHONPATH|LD_LIBRARY_PATH|PBS_JOBID|K3_BLOCK_PROFILE)' | grep -vE '^(HF_TOKEN|HUGGING_FACE_HUB_TOKEN)=' >"$LOG_DIR/effective_environment.txt" || true
+echo "effective_environment=$LOG_DIR/effective_environment.txt" | tee -a "$LOG_DIR/metadata"
+for required_var in ZE_FLAT_DEVICE_HIERARCHY:FLAT TORCHDYNAMO_DISABLE:1 FI_PROVIDER:cxi; do
+    required_name=${required_var%%:*}
+    required_value=${required_var#*:}
+    actual_value=$(awk -F= -v k="$required_name" '$1==k{print $2; f=1} END{if(!f) print "UNSET"}' "$LOG_DIR/effective_environment.txt")
+    [[ "$actual_value" == "$required_value" ]] || {
+        echo "ERROR: post-export local capture shows $required_name=$actual_value, expected $required_value" >&2
+        exit 1
+    }
+done
+if [[ -f "$LOG_DIR/effective_environment_actor.txt" ]]; then
+    for required_var in ZE_FLAT_DEVICE_HIERARCHY:FLAT TORCHDYNAMO_DISABLE:1 FI_PROVIDER:cxi; do
+        required_name=${required_var%%:*}
+        required_value=${required_var#*:}
+        actual_value=$(awk -F= -v k="$required_name" '$1==k{print $2; f=1} END{if(!f) print "UNSET"}' "$LOG_DIR/effective_environment_actor.txt")
+        [[ "$actual_value" == "$required_value" ]] || {
+            echo "ERROR: in-actor capture shows $required_name=$actual_value, expected $required_value" >&2
+            exit 1
+        }
+    done
 fi
 [[ "$EP" == 1 ]] && ARGS+=(--enable-expert-parallel)
 echo "server_args=${ARGS[*]}" | tee -a "$LOG_DIR/metadata"
