@@ -104,8 +104,13 @@ metric() {
 for concurrency in $CONCURRENCY_LIST; do
     for repeat in $(seq 1 "$REPEATS"); do
     result_log="$RUN_DIR/serve_${concurrency}_repeat_${repeat}.log"
+    # --trust-remote-code is required for models whose tokenizer ships custom
+    # code (K3: tokenization_kimi.py). The bench client loads the tokenizer in
+    # its OWN process to build the random dataset, so the server having been
+    # started with trust_remote_code=True does not cover it -- without this the
+    # very first cell dies in get_tokenizer() before issuing a single request.
     args=(bench serve --backend openai --base-url "$SERVER_URL" --model "$SERVED_MODEL"
-        --tokenizer "$TOKENIZER"
+        --tokenizer "$TOKENIZER" ${TRUST_REMOTE_CODE:+--trust-remote-code}
         --num-prompts "$PROMPTS" --dataset-name random --random-input-len "$INPUT_LEN"
         --random-output-len "$OUTPUT_LEN" --request-rate "${REQUEST_RATE:-inf}"
         --max-concurrency "$concurrency")
