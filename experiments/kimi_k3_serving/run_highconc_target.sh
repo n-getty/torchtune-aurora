@@ -45,7 +45,7 @@ OUTPUT_LEN=${OUTPUT_LEN:-512}
 # to die it will die partway through. Running high-concurrency FIRST means the
 # rung that decides whether we clear 100 tok/s executes on a fresh engine, and
 # a later death costs only the less important low-c rungs.
-LADDER=${LADDER:-"192 128 64 32"}
+LADDER=${LADDER:-"256 128 64 32"}
 SERVER_LOG=${SERVER_LOG:-$RUN_BASE/server/server.log}
 OUT=${OUT:-$RUN_BASE/highconc_results.tsv}
 
