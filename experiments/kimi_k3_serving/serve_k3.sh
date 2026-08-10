@@ -8,6 +8,7 @@ RAY_ENV=${RAY_ENV:-/lus/flare/projects/ModCon/ngetty/torchtune/experiments/ray_s
 MODEL=${MODEL:-}
 TP=${TP:-32}
 PP=${PP:-1}
+DP=${DP:-1}
 PORT=${PORT:-8000}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-16384}
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-16}
@@ -61,6 +62,7 @@ while [[ $# -gt 0 ]]; do
         --model) MODEL=$2; shift 2 ;;
         --tp) TP=$2; shift 2 ;;
         --pp) PP=$2; shift 2 ;;
+        --dp) DP=$2; shift 2 ;;
         --port) PORT=$2; shift 2 ;;
         --max-model-len) MAX_MODEL_LEN=$2; shift 2 ;;
         --max-num-seqs) MAX_NUM_SEQS=$2; shift 2 ;;
@@ -230,6 +232,17 @@ export VLLM_RPC_TIMEOUT=${VLLM_RPC_TIMEOUT:-120000}
 export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=${VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS:-900}
 mapfile -t NODES < <(sort -u "$PBS_NODEFILE")
 [[ ${#NODES[@]} -gt 0 ]] || { echo "ERROR: PBS_NODEFILE has no nodes" >&2; exit 1; }
+# DP replicates the whole model, so the allocation must cover DP x TP tiles.
+# At 12 tiles/node: DP=1 needs 3 nodes (32 of 36), DP=3 needs 8 (96 of 96).
+if [[ "$DP" != 1 ]]; then
+    required_tiles=$((TP * DP))
+    available_tiles=$(( ${#NODES[@]} * 12 ))
+    if [[ $available_tiles -lt $required_tiles ]]; then
+        echo "ERROR: DP=$DP x TP=$TP needs $required_tiles tiles but the allocation has $available_tiles (${#NODES[@]} nodes x 12)" >&2
+        exit 2
+    fi
+    echo "data_parallel=$DP tensor_parallel=$TP total_ranks=$required_tiles nodes=${#NODES[@]}"
+fi
 if [[ "$TP" == 32 && ${#NODES[@]} -lt 3 ]]; then
     echo "ERROR: Kimi-K3 TP=32 requires at least 3 nodes; refusing undersized allocation" >&2
     exit 2
@@ -531,6 +544,14 @@ ARGS=(--model "$MODEL_FOR_SERVER" --tensor-parallel-size "$TP" --pipeline-parall
     --model-impl vllm --dtype bfloat16 --load-format "$LOAD_FORMAT" --gpu-memory-utilization "$GPU_MEM_UTIL"
     --max-model-len "$MAX_MODEL_LEN" --max-num-seqs "$MAX_NUM_SEQS"
     --max-num-batched-tokens "$MAX_BATCHED_TOKENS")
+# Data parallelism is how K3 scales past 3 nodes: TP is hard-capped at 32
+# because vocab_size 163840 is not divisible by 96, so 8 nodes (96 tiles) must
+# run DP=3 x TP=32 rather than TP=96. Each DP replica holds a full copy of the
+# weights and serves independently, so aggregate throughput should scale with
+# DP while per-user latency stays at the TP=32 value.
+if [[ "$DP" != 1 ]]; then
+    ARGS+=(--data-parallel-size "$DP")
+fi
 if [[ "$ASYNC_SCHEDULING" == 0 ]]; then
     ARGS+=(--no-async-scheduling)
 elif [[ "$ASYNC_SCHEDULING" == 1 ]]; then
