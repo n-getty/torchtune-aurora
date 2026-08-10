@@ -87,7 +87,13 @@ cell() {
 }
 
 # ---- Phase A: peak aggregate. Highest concurrency first (engine-death risk).
+# NOTE: max_num_seqs >= 192 takes an unrecoverable banned:1 GPU fault after
+# exactly 6 requests (5 runs, jobs 8746183/8746327/8746385; independent of
+# chunked prefill, block count, and node freshness). Keep MAX_SEQS at 128.
 echo "=== PHASE A: peak aggregate throughput (32-in / 512-out) ==="
+if [[ $MAX_SEQS -ge 192 ]]; then
+    echo "WARNING: MAX_SEQS=$MAX_SEQS is at/above the banned:1 ceiling of 192." >&2
+fi
 for c in "$MAX_SEQS" $((MAX_SEQS / 2)) $((MAX_SEQS / 4)); do
     [[ $c -ge 1 ]] || continue
     cell peak "$c" $((c * 2)) 32 512
