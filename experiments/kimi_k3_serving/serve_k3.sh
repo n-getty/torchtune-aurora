@@ -335,6 +335,14 @@ resolve_node_ip() {
 HEAD_IP=$(resolve_node_ip "$HEAD")
 [[ -n "$HEAD_IP" ]] || { echo "ERROR: cannot resolve allocation head node $HEAD" >&2; exit 1; }
 RAY_ADDRESS=${RAY_ADDRESS:-$HEAD_IP:6379}
+# EXPORT it: the DP coordinator (vllm/v1/engine/utils.py:364) runs in its own
+# process, where ray.is_initialized() is False, and calls a bare ray.init().
+# Without RAY_ADDRESS in the environment that spins up a brand-new SINGLE-NODE
+# Ray ("Started a local Ray instance"), so DP replicas can never be placed on
+# the other 7 nodes and startup dies quietly. The main server process was
+# already connecting to the real cluster, which made this look like it should
+# have worked.
+export RAY_ADDRESS
 capture_device_snapshot() {
     local output=$1
     "$PYTHON" - <<'PY' 2>"${output%.json}.err" | awk '/^\{/{json=$0} END {if (json != "") print json}' >"$output"
