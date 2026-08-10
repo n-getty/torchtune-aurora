@@ -539,6 +539,18 @@ fi
 if [[ -n "$BLOCKS" ]]; then
     ARGS+=(--num-gpu-blocks-override "$BLOCKS")
 fi
+# CHUNKED_PREFILL=0 disables chunked prefill. Needed above ~c=128 on K3/XPU:
+# once the scheduler splits a prefill, the resumed half has context, which
+# takes MLA's chunked-context path into merge_attn_states -- and on XPU the
+# prefill backend hands it prefix_lse=None (the FA varlen wrapper asks for the
+# softmax LSE but does not get one back), so the merge dies with
+# "'NoneType' object has no attribute 'transpose'" and kills the engine.
+# Measured on job 8746183: c=384 lost 581 of 768 requests this way.
+# Requires max_num_batched_tokens >= max_model_len so a whole prompt fits in
+# one scheduling step.
+if [[ "${CHUNKED_PREFILL:-1}" == 0 ]]; then
+    ARGS+=(--no-enable-chunked-prefill)
+fi
 if [[ -n "$SAFETENSORS_LOAD_STRATEGY" ]]; then
     ARGS+=(--safetensors-load-strategy "$SAFETENSORS_LOAD_STRATEGY")
 fi
