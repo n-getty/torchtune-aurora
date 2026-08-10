@@ -550,7 +550,15 @@ ARGS=(--model "$MODEL_FOR_SERVER" --tensor-parallel-size "$TP" --pipeline-parall
 # weights and serves independently, so aggregate throughput should scale with
 # DP while per-user latency stays at the TP=32 value.
 if [[ "$DP" != 1 ]]; then
-    ARGS+=(--data-parallel-size "$DP")
+    # --data-parallel-backend ray is required on multi-node: with the default
+    # "mp" backend, data_parallel_master_ip stays at its 127.0.0.1 default, so
+    # parallel_state builds the torch.distributed TCPStore at tcp://127.0.0.1
+    # and every worker off the head node waits on its own loopback forever --
+    # no error, all ranks at ~5% CPU, indistinguishable from a hang. The ray
+    # backend calls get_ip() instead. Also pass the address explicitly so it
+    # does not depend on get_ip() resolving to the routable interface.
+    ARGS+=(--data-parallel-size "$DP" --data-parallel-backend ray)
+    [[ -n "${HEAD_IP:-}" ]] && ARGS+=(--data-parallel-address "$HEAD_IP")
 fi
 if [[ "$ASYNC_SCHEDULING" == 0 ]]; then
     ARGS+=(--no-async-scheduling)
