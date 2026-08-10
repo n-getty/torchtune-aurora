@@ -52,6 +52,13 @@ OUT=${OUT:-$RUN_BASE/highconc_results.tsv}
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY
 export no_proxy="localhost,127.0.0.1" NO_PROXY="localhost,127.0.0.1"
 export PATH="$(dirname "$PYTHON"):$PATH"
+# K3's tokenizer is remote code that imports a sibling module (encoding_k3.py)
+# living in the model directory. transformers' check_imports resolves that
+# against the CLIENT process's sys.path, not the model dir, so without this the
+# bench client dies with "requires the following packages that were not found
+# in your environment: encoding_k3" before issuing a single request. The server
+# is unaffected -- it loads the tokenizer in its own already-configured process.
+export PYTHONPATH="$TOKENIZER${PYTHONPATH:+:$PYTHONPATH}"
 
 curl --noproxy '*' --fail --silent "$URL/health" >/dev/null || {
     echo "ERROR: server unhealthy" >&2
