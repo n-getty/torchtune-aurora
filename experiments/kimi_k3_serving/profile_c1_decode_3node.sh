@@ -39,11 +39,26 @@ PORT=${PORT:-8000}
 # steps one token at a time), so a long prompt would spend the whole trace in
 # prefill and never reach the decode steps this experiment is about.
 PROMPT_TOKENS=${PROMPT_TOKENS:-32}
-# Enough decode steps to average over, few enough to keep the trace loadable.
+# Tokens to generate inside the profiled window.
 DECODE_STEPS=${DECODE_STEPS:-8}
-# Skip the prefill step and the first decodes, which allocate and are not
-# representative of steady-state decode.
-DELAY_ITERS=${DELAY_ITERS:-3}
+# delay_iterations / max_iterations are BOTH 0 on purpose -- do not "improve"
+# this by skipping the first few steps.
+#
+# Attempt 1 (job 8748640) used delay=3/max=8 to skip prefill and the first
+# decodes, and captured NOTHING: 32 workers, zero trace files, HTTP 200 on
+# both /start_profile and /stop_profile. With delay>0, WorkerProfiler.start()
+# only ARMS the profiler (`_active=True`); the real start is deferred to the
+# `_active_iteration_count == delay` check inside step(), which is driven by
+# `annotate_profile()` in Worker.execute_model. On this XPU/Ray path that
+# step() never ran, so `_running` stayed False, "Starting profiler after
+# delay..." never logged, and stop() had nothing to write.
+#
+# With both at 0, start() calls _call_start() immediately and stop() writes --
+# no dependence on the step() hook at all. Cost: the trace also contains the
+# prefill step, which is easy to identify (it is the long one) and which
+# analyze_decode_trace.py's --steps normalization accounts for.
+DELAY_ITERS=${DELAY_ITERS:-0}
+MAX_ITERS=${MAX_ITERS:-0}
 
 RUN_DIR=$EXP/logs/prof_c1_${JOB_ID%%.*}
 TRACE_DIR=$RUN_DIR/traces
@@ -88,7 +103,7 @@ ssh -o BatchMode=yes "$HEAD" "rm -rf $cache_root" 2>/dev/null
 
 # ignore_frontend: the AsyncLLM front-end profiler does not track iterations,
 # so it would capture the entire window and swamp the worker traces we want.
-PROFILER_CFG="{\"profiler\":\"torch\",\"torch_profiler_dir\":\"$TRACE_DIR\",\"delay_iterations\":$DELAY_ITERS,\"max_iterations\":$DECODE_STEPS,\"ignore_frontend\":true,\"torch_profiler_with_stack\":false,\"torch_profiler_record_shapes\":true}"
+PROFILER_CFG="{\"profiler\":\"torch\",\"torch_profiler_dir\":\"$TRACE_DIR\",\"delay_iterations\":$DELAY_ITERS,\"max_iterations\":$MAX_ITERS,\"ignore_frontend\":true,\"torch_profiler_with_stack\":false,\"torch_profiler_record_shapes\":true}"
 
 echo "phase=server_start profiler_cfg=$PROFILER_CFG"
 ssh -o BatchMode=yes "$HEAD" \
@@ -143,8 +158,19 @@ echo "server_ready time=$(date -Is)"
 # RESULTS_DISCIPLINE: the worker must say what it resolved before any number
 # from it is interpretable.
 echo "phase=worker_gate_echo"
-grep -h "K3_WORKER_GATES" "$SERVER_DIR"/*.log 2>/dev/null | head -4 \
-    || echo "WARNING: no K3_WORKER_GATES lines -- worker echo missing, flags unverified"
+# Count first, THEN print. `grep ... | head -4 || echo WARNING` looks right and
+# is wrong: head exits after 4 lines, grep dies of SIGPIPE, and the pipeline
+# returns 141, so the warning fires on every successful run. (Observed on the
+# first real run -- four correct gate lines printed, immediately followed by
+# "worker echo missing".) A false alarm on the one check whose whole job is to
+# tell you the flags are unverified is worse than no check.
+gate_lines=$(grep -hc "K3_WORKER_GATES" "$SERVER_DIR"/*.log 2>/dev/null | paste -sd+ | bc)
+if [[ "${gate_lines:-0}" -gt 0 ]]; then
+    echo "worker_gate_echo_lines=$gate_lines"
+    grep -h "K3_WORKER_GATES" "$SERVER_DIR"/*.log 2>/dev/null | sed -n '1,4p'
+else
+    echo "WARNING: no K3_WORKER_GATES lines -- worker echo missing, flags unverified"
+fi
 
 # Warm up OUTSIDE the profiled window: the very first request pays one-time
 # costs (Triton/SPIR-V JIT, allocator growth) that are not part of a
@@ -157,10 +183,20 @@ ssh -o BatchMode=yes "$HEAD" \
     >"$RUN_DIR/warmup.json" 2>&1
 echo "warmup_done rc=$?"
 
-echo "phase=profile c=1 decode_steps=$DECODE_STEPS delay=$DELAY_ITERS"
+echo "phase=profile c=1 decode_steps=$DECODE_STEPS delay=$DELAY_ITERS max=$MAX_ITERS"
 ssh -o BatchMode=yes "$HEAD" \
     "curl -s --noproxy '*' -X POST http://127.0.0.1:$PORT/start_profile" \
     >"$RUN_DIR/start_profile.txt" 2>&1
+
+# /start_profile returns 200 whether or not a worker profiler actually began
+# recording -- attempt 1 got 200 on both calls and produced zero bytes. Assert
+# the worker-side evidence NOW, before spending the request, so a
+# misconfiguration costs seconds instead of a whole profiled run.
+sleep 3
+if ! grep -qE "Torch profiling enabled|Starting profiler" "$SERVER_DIR/launcher.log" 2>/dev/null; then
+    echo "WARNING: no worker-side profiler start evidence in the server log."
+    echo "  /start_profile returning 200 only means the API accepted it."
+fi
 
 # ONE request, ONE concurrent user: this experiment is about the single-user
 # step, and any second in-flight request changes the batch shape.
