@@ -72,7 +72,11 @@ export VLLM_KIMI_XPU_KDA_CHUNKED=${VLLM_KIMI_XPU_KDA_CHUNKED:-0}
 # Shared-expert / routed all_reduce fusion (kimi_linear.py). Resolved ONCE at
 # KimiMoE.__init__ (it changes how two submodules are constructed), so it must
 # reach the worker process before the model is built -- not just the driver.
-export VLLM_KIMI_FUSE_SHARED_EXPERT_AR=${VLLM_KIMI_FUSE_SHARED_EXPERT_AR:-0}
+# Default ON as of 2026-08-11: HW-measured +9.3% at c=1 on 3 nodes
+# (1.041 -> 1.138 tok/s, 961 -> 879 ms/token), both legs in one allocation,
+# non-overlapping distributions, 0 banned:1. Upstream credits the equivalent
+# transformation ~7-8%. Set to 0 to A/B it back off.
+export VLLM_KIMI_FUSE_SHARED_EXPERT_AR=${VLLM_KIMI_FUSE_SHARED_EXPERT_AR:-1}
 # Previously NOT plumbed to Ray workers at all (neither the registration loop
 # below nor the per-node ssh export block ~:747 carried these two vars) -- a
 # worker process reading os.getenv("VLLM_KIMI_XPU_KDA_TRITON") always saw

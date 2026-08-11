@@ -125,7 +125,11 @@ run_leg() {
     # Confirm the leg's env actually reached a worker before believing its number.
     if [[ -n "$envs" ]]; then
         local var=${envs%%=*}
-        local seen; seen=$(grep -ho "$var=[^ ]*" "$dir"/*.log 2>/dev/null | sort -u | head -2 | tr '\n' ' ')
+        # Search the launcher log (where Ray worker stdout lands) AND the
+        # captured env files. Greping only "$dir"/*.log missed it and printed
+        # NOT-FOUND on a leg whose flag WAS active -- a false alarm on the one
+        # check that exists to catch inactive flags.
+        local seen; seen=$(grep -ho "$var=[^ ]*" "$dir"/launcher.log "$dir"/*.log "$dir"/*.txt 2>/dev/null | sort -u | head -2 | tr '\n' ' ')
         echo "leg_env_in_worker: ${seen:-NOT-FOUND}"
     fi
 
