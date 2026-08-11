@@ -59,6 +59,31 @@ tree_sha() { git -C "$VLLM_SRC" diff --binary HEAD | sha256sum | cut -d' ' -f1; 
 SHA0=$(tree_sha)
 echo "vllm_commit=$(git -C "$VLLM_SRC" rev-parse HEAD) tree_sha=$SHA0"
 
+# Refuse to start a leg that cannot finish. A cold-cache K3 load is ~15-25
+# min (7.8 s/shard x 96) and timing adds ~5. Attempt 3 of the capture run
+# reached 100% weights and `enforce_eager=False` with ZERO errors, then died
+# to walltime seconds before the server accepted a request -- a whole load
+# spent for no number. Check the remaining time up front instead.
+MIN_MINUTES_PER_LEG=${MIN_MINUTES_PER_LEG:-30}
+rem=$(qstat -f "$JOB_ID" 2>/dev/null | tr -d '\n\t ' \
+      | grep -oP 'Resource_List.walltime=\K[0-9:]+')
+used=$(qstat -f "$JOB_ID" 2>/dev/null | tr -d '\n\t ' \
+      | grep -oP 'resources_used.walltime=\K[0-9:]+')
+to_min() { awk -F: '{print ($1*60)+$2}' <<<"$1"; }
+if [[ -n "$rem" && -n "$used" ]]; then
+    left=$(( $(to_min "$rem") - $(to_min "$used") ))
+    n_legs=$(tr ';' '\n' <<<"$LEGS" | grep -c .)
+    need=$(( MIN_MINUTES_PER_LEG * n_legs ))
+    echo "walltime_left=${left}min legs=$n_legs need=${need}min"
+    if (( left < need )); then
+        echo "ERROR: only ${left} min left but ${n_legs} leg(s) need ~${need} min." >&2
+        echo "  A leg that dies to walltime mid-load costs a full model load for" >&2
+        echo "  zero data. Submit a fresh hold, or lower MIN_MINUTES_PER_LEG if" >&2
+        echo "  you know the page cache is warm." >&2
+        exit 2
+    fi
+fi
+
 echo "phase=daos_mount"
 LOG_DIR="$RUN_DIR" EXPECT_NODES=3 bash "$EXP/mount_daos_models_all_nodes.sh" \
     || { echo "ERROR: DAOS mount failed"; exit 2; }

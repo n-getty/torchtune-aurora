@@ -16,6 +16,27 @@ The ceiling is the point. Collective removal, host-sync hoisting and kernel
 tuning all operate *below* it. Only **fewer launches** (fusion) or **no
 per-launch cost** (capture) change it.
 
+## 0. State of the capture attempt as of end-of-session
+
+Three attempts on hold 8748640. **No performance number was obtained.** But
+the failures were distinct and all are now fixed:
+
+| attempt | outcome |
+|---|---|
+| 1 | died in engine init: `logger.info_once` unpicklable under trace |
+| 2 | died identically — my `@torch._dynamo.disable` fix was wrong (gb0098) |
+| 3 | **zero errors**, workers init clean, weights 100% loaded, killed by walltime seconds before `Application startup complete` |
+
+Attempt 3 proves the path is clean end to end through model construction:
+
+    torch=2.11.0+xpu  supports_xpu_graph=True
+    cudagraph_mode=PIECEWISE  enforce_eager=False   (0 errors)
+
+So the remaining work is **only** to run it with enough walltime. Budget
+**~25 min** for a cold-cache load (7.8 s/shard x 96) plus ~5 min to time.
+A warm load is ~3 min, but do not count on warmth: the drain between legs
+evicts the page cache, and attempt 3 was cold.
+
 ## 1. Finish the capture measurement (~20 min on a 3-node hold)
 
 Blockers cleared this session: torch-2.11 venv prepared and verified;
