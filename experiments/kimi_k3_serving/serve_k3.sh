@@ -40,10 +40,34 @@ export PBS_JOBID="$K3_JOB_ID"
 export DAOS_AGENT_DRPC_DIR=${DAOS_AGENT_DRPC_DIR:-/run/daos_agent_oneScratch}
 export D_AGENT_DRPC_DIR=${D_AGENT_DRPC_DIR:-/run/daos_agent_oneScratch}
 export VLLM_KIMI_XPU_REQUEST_DIAGNOSTIC_LIMIT=${VLLM_KIMI_XPU_REQUEST_DIAGNOSTIC_LIMIT:-4096}
-export VLLM_KIMI_XPU_KDA_VECTORIZED=${VLLM_KIMI_XPU_KDA_VECTORIZED:-0}
-export VLLM_KIMI_XPU_CONV1D_VECTORIZED=${VLLM_KIMI_XPU_CONV1D_VECTORIZED:-0}
+# Default ON. These were 0 by default, but the 65.20 tok/s reference run had
+# BOTH on -- with them off KDA decode falls back to a scalar per-token Python
+# loop (kda.py:548-577) and conv1d to its own scalar path, i.e. the default
+# silently served a config nobody has ever benchmarked as good. Every result
+# in RESULTS.md worth reproducing set these to 1 explicitly; make that the
+# default so a run that forgets them is slow-by-omission no longer possible.
+export VLLM_KIMI_XPU_KDA_VECTORIZED=${VLLM_KIMI_XPU_KDA_VECTORIZED:-1}
+export VLLM_KIMI_XPU_CONV1D_VECTORIZED=${VLLM_KIMI_XPU_CONV1D_VECTORIZED:-1}
+# XPU graph capture (xpu.py:210 reads this). Default OFF -- it additionally
+# requires torch>=2.11 (supports_xpu_graph) and world_size_across_dp==1,
+# neither of which holds on the current K3 stack. Exported unconditionally
+# anyway so the value a worker resolved is visible in its echo rather than
+# being an unset-vs-0 ambiguity.
+export VLLM_XPU_ENABLE_XPU_GRAPH=${VLLM_XPU_ENABLE_XPU_GRAPH:-0}
+# Chunked KDA prefill (kda.py:470). Read per call, default OFF.
+export VLLM_KIMI_XPU_KDA_CHUNKED=${VLLM_KIMI_XPU_KDA_CHUNKED:-0}
+# Previously NOT plumbed to Ray workers at all (neither the registration loop
+# below nor the per-node ssh export block ~:747 carried these two vars) -- a
+# worker process reading os.getenv("VLLM_KIMI_XPU_KDA_TRITON") always saw
+# unset/"0" regardless of what was exported here, so job 8744445's "Triton
+# doesn't help" conclusion was measuring the untouched Python fallback path,
+# not the Triton kernel. See docs/bugs/ (or RESULTS.md K3-step5) for the
+# original mislabeled run and kda.py:50 / causal_conv1d.py:34 for the
+# module-import-time os.getenv() reads these must reach.
+export VLLM_KIMI_XPU_KDA_TRITON=${VLLM_KIMI_XPU_KDA_TRITON:-0}
+export VLLM_KIMI_XPU_CAUSAL_CONV1D_TRITON=${VLLM_KIMI_XPU_CAUSAL_CONV1D_TRITON:-0}
 export VLLM_XPU_ALLOW_TRITON_SAMPLER=${VLLM_XPU_ALLOW_TRITON_SAMPLER:-0}
-for ray_env_name in K3_BLOCK_PROFILE_DIR K3_LOADER_ACCOUNTING_DIR VLLM_KIMI_XPU_REQUEST_DIAGNOSTIC_LIMIT; do
+for ray_env_name in K3_BLOCK_PROFILE_DIR K3_LOADER_ACCOUNTING_DIR VLLM_KIMI_XPU_REQUEST_DIAGNOSTIC_LIMIT VLLM_KIMI_XPU_KDA_TRITON VLLM_KIMI_XPU_CAUSAL_CONV1D_TRITON VLLM_KIMI_XPU_KDA_VECTORIZED VLLM_KIMI_XPU_CONV1D_VECTORIZED VLLM_KIMI_XPU_KDA_CHUNKED VLLM_KIMI_XPU_KDA_CHUNK_SIZE VLLM_KIMI_XPU_KDA_CHUNK_SOLVE VLLM_XPU_ENABLE_XPU_GRAPH VLLM_XPU_ALLOW_TRITON_SAMPLER; do
     if [[ ",${VLLM_RAY_EXTRA_ENV_VARS_TO_COPY:-}," != *,${ray_env_name},* ]]; then
         VLLM_RAY_EXTRA_ENV_VARS_TO_COPY="${VLLM_RAY_EXTRA_ENV_VARS_TO_COPY:+${VLLM_RAY_EXTRA_ENV_VARS_TO_COPY},}${ray_env_name}"
     fi
@@ -426,6 +450,23 @@ echo "ray_v2=$RAY_V2 ray_temp_root=$RAY_TEMP_ROOT" | tee -a "$LOG_DIR/metadata"
 echo "vllm_batch_invariant=$VLLM_BATCH_INVARIANT" | tee -a "$LOG_DIR/metadata"
 echo "vllm_xpu_deterministic_routing=$VLLM_XPU_DETERMINISTIC_ROUTING" | tee -a "$LOG_DIR/metadata"
 echo "vllm_xpu_deterministic_moe_gather=$VLLM_XPU_DETERMINISTIC_MOE_GATHER" | tee -a "$LOG_DIR/metadata"
+# Loud, non-fatal flag in run metadata: =1 is a ~100x slow debug path (a
+# nested Python row-gather loop with 2 host syncs per (row,slot) in
+# fused_moe_interface.py, see the comment above this var's export near the
+# top of this script) that is opt-in for deliberate kernel-level A/B only.
+# Not a hard failure -- that opt-in use is legitimate -- but any throughput
+# number from this run must be read as measuring the debug path, not
+# production performance.
+if [[ "$VLLM_XPU_DETERMINISTIC_MOE_GATHER" != 0 ]]; then
+    echo "WARNING: VLLM_XPU_DETERMINISTIC_MOE_GATHER=$VLLM_XPU_DETERMINISTIC_MOE_GATHER -- this run is on the ~100x slow debug MoE-gather path, not production. Any throughput number from this run is NOT comparable to production baselines." | tee -a "$LOG_DIR/metadata" >&2
+fi
+echo "vllm_kimi_xpu_kda_triton=$VLLM_KIMI_XPU_KDA_TRITON" | tee -a "$LOG_DIR/metadata"
+echo "vllm_kimi_xpu_causal_conv1d_triton=$VLLM_KIMI_XPU_CAUSAL_CONV1D_TRITON" | tee -a "$LOG_DIR/metadata"
+echo "vllm_kimi_xpu_kda_vectorized=$VLLM_KIMI_XPU_KDA_VECTORIZED" | tee -a "$LOG_DIR/metadata"
+echo "vllm_kimi_xpu_conv1d_vectorized=$VLLM_KIMI_XPU_CONV1D_VECTORIZED" | tee -a "$LOG_DIR/metadata"
+echo "vllm_kimi_xpu_kda_chunked=$VLLM_KIMI_XPU_KDA_CHUNKED" | tee -a "$LOG_DIR/metadata"
+echo "vllm_xpu_enable_xpu_graph=$VLLM_XPU_ENABLE_XPU_GRAPH" | tee -a "$LOG_DIR/metadata"
+echo "vllm_xpu_allow_triton_sampler=$VLLM_XPU_ALLOW_TRITON_SAMPLER" | tee -a "$LOG_DIR/metadata"
 if [[ -d "$VLLM_SRC/.git" ]]; then
     vllm_commit=$(git -C "$VLLM_SRC" rev-parse HEAD)
     git -C "$VLLM_SRC" status --porcelain=v1 >"$LOG_DIR/vllm_status.txt"
@@ -735,6 +776,10 @@ else
     remote_kimi_xpu_request_diagnostic_limit_q=$(printf '%q' "${VLLM_KIMI_XPU_REQUEST_DIAGNOSTIC_LIMIT:-4096}")
     remote_kda_vectorized_q=$(printf '%q' "$VLLM_KIMI_XPU_KDA_VECTORIZED")
     remote_conv1d_vectorized_q=$(printf '%q' "$VLLM_KIMI_XPU_CONV1D_VECTORIZED")
+    remote_kda_triton_q=$(printf '%q' "$VLLM_KIMI_XPU_KDA_TRITON")
+    remote_causal_conv1d_triton_q=$(printf '%q' "$VLLM_KIMI_XPU_CAUSAL_CONV1D_TRITON")
+    remote_xpu_enable_xpu_graph_q=$(printf '%q' "$VLLM_XPU_ENABLE_XPU_GRAPH")
+    remote_kda_chunked_q=$(printf '%q' "$VLLM_KIMI_XPU_KDA_CHUNKED")
     remote_xpu_triton_sampler_q=$(printf '%q' "$VLLM_XPU_ALLOW_TRITON_SAMPLER")
     remote_daos_agent_drpc_q=$(printf '%q' "$DAOS_AGENT_DRPC_DIR")
     remote_d_agent_drpc_q=$(printf '%q' "$D_AGENT_DRPC_DIR")
@@ -744,7 +789,7 @@ else
     remote_ray_extra_env_vars_q=$(printf '%q' "$VLLM_RAY_EXTRA_ENV_VARS_TO_COPY")
     for node in "${NODES[@]}"; do
         [[ "$node" == "$HEAD" ]] && continue
-        ssh -o BatchMode=yes -o ConnectTimeout=15 "$node" "source '$RAY_ENV' frameworks; unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY; export K3_CACHE_ROOT=$remote_cache_root_q K3_CACHE_MARKER=$remote_cache_marker_q HF_HOME=$remote_hf_home_q HF_MODULES_CACHE=$remote_hf_modules_cache_q HF_HUB_CACHE=$remote_hf_hub_cache_q TRANSFORMERS_CACHE=$remote_transformers_cache_q XDG_CACHE_HOME=$remote_xdg_cache_home_q PYTHONPATH=$remote_pythonpath_q LD_LIBRARY_PATH=$remote_ld_library_path_q no_proxy=$remote_no_proxy_q NO_PROXY=$remote_no_proxy_q TORCHDYNAMO_DISABLE=$remote_torchdynamo_disable_q TORCH_COMPILE_DISABLE=$remote_torch_compile_disable_q CCL_PROCESS_LAUNCHER=$remote_ccl_process_launcher_q CCL_ATL_TRANSPORT=$remote_ccl_atl_transport_q CCL_KVS_IFACE=$remote_ccl_kvs_iface_q FI_PROVIDER=$remote_fi_provider_q ZE_FLAT_DEVICE_HIERARCHY=$remote_ze_flat_device_hierarchy_q VLLM_WORKER_MULTIPROC_METHOD=$remote_vllm_worker_method_q VLLM_TARGET_DEVICE=$remote_vllm_target_device_q VLLM_BATCH_INVARIANT=$remote_vllm_batch_invariant_q VLLM_XPU_DETERMINISTIC_ROUTING=$remote_vllm_xpu_deterministic_routing_q VLLM_XPU_DETERMINISTIC_MOE_GATHER=$remote_vllm_xpu_deterministic_moe_gather_q VLLM_KIMI_XPU_DIAGNOSTICS=$remote_kimi_xpu_diagnostics_q VLLM_KIMI_XPU_REQUEST_DIAGNOSTIC_LIMIT=$remote_kimi_xpu_request_diagnostic_limit_q VLLM_KIMI_XPU_KDA_VECTORIZED=$remote_kda_vectorized_q VLLM_KIMI_XPU_CONV1D_VECTORIZED=$remote_conv1d_vectorized_q VLLM_XPU_ALLOW_TRITON_SAMPLER=$remote_xpu_triton_sampler_q RAY_EXPERIMENTAL_NOSET_ONEAPI_DEVICE_SELECTOR=$remote_ray_no_set_oneapi_q RAY_DEDUP_LOGS=$remote_ray_dedup_logs_q VLLM_USE_RAY_V2_EXECUTOR_BACKEND=$remote_ray_v2_q VLLM_KDA_XPU_DIAGNOSTICS=$remote_kda_xpu_diagnostics_q VLLM_RAY_EXTRA_ENV_VARS_TO_COPY=$remote_ray_extra_env_vars_q DAOS_AGENT_DRPC_DIR=$remote_daos_agent_drpc_q D_AGENT_DRPC_DIR=$remote_d_agent_drpc_q K3_BLOCK_PROFILE_DIR=$remote_k3_block_profile_dir_q K3_LOADER_ACCOUNTING_DIR=$remote_k3_loader_accounting_dir_q; if [ -e $remote_cache_root_q ]; then echo 'ERROR: remote K3 cache already exists' >&2; exit 1; fi; mkdir $remote_cache_root_q; mkdir -p $remote_ray_temp_root_q; printf '%s\\n' '$PBS_JOBID' >$remote_cache_marker_q; self=\$\$; mapfile -t pids < <(ps -eo pid=,args= | awk -v root='$RAY_TEMP_ROOT' -v self=\"\$self\" 'index(\$0, root) && \$1 != self {print \$1}'); for pid in \"\${pids[@]}\"; do kill -TERM \"\$pid\" 2>/dev/null || true; done; sleep 2; mapfile -t pids < <(ps -eo pid=,args= | awk -v root='$RAY_TEMP_ROOT' -v self=\"\$self\" 'index(\$0, root) && \$1 != self {print \$1}'); for pid in \"\${pids[@]}\"; do kill -KILL \"\$pid\" 2>/dev/null || true; done; ray start --address='$RAY_ADDRESS' --num-gpus='${NUM_GPUS:-12}' --num-cpus=4 --temp-dir=$remote_ray_temp_root_q --block" \
+        ssh -o BatchMode=yes -o ConnectTimeout=15 "$node" "source '$RAY_ENV' frameworks; unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY; export K3_CACHE_ROOT=$remote_cache_root_q K3_CACHE_MARKER=$remote_cache_marker_q HF_HOME=$remote_hf_home_q HF_MODULES_CACHE=$remote_hf_modules_cache_q HF_HUB_CACHE=$remote_hf_hub_cache_q TRANSFORMERS_CACHE=$remote_transformers_cache_q XDG_CACHE_HOME=$remote_xdg_cache_home_q PYTHONPATH=$remote_pythonpath_q LD_LIBRARY_PATH=$remote_ld_library_path_q no_proxy=$remote_no_proxy_q NO_PROXY=$remote_no_proxy_q TORCHDYNAMO_DISABLE=$remote_torchdynamo_disable_q TORCH_COMPILE_DISABLE=$remote_torch_compile_disable_q CCL_PROCESS_LAUNCHER=$remote_ccl_process_launcher_q CCL_ATL_TRANSPORT=$remote_ccl_atl_transport_q CCL_KVS_IFACE=$remote_ccl_kvs_iface_q FI_PROVIDER=$remote_fi_provider_q ZE_FLAT_DEVICE_HIERARCHY=$remote_ze_flat_device_hierarchy_q VLLM_WORKER_MULTIPROC_METHOD=$remote_vllm_worker_method_q VLLM_TARGET_DEVICE=$remote_vllm_target_device_q VLLM_BATCH_INVARIANT=$remote_vllm_batch_invariant_q VLLM_XPU_DETERMINISTIC_ROUTING=$remote_vllm_xpu_deterministic_routing_q VLLM_XPU_DETERMINISTIC_MOE_GATHER=$remote_vllm_xpu_deterministic_moe_gather_q VLLM_KIMI_XPU_DIAGNOSTICS=$remote_kimi_xpu_diagnostics_q VLLM_KIMI_XPU_REQUEST_DIAGNOSTIC_LIMIT=$remote_kimi_xpu_request_diagnostic_limit_q VLLM_KIMI_XPU_KDA_VECTORIZED=$remote_kda_vectorized_q VLLM_KIMI_XPU_CONV1D_VECTORIZED=$remote_conv1d_vectorized_q VLLM_KIMI_XPU_KDA_TRITON=$remote_kda_triton_q VLLM_KIMI_XPU_CAUSAL_CONV1D_TRITON=$remote_causal_conv1d_triton_q VLLM_XPU_ENABLE_XPU_GRAPH=$remote_xpu_enable_xpu_graph_q VLLM_KIMI_XPU_KDA_CHUNKED=$remote_kda_chunked_q VLLM_XPU_ALLOW_TRITON_SAMPLER=$remote_xpu_triton_sampler_q RAY_EXPERIMENTAL_NOSET_ONEAPI_DEVICE_SELECTOR=$remote_ray_no_set_oneapi_q RAY_DEDUP_LOGS=$remote_ray_dedup_logs_q VLLM_USE_RAY_V2_EXECUTOR_BACKEND=$remote_ray_v2_q VLLM_KDA_XPU_DIAGNOSTICS=$remote_kda_xpu_diagnostics_q VLLM_RAY_EXTRA_ENV_VARS_TO_COPY=$remote_ray_extra_env_vars_q DAOS_AGENT_DRPC_DIR=$remote_daos_agent_drpc_q D_AGENT_DRPC_DIR=$remote_d_agent_drpc_q K3_BLOCK_PROFILE_DIR=$remote_k3_block_profile_dir_q K3_LOADER_ACCOUNTING_DIR=$remote_k3_loader_accounting_dir_q; if [ -e $remote_cache_root_q ]; then echo 'ERROR: remote K3 cache already exists' >&2; exit 1; fi; mkdir $remote_cache_root_q; mkdir -p $remote_ray_temp_root_q; printf '%s\\n' '$PBS_JOBID' >$remote_cache_marker_q; self=\$\$; mapfile -t pids < <(ps -eo pid=,args= | awk -v root='$RAY_TEMP_ROOT' -v self=\"\$self\" 'index(\$0, root) && \$1 != self {print \$1}'); for pid in \"\${pids[@]}\"; do kill -TERM \"\$pid\" 2>/dev/null || true; done; sleep 2; mapfile -t pids < <(ps -eo pid=,args= | awk -v root='$RAY_TEMP_ROOT' -v self=\"\$self\" 'index(\$0, root) && \$1 != self {print \$1}'); for pid in \"\${pids[@]}\"; do kill -KILL \"\$pid\" 2>/dev/null || true; done; ray start --address='$RAY_ADDRESS' --num-gpus='${NUM_GPUS:-12}' --num-cpus=4 --temp-dir=$remote_ray_temp_root_q --block" \
         >"$LOG_DIR/ray_${node}.log" 2>&1 &
         ray_pids+=("$!")
     done
@@ -818,6 +863,31 @@ if [[ -f "$LOG_DIR/effective_environment_actor.txt" ]]; then
             exit 1
         }
     done
+fi
+# Wheel-patch checksum guard: vllm_xpu_kernels/fused_moe_interface.py is
+# hand-edited directly inside site-packages (not an editable checkout like
+# vllm-xpu-src), and there is no pristine 0.1.7 wheel to diff against --
+# `pip install --force-reinstall` or a fresh venv build silently reverts the
+# patch with no error. A reverted patch changes MoE combine-step behavior
+# (VLLM_XPU_DETERMINISTIC_MOE_GATHER branch) without changing any launch
+# argument, so a stale wheel would otherwise look like a clean, unexplained
+# numerics/perf drift. See wheel_patches/README.md for the reapply procedure.
+WHEEL_PATCH_TARGET="$PYTHON_SITE_PACKAGES/vllm_xpu_kernels/fused_moe_interface.py"
+WHEEL_PATCH_REFERENCE="$SCRIPT_DIR/wheel_patches/vllm_xpu_kernels_0.1.7_fused_moe_interface.py"
+if [[ -f "$WHEEL_PATCH_REFERENCE" ]]; then
+    [[ -f "$WHEEL_PATCH_TARGET" ]] || {
+        echo "ERROR: expected hand-patched file is missing: $WHEEL_PATCH_TARGET" >&2
+        exit 1
+    }
+    wheel_patch_reference_sha256=$(sha256sum "$WHEEL_PATCH_REFERENCE" | awk '{print $1}')
+    wheel_patch_target_sha256=$(sha256sum "$WHEEL_PATCH_TARGET" | awk '{print $1}')
+    [[ "$wheel_patch_target_sha256" == "$wheel_patch_reference_sha256" ]] || {
+        echo "ERROR: $WHEEL_PATCH_TARGET does not match the known-good hand patch (sha256 $wheel_patch_target_sha256 != $wheel_patch_reference_sha256). A venv rebuild or pip --force-reinstall likely reverted it -- see wheel_patches/README.md to reapply before trusting any result from this run." >&2
+        exit 1
+    }
+    echo "wheel_patch_verified=$WHEEL_PATCH_TARGET sha256=$wheel_patch_target_sha256" | tee -a "$LOG_DIR/metadata"
+else
+    echo "WARNING: no wheel patch reference found at $WHEEL_PATCH_REFERENCE; skipping checksum guard" | tee -a "$LOG_DIR/metadata" >&2
 fi
 [[ "$EP" == 1 ]] && ARGS+=(--enable-expert-parallel)
 echo "server_args=${ARGS[*]}" | tee -a "$LOG_DIR/metadata"
