@@ -45,6 +45,9 @@ GATED_ENV_VARS = [
     # control, and a flag resolved at model-construction time must reach the
     # worker before the model is built.
     "VLLM_KIMI_FUSE_SHARED_EXPERT_AR",
+    # Fused single-kernel KDA decode. Resolved at import time in kda.py, so it
+    # must reach the worker process, not just the driver.
+    "VLLM_KIMI_XPU_KDA_FUSED_DECODE",
 ]
 
 

@@ -102,22 +102,29 @@ therefore cut at all 69 KDA call sites, and the op body is dispatched through
 `forward_context.no_compile_layers` — it runs eagerly and is never traced or
 captured.
 
-**Consequence: capture and KDA fusion cannot reach the same launches.**
+**Consequence: capture and KDA fusion reach overlapping but different sets.**
 
-| | launches | residual ms |
-|---|---:|---:|
-| capturable (inside the graph) | 13,777 | 380 |
-| not capturable (KDA, split out) | 5,865 | 162 |
+The boundary is not "all of KDA" — it runs through the middle of the layer.
+`fused_kda_gate` and `o_norm` are called in `KimiDeltaAttention.forward()`,
+*outside* the custom op, so they stay in the graph. Only `_forward`'s body
+(the three conv1d state updates and the recurrence) is split out:
 
-| scenario | step | tok/s |
-|---|---:|---:|
-| now (AR-fused default) | 879 ms | 1.138 |
-| + perfect capture of everything capturable | 499 ms | 2.00 |
-| + KDA also fused to 4 launches/layer | 345 ms | 2.90 |
+| | per layer | x69 | residual ms |
+|---|---:|---:|---:|
+| capturable (incl. gate + o_norm) | — | 15,502 | 428 |
+| **not** capturable (`_forward`: conv x3 + recurrence) | 60 | 4,140 | 114 |
 
-So capture's upper bound is **~43%**, not the ~62% the residual share alone
-suggested — KDA's 162 ms is out of its reach by construction. And the levers
-are **complementary**, not competing: each owns a disjoint share.
+| scenario | step | tok/s | vs now |
+|---|---:|---:|---:|
+| now (AR-fused default) | 879 ms | 1.138 | — |
+| perfect capture alone | 451 ms | 2.22 | +95% |
+| fused KDA alone (to 1 launch/layer) | 767 ms | 1.30 | +13% |
+| both | 339 ms | 2.95 | +159% |
+
+So capture's upper bound is **~49%** of the step, and fused-KDA-alone is
+**~13%** — the exclusive part of its domain is the 114 ms that capture cannot
+touch. (The kernel as written also absorbs `o_norm`, which capture *could*
+reach; that overlap is why the two do not simply add.)
 
 **The fused-RMSNorm anti-stacking result does not apply here.** That finding
 (`memory/project_fused_rmsnorm_anti_stacks_with_compile_20260716.md`) was a
@@ -129,11 +136,12 @@ mechanism that caused the sign flip is absent.
 
 ## Revised priority
 
-1. **Graph capture at TP=32** — ~43% upper bound, and attempt 3 already proved
+1. **Graph capture at TP=32** — ~49% upper bound, and attempt 3 already proved
    the path runs clean end-to-end. Needs only hold time.
-2. **Fused KDA decode kernel** — ~17.5% upper bound, and it is the only lever
-   that touches the 30% of launches capture structurally cannot. Stacks with
-   1. Start CPU-side; no hold needed.
+2. **Fused KDA decode kernel** — ~13% alone, but it owns the 114 ms that
+   capture structurally cannot reach, so the two together project ~2.95 tok/s.
+   Implemented and CPU-verified (`kda_fused_decode_xpu.py`, 9 equivalence
+   tests + 3 mutation checks); needs a hardware A/B.
 3. Collectives — 24% and already cut once by AR fusion. Sequence parallelism
    is the next structural cut, per upstream.
 
