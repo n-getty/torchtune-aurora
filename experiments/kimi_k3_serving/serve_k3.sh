@@ -30,6 +30,19 @@ STAGE_MODEL=${STAGE_MODEL:-0}
 STAGE_ROOT=${STAGE_ROOT:-/tmp/kimi_k3_models}
 STAGE_ONLY=${STAGE_ONLY:-0}
 PYTHON=${PYTHON:-/flare/ModCon/ngetty/venvs/kimi-k3-xpu-framework/bin/python}
+# Which environment setup_ray_env.sh applies on EVERY node (head via the local
+# source, the others via the ssh block). "frameworks" = module load
+# frameworks/2025.3.1, which is where the K3 venv gets torch 2.10. "torch211"
+# activates /flare/ModCon/ngetty/venvs/torchtune-pt-nightly-xpu (torch 2.11,
+# the only build with torch.xpu.XPUGraph, i.e. the prerequisite for XPU graph
+# capture -- supports_xpu_graph() is a bare version check).
+#
+# This MUST move together with PYTHON: setting PYTHON to the 2.11 venv while
+# the remote nodes still `module load frameworks` gives a head process on 2.11
+# and 24 workers on 2.10. Each worker now echoes its own torch version
+# (K3_WORKER_GATES), so that mismatch is visible rather than silent -- but the
+# knob has to exist before it can be set correctly.
+RAY_ENV_MODE=${RAY_ENV_MODE:-frameworks}
 VLLM_SRC=${VLLM_SRC:-/flare/ModCon/ngetty/vllm-xpu-src}
 SYCL_LIB_DIR=${SYCL_LIB_DIR:-/opt/aurora/26.26.0/oneapi/2025.3/lib}
 VERIFY_CHECKPOINT=${VERIFY_CHECKPOINT:-0}
@@ -405,7 +418,7 @@ capture_device_snapshot "$LOG_DIR/device_snapshot_$(hostname -s).json"
 for node in "${NODES[@]}"; do
     [[ "${node%%.*}" == "$CURRENT_NODE" ]] && continue
     ssh -o BatchMode=yes -o ConnectTimeout=15 "$node" \
-        "source '$RAY_ENV' frameworks; $PYTHON -" \
+        "source '$RAY_ENV' '$RAY_ENV_MODE'; $PYTHON -" \
         < <(cat <<'PY'
 import json
 import os
@@ -467,6 +480,7 @@ echo "vllm_kimi_xpu_conv1d_vectorized=$VLLM_KIMI_XPU_CONV1D_VECTORIZED" | tee -a
 echo "vllm_kimi_xpu_kda_chunked=$VLLM_KIMI_XPU_KDA_CHUNKED" | tee -a "$LOG_DIR/metadata"
 echo "vllm_xpu_enable_xpu_graph=$VLLM_XPU_ENABLE_XPU_GRAPH" | tee -a "$LOG_DIR/metadata"
 echo "vllm_xpu_allow_triton_sampler=$VLLM_XPU_ALLOW_TRITON_SAMPLER" | tee -a "$LOG_DIR/metadata"
+echo "python=$PYTHON ray_env_mode=$RAY_ENV_MODE" | tee -a "$LOG_DIR/metadata"
 if [[ -d "$VLLM_SRC/.git" ]]; then
     vllm_commit=$(git -C "$VLLM_SRC" rev-parse HEAD)
     git -C "$VLLM_SRC" status --porcelain=v1 >"$LOG_DIR/vllm_status.txt"
@@ -671,7 +685,7 @@ else
     done
     export no_proxy="$NOPROXY_EXTRA" NO_PROXY="$NOPROXY_EXTRA" VLLM_HOST_IP="$HEAD_IP" RAY_HEAD_IP="$HEAD_IP"
     set +u
-    source "$RAY_ENV" frameworks
+    source "$RAY_ENV" "$RAY_ENV_MODE"
     set -u
     # The framework helper may alter Python environment state. Reassert the
     # patched source and its site-packages before starting API/Ray processes.
@@ -789,7 +803,7 @@ else
     remote_ray_extra_env_vars_q=$(printf '%q' "$VLLM_RAY_EXTRA_ENV_VARS_TO_COPY")
     for node in "${NODES[@]}"; do
         [[ "$node" == "$HEAD" ]] && continue
-        ssh -o BatchMode=yes -o ConnectTimeout=15 "$node" "source '$RAY_ENV' frameworks; unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY; export K3_CACHE_ROOT=$remote_cache_root_q K3_CACHE_MARKER=$remote_cache_marker_q HF_HOME=$remote_hf_home_q HF_MODULES_CACHE=$remote_hf_modules_cache_q HF_HUB_CACHE=$remote_hf_hub_cache_q TRANSFORMERS_CACHE=$remote_transformers_cache_q XDG_CACHE_HOME=$remote_xdg_cache_home_q PYTHONPATH=$remote_pythonpath_q LD_LIBRARY_PATH=$remote_ld_library_path_q no_proxy=$remote_no_proxy_q NO_PROXY=$remote_no_proxy_q TORCHDYNAMO_DISABLE=$remote_torchdynamo_disable_q TORCH_COMPILE_DISABLE=$remote_torch_compile_disable_q CCL_PROCESS_LAUNCHER=$remote_ccl_process_launcher_q CCL_ATL_TRANSPORT=$remote_ccl_atl_transport_q CCL_KVS_IFACE=$remote_ccl_kvs_iface_q FI_PROVIDER=$remote_fi_provider_q ZE_FLAT_DEVICE_HIERARCHY=$remote_ze_flat_device_hierarchy_q VLLM_WORKER_MULTIPROC_METHOD=$remote_vllm_worker_method_q VLLM_TARGET_DEVICE=$remote_vllm_target_device_q VLLM_BATCH_INVARIANT=$remote_vllm_batch_invariant_q VLLM_XPU_DETERMINISTIC_ROUTING=$remote_vllm_xpu_deterministic_routing_q VLLM_XPU_DETERMINISTIC_MOE_GATHER=$remote_vllm_xpu_deterministic_moe_gather_q VLLM_KIMI_XPU_DIAGNOSTICS=$remote_kimi_xpu_diagnostics_q VLLM_KIMI_XPU_REQUEST_DIAGNOSTIC_LIMIT=$remote_kimi_xpu_request_diagnostic_limit_q VLLM_KIMI_XPU_KDA_VECTORIZED=$remote_kda_vectorized_q VLLM_KIMI_XPU_CONV1D_VECTORIZED=$remote_conv1d_vectorized_q VLLM_KIMI_XPU_KDA_TRITON=$remote_kda_triton_q VLLM_KIMI_XPU_CAUSAL_CONV1D_TRITON=$remote_causal_conv1d_triton_q VLLM_XPU_ENABLE_XPU_GRAPH=$remote_xpu_enable_xpu_graph_q VLLM_KIMI_XPU_KDA_CHUNKED=$remote_kda_chunked_q VLLM_XPU_ALLOW_TRITON_SAMPLER=$remote_xpu_triton_sampler_q RAY_EXPERIMENTAL_NOSET_ONEAPI_DEVICE_SELECTOR=$remote_ray_no_set_oneapi_q RAY_DEDUP_LOGS=$remote_ray_dedup_logs_q VLLM_USE_RAY_V2_EXECUTOR_BACKEND=$remote_ray_v2_q VLLM_KDA_XPU_DIAGNOSTICS=$remote_kda_xpu_diagnostics_q VLLM_RAY_EXTRA_ENV_VARS_TO_COPY=$remote_ray_extra_env_vars_q DAOS_AGENT_DRPC_DIR=$remote_daos_agent_drpc_q D_AGENT_DRPC_DIR=$remote_d_agent_drpc_q K3_BLOCK_PROFILE_DIR=$remote_k3_block_profile_dir_q K3_LOADER_ACCOUNTING_DIR=$remote_k3_loader_accounting_dir_q; if [ -e $remote_cache_root_q ]; then echo 'ERROR: remote K3 cache already exists' >&2; exit 1; fi; mkdir $remote_cache_root_q; mkdir -p $remote_ray_temp_root_q; printf '%s\\n' '$PBS_JOBID' >$remote_cache_marker_q; self=\$\$; mapfile -t pids < <(ps -eo pid=,args= | awk -v root='$RAY_TEMP_ROOT' -v self=\"\$self\" 'index(\$0, root) && \$1 != self {print \$1}'); for pid in \"\${pids[@]}\"; do kill -TERM \"\$pid\" 2>/dev/null || true; done; sleep 2; mapfile -t pids < <(ps -eo pid=,args= | awk -v root='$RAY_TEMP_ROOT' -v self=\"\$self\" 'index(\$0, root) && \$1 != self {print \$1}'); for pid in \"\${pids[@]}\"; do kill -KILL \"\$pid\" 2>/dev/null || true; done; ray start --address='$RAY_ADDRESS' --num-gpus='${NUM_GPUS:-12}' --num-cpus=4 --temp-dir=$remote_ray_temp_root_q --block" \
+        ssh -o BatchMode=yes -o ConnectTimeout=15 "$node" "source '$RAY_ENV' '$RAY_ENV_MODE'; unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY; export K3_CACHE_ROOT=$remote_cache_root_q K3_CACHE_MARKER=$remote_cache_marker_q HF_HOME=$remote_hf_home_q HF_MODULES_CACHE=$remote_hf_modules_cache_q HF_HUB_CACHE=$remote_hf_hub_cache_q TRANSFORMERS_CACHE=$remote_transformers_cache_q XDG_CACHE_HOME=$remote_xdg_cache_home_q PYTHONPATH=$remote_pythonpath_q LD_LIBRARY_PATH=$remote_ld_library_path_q no_proxy=$remote_no_proxy_q NO_PROXY=$remote_no_proxy_q TORCHDYNAMO_DISABLE=$remote_torchdynamo_disable_q TORCH_COMPILE_DISABLE=$remote_torch_compile_disable_q CCL_PROCESS_LAUNCHER=$remote_ccl_process_launcher_q CCL_ATL_TRANSPORT=$remote_ccl_atl_transport_q CCL_KVS_IFACE=$remote_ccl_kvs_iface_q FI_PROVIDER=$remote_fi_provider_q ZE_FLAT_DEVICE_HIERARCHY=$remote_ze_flat_device_hierarchy_q VLLM_WORKER_MULTIPROC_METHOD=$remote_vllm_worker_method_q VLLM_TARGET_DEVICE=$remote_vllm_target_device_q VLLM_BATCH_INVARIANT=$remote_vllm_batch_invariant_q VLLM_XPU_DETERMINISTIC_ROUTING=$remote_vllm_xpu_deterministic_routing_q VLLM_XPU_DETERMINISTIC_MOE_GATHER=$remote_vllm_xpu_deterministic_moe_gather_q VLLM_KIMI_XPU_DIAGNOSTICS=$remote_kimi_xpu_diagnostics_q VLLM_KIMI_XPU_REQUEST_DIAGNOSTIC_LIMIT=$remote_kimi_xpu_request_diagnostic_limit_q VLLM_KIMI_XPU_KDA_VECTORIZED=$remote_kda_vectorized_q VLLM_KIMI_XPU_CONV1D_VECTORIZED=$remote_conv1d_vectorized_q VLLM_KIMI_XPU_KDA_TRITON=$remote_kda_triton_q VLLM_KIMI_XPU_CAUSAL_CONV1D_TRITON=$remote_causal_conv1d_triton_q VLLM_XPU_ENABLE_XPU_GRAPH=$remote_xpu_enable_xpu_graph_q VLLM_KIMI_XPU_KDA_CHUNKED=$remote_kda_chunked_q VLLM_XPU_ALLOW_TRITON_SAMPLER=$remote_xpu_triton_sampler_q RAY_EXPERIMENTAL_NOSET_ONEAPI_DEVICE_SELECTOR=$remote_ray_no_set_oneapi_q RAY_DEDUP_LOGS=$remote_ray_dedup_logs_q VLLM_USE_RAY_V2_EXECUTOR_BACKEND=$remote_ray_v2_q VLLM_KDA_XPU_DIAGNOSTICS=$remote_kda_xpu_diagnostics_q VLLM_RAY_EXTRA_ENV_VARS_TO_COPY=$remote_ray_extra_env_vars_q DAOS_AGENT_DRPC_DIR=$remote_daos_agent_drpc_q D_AGENT_DRPC_DIR=$remote_d_agent_drpc_q K3_BLOCK_PROFILE_DIR=$remote_k3_block_profile_dir_q K3_LOADER_ACCOUNTING_DIR=$remote_k3_loader_accounting_dir_q; if [ -e $remote_cache_root_q ]; then echo 'ERROR: remote K3 cache already exists' >&2; exit 1; fi; mkdir $remote_cache_root_q; mkdir -p $remote_ray_temp_root_q; printf '%s\\n' '$PBS_JOBID' >$remote_cache_marker_q; self=\$\$; mapfile -t pids < <(ps -eo pid=,args= | awk -v root='$RAY_TEMP_ROOT' -v self=\"\$self\" 'index(\$0, root) && \$1 != self {print \$1}'); for pid in \"\${pids[@]}\"; do kill -TERM \"\$pid\" 2>/dev/null || true; done; sleep 2; mapfile -t pids < <(ps -eo pid=,args= | awk -v root='$RAY_TEMP_ROOT' -v self=\"\$self\" 'index(\$0, root) && \$1 != self {print \$1}'); for pid in \"\${pids[@]}\"; do kill -KILL \"\$pid\" 2>/dev/null || true; done; ray start --address='$RAY_ADDRESS' --num-gpus='${NUM_GPUS:-12}' --num-cpus=4 --temp-dir=$remote_ray_temp_root_q --block" \
         >"$LOG_DIR/ray_${node}.log" 2>&1 &
         ray_pids+=("$!")
     done

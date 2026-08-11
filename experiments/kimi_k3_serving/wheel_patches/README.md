@@ -40,6 +40,27 @@ Used throughout the K3 investigation (see `RESULTS.md`, entries referencing
 non-determinism/degeneration came from the native kernel's row gather versus
 elsewhere in the pipeline.
 
+### This snapshot carries MORE than the gather toggle — it is load-bearing
+
+The description above understates the file. The snapshot also contains the
+**`situ` activation support K3 cannot run without** (`config.hidden_act ==
+"situ"`), which the stock 0.1.7 wheel does not have. Measured 2026-08-11:
+
+| file | `grep -c situ` | sha256 |
+|---|---:|---|
+| this snapshot | 7 | `93b0e7d3…` |
+| K3 venv (`kimi-k3-xpu-framework`) | 7 | `93b0e7d3…` (identical) |
+| nightly venv (`torchtune-pt-nightly-xpu`) | **0** | `78e79a97…` |
+
+So copying this file is **mandatory**, not optional, for any venv that will
+serve K3 — including the torch-2.11 venv proposed for XPU graph capture,
+whose `vllm_xpu_kernels` is the same version `0.1.7` but has zero `situ`
+support. Reverting it does not produce a slow-but-correct run; it produces a
+model that cannot execute its own activation.
+
+`serve_k3.sh` asserts this sha256 at job start, but only against the venv
+`PYTHON=` points at.
+
 ### Reapplying after a venv rebuild
 
 ```bash
