@@ -10,11 +10,18 @@ Everything here is committed and runnable. Both trees clean
 | c=1 baseline | **1.041 tok/s** (961 ms/token), measured, 0.19% spread |
 | with AR fusion (now default) | **1.138 tok/s** (879 ms/token), +9.3% measured |
 | upstream reference | 118 tok/s @ c=1, GB300 TP16, no spec decode |
-| **eager ceiling** | **7.2 tok/s** = 21,293 launches/token x 6.5 us |
+| ~~eager ceiling 7.2 tok/s~~ | **RETRACTED — see `DECODE_BUDGET_CORRECTED_20260812.md`** |
 
-The ceiling is the point. Collective removal, host-sync hoisting and kernel
-tuning all operate *below* it. Only **fewer launches** (fusion) or **no
-per-launch cost** (capture) change it.
+The "7.2 tok/s eager ceiling" was wrong in both factors: the step is 19,642
+launches (not 21,293 — prefill was folded in) and in-situ per-launch cost is
+~28 us (not 6.5 us — that microbenchmark looped a single op). There is no
+wall. The measured budget of the 879 ms step is compute 130 ms (15%),
+collectives 207 ms (24%), host/dispatch residual 542 ms (62%).
+
+The conclusion that survives: the step is **dispatch-dominated**, so only
+**fewer launches** (fusion) or **cheaper launches** (capture) matter. The
+priority in section 2 below is REVERSED by the correction — capture's upper
+bound is ~62%, KDA fusion's is ~17.5% (KDA is only 30% of launches).
 
 ## 0. State of the capture attempt as of end-of-session
 
@@ -52,24 +59,42 @@ LEGS="capture=ENFORCE_EAGER=0,CUDAGRAPH_MODE=FULL_DECODE_ONLY,VLLM_XPU_ENABLE_XP
 bash ab_c1_levers_3node.sh <FULL_PBS_JOB_ID>
 ```
 
-**Pre-registered** (dispatch is 138 ms of 961, so this bounds it):
-all dispatch removed = 1.215 tok/s (+16.7%); half = +7.7%; quarter = +3.7%.
-Decision: >=+10% pursue FULL capture; +2-10% real but PIECEWISE-bound;
-~0% replay overhead cancels the saving at this scale (matches Phase 0's
-0.55-0.83x microbenchmark caveat) — report and stop, do not retry blindly.
+**Pre-registered, REVISED 2026-08-12.** The old thresholds assumed dispatch
+was 138 ms of 961; it is actually ~542 ms of 879. Against the current
+AR-fused 879 ms default:
+
+| dispatch removed | step | tok/s | delta |
+|---|---:|---:|---:|
+| all (upper bound) | 337 ms | 2.97 | +161% |
+| half | 608 ms | 1.64 | +45% |
+| quarter | 744 ms | 1.34 | +18% |
+| PIECEWISE, ~93 segments each paying replay | — | — | plausibly single digits |
+
+Decision: **>=+15%** pursue FULL capture (needs a capturable attention
+backend); **+3-15%** real but PIECEWISE-bound — bank it and go to the fused
+KDA kernel; **~0 or negative** replay overhead cancels the saving at 93
+segments (consistent with Phase 0's 0.55-0.83x microbenchmark) — report and
+stop, do not retry blindly.
 
 Expect **PIECEWISE**, not FULL: `xpu.py:223-232` downgrades because
 sycl-tla FMHA cannot be captured. Verify from `K3_WORKER_GATES` (each rank
 echoes `torch=`, `supports_xpu_graph=`, `cudagraph_mode=`) before believing
 any number.
 
-## 2. Fused KDA decode kernel — the bigger lever (no hold needed to start)
+## 2. Fused KDA decode kernel — worth having, NOT the biggest lever
+
+**Corrected 2026-08-12.** KDA decode issues 85 kernel-launching aten ops per
+layer x 69 layers = **5,865 launches, 30% of the step's 19,642** (counted by
+`TorchDispatchMode` against the exact c=1 code path — run
+`analysis/count_kda_decode_ops.py`). Fusing all of it to ~4 launches/layer is
+worth **+17.5% upper bound**, charging removed launches at the residual rate.
+
+The other 13,777 launches/step are MoE/MLA/norm/sampler, so the biggest lever
+is whatever removes launches across all 93 layers at once — capture or
+whole-graph fusion — not one hand-written kernel. Do this SECOND; it composes
+with capture (capture removes per-launch cost, fusion removes the launches).
 
 Upstream folds causal conv + recurrent update + RMSNorm into ONE launch.
-We currently spend **12,702 of 21,293 launches/token on elementwise ops**
-doing only 62 ms of real work. This reduces the launch COUNT, so unlike
-capture it is not bounded by `+16.7%`, and it does not depend on the
-attention backend.
 
 Start from `kda.py::_kda_recurrent_xpu` (the vectorized decode branch) and
 the chunked-prefill Triton work already in the tree. A Triton fused decode

@@ -3,6 +3,17 @@
 Written 2026-08-11, after the first direct c=1 measurement on Aurora and
 after reading vLLM's Kimi-K3 blog + recipe.
 
+> **CORRECTED 2026-08-12 — read `DECODE_BUDGET_CORRECTED_20260812.md` first.**
+> Two numbers below are wrong. The step is **19,642** launches (not 21,293 —
+> that divided 12 forward passes by 12 tokens, but one of them is prefill),
+> and the in-situ per-launch cost is **~28-44 us** (not 6.5 us — that
+> microbenchmark re-issued a single op in a tight loop). **There is therefore
+> no "7.2 tok/s eager ceiling"**; the correct framing is a budget in which
+> host/dispatch is ~62% of the step. The qualitative conclusion — dispatch-
+> dominated, so fewer launches or cheaper launches are the only levers —
+> stands, and is if anything stronger. The *priority* it implied is reversed:
+> capture's upper bound is ~62%, not ~17%.
+
 ## The two numbers are the same measurement
 
 | | ours | vLLM upstream |
