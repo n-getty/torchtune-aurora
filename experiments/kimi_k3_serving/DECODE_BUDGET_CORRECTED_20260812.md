@@ -93,13 +93,47 @@ That reverses yesterday's priority call. Capture's value was previously
 computed as "+16.7% max, because dispatch is only 138 ms of 961". With
 dispatch actually ~542 ms of 879, **capture's upper bound is ~62%, not 17%**.
 
+## The two levers hit DISJOINT launch sets (this settles the priority)
+
+`vllm::kda_attention` is registered via `direct_register_custom_op` and is a
+member of `CompilationConfig._attention_ops` (`config/compilation.py:738-750`),
+which is the **default `splitting_ops` list**. Under PIECEWISE the fx graph is
+therefore cut at all 69 KDA call sites, and the op body is dispatched through
+`forward_context.no_compile_layers` — it runs eagerly and is never traced or
+captured.
+
+**Consequence: capture and KDA fusion cannot reach the same launches.**
+
+| | launches | residual ms |
+|---|---:|---:|
+| capturable (inside the graph) | 13,777 | 380 |
+| not capturable (KDA, split out) | 5,865 | 162 |
+
+| scenario | step | tok/s |
+|---|---:|---:|
+| now (AR-fused default) | 879 ms | 1.138 |
+| + perfect capture of everything capturable | 499 ms | 2.00 |
+| + KDA also fused to 4 launches/layer | 345 ms | 2.90 |
+
+So capture's upper bound is **~43%**, not the ~62% the residual share alone
+suggested — KDA's 162 ms is out of its reach by construction. And the levers
+are **complementary**, not competing: each owns a disjoint share.
+
+**The fused-RMSNorm anti-stacking result does not apply here.** That finding
+(`memory/project_fused_rmsnorm_anti_stacks_with_compile_20260716.md`) was a
+Triton kernel placed *inside* a compiled region, where it became an opaque
+barrier and cost more Inductor fusion than it saved. `kda_attention` is
+already a graph-splitting custom op running eagerly, so a Triton kernel there
+displaces eager ops and blocks nothing. Worth re-checking empirically, but the
+mechanism that caused the sign flip is absent.
+
 ## Revised priority
 
-1. **Graph capture at TP=32** — biggest measured upside, and attempt 3 already
-   proved the path runs clean end-to-end. Needs only hold time.
-2. **Fused KDA decode kernel** — +17.5% upper bound, independent of capture,
-   and it composes (capture removes per-launch cost; fusion removes the
-   launches). Start CPU-side; no hold needed.
+1. **Graph capture at TP=32** — ~43% upper bound, and attempt 3 already proved
+   the path runs clean end-to-end. Needs only hold time.
+2. **Fused KDA decode kernel** — ~17.5% upper bound, and it is the only lever
+   that touches the 30% of launches capture structurally cannot. Stacks with
+   1. Start CPU-side; no hold needed.
 3. Collectives — 24% and already cut once by AR fusion. Sequence parallelism
    is the next structural cut, per upstream.
 
