@@ -159,6 +159,54 @@ def merged_busy_span(intervals: list[tuple[float, float]]) -> float:
     return total
 
 
+def trace_can_support_a_verdict(events: list[dict]) -> tuple[bool, str]:
+    """Refuse to decide when the trace cannot see the term under debate.
+
+    Learned the hard way on job 8748640: the first real trace contained ONLY
+    device rows (cat in {kernel, gpu_memcpy}), zero CPU rows -- every "Self
+    CPU" in the companion profiler_out_*.txt was 0.000us/NaN -- and zero
+    collective kernels, despite distributedInfo reporting
+    `backend=xccl, world_size=32, pg_count=263`. Collectives demonstrably ran;
+    Kineto just did not record them, and without CPU rows there is nothing to
+    attribute the host side to either.
+
+    That trace still produced a confident-looking "CAPTURE" verdict, because
+    91.5% of wall time landed in the inter-kernel gap and the gap rule fired.
+    But an unattributed gap is exactly the ambiguity the experiment exists to
+    resolve: it is host dispatch (-> capture) OR time blocked inside oneCCL
+    (-> cut collectives), and this trace cannot tell them apart. Reporting
+    CAPTURE from it would have picked the branch by accident.
+
+    So: no CPU rows, or no collectives in a multi-rank job, means NO VERDICT.
+    """
+    has_cpu = any(
+        str(e.get("cat", "")).lower() in ("cpu_op", "user_annotation", "python_function")
+        for e in events
+    )
+    has_collective = any(
+        categorize(e.get("name", "")) == "collective" for e in events
+    )
+    if not has_cpu and not has_collective:
+        return False, (
+            "trace has NO CPU rows and NO collective kernels -- the "
+            "inter-kernel gap is unattributed, and 'host dispatch' vs 'blocked "
+            "in oneCCL' are precisely the two hypotheses under test. Re-profile "
+            "with CPU activity actually recording."
+        )
+    if not has_cpu:
+        return False, (
+            "trace has NO CPU rows, so host dispatch time cannot be measured "
+            "and the gaps+syncs rule would be reading unattributed time."
+        )
+    if not has_collective:
+        return False, (
+            "trace has NO collective kernels. On a multi-rank job that means "
+            "they were not recorded, not that they did not happen -- the "
+            "collective share would read as 0% and wrongly clear Step 2."
+        )
+    return True, ""
+
+
 def analyze(events: list[dict], steps: int) -> dict:
     device_events = [e for e in events if is_device_event(e)]
     if not device_events:
@@ -287,10 +335,16 @@ def main() -> int:
     parser.add_argument("--json", help="also write the report as JSON here")
     args = parser.parse_args()
 
-    report = analyze(load_events(args.trace), args.steps)
-    call, rationale = verdict(report)
+    events = load_events(args.trace)
+    report = analyze(events, args.steps)
+    usable, why_not = trace_can_support_a_verdict(events)
+    if usable:
+        call, rationale = verdict(report)
+    else:
+        call, rationale = "NO-VERDICT", why_not
     report["verdict"] = call
     report["rationale"] = rationale
+    report["trace_usable"] = usable
 
     print(f"trace           {args.trace}")
     print(f"steps           {args.steps}")
