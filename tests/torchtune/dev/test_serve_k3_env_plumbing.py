@@ -38,6 +38,13 @@ GATED_ENV_VARS = [
     "VLLM_KIMI_XPU_KDA_CHUNKED",
     "VLLM_XPU_ENABLE_XPU_GRAPH",
     "VLLM_XPU_ALLOW_TRITON_SAMPLER",
+    # Added after it was found unplumbed DURING an A/B that was about to
+    # measure it (2026-08-11). vLLM's own `VLLM_` prefix rule would have
+    # carried it into Ray actors, so the leg might have worked by accident --
+    # but the launcher must not depend on an upstream default it does not
+    # control, and a flag resolved at model-construction time must reach the
+    # worker before the model is built.
+    "VLLM_KIMI_FUSE_SHARED_EXPERT_AR",
 ]
 
 
