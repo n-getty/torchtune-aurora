@@ -890,6 +890,15 @@ else
     echo "WARNING: no wheel patch reference found at $WHEEL_PATCH_REFERENCE; skipping checksum guard" | tee -a "$LOG_DIR/metadata" >&2
 fi
 [[ "$EP" == 1 ]] && ARGS+=(--enable-expert-parallel)
+# Escape hatch for args this launcher does not model (e.g. --profiler-config
+# for the Kineto decode-step trace). Word-split deliberately -- the caller
+# passes a plain string. Recorded in metadata below like every other arg, so
+# a run that used it is not mistakable for a stock one.
+if [[ -n "${EXTRA_SERVER_ARGS:-}" ]]; then
+    # shellcheck disable=SC2206
+    ARGS+=(${EXTRA_SERVER_ARGS})
+    echo "extra_server_args=$EXTRA_SERVER_ARGS" | tee -a "$LOG_DIR/metadata"
+fi
 echo "server_args=${ARGS[*]}" | tee -a "$LOG_DIR/metadata"
 echo "server_start=$(date -Is)" | tee -a "$LOG_DIR/metadata"
 if "$PYTHON" -m vllm.entrypoints.openai.api_server "${ARGS[@]}" \
