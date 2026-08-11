@@ -97,6 +97,7 @@ run_leg() {
         "VLLM_KIMI_XPU_KDA_VECTORIZED=1 VLLM_KIMI_XPU_CONV1D_VECTORIZED=1 \
          VLLM_KIMI_XPU_KDA_TRITON=0 VLLM_KIMI_XPU_CAUSAL_CONV1D_TRITON=0 \
          VLLM_XPU_ALLOW_TRITON_SAMPLER=0 $envstr \
+         PYTHON='$PYTHON' RAY_ENV_MODE='${RAY_ENV_MODE:-frameworks}' \
          K3_JOB_ID='$JOB_ID' K3_NODEFILE='$NODEFILE' PBS_NODEFILE='$NODEFILE' \
          K3_CACHE_ROOT='$cache' LOG_DIR='$dir' \
          nohup timeout 3600 bash '$EXP/serve_k3.sh' \

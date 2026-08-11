@@ -490,6 +490,19 @@ echo "vllm_xpu_enable_xpu_graph=$VLLM_XPU_ENABLE_XPU_GRAPH" | tee -a "$LOG_DIR/m
 echo "vllm_xpu_allow_triton_sampler=$VLLM_XPU_ALLOW_TRITON_SAMPLER" | tee -a "$LOG_DIR/metadata"
 echo "vllm_kimi_fuse_shared_expert_ar=$VLLM_KIMI_FUSE_SHARED_EXPERT_AR" | tee -a "$LOG_DIR/metadata"
 echo "python=$PYTHON ray_env_mode=$RAY_ENV_MODE" | tee -a "$LOG_DIR/metadata"
+# PYTHON and RAY_ENV_MODE must move together. Setting PYTHON alone puts the
+# head process on one torch and all remote workers on another -- which
+# presents as a clean run at the WRONG version, i.e. a null result that looks
+# real. Hit exactly that on 2026-08-11 when a torch211 capture leg silently
+# ran on the 2.10 venv.
+case "$PYTHON:$RAY_ENV_MODE" in
+    */torchtune-pt-nightly-xpu/*:torch211|*/kimi-k3-xpu-framework/*:frameworks) ;;
+    *)
+        echo "ERROR: PYTHON and RAY_ENV_MODE disagree -- PYTHON=$PYTHON RAY_ENV_MODE=$RAY_ENV_MODE." >&2
+        echo "  torch211 venv requires RAY_ENV_MODE=torch211; frameworks venv requires RAY_ENV_MODE=frameworks." >&2
+        echo "  Set K3_ALLOW_VENV_MODE_MISMATCH=1 only if you truly intend a split stack." >&2
+        [[ "${K3_ALLOW_VENV_MODE_MISMATCH:-0}" == 1 ]] || exit 1 ;;
+esac
 if [[ -d "$VLLM_SRC/.git" ]]; then
     vllm_commit=$(git -C "$VLLM_SRC" rev-parse HEAD)
     git -C "$VLLM_SRC" status --porcelain=v1 >"$LOG_DIR/vllm_status.txt"
@@ -810,8 +823,10 @@ else
     remote_pythonpath_q=$(printf '%q' "${PYTHONPATH:-}")
     remote_ld_library_path_q=$(printf '%q' "${LD_LIBRARY_PATH:-}")
     remote_no_proxy_q=$(printf '%q' "$NOPROXY_EXTRA")
-    remote_torchdynamo_disable_q=$(printf '%q' "$TORCHDYNAMO_DISABLE")
-    remote_torch_compile_disable_q=$(printf '%q' "$TORCH_COMPILE_DISABLE")
+    # Default-expand: under ENFORCE_EAGER=0 these are deliberately UNSET, and
+    # a bare "$VAR" under `set -u` aborts the launcher (hit 2026-08-11).
+    remote_torchdynamo_disable_q=$(printf '%q' "${TORCHDYNAMO_DISABLE:-}")
+    remote_torch_compile_disable_q=$(printf '%q' "${TORCH_COMPILE_DISABLE:-}")
     remote_ccl_process_launcher_q=$(printf '%q' "$CCL_PROCESS_LAUNCHER")
     remote_ccl_atl_transport_q=$(printf '%q' "$CCL_ATL_TRANSPORT")
     remote_ccl_kvs_iface_q=$(printf '%q' "$CCL_KVS_IFACE")
