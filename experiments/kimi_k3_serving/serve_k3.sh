@@ -608,10 +608,25 @@ PY
 echo "block_profile=$BLOCK_PROFILE block_profile_dir=$BLOCK_PROFILE_DIR" | tee -a "$LOG_DIR/metadata"
 
 ARGS=(--model "$MODEL_FOR_SERVER" --tensor-parallel-size "$TP" --pipeline-parallel-size "$PP"
-    --port "$PORT" --host 0.0.0.0 --enforce-eager --trust-remote-code
+    --port "$PORT" --host 0.0.0.0 --trust-remote-code
     --model-impl vllm --dtype bfloat16 --load-format "$LOAD_FORMAT" --gpu-memory-utilization "$GPU_MEM_UTIL"
     --max-model-len "$MAX_MODEL_LEN" --max-num-seqs "$MAX_NUM_SEQS"
     --max-num-batched-tokens "$MAX_BATCHED_TOKENS")
+# --enforce-eager was hardcoded above. It is correct for PREFILL (upstream's
+# own disaggregated prefill worker sets it) and wrong for DECODE: it forfeits
+# graph capture, and our measured eager floor is 21,293 launches/token x
+# 6.5 us = 138 ms/token = 7.2 tok/s, below the 20-70 tok/s target no matter
+# what else is fixed. ENFORCE_EAGER=0 drops it so a capture mode can be
+# selected via CUDAGRAPH_MODE (upstream's AMD profile -- the closest
+# non-CUDA precedent -- uses FULL_DECODE_ONLY).
+ENFORCE_EAGER=${ENFORCE_EAGER:-1}
+CUDAGRAPH_MODE=${CUDAGRAPH_MODE:-}
+if [[ "$ENFORCE_EAGER" == 1 ]]; then
+    ARGS+=(--enforce-eager)
+fi
+if [[ -n "$CUDAGRAPH_MODE" ]]; then
+    ARGS+=(--compilation-config "{\"cudagraph_mode\":\"$CUDAGRAPH_MODE\"}")
+fi
 # Data parallelism is how K3 scales past 3 nodes: TP is hard-capped at 32
 # because vocab_size 163840 is not divisible by 96, so 8 nodes (96 tiles) must
 # run DP=3 x TP=32 rather than TP=96. Each DP replica holds a full copy of the
@@ -672,7 +687,15 @@ if [[ ${#NODES[@]} -eq 1 ]]; then
     set +u
     module load frameworks
     set -u
-    export TORCHDYNAMO_DISABLE=1 TORCH_COMPILE_DISABLE=1
+    # Only disable dynamo/compile when we are deliberately eager. Under
+    # graph capture these must be UNSET: vllm/config/vllm.py keys on
+    # TORCH_COMPILE_DISABLE, so clearing TORCHDYNAMO_DISABLE alone is not
+    # enough to re-enable compilation.
+    if [[ "${ENFORCE_EAGER:-1}" == 1 ]]; then
+        export TORCHDYNAMO_DISABLE=1 TORCH_COMPILE_DISABLE=1
+    else
+        unset TORCHDYNAMO_DISABLE TORCH_COMPILE_DISABLE
+    fi
     export CCL_PROCESS_LAUNCHER=none CCL_ATL_TRANSPORT=ofi FI_PROVIDER=cxi
     export CCL_KVS_IFACE=${CCL_KVS_IFACE:-lo}
     export ZE_FLAT_DEVICE_HIERARCHY=FLAT VLLM_WORKER_MULTIPROC_METHOD=spawn
@@ -701,7 +724,15 @@ else
         echo "ERROR: patched vLLM source is not active: $vllm_source" >&2
         exit 1
     }
-    export TORCHDYNAMO_DISABLE=1 TORCH_COMPILE_DISABLE=1
+    # Only disable dynamo/compile when we are deliberately eager. Under
+    # graph capture these must be UNSET: vllm/config/vllm.py keys on
+    # TORCH_COMPILE_DISABLE, so clearing TORCHDYNAMO_DISABLE alone is not
+    # enough to re-enable compilation.
+    if [[ "${ENFORCE_EAGER:-1}" == 1 ]]; then
+        export TORCHDYNAMO_DISABLE=1 TORCH_COMPILE_DISABLE=1
+    else
+        unset TORCHDYNAMO_DISABLE TORCH_COMPILE_DISABLE
+    fi
     export CCL_PROCESS_LAUNCHER=none CCL_ATL_TRANSPORT=ofi FI_PROVIDER=cxi
     export CCL_KVS_IFACE=${CCL_KVS_IFACE:-hsn0}
     export ZE_FLAT_DEVICE_HIERARCHY=FLAT VLLM_WORKER_MULTIPROC_METHOD=spawn
@@ -864,7 +895,10 @@ PY
 fi
 env | sort | grep -E '^(CCL_|FI_PROVIDER|ZE_|VLLM_|TORCH|PYTORCH_|HF_|TRANSFORMERS_|XDG_|RAY_|PYTHONPATH|LD_LIBRARY_PATH|PBS_JOBID|K3_BLOCK_PROFILE)' | grep -vE '^(HF_TOKEN|HUGGING_FACE_HUB_TOKEN)=' >"$LOG_DIR/effective_environment.txt" || true
 echo "effective_environment=$LOG_DIR/effective_environment.txt" | tee -a "$LOG_DIR/metadata"
-for required_var in ZE_FLAT_DEVICE_HIERARCHY:FLAT TORCHDYNAMO_DISABLE:1 FI_PROVIDER:cxi; do
+# TORCHDYNAMO_DISABLE must be 1 in eager mode and UNSET under capture --
+# asserting :1 unconditionally would reject every graph-capture run.
+DYNAMO_EXPECT=$([[ "${ENFORCE_EAGER:-1}" == 1 ]] && echo 1 || echo UNSET)
+for required_var in ZE_FLAT_DEVICE_HIERARCHY:FLAT TORCHDYNAMO_DISABLE:$DYNAMO_EXPECT FI_PROVIDER:cxi; do
     required_name=${required_var%%:*}
     required_value=${required_var#*:}
     actual_value=$(awk -F= -v k="$required_name" '$1==k{print $2; f=1} END{if(!f) print "UNSET"}' "$LOG_DIR/effective_environment.txt")
@@ -874,7 +908,7 @@ for required_var in ZE_FLAT_DEVICE_HIERARCHY:FLAT TORCHDYNAMO_DISABLE:1 FI_PROVI
     }
 done
 if [[ -f "$LOG_DIR/effective_environment_actor.txt" ]]; then
-    for required_var in ZE_FLAT_DEVICE_HIERARCHY:FLAT TORCHDYNAMO_DISABLE:1 FI_PROVIDER:cxi; do
+    for required_var in ZE_FLAT_DEVICE_HIERARCHY:FLAT TORCHDYNAMO_DISABLE:$DYNAMO_EXPECT FI_PROVIDER:cxi; do
         required_name=${required_var%%:*}
         required_value=${required_var#*:}
         actual_value=$(awk -F= -v k="$required_name" '$1==k{print $2; f=1} END{if(!f) print "UNSET"}' "$LOG_DIR/effective_environment_actor.txt")
