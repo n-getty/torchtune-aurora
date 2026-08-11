@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #PBS -N kimi_k3_hold_3n
-#PBS -l walltime=03:00:00
+#PBS -l walltime=04:00:00
 #PBS -A AuroraGPT
 #PBS -q capacity
 #PBS -l select=3
@@ -41,4 +41,4 @@ for attempt in $(seq 1 36); do
 done
 
 echo "hold_ready job=$PBS_JOBID time=$(date -Is)"
-sleep 10620
+sleep 14220
