@@ -131,18 +131,35 @@ def main() -> int:
         del tensor
 
     if rank == 0:
-        small = results[1]["median_ms"]          # 14 KiB
-        large = results[-1]["median_ms"]         # 4 MiB
-        ratio = large / small if small else float("inf")
+        small = results[1]["median_ms"]          # 14 KiB -- K3's actual size
+        large = results[-1]["median_ms"]         # 4 MiB  -- far off K3's point
         print("")
-        print(f"4MiB/14KiB latency ratio = {ratio:.2f}x")
-        if ratio < 2.0:
-            print("  -> LATENCY-BOUND: a 292x byte increase barely moves the")
-            print("     time, so cost is per-collective overhead. Only REMOVING")
-            print("     collectives helps; shrinking messages will not.")
+        print(f"4MiB/14KiB latency ratio = {large / small:.2f}x  (context only)")
+
+        # Judge flatness IN K3'S REGIME, not against 4 MiB. The first run
+        # (job 8748815) reported "bandwidth matters" purely because the 4 MiB
+        # point is 6.4x the 14 KiB point -- but K3 never sends 4 MiB at c=1,
+        # and across 7 KiB -> 256 KiB (a 36x byte increase) latency moved only
+        # 0.544 -> 0.680 ms. Comparing against a size the workload does not
+        # use answers a question nobody asked.
+        in_regime = [r for r in results if r["bytes"] <= 256 * 1024]
+        lo = in_regime[0]
+        hi = in_regime[-1]
+        byte_factor = hi["bytes"] / lo["bytes"]
+        time_factor = hi["median_ms"] / lo["median_ms"]
+        print(
+            f"in-regime ({lo['bytes']}B -> {hi['bytes']}B, {byte_factor:.0f}x "
+            f"bytes): latency {lo['median_ms']:.3f} -> {hi['median_ms']:.3f} ms "
+            f"= {time_factor:.2f}x"
+        )
+        if time_factor < 1.5:
+            print("  -> LATENCY-BOUND at K3's message size: a large byte")
+            print("     increase barely moves the time, so cost is")
+            print("     per-collective overhead. Only REMOVING collectives")
+            print("     helps; shrinking messages will not. (Consistent with")
+            print("     the measured WS6/WS7/FP8-wire null results.)")
         else:
-            print("  -> bandwidth matters at the large end; check whether the")
-            print("     14 KiB point is still on the flat part of the curve.")
+            print("  -> bandwidth already matters inside K3's own size range.")
 
         share = results[1]["projected_share_of_step"]
         print("")
