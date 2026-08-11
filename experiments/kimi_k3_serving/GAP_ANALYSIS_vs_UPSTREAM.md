@@ -115,3 +115,41 @@ single-user decode than it looked.
 - Closing to *parity* is not the claim. Closing 25x of structural gap to
   land in the 10-30 tok/s range is the plausible target, and that is within
   the original 20-70 ambition.
+
+---
+
+## Update: capture ENGAGED at TP=32 (2026-08-11, same session)
+
+First time on this stack. Worker gates, read from inside a rank:
+
+    torch=2.11.0+xpu  supports_xpu_graph=True  world_size_across_dp=32
+    cudagraph_mode=PIECEWISE  enforce_eager=False
+
+Note `world_size_across_dp=32` — the gate that previously forced
+`cudagraph_mode=NONE` — now passes because of the
+`VLLM_XPU_ALLOW_GRAPH_WITH_COMMS=1` escape hatch.
+
+**But the mode resolved to PIECEWISE, not the requested FULL_DECODE_ONLY.**
+`xpu.py:223-232` downgrades it: *"FMHA sycl-tla kernels cannot be captured
+with XPU graphs, falling back to PIECEWISE graph mode on XPU platform."*
+Attention is excluded from the graph and the graph is broken at every
+attention boundary — with 93 layers, roughly 93 segments, each paying its
+own replay overhead.
+
+So **FULL capture on XPU is blocked on the attention backend**, not on the
+comms gate. That is a concrete, nameable next target: either a capturable
+XPU attention path, or the fused-KDA-decode route (which reduces launches
+rather than eliminating their cost, and does not depend on capture at all).
+
+Pre-registered before seeing the number (dispatch is 138 ms of a 961 ms
+step, so this bounds what capture alone can do):
+
+| scenario | predicted |
+|---|---|
+| all dispatch removed (upper bound) | 1.215 tok/s, +16.7% |
+| half removed | 1.121 tok/s, +7.7% |
+| quarter removed | 1.079 tok/s, +3.7% |
+
+**Even a perfect capture is +16.7%.** That is worth having and it is not the
+answer on its own — which is exactly why the launch COUNT (fusion) matters
+at least as much as the launch COST (capture). Upstream has both.
