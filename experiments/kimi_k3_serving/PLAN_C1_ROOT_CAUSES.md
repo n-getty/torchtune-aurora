@@ -132,3 +132,34 @@ carrying a fast-but-wrong kernel is a liability.
    hang is a servability blocker and the cause is still unknown.
 
 Items 3-5 above need their own hold.
+
+---
+
+## Pre-run verification (2026-08-12, before the compile legs)
+
+Checked offline so a bad config could not silently produce a null result:
+
+**Control reproduces across nodes.** `eager_base` on x4412/x4412/x4610 gave
+**1.158 tok/s** (1.158 / 1.152 / 1.149, 0.8% spread, banned=0) against
+1.152 median last night on x4320/x4407/x4608 — **+0.5%**. Node variance,
+a documented Aurora confounder, is not affecting this A/B.
+
+**Thresholds fixed against THIS control before seeing any compile number:**
+
+| observed | reading |
+|---|---|
+| >= 1.447 (+25%) | compile is the main line, iterate |
+| 1.216 - 1.447 (+5-25%) | real, bank it, investigate the limit |
+| <= 1.193 (+/-3%) | no effect — **verify engagement before concluding** |
+
+**The `SPLITTING_OPS_EMPTY` guard was tested both directions**, not just
+assumed: with `CUDAGRAPH_MODE=PIECEWISE` it rejects (`requires
+CUDAGRAPH_MODE=NONE`); with `NONE` it emits
+`{"cudagraph_mode":"NONE","splitting_ops":[]}`. vLLM's own
+`CompilationConfig` parses that to `cudagraph_mode=NONE splitting_ops=[]`.
+
+**Engagement will be verified from the worker log, not assumed.**
+`analysis/compile_diagnose.sh` reports the RESOLVED `CompilationMode`. A leg
+that resolves to `NONE` is void as a compile measurement whatever its tok/s —
+which is exactly how the capture attempt looked healthy right up until it hit
+a second gate nobody knew about.
