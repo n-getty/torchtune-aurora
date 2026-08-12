@@ -48,6 +48,9 @@ GATED_ENV_VARS = [
     # Fused single-kernel KDA decode. Resolved at import time in kda.py, so it
     # must reach the worker process, not just the driver.
     "VLLM_KIMI_XPU_KDA_FUSED_DECODE",
+    # Whole-model fx graph for cross-layer Inductor fusion; read at engine
+    # construction in the worker, so it must reach the worker process.
+    "SPLITTING_OPS_EMPTY",
 ]
 
 

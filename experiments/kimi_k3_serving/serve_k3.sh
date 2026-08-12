@@ -74,6 +74,9 @@ export VLLM_KIMI_XPU_KDA_CHUNKED=${VLLM_KIMI_XPU_KDA_CHUNKED:-0}
 # custom op and are therefore invisible to graph capture. Default OFF pending
 # the hardware A/B; see DECODE_BUDGET_CORRECTED_20260812.md.
 export VLLM_KIMI_XPU_KDA_FUSED_DECODE=${VLLM_KIMI_XPU_KDA_FUSED_DECODE:-0}
+# One whole-model fx graph (no attention splits) for cross-layer Inductor
+# fusion. Requires CUDAGRAPH_MODE=NONE. Default 0.
+export SPLITTING_OPS_EMPTY=${SPLITTING_OPS_EMPTY:-0}
 # Shared-expert / routed all_reduce fusion (kimi_linear.py). Resolved ONCE at
 # KimiMoE.__init__ (it changes how two submodules are constructed), so it must
 # reach the worker process before the model is built -- not just the driver.
@@ -93,7 +96,7 @@ export VLLM_KIMI_FUSE_SHARED_EXPERT_AR=${VLLM_KIMI_FUSE_SHARED_EXPERT_AR:-1}
 export VLLM_KIMI_XPU_KDA_TRITON=${VLLM_KIMI_XPU_KDA_TRITON:-0}
 export VLLM_KIMI_XPU_CAUSAL_CONV1D_TRITON=${VLLM_KIMI_XPU_CAUSAL_CONV1D_TRITON:-0}
 export VLLM_XPU_ALLOW_TRITON_SAMPLER=${VLLM_XPU_ALLOW_TRITON_SAMPLER:-0}
-for ray_env_name in K3_BLOCK_PROFILE_DIR K3_LOADER_ACCOUNTING_DIR VLLM_KIMI_XPU_REQUEST_DIAGNOSTIC_LIMIT VLLM_KIMI_XPU_KDA_TRITON VLLM_KIMI_XPU_CAUSAL_CONV1D_TRITON VLLM_KIMI_XPU_KDA_VECTORIZED VLLM_KIMI_XPU_CONV1D_VECTORIZED VLLM_KIMI_XPU_KDA_CHUNKED VLLM_KIMI_XPU_KDA_FUSED_DECODE VLLM_KIMI_XPU_KDA_CHUNK_SIZE VLLM_KIMI_XPU_KDA_CHUNK_SOLVE VLLM_XPU_ENABLE_XPU_GRAPH VLLM_XPU_ALLOW_TRITON_SAMPLER VLLM_KIMI_FUSE_SHARED_EXPERT_AR; do
+for ray_env_name in K3_BLOCK_PROFILE_DIR K3_LOADER_ACCOUNTING_DIR VLLM_KIMI_XPU_REQUEST_DIAGNOSTIC_LIMIT VLLM_KIMI_XPU_KDA_TRITON VLLM_KIMI_XPU_CAUSAL_CONV1D_TRITON VLLM_KIMI_XPU_KDA_VECTORIZED VLLM_KIMI_XPU_CONV1D_VECTORIZED VLLM_KIMI_XPU_KDA_CHUNKED VLLM_KIMI_XPU_KDA_FUSED_DECODE SPLITTING_OPS_EMPTY VLLM_KIMI_XPU_KDA_CHUNK_SIZE VLLM_KIMI_XPU_KDA_CHUNK_SOLVE VLLM_XPU_ENABLE_XPU_GRAPH VLLM_XPU_ALLOW_TRITON_SAMPLER VLLM_KIMI_FUSE_SHARED_EXPERT_AR; do
     if [[ ",${VLLM_RAY_EXTRA_ENV_VARS_TO_COPY:-}," != *,${ray_env_name},* ]]; then
         VLLM_RAY_EXTRA_ENV_VARS_TO_COPY="${VLLM_RAY_EXTRA_ENV_VARS_TO_COPY:+${VLLM_RAY_EXTRA_ENV_VARS_TO_COPY},}${ray_env_name}"
     fi
@@ -492,6 +495,7 @@ echo "vllm_kimi_xpu_kda_vectorized=$VLLM_KIMI_XPU_KDA_VECTORIZED" | tee -a "$LOG
 echo "vllm_kimi_xpu_conv1d_vectorized=$VLLM_KIMI_XPU_CONV1D_VECTORIZED" | tee -a "$LOG_DIR/metadata"
 echo "vllm_kimi_xpu_kda_chunked=$VLLM_KIMI_XPU_KDA_CHUNKED" | tee -a "$LOG_DIR/metadata"
 echo "vllm_kimi_xpu_kda_fused_decode=$VLLM_KIMI_XPU_KDA_FUSED_DECODE" | tee -a "$LOG_DIR/metadata"
+echo "splitting_ops_empty=$SPLITTING_OPS_EMPTY" | tee -a "$LOG_DIR/metadata"
 echo "vllm_xpu_enable_xpu_graph=$VLLM_XPU_ENABLE_XPU_GRAPH" | tee -a "$LOG_DIR/metadata"
 echo "vllm_xpu_allow_triton_sampler=$VLLM_XPU_ALLOW_TRITON_SAMPLER" | tee -a "$LOG_DIR/metadata"
 echo "vllm_kimi_fuse_shared_expert_ar=$VLLM_KIMI_FUSE_SHARED_EXPERT_AR" | tee -a "$LOG_DIR/metadata"
@@ -648,7 +652,19 @@ if [[ "$ENFORCE_EAGER" == 1 ]]; then
     ARGS+=(--enforce-eager)
 fi
 if [[ -n "$CUDAGRAPH_MODE" ]]; then
-    ARGS+=(--compilation-config "{\"cudagraph_mode\":\"$CUDAGRAPH_MODE\"}")
+    # SPLITTING_OPS_EMPTY=1 gives ONE whole-model fx graph instead of ~93
+    # segments cut at every attention op, so Inductor can fuse ACROSS layer
+    # boundaries. Only legal at cudagraph_mode=NONE (compilation.py:1125
+    # rejects an empty list under PIECEWISE/FULL_AND_PIECEWISE).
+    if [[ "${SPLITTING_OPS_EMPTY:-0}" == 1 ]]; then
+        if [[ "$CUDAGRAPH_MODE" != "NONE" ]]; then
+            echo "ERROR: SPLITTING_OPS_EMPTY=1 requires CUDAGRAPH_MODE=NONE (got '$CUDAGRAPH_MODE')" >&2
+            exit 2
+        fi
+        ARGS+=(--compilation-config "{\"cudagraph_mode\":\"$CUDAGRAPH_MODE\",\"splitting_ops\":[]}")
+    else
+        ARGS+=(--compilation-config "{\"cudagraph_mode\":\"$CUDAGRAPH_MODE\"}")
+    fi
 fi
 # Data parallelism is how K3 scales past 3 nodes: TP is hard-capped at 32
 # because vocab_size 163840 is not divisible by 96, so 8 nodes (96 tiles) must
@@ -856,6 +872,7 @@ else
     remote_xpu_enable_xpu_graph_q=$(printf '%q' "$VLLM_XPU_ENABLE_XPU_GRAPH")
     remote_kda_chunked_q=$(printf '%q' "$VLLM_KIMI_XPU_KDA_CHUNKED")
     remote_kda_fused_decode_q=$(printf '%q' "$VLLM_KIMI_XPU_KDA_FUSED_DECODE")
+    remote_splitting_ops_empty_q=$(printf '%q' "$SPLITTING_OPS_EMPTY")
     remote_fuse_shared_ar_q=$(printf '%q' "$VLLM_KIMI_FUSE_SHARED_EXPERT_AR")
     remote_xpu_triton_sampler_q=$(printf '%q' "$VLLM_XPU_ALLOW_TRITON_SAMPLER")
     remote_daos_agent_drpc_q=$(printf '%q' "$DAOS_AGENT_DRPC_DIR")
@@ -866,7 +883,7 @@ else
     remote_ray_extra_env_vars_q=$(printf '%q' "$VLLM_RAY_EXTRA_ENV_VARS_TO_COPY")
     for node in "${NODES[@]}"; do
         [[ "$node" == "$HEAD" ]] && continue
-        ssh -o BatchMode=yes -o ConnectTimeout=15 "$node" "source '$RAY_ENV' '$RAY_ENV_MODE'; unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY; export K3_CACHE_ROOT=$remote_cache_root_q K3_CACHE_MARKER=$remote_cache_marker_q HF_HOME=$remote_hf_home_q HF_MODULES_CACHE=$remote_hf_modules_cache_q HF_HUB_CACHE=$remote_hf_hub_cache_q TRANSFORMERS_CACHE=$remote_transformers_cache_q XDG_CACHE_HOME=$remote_xdg_cache_home_q PYTHONPATH=$remote_pythonpath_q LD_LIBRARY_PATH=$remote_ld_library_path_q no_proxy=$remote_no_proxy_q NO_PROXY=$remote_no_proxy_q TORCHDYNAMO_DISABLE=$remote_torchdynamo_disable_q TORCH_COMPILE_DISABLE=$remote_torch_compile_disable_q CCL_PROCESS_LAUNCHER=$remote_ccl_process_launcher_q CCL_ATL_TRANSPORT=$remote_ccl_atl_transport_q CCL_KVS_IFACE=$remote_ccl_kvs_iface_q FI_PROVIDER=$remote_fi_provider_q ZE_FLAT_DEVICE_HIERARCHY=$remote_ze_flat_device_hierarchy_q VLLM_WORKER_MULTIPROC_METHOD=$remote_vllm_worker_method_q VLLM_TARGET_DEVICE=$remote_vllm_target_device_q VLLM_BATCH_INVARIANT=$remote_vllm_batch_invariant_q VLLM_XPU_DETERMINISTIC_ROUTING=$remote_vllm_xpu_deterministic_routing_q VLLM_XPU_DETERMINISTIC_MOE_GATHER=$remote_vllm_xpu_deterministic_moe_gather_q VLLM_KIMI_XPU_DIAGNOSTICS=$remote_kimi_xpu_diagnostics_q VLLM_KIMI_XPU_REQUEST_DIAGNOSTIC_LIMIT=$remote_kimi_xpu_request_diagnostic_limit_q VLLM_KIMI_XPU_KDA_VECTORIZED=$remote_kda_vectorized_q VLLM_KIMI_XPU_CONV1D_VECTORIZED=$remote_conv1d_vectorized_q VLLM_KIMI_XPU_KDA_TRITON=$remote_kda_triton_q VLLM_KIMI_XPU_CAUSAL_CONV1D_TRITON=$remote_causal_conv1d_triton_q VLLM_XPU_ENABLE_XPU_GRAPH=$remote_xpu_enable_xpu_graph_q VLLM_KIMI_XPU_KDA_CHUNKED=$remote_kda_chunked_q VLLM_KIMI_XPU_KDA_FUSED_DECODE=$remote_kda_fused_decode_q VLLM_KIMI_FUSE_SHARED_EXPERT_AR=$remote_fuse_shared_ar_q VLLM_XPU_ALLOW_TRITON_SAMPLER=$remote_xpu_triton_sampler_q RAY_EXPERIMENTAL_NOSET_ONEAPI_DEVICE_SELECTOR=$remote_ray_no_set_oneapi_q RAY_DEDUP_LOGS=$remote_ray_dedup_logs_q VLLM_USE_RAY_V2_EXECUTOR_BACKEND=$remote_ray_v2_q VLLM_KDA_XPU_DIAGNOSTICS=$remote_kda_xpu_diagnostics_q VLLM_RAY_EXTRA_ENV_VARS_TO_COPY=$remote_ray_extra_env_vars_q DAOS_AGENT_DRPC_DIR=$remote_daos_agent_drpc_q D_AGENT_DRPC_DIR=$remote_d_agent_drpc_q K3_BLOCK_PROFILE_DIR=$remote_k3_block_profile_dir_q K3_LOADER_ACCOUNTING_DIR=$remote_k3_loader_accounting_dir_q; if [ -e $remote_cache_root_q ]; then echo 'ERROR: remote K3 cache already exists' >&2; exit 1; fi; mkdir $remote_cache_root_q; mkdir -p $remote_ray_temp_root_q; printf '%s\\n' '$PBS_JOBID' >$remote_cache_marker_q; self=\$\$; mapfile -t pids < <(ps -eo pid=,args= | awk -v root='$RAY_TEMP_ROOT' -v self=\"\$self\" 'index(\$0, root) && \$1 != self {print \$1}'); for pid in \"\${pids[@]}\"; do kill -TERM \"\$pid\" 2>/dev/null || true; done; sleep 2; mapfile -t pids < <(ps -eo pid=,args= | awk -v root='$RAY_TEMP_ROOT' -v self=\"\$self\" 'index(\$0, root) && \$1 != self {print \$1}'); for pid in \"\${pids[@]}\"; do kill -KILL \"\$pid\" 2>/dev/null || true; done; ray start --address='$RAY_ADDRESS' --num-gpus='${NUM_GPUS:-12}' --num-cpus=4 --temp-dir=$remote_ray_temp_root_q --block" \
+        ssh -o BatchMode=yes -o ConnectTimeout=15 "$node" "source '$RAY_ENV' '$RAY_ENV_MODE'; unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY; export K3_CACHE_ROOT=$remote_cache_root_q K3_CACHE_MARKER=$remote_cache_marker_q HF_HOME=$remote_hf_home_q HF_MODULES_CACHE=$remote_hf_modules_cache_q HF_HUB_CACHE=$remote_hf_hub_cache_q TRANSFORMERS_CACHE=$remote_transformers_cache_q XDG_CACHE_HOME=$remote_xdg_cache_home_q PYTHONPATH=$remote_pythonpath_q LD_LIBRARY_PATH=$remote_ld_library_path_q no_proxy=$remote_no_proxy_q NO_PROXY=$remote_no_proxy_q TORCHDYNAMO_DISABLE=$remote_torchdynamo_disable_q TORCH_COMPILE_DISABLE=$remote_torch_compile_disable_q CCL_PROCESS_LAUNCHER=$remote_ccl_process_launcher_q CCL_ATL_TRANSPORT=$remote_ccl_atl_transport_q CCL_KVS_IFACE=$remote_ccl_kvs_iface_q FI_PROVIDER=$remote_fi_provider_q ZE_FLAT_DEVICE_HIERARCHY=$remote_ze_flat_device_hierarchy_q VLLM_WORKER_MULTIPROC_METHOD=$remote_vllm_worker_method_q VLLM_TARGET_DEVICE=$remote_vllm_target_device_q VLLM_BATCH_INVARIANT=$remote_vllm_batch_invariant_q VLLM_XPU_DETERMINISTIC_ROUTING=$remote_vllm_xpu_deterministic_routing_q VLLM_XPU_DETERMINISTIC_MOE_GATHER=$remote_vllm_xpu_deterministic_moe_gather_q VLLM_KIMI_XPU_DIAGNOSTICS=$remote_kimi_xpu_diagnostics_q VLLM_KIMI_XPU_REQUEST_DIAGNOSTIC_LIMIT=$remote_kimi_xpu_request_diagnostic_limit_q VLLM_KIMI_XPU_KDA_VECTORIZED=$remote_kda_vectorized_q VLLM_KIMI_XPU_CONV1D_VECTORIZED=$remote_conv1d_vectorized_q VLLM_KIMI_XPU_KDA_TRITON=$remote_kda_triton_q VLLM_KIMI_XPU_CAUSAL_CONV1D_TRITON=$remote_causal_conv1d_triton_q VLLM_XPU_ENABLE_XPU_GRAPH=$remote_xpu_enable_xpu_graph_q VLLM_KIMI_XPU_KDA_CHUNKED=$remote_kda_chunked_q VLLM_KIMI_XPU_KDA_FUSED_DECODE=$remote_kda_fused_decode_q SPLITTING_OPS_EMPTY=$remote_splitting_ops_empty_q VLLM_KIMI_FUSE_SHARED_EXPERT_AR=$remote_fuse_shared_ar_q VLLM_XPU_ALLOW_TRITON_SAMPLER=$remote_xpu_triton_sampler_q RAY_EXPERIMENTAL_NOSET_ONEAPI_DEVICE_SELECTOR=$remote_ray_no_set_oneapi_q RAY_DEDUP_LOGS=$remote_ray_dedup_logs_q VLLM_USE_RAY_V2_EXECUTOR_BACKEND=$remote_ray_v2_q VLLM_KDA_XPU_DIAGNOSTICS=$remote_kda_xpu_diagnostics_q VLLM_RAY_EXTRA_ENV_VARS_TO_COPY=$remote_ray_extra_env_vars_q DAOS_AGENT_DRPC_DIR=$remote_daos_agent_drpc_q D_AGENT_DRPC_DIR=$remote_d_agent_drpc_q K3_BLOCK_PROFILE_DIR=$remote_k3_block_profile_dir_q K3_LOADER_ACCOUNTING_DIR=$remote_k3_loader_accounting_dir_q; if [ -e $remote_cache_root_q ]; then echo 'ERROR: remote K3 cache already exists' >&2; exit 1; fi; mkdir $remote_cache_root_q; mkdir -p $remote_ray_temp_root_q; printf '%s\\n' '$PBS_JOBID' >$remote_cache_marker_q; self=\$\$; mapfile -t pids < <(ps -eo pid=,args= | awk -v root='$RAY_TEMP_ROOT' -v self=\"\$self\" 'index(\$0, root) && \$1 != self {print \$1}'); for pid in \"\${pids[@]}\"; do kill -TERM \"\$pid\" 2>/dev/null || true; done; sleep 2; mapfile -t pids < <(ps -eo pid=,args= | awk -v root='$RAY_TEMP_ROOT' -v self=\"\$self\" 'index(\$0, root) && \$1 != self {print \$1}'); for pid in \"\${pids[@]}\"; do kill -KILL \"\$pid\" 2>/dev/null || true; done; ray start --address='$RAY_ADDRESS' --num-gpus='${NUM_GPUS:-12}' --num-cpus=4 --temp-dir=$remote_ray_temp_root_q --block" \
         >"$LOG_DIR/ray_${node}.log" 2>&1 &
         ray_pids+=("$!")
     done
