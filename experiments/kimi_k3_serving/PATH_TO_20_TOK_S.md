@@ -104,6 +104,22 @@ Ranked by (value x feasibility) for unattended overnight work:
 4. **Whole-graph compile** (`mode=VLLM_COMPILE` without cudagraphs) — attacks
    dispatch without needing the blocked `graph_capture()` path.
 
+## Checked and rejected: expert offload to free up TP
+
+The model is ~92% MoE expert weights (896 experts x 3 x 3584 x 3072 x 92
+layers = 2.72 T params = 1443 GB at MXFP4, matching the 1561 GB on disk --
+note experts run at `routed_expert_hidden_size`=3584, not hidden=7168). Only
+18 of 896 experts fire per token, so "keep hot experts resident, stream the
+rest" is the obvious idea for cutting resident memory and therefore TP.
+
+**It does not work at c=1.** You cannot know which experts are needed until
+the router runs, and streaming the ~29.7 GB of active weights per token over
+PCIe (~64 GB/s) costs ~464 ms/token *serialized after* the router. That is
+the same order as the entire current step, with none of it overlappable at
+batch 1. Offload is a throughput/capacity technique, not a latency one.
+
+TP=32 stands as forced.
+
 ## The honest headline
 
 **Single-user 20-60 tok/s is not reachable on 3 nodes of PVC with this
