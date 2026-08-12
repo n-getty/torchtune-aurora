@@ -167,3 +167,46 @@ Two harness defects it exposed, both fixed (commit 570a22e8):
 aggregate result on record, and aggregate throughput remains the only route
 to 20-60 tok/s on this hardware. What is still unmeasured is whether the
 fused KDA kernel moves that aggregate curve.
+
+---
+
+## RESULT: c=64 + fused KDA = 49.31 tok/s aggregate — inside the 20-60 target
+
+Job 8749725, 2026-08-12.
+
+| | |
+|---|---|
+| reps | 49.152, 49.312 tok/s (0.3% spread) |
+| responses | **64/64 non-empty**, 4096 tokens total |
+| wall | 83.1 s for 64 streams x 64 tokens |
+| banned:1 | 0 |
+| flags | `VLLM_KIMI_XPU_KDA_FUSED_DECODE=1`, TP=32, EP, mnbt=2048, util 0.80 |
+
+Verified not a repeat of the conc32 phantom: every response file is
+non-empty and the token count is exactly 64x64.
+
+**Scaling efficiency: 38.9x throughput from 64x concurrency = 61%.** That is
+the useful number. Single-stream latency is unchanged (each user still waits
+~1.3 tok/s), but *served* throughput is 49.3 tok/s.
+
+For context, the prior record is 65.20 tok/s at c=128 (2026-08-10, before the
+fused kernel). c=64 reaches 76% of that with half the concurrency, which is
+consistent with the sublinear step(c) = 1.249 + 0.00516c fit already on
+record. **This run does not isolate the fused kernel's contribution at c=64**
+— there is no c=64 baseline leg, because the c=32 leg that would have
+anchored the curve died in warmup. Do not credit the +9.8% here.
+
+### What this means for the 20-60 tok/s goal
+
+**Met, in the aggregate sense, and reproducibly.** 49.3 tok/s at c=64 and
+65.2 at c=128 both sit in the requested band.
+
+**Not met, and not reachable, in the single-user sense** — see the analysis
+above: perfect removal of all eager overhead still leaves 7.7 tok/s because
+of the 130 ms compute floor, itself forced by TP=32, itself forced by 1.56 TB
+of weights against 68.7 GB tiles.
+
+If the requirement is "serve this model at 20-60 tok/s", that is done today.
+If it is "one user sees 20-60 tok/s", it needs hardware with more HBM per
+rank (upstream uses GB300 at ~4x our per-rank memory) or a substantially
+smaller/quantized model.
