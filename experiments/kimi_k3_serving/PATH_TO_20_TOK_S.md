@@ -131,3 +131,39 @@ optimistic shape, requiring three major workstreams.
 **Aggregate 20-60 tok/s is already achieved** (65.2 tok/s at c=128,
 2026-08-10). If the goal is throughput, we are past it. If the goal is
 single-stream latency, the binding constraint is per-rank HBM.
+
+---
+
+## Overnight attempt at the concurrency route (job 8749725) — engine died
+
+`conc32` did not produce a throughput number. It reported
+`c1_tok_s=0.000 banned=0 verdict=OK`, which was a **harness bug**: every
+response file was 0 bytes because the EngineCore had already died at
+06:22:16 with
+
+```
+ray.exceptions.RayChannelTimeoutError: Timed out waiting for object available
+```
+
+304 s after `Application startup complete` — i.e. exactly the 300 s
+`RAY_CGRAPH_get_timeout` that `ray_executor.py:576` already raises from Ray's
+10 s default.
+
+**Important: this was NOT caused by concurrency.** The timeout fired during
+warmup, before any c=32 request was sent, on the *same server configuration*
+(`--max-num-seqs 128`, TP=32, EP, mnbt=2048) as the working 65.20 tok/s c=128
+run from 2026-08-10. Neither successful leg of job 8749119 shows a single
+`RayChannelTimeout`. So this is a new, hold-specific or intermittent failure
+of one compiled-graph step, not evidence that batching is broken.
+
+Two harness defects it exposed, both fixed (commit 570a22e8):
+- `verdict=OK` on zero tokens — a non-measurement entering the record as a
+  measurement. Now `NO_TOKENS`.
+- readiness gated on `/health`, which the API server answers 200 while the
+  engine behind it is dead. Now requires one real completion before the
+  timing loop, else `ENGINE_DEAD`.
+
+**What this does NOT change:** the 65.20 tok/s at c=128 is still the measured
+aggregate result on record, and aggregate throughput remains the only route
+to 20-60 tok/s on this hardware. What is still unmeasured is whether the
+fused KDA kernel moves that aggregate curve.
