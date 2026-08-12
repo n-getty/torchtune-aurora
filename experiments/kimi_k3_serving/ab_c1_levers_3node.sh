@@ -114,12 +114,20 @@ fi
 # "Current node has no GPU available" -- which reads like a hardware fault
 # and cost a full model load on job 8749119. Force a clean slate first.
 echo "phase=ray_stop"
+# Collect PIDs and wait on each SPECIFICALLY. A bare `wait` also waits on the
+# `tee` from the `exec > >(tee ...)` redirection at the top of this script,
+# which never exits -- that hung the driver at phase=ray_stop for 24 min on
+# job 8749119. drain() below already uses the collect-PIDs pattern; this must
+# too. `timeout` bounds a node that is wedged rather than merely slow.
+ray_stop_pids=()
 for node in "${NODES[@]}"; do
-    ssh -o BatchMode=yes -o ConnectTimeout=20 "$node" \
+    timeout 60 ssh -o BatchMode=yes -o ConnectTimeout=20 "$node" \
         "source '$EXP/../ray_smoke/setup_ray_env.sh' '${RAY_ENV_MODE:-frameworks}' >/dev/null 2>&1; \
          ray stop --force >/dev/null 2>&1; true" >/dev/null 2>&1 &
+    ray_stop_pids+=($!)
 done
-wait
+for p in "${ray_stop_pids[@]}"; do wait "$p" 2>/dev/null; done
+echo "phase=ray_stop_done"
 sleep 5
 
 echo "phase=daos_mount"
