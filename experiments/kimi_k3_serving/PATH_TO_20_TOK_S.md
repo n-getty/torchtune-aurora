@@ -1,3 +1,31 @@
+> # ⚠ THIS DOCUMENT'S CENTRAL CLAIM IS WRONG — RETRACTED 2026-08-12
+>
+> I claimed single-user 20 tok/s is "not reachable" because 130 ms of compute
+> is a floor forced by TP=32. **Both halves are wrong.**
+>
+> **1. TP=32 does not make compute slow — it makes it faster.** At c=1 decode
+> a matmul is a matrix-VECTOR product: bandwidth-bound, not flop-bound. Each
+> rank reads only 29.7/32 = **0.93 GB**, which at 0.8 TB/s takes **1.16 ms**,
+> and the 32 ranks run concurrently. Splitting weights 32 ways REDUCES
+> per-rank bytes. I reasoned "smaller matmuls = worse occupancy" from a
+> flop-bound intuition that does not apply to batch-1 decode.
+>
+> **2. 130 ms is not a floor, it is 0.9% bandwidth efficiency.** 0.93 GB in
+> 122.7 ms = 7.6 GB/s against 800 GB/s peak. That is a software problem, and
+> the trace names it: **12,405 of 18,399 kernels (67%) are elementwise, doing
+> 62 ms of work at ~5 us each.** The MoE GEMMs are already batched (368/step,
+> 26 us each — the only well-sized kernels in the trace).
+>
+> So the "7.7 tok/s ceiling" measured *our current software*, not the
+> hardware. Unfused elementwise glue is precisely what Inductor exists to
+> fuse — and the whole-graph compile leg that targets it never ran.
+>
+> The GB300 comparison was also overstated: more HBM per rank cannot explain
+> a 110x gap when our own per-rank read is 1.16 ms of a 789 ms step.
+>
+> Everything below is kept for the reasoning trail. Treat the "forced",
+> "floor" and "unreachable" language as retracted.
+
 # What 20-60 tok/s actually requires (2026-08-12, overnight analysis)
 
 Written before spending hold time, so the night's work targets something
