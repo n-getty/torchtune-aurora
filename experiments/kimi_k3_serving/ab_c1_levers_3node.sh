@@ -50,6 +50,12 @@ PORT=${PORT:-8000}
 PROMPT_TOKENS=${PROMPT_TOKENS:-32}
 MAX_TOKENS=${MAX_TOKENS:-64}
 REPEATS=${REPEATS:-3}
+# CONCURRENCY>1 fires N simultaneous requests and reports AGGREGATE tok/s
+# (sum of all streams) alongside per-stream. Single-user latency at TP=32 is
+# capped near 7.7 tok/s even with perfect overhead removal (compute floor,
+# see PATH_TO_20_TOK_S.md), so aggregate is the only route to 20-60 tok/s on
+# this hardware. c=1 remains the default.
+CONCURRENCY=${CONCURRENCY:-1}
 # vLLM refuses to start if any tile has less free memory than this fraction
 # demands, and Aurora tiles are NOT reliably clean: on job 8749119 one node of
 # three had 52.6/64 GiB free per tile (the other two had 62.7 and 60.7) with no
@@ -213,21 +219,44 @@ run_leg() {
           \"prompt\":\"$(head -c 64 /dev/zero | tr '\0' 'a')\",\"max_tokens\":8,
           \"temperature\":0,\"ignore_eos\":true}'" >"$dir/warmup.json" 2>&1
 
-    local prompt; prompt=$(head -c $((PROMPT_TOKENS*4)) /dev/zero | tr '\0' 'a')
+    # PROMPT overrides the degenerate a-repeat default. The default is fine
+    # for TIMING (fixed token count, no tokenizer variance) but useless for
+    # CORRECTNESS: 64 'a's in -> 64 'a's out would survive a numerically
+    # wrong kernel. Set PROMPT to something with a checkable answer when
+    # A/B-ing a kernel change, then diff the completions between legs.
+    local prompt
+    if [[ -n "${PROMPT:-}" ]]; then
+        prompt=$PROMPT
+    else
+        prompt=$(head -c $((PROMPT_TOKENS*4)) /dev/zero | tr '\0' 'a')
+    fi
     for r in $(seq 1 "$REPEATS"); do
         local t0 t1
         t0=$(date +%s.%N)
-        ssh -o BatchMode=yes "$HEAD" \
-            "timeout 900 curl -s --noproxy '*' -X POST http://127.0.0.1:$PORT/v1/completions \
-              -H 'Content-Type: application/json' -d '{\"model\":\"$SERVED\",
-              \"prompt\":\"$prompt\",\"max_tokens\":$MAX_TOKENS,\"temperature\":0,
-              \"ignore_eos\":true}'" >"$dir/req_$r.json" 2>&1
+        # All CONCURRENCY streams are launched together and we wait for the
+        # LAST to finish, so aggregate tok/s = total tokens / wall of the
+        # slowest -- an honest server-throughput number, not a sum of
+        # independently-timed runs.
+        local cpids=()
+        for c in $(seq 1 "$CONCURRENCY"); do
+            ssh -o BatchMode=yes "$HEAD" \
+                "timeout 900 curl -s --noproxy '*' -X POST http://127.0.0.1:$PORT/v1/completions \
+                  -H 'Content-Type: application/json' -d '{\"model\":\"$SERVED\",
+                  \"prompt\":\"$prompt\",\"max_tokens\":$MAX_TOKENS,\"temperature\":0,
+                  \"ignore_eos\":true}'" >"$dir/req_${r}_c${c}.json" 2>&1 &
+            cpids+=($!)
+        done
+        for cp in "${cpids[@]}"; do wait "$cp" 2>/dev/null; done
         t1=$(date +%s.%N)
+        cp "$dir/req_${r}_c1.json" "$dir/req_$r.json" 2>/dev/null
         local toks; toks=$("$PYTHON" -c "
-import json,sys
-try: print(json.load(open('$dir/req_$r.json'))['usage']['completion_tokens'])
-except Exception: print(0)")
-        echo "  rep$r tokens=$toks wall=$(echo "$t1-$t0"|bc)s tok_s=$("$PYTHON" -c "
+import json,glob
+t=0
+for f in glob.glob('$dir/req_${r}_c*.json'):
+    try: t+=json.load(open(f))['usage']['completion_tokens']
+    except Exception: pass
+print(t)")
+        echo "  rep$r conc=$CONCURRENCY tokens=$toks wall=$(echo "$t1-$t0"|bc)s tok_s=$("$PYTHON" -c "
 print(f'{$toks/max(1e-9,$t1-$t0):.3f}')")"
     done
 
