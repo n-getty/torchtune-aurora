@@ -25,6 +25,15 @@ Targets: 20 tok/s = 50 ms (17.3x). 60 tok/s = 16.7 ms (52x).
 
 ### 1. Whole-graph compile — the one that attacks 61% of the step
 
+**Status (2026-08-12, job 8750347): RUN. `compile_seg` = +20.5%**
+(1.158 -> 1.395 tok/s), compile confirmed engaged (`mode=VLLM_COMPILE`,
+0 graph breaks). Lands in the +5-25% "real, bank it, then explain" band;
+dispatch term 527 -> 380 ms = 1.39x, short of the 3x assumed below.
+`compile_whole` (`splitting_ops: []`, one graph) in flight.
+**Correctness gate still pending** — both legs used the degenerate
+`'a'` prompt. See `COMPILE_AB_RESULT_20260812.md`. The historical note
+below is kept for the pre-registration it records.
+
 **Status: verified reachable, never run.** This is the biggest miss of the
 last two sessions: I queued it last, my own wrong ceiling justified
 deprioritising it, and the flock refused it when the correctness rerun
