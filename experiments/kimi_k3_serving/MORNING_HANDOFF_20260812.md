@@ -24,7 +24,8 @@
 
 | | tok/s | status |
 |---|---:|---|
-| **c=64, fused KDA** | **49.31** | measured tonight — but ran the BROKEN kernel, see warning. Re-measure without it. |
+| **c=64, clean** | **46.06** | **TRUSTWORTHY** — kernel OFF, 64/64 responses, banned=0 |
+| c=64, broken kernel | 49.31 | tainted; the +7.4% was bought with wrong tokens |
 | c=128 (no fused kernel) | 65.20 | measured 2026-08-10 |
 | c=1 single-user | 1.267 | measured, +21.7% over two sessions |
 | c=1 theoretical best | ~7.7 | **if 100% of dispatch AND collectives were removed** |
@@ -72,8 +73,11 @@ runs, and streaming 29.7 GB over PCIe costs ~464 ms serialized.
   leg ran `VLLM_KIMI_XPU_KDA_FUSED_DECODE=1`, now known to be numerically
   wrong.** The throughput is what the machine did, but it is not a number you
   can ship, because the tokens it produced are suspect. The c=128 65.20 tok/s
-  from 2026-08-10 predates the kernel and is unaffected — treat THAT as the
-  trustworthy aggregate result, and re-measure c=64 with the flag off.
+  from 2026-08-10 predates the kernel and is unaffected.
+- **RE-MEASURED CLEAN: 46.06 tok/s at c=64** with the flag OFF (reps 45.909 /
+  46.061, 64/64 non-empty, banned=0). This is the trustworthy c=64 number.
+  The broken kernel's 49.31 was **+7.4% higher** — that is the amount of
+  apparent throughput the incorrect numerics were buying.
 - **Fused KDA decode kernel: +9.8% at c=1 but NUMERICALLY WRONG** — see the
   warning at the top. The speedup is real and reproducible; the output is
   not. Default OFF, and it must stay off until the codegen bug is found.
