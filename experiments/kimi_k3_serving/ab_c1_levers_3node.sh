@@ -99,7 +99,13 @@ rem=$(qstat -f "$JOB_ID" 2>/dev/null | tr -d '\n\t ' \
 used=$(qstat -f "$JOB_ID" 2>/dev/null | tr -d '\n\t ' \
       | grep -oP 'resources_used.walltime=\K[0-9:]+')
 to_min() { awk -F: '{print ($1*60)+$2}' <<<"$1"; }
-if [[ -n "$rem" && -n "$used" ]]; then
+# A job that just started has NO resources_used.walltime, so requiring both
+# made the guard silently skip on a fresh hold -- benign there (max time
+# available) but it would also skip if PBS ever changed its output, which is
+# the case the guard exists for. Treat a missing "used" as 0 and only skip
+# when the total walltime itself is unreadable.
+[[ -z "$used" ]] && used="00:00:00"
+if [[ -n "$rem" ]]; then
     left=$(( $(to_min "$rem") - $(to_min "$used") ))
     n_legs=$(tr ';' '\n' <<<"$LEGS" | grep -c .)
     need=$(( MIN_MINUTES_PER_LEG * n_legs ))
