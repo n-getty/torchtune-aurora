@@ -94,7 +94,13 @@ collected-PID wait). See
 
 ---
 
-# Fused KDA decode: +9.8% MEASURED (same hold, same nodes)
+# Fused KDA decode: +9.8% measured — but the kernel is WRONG (retracted)
+
+> **RETRACTED 2026-08-12.** The real-prompt correctness A/B later showed this
+> kernel produces different text from eager on hardware (corrupted recurrent
+> state that compounds). The speedup below is real; the output is not. Do not
+> enable `VLLM_KIMI_XPU_KDA_FUSED_DECODE`. See `MORNING_HANDOFF_20260812.md`.
+
 
 | leg | tok/s | reps | banned |
 |---|---|---|---|
