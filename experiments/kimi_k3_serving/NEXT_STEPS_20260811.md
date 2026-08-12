@@ -1,3 +1,8 @@
+> **SUPERSEDED 2026-08-12 by `NEXT_STEPS_20260812.md`.** The capture leg in
+> section 1 below is a DEAD END reachable only by a vLLM code change (see
+> `CAPTURE_BLOCKED_20260812.md`); do not spend hold time on it. Fused KDA is
+> measured at +9.8%. Kept for the retraction history only.
+
 # K3 single-user: exact next steps (written 2026-08-11, end of session)
 
 Everything here is committed and runnable. Both trees clean
