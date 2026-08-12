@@ -108,10 +108,67 @@ So PP is the mechanism that makes TP=16 fit. Estimated 207 ms -> ~135 ms of
 collectives = **~+9%**. Worth doing, not a route to 20 tok/s, and it costs a
 config bring-up. Do it after 1.
 
-### 4. Sequence parallelism / collective count (24%)
+**Correction (2026-08-12): TP=16 is the wrong target — it is still a fabric
+collective.** Aurora nodes have 12 tiles, so a 16-rank TP group *straddles a
+node boundary* and every all_reduce still crosses Slingshot. Halving the rank
+count on a latency-bound fabric is exactly the kind of change already
+measured as null three times (WS6, WS7, FP8-wire all cut bytes/width and
+bought nothing).
 
-Untouched. Upstream's o_proj `all_reduce` -> `reduce_scatter` transformation.
-AR fusion already removed 92 of 463. Composes with 3.
+The configuration this table missed is **TP=12 x PP=3 = 36 ranks = 3 nodes x
+12 tiles**, which makes every TP group **node-local**:
+
+| | ranks | nodes | GB/rank | TP node-local? |
+|---|---:|---:|---:|---|
+| TP=32 x PP=1 (today) | 32 | 2.67 | 48.8 | no |
+| TP=16 x PP=2 (above) | 32 | 2.67 | 48.8 | **no** |
+| **TP=12 x PP=3** | **36** | **3.00** | **43.3** | **YES** |
+
+It uses the *same three nodes*, and gives **more** headroom per rank, not
+less. All 371 all_reduces would move onto Xe Link, leaving only 2 PP boundary
+sends per token on the fabric.
+
+Legality checked in source, not assumed:
+- `KimiK3ForConditionalGeneration` (the served arch) subclasses
+  `KimiLinearForCausalLM`, which is `SupportsPP` with `make_layers` /
+  `PPMissingLayer`. PP is reachable. (`kimi_k3.py:33`)
+- `kimi_linear.py:846` asserts `num_attention_heads % tp_size == 0`;
+  96 % 12 == 0. OK.
+- `config.py:1190` sets `ep_size = tp_size`, so TP=12 forces EP=12. 896 % 12
+  = 8, i.e. **uneven** — but `layer.py:112-120` distributes the remainder
+  (`base+1` for the first 8 ranks) and only *EPLB* requires even division
+  (`layer.py:380`). Legal without EPLB.
+
+**Do not spend a K3 hold on this until the ratio is measured.** The whole
+value rests on one number nobody has measured: is a 12-rank *intra-node*
+all_reduce actually cheaper than a 32-rank cross-node one at K3's 7-14 KiB
+message size? `project_k3_collective_latency_measured_20260811` found this
+fabric **latency-bound** in that regime (37x bytes -> 1.25x time), which
+predicts the cost is fixed per-collective software overhead and locality will
+buy little. `bench_tp_group_locality.py` (free debug-scaling queue, ~3 min)
+settles it with the rule pre-registered: **<=0.4x -> pursue; >=0.8x -> drop
+this lever entirely.**
+
+### 4. Sequence parallelism / collective count (24%) — BLOCKED in platform code
+
+Upstream's o_proj `all_reduce` -> `reduce_scatter` transformation. AR fusion
+already removed 92 of 463. Composes with 3.
+
+**Not "untouched" — blocked.** `xpu.py:238-257` unconditionally force-disables
+eight fusion passes as "not yet supported on XPU", two of which are exactly
+this item's mechanism: **`enable_sp` (sequence parallelism)** and
+**`fuse_allreduce_rms`**. Setting them in a config is silently overridden at
+platform init, so this cannot be A/B'd without editing `xpu.py`.
+
+Measured, not just read: the eager leg logged two such warnings (act+quant,
+norm+quant) and the compile legs logged zero with `pass_config: {}` — so
+these passes were never even requested in any leg to date.
+
+Before running it, decide whether that override is a genuine capability gap
+or the same blanket conservatism already shown wrong on the
+graph-with-comms gate (whose own comment in this file now concedes it "has
+been shown not to hold universally"). Nothing here says enabling SP would
+help — only that the experiment is currently unrunnable.
 
 ### 5. Fix or delete the fused KDA kernel
 
