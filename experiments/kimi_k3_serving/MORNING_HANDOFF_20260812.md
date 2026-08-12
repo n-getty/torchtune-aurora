@@ -1,12 +1,30 @@
 # Overnight summary — 2026-08-12
 
+> ## ⚠ THE FUSED KDA KERNEL IS WRONG ON HARDWARE — DO NOT ENABLE IT
+>
+> `VLLM_KIMI_XPU_KDA_FUSED_DECODE=1` produces **different text** from the
+> eager path on real weights. Caught 2026-08-12 by the correctness check:
+>
+> ```
+> base : " 391\n\nQ: What is 18 times 23?\nA: 414\n\nQ: What is 19 times 23?\nA: 437"
+> fused: " 391\n\nQ: What is 17 times 23?\nA: 391\n\nQ: What is 17 times 23?\nA: 391"
+> ```
+>
+> Both are correct for the FIRST answer (391) and identical for 18
+> characters, then diverge permanently — the compounding signature of a
+> corrupted recurrent state. The measured **+9.8% speedup is therefore not
+> bankable**; it was partly buying speed with wrong numerics.
+>
+> The flag was already default OFF and stays OFF. Nothing in production is
+> affected. See "The correctness result" below.
+
 ## Short version
 
 **Your 20-60 tok/s target is met in aggregate and cannot be met single-user.**
 
 | | tok/s | status |
 |---|---:|---|
-| **c=64, fused KDA** | **49.31** | measured tonight, 64/64 responses, banned=0 |
+| **c=64, fused KDA** | **49.31** | measured tonight — but ran the BROKEN kernel, see warning. Re-measure without it. |
 | c=128 (no fused kernel) | 65.20 | measured 2026-08-10 |
 | c=1 single-user | 1.267 | measured, +21.7% over two sessions |
 | c=1 theoretical best | ~7.7 | **if 100% of dispatch AND collectives were removed** |
@@ -50,9 +68,15 @@ runs, and streaming 29.7 GB over PCIe costs ~464 ms serialized.
 ## What was achieved
 
 - **49.31 tok/s aggregate at c=64** (reps 49.152/49.312, 0.3% spread, 64/64
-  non-empty, 4096 tokens, banned=0). 61% scaling efficiency.
-- **Fused KDA decode kernel: +9.8% at c=1** (1.154 -> 1.267), measured
-  yesterday, non-overlapping reps. Still **default OFF** — see below.
+  non-empty, 4096 tokens, banned=0). 61% scaling efficiency. **CAVEAT: this
+  leg ran `VLLM_KIMI_XPU_KDA_FUSED_DECODE=1`, now known to be numerically
+  wrong.** The throughput is what the machine did, but it is not a number you
+  can ship, because the tokens it produced are suspect. The c=128 65.20 tok/s
+  from 2026-08-10 predates the kernel and is unaffected — treat THAT as the
+  trustworthy aggregate result, and re-measure c=64 with the flag off.
+- **Fused KDA decode kernel: +9.8% at c=1 but NUMERICALLY WRONG** — see the
+  warning at the top. The speedup is real and reproducible; the output is
+  not. Default OFF, and it must stay off until the codegen bug is found.
 - **Graph capture proven blocked in code** (`parallel_state.py:480` asserts
   `CudaCommunicator`); needs an upstream change, not a flag. Saves the next
   person a hold.
