@@ -24,6 +24,22 @@ case "$JOB_ID" in
     *) echo "ERROR: need the FULL PBS job id" >&2; exit 2 ;;
 esac
 
+# Refuse to run two drivers against the same allocation. On job 8749119 a
+# relaunch was started while the first driver was still alive; both legs used
+# the same RAY_TEMP_ROOT (keyed on job id) and killed each other's Ray
+# workers, producing a NO_START that looked like a node/memory fault. The
+# lock makes that operator error impossible instead of merely unlikely.
+LOCK=/tmp/k3_abc1_driver_${JOB_ID%%.*}.lock
+exec 9>"$LOCK" || { echo "ERROR: cannot open $LOCK" >&2; exit 2; }
+if ! flock -n 9; then
+    echo "ERROR: another ab_c1_levers driver is already running for ${JOB_ID%%.*}." >&2
+    echo "  Kill it first (pkill -f '[a]b_c1_levers_3node') and drain Ray," >&2
+    echo "  or wait for it to finish. Two drivers share RAY_TEMP_ROOT and will" >&2
+    echo "  tear down each other's workers." >&2
+    exit 2
+fi
+echo "driver_lock=$LOCK pid=$$"
+
 EXP=/lus/flare/projects/ModCon/ngetty/torchtune/experiments/kimi_k3_serving
 PYTHON=${PYTHON:-/flare/ModCon/ngetty/venvs/kimi-k3-xpu-framework/bin/python}
 MODEL=${MODEL:-/tmp/ngetty/AuroraGPT/prism_models}
@@ -132,6 +148,7 @@ run_leg() {
          PYTHON='$PYTHON' RAY_ENV_MODE='${RAY_ENV_MODE:-frameworks}' \
          K3_JOB_ID='$JOB_ID' K3_NODEFILE='$NODEFILE' PBS_NODEFILE='$NODEFILE' \
          K3_CACHE_ROOT='$cache' LOG_DIR='$dir' \
+         RAY_TEMP_ROOT='/tmp/k3_ray_${JOB_ID%%.*}_${name}' \
          nohup timeout 3600 bash '$EXP/serve_k3.sh' \
             --model '$MODEL' --served-model-name '$SERVED' \
             --tp 32 --ep --port $PORT \
