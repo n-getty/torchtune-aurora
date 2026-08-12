@@ -222,6 +222,22 @@ run_leg() {
         kill -TERM "$pid" 2>/dev/null; drain; return
     fi
 
+    # /health returns 200 from the API server even when the EngineCore behind
+    # it is dead -- on job 8749725 conc32 passed readiness, then every request
+    # came back 0 bytes because the engine had died with
+    # RayChannelTimeoutError during warmup. Require one real completion before
+    # spending the timing loop, and fail the leg honestly if it never comes.
+    local probe; probe=$(ssh -o BatchMode=yes -o ConnectTimeout=15 "$HEAD" \
+        "timeout 600 curl -s --noproxy '*' -X POST http://127.0.0.1:$PORT/v1/completions \
+          -H 'Content-Type: application/json' -d '{\"model\":\"$SERVED\",
+          \"prompt\":\"hello\",\"max_tokens\":4,\"temperature\":0}'" 2>/dev/null)
+    if ! grep -q '"text"' <<<"$probe"; then
+        local f; f=$(grep -rho "banned: *1" "$dir" 2>/dev/null | wc -l)
+        echo "engine_probe_failed: ${probe:0:200}"
+        echo "RESULT leg=$name verdict=$([[ $f -gt 0 ]] && echo FAULTED || echo ENGINE_DEAD)"
+        kill -TERM "$pid" 2>/dev/null; drain; return
+    fi
+
     # Confirm the leg's env actually reached a worker before believing its number.
     if [[ -n "$envs" ]]; then
         local var=${envs%%=*}
@@ -284,7 +300,18 @@ print(f'{$toks/max(1e-9,$t1-$t0):.3f}')")"
     local best; best=$(grep -oE "tok_s=[0-9.]+" "$RUN_DIR/ab.log" | tail -"$REPEATS" \
                        | cut -d= -f2 | sort -rn | head -1)
     local faults; faults=$(grep -rho "banned: *1" "$dir" 2>/dev/null | wc -l)
-    echo "RESULT leg=$name c1_tok_s=$best banned=$faults verdict=$([[ $faults -gt 0 ]] && echo FAULTED || echo OK)"
+    # A leg that produced ZERO tokens is not OK. conc32 on job 8749725
+    # reported "c1_tok_s=0.000 banned=0 verdict=OK" after the engine had
+    # already died (RayChannelTimeoutError during warmup) -- every response
+    # file was 0 bytes. verdict=OK on no data is worse than a failure: it
+    # silently enters the record as a measurement.
+    local verdict=OK
+    if (( faults > 0 )); then
+        verdict=FAULTED
+    elif [[ -z "$best" || "$best" == "0.000" || "$best" == "0" ]]; then
+        verdict=NO_TOKENS
+    fi
+    echo "RESULT leg=$name c1_tok_s=${best:-0.000} banned=$faults verdict=$verdict"
 
     kill -TERM "$pid" 2>/dev/null
     drain
