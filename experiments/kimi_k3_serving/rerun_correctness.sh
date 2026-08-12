@@ -16,7 +16,11 @@ set -uo pipefail
 EXP=/lus/flare/projects/ModCon/ngetty/torchtune/experiments/kimi_k3_serving
 JOB=${1:-}
 if [[ -z "$JOB" ]]; then
+    # qstat -u TRUNCATES the job id ("8749725.aurora-pbs-*"), so feeding it
+    # back to `qstat -x -f` returns nothing and the lookup silently fails.
+    # Take the numeric prefix and re-resolve to the full id.
     J=$(qstat -u ngetty 2>/dev/null | awk '/kimi_k3_h/ && $10=="R" {print $1}' | head -1)
+    J=${J%%.*}
     [[ -n "$J" ]] && JOB=$(qstat -x -f "$J" 2>/dev/null | awk -F': ' '/^Job Id/{print $2}')
 fi
 [[ -n "$JOB" ]] || { echo "no running kimi hold"; exit 2; }
