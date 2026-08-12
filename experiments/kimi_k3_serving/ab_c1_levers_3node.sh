@@ -252,7 +252,28 @@ run_leg() {
         # NOT-FOUND on a leg whose flag WAS active -- a false alarm on the one
         # check that exists to catch inactive flags.
         local seen; seen=$(grep -ho "$var=[^ ]*" "$dir"/launcher.log "$dir"/*.log "$dir"/*.txt 2>/dev/null | sort -u | head -2 | tr '\n' ' ')
-        echo "leg_env_in_worker: ${seen:-NOT-FOUND}"
+        case "$var" in
+            # Launcher-consumed vars never reach a worker BY DESIGN: they
+            # select CLI flags (--enforce-eager, -cc.cudagraph_mode,
+            # -cc.splitting_ops) and are not in
+            # VLLM_RAY_EXTRA_ENV_VARS_TO_COPY. On job 8750347 this printed
+            # NOT-FOUND for a compile leg that HAD engaged, which invites
+            # discarding a valid measurement. For these, the load-bearing
+            # evidence is the resolved CompilationMode in server.log --
+            # check that instead of a worker env grep.
+            ENFORCE_EAGER|CUDAGRAPH_MODE|SPLITTING_OPS_EMPTY)
+                local mode; mode=$(grep -oE "'mode': <CompilationMode\.[A-Z_]+" \
+                    "$dir/server.log" 2>/dev/null | head -1 | grep -oE '[A-Z_]+$')
+                echo "leg_env_in_worker: n/a (launcher-consumed); resolved_mode=${mode:-UNKNOWN}"
+                if [[ "$mode" == "NONE" ]]; then
+                    echo "  WARNING: leg asked for compile but engine resolved mode=NONE."
+                    echo "  This leg measured EAGER -- void as a compile result."
+                fi
+                ;;
+            *)
+                echo "leg_env_in_worker: ${seen:-NOT-FOUND}"
+                ;;
+        esac
     fi
 
     # Warm up (first request pays JIT/allocator), then time c=1.
