@@ -77,7 +77,19 @@ runs, and streaming 29.7 GB over PCIe costs ~464 ms serialized.
    single most useful cheap experiment outstanding** — a server that only
    handles 16-token prompts is not servable, whatever its tok/s.
 
-3. Whole-graph compile (`VLLM_COMPILE` + `cudagraph_mode=NONE`) never ran —
+3. **A 41-token prompt hangs but a 12-token one works, WITH chunked prefill
+   on** (`VLLM_KIMI_XPU_KDA_CHUNKED=1`). The corr3 base leg produced
+   `17x23 = 391` (also 18x23=414, 19x23=437 -- all correct) from a 12-token
+   prompt in 29.1 s. Two variables changed at once (prompt 41->12 AND
+   chunking off->on), so this does NOT isolate which one cleared the hang.
+   The ladder experiment must vary one at a time.
+
+   Note the 1.100 tok/s from that leg is NOT comparable to the 1.267
+   baseline: different prompt length, half the completion length (32 vs 64,
+   so prefill amortizes over fewer tokens), and chunking on. Do not read it
+   as a regression.
+
+4. Whole-graph compile (`VLLM_COMPILE` + `cudagraph_mode=NONE`) never ran —
    the flock correctly refused it while the correctness re-run held the lock.
    Untested, and does not route through the blocked `graph_capture()`.
 
