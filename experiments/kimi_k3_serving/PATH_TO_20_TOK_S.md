@@ -210,3 +210,47 @@ If the requirement is "serve this model at 20-60 tok/s", that is done today.
 If it is "one user sees 20-60 tok/s", it needs hardware with more HBM per
 rank (upstream uses GB300 at ~4x our per-rank memory) or a substantially
 smaller/quantized model.
+
+---
+
+## Correctness check STILL not obtained — 41-token prompt hangs the engine
+
+Both re-run legs returned `verdict=NO_TOKENS` (the new guard working: it
+refused to call zero tokens OK). Root cause is **prompt length**, not the
+kernel and not concurrency.
+
+The HTTP log settles the ordering — `2x 200` then `1x 500`:
+
+| # | request | prompt tokens | result |
+|---|---|---:|---|
+| 1 | engine probe `hello` | ~1 | **200 OK** |
+| 2 | warmup, 64 `a`s | 16 | **200 OK** |
+| 3 | the timed request, real question | **41** | **500 after 300.9 s** |
+
+`RAY_CGRAPH_get_timeout` is 300 s, so the third request hung for exactly the
+timeout. `Dumping input data` confirms `prompt_token_ids_len=41`.
+
+**Every successful K3 run in this repo used 16 prompt tokens** — last night's
+baseline, the fused-KDA leg, and today's c=64 run all used the 64-`a`
+prompt that tokenizes to 16. The 41-token prompt is the first non-trivial
+prefill anyone has attempted here, and it hangs.
+
+This is consistent with an already-recorded finding I failed to apply:
+[[project_k3_48b_mnbt_ab_null_result_20260811]] states "512-token prompts are
+unusable for fault-hunting on this stack (0 completions in 544 s)" because
+**the XPU KDA prefill steps one token at a time** (`kda.py`). The harness even
+carries the comment `512-in is unusable`. I designed a correctness prompt
+without checking the known prefill limit.
+
+**What is NOT established:** a naive linear model (41 x 0.789 s = 32 s) does
+not predict a 300 s hang, so per-token prefill cost alone does not explain
+it. The mechanism is unconfirmed — it may be superlinear, or a different
+fault that longer prefill merely triggers. Do not state a cause without
+measuring the prefill-length curve.
+
+**Actionable next step:** `VLLM_KIMI_XPU_KDA_CHUNKED=1` exists and is
+HW-validated at 2.15-7.12x on prefill
+([[project_k3_chunked_prefill_xpu_validated_20260811]]) but is **default
+OFF**. The correctness re-run should set it. Also worth measuring directly:
+a prompt-length ladder (16 / 24 / 32 / 41 / 64 tokens) to find where the
+cliff is, which is a cheap and genuinely useful number nobody has.
