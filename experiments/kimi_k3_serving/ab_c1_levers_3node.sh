@@ -140,6 +140,27 @@ echo "phase=daos_mount"
 LOG_DIR="$RUN_DIR" EXPECT_NODES=3 bash "$EXP/mount_daos_models_all_nodes.sh" \
     || { echo "ERROR: DAOS mount failed"; exit 2; }
 
+# The DAOS mount script can report success before the fuse mount is visible
+# to a NEW ssh session on the same node -- on job 8749725 both correctness
+# legs died with "EP requires a model config: .../config.json" while the
+# mount log said "Mount successful!" and the file was present seconds later.
+# A whole phase (76 min) was lost to a race. Verify what the leg will
+# actually see, from a fresh ssh, before starting any leg.
+echo "phase=verify_model_visible"
+for node in "${NODES[@]}"; do
+    ok=0
+    for _ in $(seq 1 30); do
+        if ssh -o BatchMode=yes -o ConnectTimeout=10 "$node" \
+               "test -f '$MODEL/config.json'" 2>/dev/null; then ok=1; break; fi
+        sleep 4
+    done
+    if [[ "$ok" != 1 ]]; then
+        echo "ERROR: $MODEL/config.json not visible on $node after 120s" >&2
+        exit 2
+    fi
+    echo "node=$node model_visible=yes"
+done
+
 drain() {
     local pids=()
     for node in "${NODES[@]}"; do
