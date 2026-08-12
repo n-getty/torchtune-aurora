@@ -172,3 +172,59 @@ CUDAGRAPH_MODE=NONE`); with `NONE` it emits
 that resolves to `NONE` is void as a compile measurement whatever its tok/s —
 which is exactly how the capture attempt looked healthy right up until it hit
 a second gate nobody knew about.
+
+---
+
+## RESULT: compile_seg = 1.395 tok/s, +20.5% — the first win on the dispatch term
+
+Job 8750347, all legs one allocation, same nodes.
+
+| leg | tok/s | reps | vs control |
+|---|---:|---|---:|
+| `eager_base` | 1.158 | 1.158 / 1.152 / 1.149 | — |
+| **`compile_seg`** | **1.395** | 1.363 / 1.395 / 1.384 | **+20.5%** |
+
+Non-overlapping (control max 1.158 < compile min 1.363), banned=0 both legs.
+Step **864 -> 717 ms**, i.e. **147 ms saved = 28% of the 529 ms dispatch
+term**.
+
+**Engagement verified from the worker log, not assumed:**
+
+```
+mode = VLLM_COMPILE          cudagraph_mode = NONE
+Dynamo bytecode transform: 64.4 s      graph breaks: 0      errors: 0
+```
+
+Zero graph breaks on a 93-layer MoE model — Dynamo traced it whole, so
+Inductor had intact graphs to fuse. Compilation finished at 13:07:17, inside
+the 30-min readiness window (deadline 13:15:19) with ~8 min to spare.
+
+**This confirms the source reading**: `profile_cudagraph_memory()` is skipped
+at `cudagraph_mode=NONE` (`gpu_worker.py:414-419`), so compile-without-
+cudagraphs cleanly bypasses the `CudaCommunicator` assert that blocks capture.
+The lever that sat untested for two sessions works.
+
+### Against the pre-registered rules
+
++20.5% lands in the **"+5-25% = real, bank it, investigate the limit"** band,
+just under the +25% that would have made it the main line. The launch-count
+model predicted +36% at 3x fusion; we got 20.5%, so **the model over-predicts
+here by ~1.75x** — consistent with the ~1.5x over-prediction seen on the
+fused-KDA kernel. Two independent data points now say: treat launch-count
+projections as roughly 1.5-1.8x optimistic.
+
+### Why it is not larger, and what to try next
+
+147 ms of 529 ms means Inductor fused a meaningful slice but far from all of
+it. Likely limits, in order of cheapness to test:
+
+1. **93 forced graph cuts.** `splitting_ops` defaults to the attention ops, so
+   fusion cannot cross a layer boundary. That is exactly what `compile_whole`
+   (`splitting_ops=[]`) tests — running now.
+2. **`custom_ops`.** vLLM's default keeps several ops as opaque custom kernels
+   Inductor cannot fuse through. Upstream's AMD recipe passes
+   `custom_ops=["+fused_rms_norm_gated"]`; the inverse (`-all` to let Inductor
+   own more of them) is worth an A/B.
+3. **`mode=max-autotune`** on the hot GEMMs.
+4. The remaining 382 ms may simply not be per-launch host work — the
+   collectives term (207 ms) is inside it and compile cannot touch that.
