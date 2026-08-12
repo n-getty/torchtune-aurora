@@ -10,7 +10,7 @@ route through the blocked `graph_capture()` path).
 |---|---|---:|---:|
 | `eager_base` | — | 1.158 | 864 |
 | `compile_seg` | `ENFORCE_EAGER=0,CUDAGRAPH_MODE=NONE` | **1.395** | **717** |
-| `compile_whole` | + `SPLITTING_OPS_EMPTY=1` | *(in flight)* | |
+| `compile_whole` | + `SPLITTING_OPS_EMPTY=1` | 1.383 | 723 |
 
 **+20.5%**, and tight across reps (1.363 / 1.395 / 1.384) — not node noise.
 
@@ -69,6 +69,48 @@ compile changed only the dispatch term. Kineto on this stack emits no CPU
 rows (`project_k3_kineto_no_cpu_rows_20260811`), so the launch count under
 compile has **not** been measured directly. Do not quote "1.39x fewer
 launches" — quote 1.39x on the inferred dispatch term.
+
+## `compile_whole` is a NULL result — whole-graph compile adds nothing
+
+**1.383 vs `compile_seg` 1.395 (−0.9%, inside rep spread 1.370/1.381/1.383).**
+Engagement verified the same way: `mode=VLLM_COMPILE`, `cudagraph_mode=NONE`,
+`'splitting_ops': []` — this really was one whole-model graph, not 93
+attention-split segments.
+
+This **answers the "why is compile only +20.5%" question in the section
+above, and rules out its first hypothesis.** The 93 forced graph cuts at
+attention boundaries were the leading suspect for limited fusion; removing
+them entirely changes nothing. So Inductor was already extracting essentially
+all the cross-op fusion available *within* a layer, and there is no
+significant fusable work spanning layer boundaries.
+
+Consequence for the plan: **whole-graph compile is closed as a lever.** The
+remaining compile-side ideas are `custom_ops` (let Inductor own ops currently
+opaque to it) and `max-autotune`.
+
+### Side finding: plan item §4 (sequence parallelism) is blocked in platform code
+
+`xpu.py:238-257` force-disables eight fusion passes with "not yet supported
+on XPU": `enable_sp`, `fuse_gemm_comms`, `fuse_allreduce_rms`,
+`fuse_norm_quant`, `fuse_act_quant`, `fuse_attn_quant`, `fuse_act_padding`,
+`fuse_rope_kvcache`.
+
+Two of those — **`enable_sp` (sequence parallelism) and `fuse_allreduce_rms`
+(AllReduce+RMSNorm fusion)** — are precisely the mechanism plan §4 proposes
+for the 24% collectives term. §4 is therefore not "untouched", it is
+**blocked by an unconditional platform override**, and any attempt to run it
+must first decide whether that override is a real capability gap or the same
+blanket conservatism already found to be wrong on the graph-with-comms gate
+(the `VLLM_XPU_ALLOW_GRAPH_WITH_COMMS` note in the same file says that gate
+"has been shown not to hold universally").
+
+Measured, so this is not inferred from source alone: the eager leg logged
+exactly two of these warnings (`Activation + quant fusion`, `RMSNorm + quant
+fusion`) and the compile legs logged **zero** with `pass_config: {}`. So the
+SP / allreduce-RMS passes were never requested in any leg — they are off by
+default *and* would be overridden if turned on. Nothing measured here says
+they would help; it says the experiment cannot be run without touching
+`xpu.py`.
 
 ## NOT YET A BANKABLE RESULT — correctness is pending
 
