@@ -213,15 +213,31 @@ here by ~1.75x** — consistent with the ~1.5x over-prediction seen on the
 fused-KDA kernel. Two independent data points now say: treat launch-count
 projections as roughly 1.5-1.8x optimistic.
 
+### compile_whole: removing the 93 graph cuts changes NOTHING
+
+| leg | median | reps | vs control |
+|---|---:|---|---:|
+| `eager_base` | 1.152 | 1.158 / 1.152 / 1.149 | — |
+| `compile_seg` (93 segments) | **1.384** | 1.363 / 1.395 / 1.384 | **+20.1%** |
+| `compile_whole` (`splitting_ops=[]`) | **1.381** | 1.370 / 1.381 / 1.383 | **+19.9%** |
+
+`seg` vs `whole` = **-0.2%**, ranges overlap ([1.363,1.395] vs
+[1.370,1.383]) — a tie. Configs genuinely differed, confirmed from the worker
+logs: `'splitting_ops': []` vs `'splitting_ops': ['vllm::unified_attention_
+with_output', ...]`, so this is a real negative and not two identical runs.
+
+**Conclusion: cross-layer fusion is NOT the limiter.** Hypothesis 1 below is
+refuted. Inductor extracts the same ~147 ms whether or not it is allowed to
+fuse across attention boundaries, which means the remaining 382 ms is not
+blocked by graph segmentation.
+
 ### Why it is not larger, and what to try next
 
 147 ms of 529 ms means Inductor fused a meaningful slice but far from all of
 it. Likely limits, in order of cheapness to test:
 
-1. **93 forced graph cuts.** `splitting_ops` defaults to the attention ops, so
-   fusion cannot cross a layer boundary. That is exactly what `compile_whole`
-   (`splitting_ops=[]`) tests — running now.
-2. **`custom_ops`.** vLLM's default keeps several ops as opaque custom kernels
+1. ~~**93 forced graph cuts.**~~ **REFUTED** — `compile_whole` measured a tie.
+2. **`custom_ops`** — now the leading hypothesis. vLLM's default keeps several ops as opaque custom kernels
    Inductor cannot fuse through. Upstream's AMD recipe passes
    `custom_ops=["+fused_rms_norm_gated"]`; the inverse (`-all` to let Inductor
    own more of them) is worth an A/B.
