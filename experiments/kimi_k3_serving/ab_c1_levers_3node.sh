@@ -107,6 +107,21 @@ if [[ -n "$rem" && -n "$used" ]]; then
     fi
 fi
 
+# Ray placement groups survive a pkill-based teardown. `ray stop` releases
+# them; killing the processes does not, and the GPUs stay reserved in
+# bundle_group_* entries. vLLM checks AVAILABLE (not total) GPUs on the
+# driver node (ray_utils.py:646-655), so a leaked PG yields
+# "Current node has no GPU available" -- which reads like a hardware fault
+# and cost a full model load on job 8749119. Force a clean slate first.
+echo "phase=ray_stop"
+for node in "${NODES[@]}"; do
+    ssh -o BatchMode=yes -o ConnectTimeout=20 "$node" \
+        "source '$EXP/../ray_smoke/setup_ray_env.sh' '${RAY_ENV_MODE:-frameworks}' >/dev/null 2>&1; \
+         ray stop --force >/dev/null 2>&1; true" >/dev/null 2>&1 &
+done
+wait
+sleep 5
+
 echo "phase=daos_mount"
 LOG_DIR="$RUN_DIR" EXPECT_NODES=3 bash "$EXP/mount_daos_models_all_nodes.sh" \
     || { echo "ERROR: DAOS mount failed"; exit 2; }
