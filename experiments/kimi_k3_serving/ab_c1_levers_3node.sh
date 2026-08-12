@@ -34,6 +34,13 @@ PORT=${PORT:-8000}
 PROMPT_TOKENS=${PROMPT_TOKENS:-32}
 MAX_TOKENS=${MAX_TOKENS:-64}
 REPEATS=${REPEATS:-3}
+# vLLM refuses to start if any tile has less free memory than this fraction
+# demands, and Aurora tiles are NOT reliably clean: on job 8749119 one node of
+# three had 52.6/64 GiB free per tile (the other two had 62.7 and 60.7) with no
+# user process on it, which failed every leg at init with
+# "Free memory on device xpu:N ... is less than desired GPU memory utilization".
+# Keep this BELOW the worst tile's free fraction. 0.92 needs 58.9 GiB free.
+GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.92}
 
 # name=VAR=VAL[,VAR=VAL...]  (semicolon-separated legs)
 LEGS=${LEGS:-"baseline=;ar_fusion=VLLM_KIMI_FUSE_SHARED_EXPERT_AR=1;op_sync_off=CCL_OP_SYNC=0;both=VLLM_KIMI_FUSE_SHARED_EXPERT_AR=1,CCL_OP_SYNC=0"}
@@ -130,7 +137,7 @@ run_leg() {
             --tp 32 --ep --port $PORT \
             --max-model-len 2048 --max-num-seqs 128 \
             --max-num-batched-tokens 2048 \
-            --gpu-memory-utilization 0.92 \
+            --gpu-memory-utilization $GPU_MEM_UTIL \
             --diagnostic-blocks 800 --no-async-scheduling" \
         >"$dir/launcher.log" 2>&1 &
     local pid=$!
