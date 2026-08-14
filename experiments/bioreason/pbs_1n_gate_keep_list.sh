@@ -15,7 +15,6 @@ PARQUET=${PARQUET:-/lus/flare/projects/ModCon/ngetty/datasets/bioreason_rl}
 CACHE=${CACHE:-/lus/flare/projects/ModCon/ngetty/datasets/bioreason_rl/esm3_cache_2048.pt}
 cd "${TT}"
 module load frameworks/2025.3.1
-set -u
 unset VIRTUAL_ENV
 export PYTHONNOUSERSITE=1 HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 HF_HUB_DISABLE_TELEMETRY=1
 export BIOREASON_SRC=/lus/flare/projects/ModCon/ngetty/BioReason-Pro

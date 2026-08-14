@@ -1,4 +1,0 @@
-tp=1 SERVER_OK
-tp=1 single_step exit=0
-tp=1 ladder exit=1
-tp=1 long_decode exit=1

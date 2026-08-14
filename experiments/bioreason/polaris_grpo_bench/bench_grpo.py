@@ -23,19 +23,39 @@ import argparse, json, os, platform, sys, time
 import torch
 import torch.distributed as dist
 
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..",
+                                 "benchmarks", "grpo_cross_machine"))
+try:
+    from device_peak_flops import peak_flops_for_device_name
+except ImportError:
+    # Standalone-copy fallback (e.g. the /lus/eagle mirror on Polaris, which
+    # does not carry the rest of this repo's benchmarks/ tree) -- keep the
+    # same values as benchmarks/grpo_cross_machine/device_peak_flops.py.
+    def peak_flops_for_device_name(name):
+        name = (name or "").upper()
+        if "H200" in name:
+            return 989.5e12
+        if "H100" in name:
+            return 989e12
+        if "A100" in name:
+            return 312e12
+        if "MAX" in name or "PVC" in name or "1550" in name:
+            return 419.5e12
+        return None
+
 
 # ----------------------------------------------------------------------------- device
 def device_info():
     if torch.cuda.is_available():
         name = torch.cuda.get_device_name(0)
-        peak = 312e12 if "A100" in name else None  # A100 bf16 dense peak
+        peak = peak_flops_for_device_name(name)  # e.g. A100 bf16 dense peak = 312e12
         return "cuda", name, peak
     if hasattr(torch, "xpu") and torch.xpu.is_available():
         try:
             name = torch.xpu.get_device_name(0)
         except Exception:
             name = "Intel XPU"
-        peak = 419.5e12  # PVC Max 1550 per-tile bf16
+        peak = peak_flops_for_device_name(name) or 419.5e12  # PVC Max 1550 per-tile bf16
         return "xpu", name, peak
     return "cpu", platform.processor() or "cpu", None
 
@@ -146,6 +166,14 @@ def make_callback(warmup, measured, holder):
     class _CB(TrainerCallback):
         def __init__(self):
             self.times = []
+            # TRL's own training_step() wraps ONLY the super().training_step() call
+            # (the actual fwd+bwd+optim, excluding _prepare_inputs' generation) into
+            # self._metrics["train"]["step_time"], which GRPOTrainer.log() merges into
+            # the `logs` dict passed to on_log -- a stable public hook, no need to
+            # monkeypatch a private method. This is exactly the train-phase-only /
+            # MFU window: generation is NOT included (it happens in _prepare_inputs,
+            # timed separately by TRL and excluded from step_time).
+            self.train_phase_times = []
             self._t = None
             self.count = 0
             # snapshot gen-token counters at the warmup boundary so the throughput metric
@@ -165,6 +193,16 @@ def make_callback(warmup, measured, holder):
                         holder["gen_tokens"] - (self.gen_tokens_at_measure_start or 0))
                     control.should_training_stop = True
             self._t = time.perf_counter()
+            return control
+
+        def on_log(self, args, state, control, logs=None, **kw):
+            # Fires after on_step_end for the same step (HF Trainer calls
+            # _maybe_log_save_evaluate, which triggers this, right after
+            # on_step_end in the training loop) -- self.count is already
+            # incremented for the current step by the time this runs.
+            if logs is not None and "step_time" in logs and self.count > warmup:
+                if len(self.train_phase_times) < measured:
+                    self.train_phase_times.append(logs["step_time"])
             return control
 
     cb = _CB()
@@ -304,7 +342,39 @@ def main():
     mean_completion_len = (gen_tok_measured_node / (completions_per_step * len(times))
                            if completions_per_step and times else None)
 
+    # ---- train-phase-only (fwd+bwd+optim) timing + MFU, mirroring
+    # benchmarks/sft_throughput_aurora_vs_polaris/bench_sft.py's convention:
+    # generation is excluded (TRL's own training_step() timer only wraps
+    # super().training_step(), not _prepare_inputs' rollout call).
+    train_phase_times = cb.train_phase_times
+    train_phase_s_median = st.median(train_phase_times) if train_phase_times else None
+    # tokens/optimizer-step = full completion volume trained on this step
+    # (context + generated tokens), consistent with the dense-SFT convention
+    # tokens_trained_per_step = world_size * micro_bsz * grad_accum * seqlen.
+    seqlen = obs_prompt_len + args.max_completion_length
+    tokens_trained_per_step = ws * args.micro_bsz * args.grad_accum * seqlen
+    mfu_percent = None
+    if train_phase_times and DEV_PEAK_FLOPS:
+        train_phase_wall_time_s_total = sum(train_phase_times)
+        measured_train_steps = len(train_phase_times)
+        mfu_percent = 100.0 * (
+            6 * n_params * tokens_trained_per_step * measured_train_steps
+        ) / (train_phase_wall_time_s_total * ws * DEV_PEAK_FLOPS)
+    tok_per_sec_device = (
+        (tokens_trained_per_step / ws) / train_phase_s_median
+        if train_phase_s_median else None
+    )
+    tok_per_sec_node = (
+        tokens_trained_per_step / train_phase_s_median
+        if train_phase_s_median else None
+    )
+
     result = dict(
+        machine="polaris",
+        leg="proxy",
+        proxy=True,
+        model_size_label=os.environ.get("BENCH_MODEL_SIZE_LABEL", ""),
+        model_path=args.model_path,
         tag=args.tag,
         platform=DEV_TYPE,
         device_name=DEV_NAME,
@@ -312,6 +382,7 @@ def main():
         framework="trl-grpo",
         gen_backend=args.gen,
         world_size=ws,
+        nodes=int(os.environ.get("NNODES", "1")),
         attn=args.attn,
         prompt_len_requested=args.prompt_len,
         prompt_len_observed=obs_prompt_len,
@@ -329,10 +400,18 @@ def main():
         step_time_p10_s=p10,
         step_time_p90_s=p90,
         step_time_cov=(p90 - p10) / med if med else None,
+        train_phase_s_median=train_phase_s_median,
+        gen_phase_s_median=(med - train_phase_s_median
+                            if (med and train_phase_s_median) else None),
+        tokens_trained_per_step=tokens_trained_per_step,
+        tok_per_sec_device=tok_per_sec_device,
+        tok_per_sec_node=tok_per_sec_node,
+        mfu_percent=mfu_percent,
         mean_completion_len=mean_completion_len,
         gen_tokens_measured_node=gen_tok_measured_node,
         gen_tok_per_sec_node=gen_tok_per_sec_node,
         gen_tok_per_sec_device=gen_tok_per_sec_dev,
+        health="GREEN" if (train_phase_times and mfu_percent and 0 < mfu_percent < 100) else "DEGRADED",
         fingerprint=dict(
             model=os.path.basename(args.model_path.rstrip("/")),
             n_params=n_params, prompt_len=args.prompt_len,

@@ -43,7 +43,7 @@ BETA=${BETA:-0.04}
 TAG=${TAG:-polaris_grpo_${GEN}_g${G}}
 
 BENCH=/lus/eagle/projects/ModCon/ngetty/grpo_bench/bench_grpo.py
-MODEL=/lus/eagle/projects/ModCon/ngetty/models/Qwen3-4B
+MODEL=${MODEL:-/lus/eagle/projects/ModCon/ngetty/models/Qwen3-4B}
 OUT=/lus/eagle/projects/ModCon/ngetty/grpo_bench/results/${TAG}.json
 mkdir -p /lus/eagle/projects/ModCon/ngetty/grpo_bench/results
 
@@ -54,6 +54,7 @@ export TOKENIZERS_PARALLELISM=false
 export PYTHONUNBUFFERED=1
 export NCCL_NET_GDR_LEVEL=PHB
 export NCCL_CROSS_NIC=1
+export BENCH_MODEL_SIZE_LABEL=${BENCH_MODEL_SIZE_LABEL:-}
 # vLLM on Polaris: keep it from re-grabbing all GPUs; colocate shares the trainer's device.
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 

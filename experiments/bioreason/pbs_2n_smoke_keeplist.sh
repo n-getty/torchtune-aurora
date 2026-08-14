@@ -19,5 +19,6 @@ export OUTDIR="${OUTDIR:-${PROJDIR}/experiments/bioreason/runs/sft_qwen3_32b_sta
 export EPOCHS=1
 export SAVE_EVERY="${SAVE_EVERY:-10}"
 export MAX_STEPS="${MAX_STEPS:-15}"
-export BIOREASON_RESUME=0
+export BIOREASON_RESUME="${BIOREASON_RESUME:-0}"
+export COMPILE_MODEL="${COMPILE_MODEL:-true}"
 exec bash "${PROJDIR}/experiments/bioreason/pbs_4n_sft_full.sh"

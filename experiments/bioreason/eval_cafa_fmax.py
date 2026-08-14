@@ -155,7 +155,8 @@ def build_prompt_string(sample, tokenizer, enable_thinking: bool = True) -> str:
 
 def build_native_input_ids(row, protein_seq, tokenizer, protein_token_id, go_token_id,
                            num_go_tokens, inject_go_pred=True,
-                           interpro_in_prompt=True, ppi_in_prompt=True):
+                           interpro_in_prompt=True, ppi_in_prompt=True,
+                           keep_list_prefix=False, add_uniprot_summary=False):
     """Build prompt input_ids EXACTLY as the native SFT trained (dataset_sft).
 
     Reuses BioReasonSFTDataset._build_prompt_ids verbatim (via __new__, no data load) so
@@ -165,9 +166,10 @@ def build_native_input_ids(row, protein_seq, tokenizer, protein_token_id, go_tok
     chat-template/<|protein_pad|> path is for the published HF model, NOT our native ckpt).
 
     interpro_in_prompt / ppi_in_prompt: text ablation (default True = unchanged prior
-    behavior), forwarded to BioReasonSFTDataset._build_prompt_text. Unlike the non-native
-    path, there is no include_protein_function_summary equivalent — the native prompt
-    format never includes that field.
+    behavior), forwarded to BioReasonSFTDataset._build_prompt_text.
+    add_uniprot_summary: MUST match whatever the checkpoint was trained with (parity
+    contract confound #5) — appends " Summarize in UniProt format." to the prompt. Default
+    False preserves prior behavior for every checkpoint trained before this flag existed.
     """
     import torch
     from torchtune.dev.bioreason.dataset_sft import BioReasonSFTDataset
@@ -179,8 +181,28 @@ def build_native_input_ids(row, protein_seq, tokenizer, protein_token_id, go_tok
     ds.inject_go_pred = bool(inject_go_pred)
     ds.interpro_in_prompt = bool(interpro_in_prompt)
     ds.ppi_in_prompt = bool(ppi_in_prompt)
+    ds.keep_list_prefix = bool(keep_list_prefix)
+    ds.add_uniprot_summary = bool(add_uniprot_summary)
     ids = ds._build_prompt_ids(row, protein_seq)
     return torch.tensor(ids, dtype=torch.long)
+
+
+def build_native_prompt_text(row, tokenizer, interpro_in_prompt=True, ppi_in_prompt=True,
+                             keep_list_prefix=False, add_uniprot_summary=False):
+    """Return the native SFT text prompt used to build the integer-id input layout."""
+    from torchtune.dev.bioreason.dataset_sft import BioReasonSFTDataset
+
+    ds = BioReasonSFTDataset.__new__(BioReasonSFTDataset)
+    ds.tokenizer = tokenizer
+    ds.interpro_in_prompt = bool(interpro_in_prompt)
+    ds.ppi_in_prompt = bool(ppi_in_prompt)
+    ds.keep_list_prefix = bool(keep_list_prefix)
+    ds.add_uniprot_summary = bool(add_uniprot_summary)
+    return ds._build_prompt_text(
+        row,
+        interpro_in_prompt=ds.interpro_in_prompt,
+        ppi_in_prompt=ds.ppi_in_prompt,
+    )
 
 
 def build_input_ids(prompt_string, protein_seq, tokenizer, num_go_tokens):
@@ -561,6 +583,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
                     action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--ppi_in_prompt",
                     action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--add_uniprot_summary",
+                    action=argparse.BooleanOptionalAction, default=False,
+                    help="native-prompt path only (--native_prompt): MUST match whatever "
+                         "the checkpoint was trained with (dataset_sft's add_uniprot_summary "
+                         "flag). Default False for backward compat with every checkpoint "
+                         "trained before this flag existed.")
     ap.add_argument("--val_split_ratio", type=float, default=0.1)
     ap.add_argument("--seed", type=int, default=23)
     ap.add_argument("--max_samples", type=int, default=-1)
@@ -584,13 +612,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          "hosts the sharded backbone; the client builds prompt_embeds "
                          "(backbone-free) and POSTs them. Mutually exclusive with --no_vllm and "
                          "the in-process LLM() path. Uses VLLMClient.generate_from_embeds.")
-    ap.add_argument("--vllm_max_model_len", type=int, default=4808,
+    ap.add_argument("--vllm_max_model_len", type=int, default=8192,
                     help="MUST match --max-model-len on the vLLM server (launch_vllm_http_32b_"
                          "tp2.sh default 4808). Used to clamp the per-request max_tokens to "
                          "(max_model_len - actual_prompt_len) — a fixed max_new_tokens overflows "
                          "vLLM's own budget check on long prompts (protein+text+GO exceeding the "
                          "assumed 2048+512+200 split), producing 'max_tokens must be at least 1, "
                          "got <negative>' 400s that silently drop that shard's remaining samples.")
+    ap.add_argument("--require_full_max_new_tokens", action="store_true",
+                    help="Fail a sample instead of silently reducing max_new_tokens when "
+                         "the vLLM context budget is too small for an apples-to-apples eval.")
     ap.add_argument("--backbone_device_map", default=None,
                     help="HF device_map for the backbone (e.g. 'auto'). Shards the 32B "
                          "across the tiles VISIBLE to this process (set via ZE_AFFINITY_MASK "
@@ -599,6 +630,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
                     help="build inputs via dataset_sft (native SFT training layout: text + "
                          "integer-id placeholders), NOT the HF chat-template/<|protein_pad|> "
                          "path. REQUIRED to eval a native-SFT checkpoint. One sample/protein.")
+    ap.add_argument("--native_keep_list_prefix", action="store_true",
+                    help="Match keep_list_prefix=true training: place GO terms\\n immediately "
+                         "after the native Reasoning header.")
     ap.add_argument("--disable_protein_splice", action="store_true", default=False,
                     help="ABLATION (Exp 2): keep protein placeholder tokens but do NOT write "
                          "projected ESM3 features. Isolates the protein-embedding modality's "
@@ -723,15 +757,25 @@ def main() -> int:
         # 8680415 (N=280, 2 shards died on one bad protein each via an unhandled 400 from
         # vLLM). Log + skip; keep the process, and the shard, alive for the rest.
         try:
+            _effective_max_new_tokens = args.max_new_tokens
             if getattr(args, "native_prompt", False):
                 # Bit-identical to training: native text + integer-id placeholder layout.
-                prompt_string = None
+                prompt_string = build_native_prompt_text(
+                    s["row"],
+                    _tt_tok,
+                    interpro_in_prompt=getattr(args, "interpro_in_prompt", True),
+                    ppi_in_prompt=getattr(args, "ppi_in_prompt", True),
+                    keep_list_prefix=getattr(args, "native_keep_list_prefix", False),
+                    add_uniprot_summary=getattr(args, "add_uniprot_summary", False),
+                )
                 input_ids = build_native_input_ids(
                     s["row"], seq[:args.max_protein_len], _tt_tok,
                     args.protein_token_id, args.go_token_id, args.num_go_tokens,
                     inject_go_pred=getattr(args, "inject_go_pred", True),
                     interpro_in_prompt=getattr(args, "interpro_in_prompt", True),
                     ppi_in_prompt=getattr(args, "ppi_in_prompt", True),
+                    keep_list_prefix=getattr(args, "native_keep_list_prefix", False),
+                    add_uniprot_summary=getattr(args, "add_uniprot_summary", False),
                 ).to(device).unsqueeze(0)
             else:
                 # BioReasonModel.tokenizer is the raw HF tokenizer (apply_chat_template + encode).
@@ -779,7 +823,19 @@ def main() -> int:
                         if model.tokenizer.eos_token_id is not None else None)
                 _prompt_len = int(pe[0].shape[0])
                 _budget = args.vllm_max_model_len - _prompt_len - 8  # small safety margin
+                if args.require_full_max_new_tokens and _budget < args.max_new_tokens:
+                    raise RuntimeError(
+                        f"vLLM parity budget too small: prompt_tokens={_prompt_len}, "
+                        f"max_model_len={args.vllm_max_model_len}, "
+                        f"requested_new_tokens={args.max_new_tokens}"
+                    )
                 _req_max_tokens = max(1, min(args.max_new_tokens, _budget))
+                _effective_max_new_tokens = _req_max_tokens
+                print(
+                    f"[eval] vllm_budget protein_id={s['protein_id']} prompt_tokens="
+                    f"{_prompt_len} requested={args.max_new_tokens} effective={_req_max_tokens}",
+                    flush=True,
+                )
                 if _budget < 1:
                     print(f"[eval] WARNING: prompt_len={_prompt_len} >= vllm_max_model_len="
                           f"{args.vllm_max_model_len} for {s['protein_id']} — skipping (no "
@@ -801,6 +857,14 @@ def main() -> int:
 
             rec = make_record(s, resp)
             rec["input_prompt"] = prompt_string
+            rec["native_keep_list_prefix"] = bool(
+                getattr(args, "native_keep_list_prefix", False)
+            )
+            rec["requested_max_new_tokens"] = int(args.max_new_tokens)
+            rec["effective_max_new_tokens"] = int(_effective_max_new_tokens)
+            rec["generation_backend"] = (
+                "vllm_http" if args.vllm_http_url else "hf_generate" if args.no_vllm else "vllm"
+            )
             fn = f"{s['protein_id']}_{aspect_code(s['go_aspect'])}_k00.json"
             with open(os.path.join(args.out, fn), "w") as f:
                 json.dump(rec, f, indent=2)

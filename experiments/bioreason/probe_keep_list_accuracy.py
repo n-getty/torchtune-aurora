@@ -21,6 +21,7 @@ SPECULATIONS = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 KEEP_LIST = re.compile(r"(?:^|\n)GO terms:\s*\n(?P<body>.*?)(?:\n\n|$)", re.DOTALL)
+PREFIX_LIST = re.compile(r"^(?P<body>(?:GO:\d{7}\s*\n)+)", re.DOTALL)
 
 
 Number = Union[int, float]
@@ -44,9 +45,9 @@ def prompt_candidates(prompt: str) -> Set[str]:
     return _terms(match.group(1)) if match else set()
 
 
-def emitted_keep_list(response: str) -> Set[str]:
+def emitted_keep_list(response: str, prefix_in_prompt: bool = False) -> Set[str]:
     """Parse only the candidates-first bare-ID block, not reasoning text."""
-    match = KEEP_LIST.search(response)
+    match = PREFIX_LIST.search(response) if prefix_in_prompt else KEEP_LIST.search(response)
     if not match:
         return set()
     return set(
@@ -59,7 +60,10 @@ def emitted_keep_list(response: str) -> Set[str]:
 def measure(record: dict) -> Dict[str, Number]:
     candidates = prompt_candidates(record.get("input_prompt", ""))
     truth = _terms(record.get("go_mf")) | _terms(record.get("go_cc")) | _terms(record.get("go_bp"))
-    emitted = emitted_keep_list(record.get("generated_response", ""))
+    emitted = emitted_keep_list(
+        record.get("generated_response", ""),
+        prefix_in_prompt=bool(record.get("native_keep_list_prefix", False)),
+    )
     true_candidates = candidates & truth
     false_candidates = candidates - truth
     true_positives = len(emitted & true_candidates)
@@ -161,9 +165,11 @@ def main() -> int:
         "precision": tp / (tp + fp) if tp + fp else 1.0,
         "recall": tp / (tp + fn) if tp + fn else 1.0,
     }
+    specificity = tn / (tn + fp) if tn + fp else 1.0
+    summary["balanced_accuracy"] = (summary["recall"] + specificity) / 2.0
     summary["gates"] = (
-        "CLEAR_80" if summary["candidate_accuracy"] >= 0.8
-        else "CLEAR_60" if summary["candidate_accuracy"] >= 0.6
+        "CLEAR_80" if summary["balanced_accuracy"] >= 0.8 and summary["recall"] > 0.0
+        else "CLEAR_60" if summary["balanced_accuracy"] >= 0.6 and summary["recall"] > 0.0
         else "BELOW_60"
     )
     if args.json:
@@ -171,6 +177,7 @@ def main() -> int:
     else:
         print(f"records: {records}")
         print(f"candidate accuracy: {summary['candidate_accuracy']:.4f}")
+        print(f"balanced accuracy: {summary['balanced_accuracy']:.4f}")
         print(f"precision: {summary['precision']:.4f}")
         print(f"recall: {summary['recall']:.4f}")
         print(f"gates: {summary['gates']}")

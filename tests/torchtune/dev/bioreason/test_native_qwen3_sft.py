@@ -452,6 +452,29 @@ def test_both_off_strips_both():
     assert "GO:0005524" in text  # go_pred (the third context field) untouched
 
 
+def test_keep_list_prefix_is_added_after_reasoning_header():
+    from torchtune.dev.bioreason import dataset_sft as sft
+
+    ex = _row(3)
+    ex["go_pred"] = "GO:0005524"
+    ds = sft.BioReasonSFTDataset.__new__(sft.BioReasonSFTDataset)
+    ds.tokenizer = _StubTok()
+    ds.protein_token_id = _PROT_ID
+    ds.go_token_id = _GO_ID
+    ds.num_go_tokens = 5
+    ds.interpro_in_prompt = True
+    ds.ppi_in_prompt = True
+    ds.inject_go_pred = True
+
+    ds.keep_list_prefix = False
+    without_prefix = ds._build_prompt_ids(ex, "MKT")
+    ds.keep_list_prefix = True
+    with_prefix = ds._build_prompt_ids(ex, "MKT")
+
+    assert len(with_prefix) == len(without_prefix) + 2
+    assert with_prefix[:-2] == without_prefix
+
+
 def _row_gt(mf=None, cc=None, bp=None):
     r = _row(3)
     r["go_mf"] = mf or []

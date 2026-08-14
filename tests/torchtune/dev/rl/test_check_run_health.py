@@ -221,6 +221,31 @@ def test_monotonicity_ok_on_plausible(tmp_path):
     assert "OK" in out
 
 
+def test_monotonicity_32b_not_misclassified_as_2b(tmp_path):
+    """Regression: bash `case` takes the first match, and "2b" is a substring of
+    "32b" — a naive pattern ordering silently classifies every 32B run as
+    AGPT-2B (20s ceiling) instead of Qwen3-32B-2N (80s ceiling), producing a
+    false WARN on legitimate 32B step times. Found live on job 8754767
+    (2026-08-14): a healthy 77.5s/step 32B run WARNed as "AGPT-2B ... > ~20s".
+    """
+    rc, out = _run("--baseline", "32b", "77.5")
+    assert rc == 0, out
+    assert "OK" in out
+    assert "Qwen3-32B-2N" in out
+    assert "AGPT-2B" not in out
+
+
+def test_monotonicity_a3b_not_misclassified_as_3b(tmp_path):
+    """Same substring-collision class as the 32b/2b case above: "3b" is a
+    substring of "a3b", which must classify as Qwen3-30B-A3B (70s ceiling),
+    not Qwen2.5-3B (30s ceiling)."""
+    rc, out = _run("--baseline", "a3b", "60")
+    assert rc == 0, out
+    assert "OK" in out
+    assert "Qwen3-30B-A3B" in out
+    assert "Qwen2.5-3B" not in out
+
+
 def test_real_incident_logs_if_present():
     """If the real incident logs are on disk, the gate must classify them right."""
     deg = REPO_ROOT / "experiments/lora_grpo/dense_baseline_chunked_20260617_205501.log"

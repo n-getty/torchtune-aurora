@@ -54,20 +54,38 @@ def main():
         eval_df, best = cafa_eval(args.ontology, pred_dir, gt_tsv, th_step=0.99)
         weighted = False
 
-    fdf = best.get("f")
-    if fdf is None:
+    fdf_unw = best.get("f")
+    if fdf_unw is None:
         print("[score] ERROR: no best-F dataframe")
         return 1
-    fdf = fdf.reset_index()
-    print("\n=== F_max (unweighted) by namespace ===")
-    per_ns = {}
-    for _, r in fdf.iterrows():
-        per_ns[r["ns"]] = float(r["f"])
-        print(f"  {r['ns']:25s}: {r['f']:.4f}")
-    overall = sum(per_ns.values()) / len(per_ns) if per_ns else 0.0
-    print(f"  {'OVERALL MEAN F_max':25s}: {overall:.4f}")
-    print(f"\n[score] proteins_with_preds={len(preds)} proteins_with_gt={len(gts)} "
-          f"weighted={weighted}")
+    fdf_unw = fdf_unw.reset_index()
+    per_ns_unw = {r["ns"]: float(r["f"]) for _, r in fdf_unw.iterrows()}
+    overall_unw = sum(per_ns_unw.values()) / len(per_ns_unw) if per_ns_unw else 0.0
+
+    print("\n=== F_max (UNWEIGHTED) by namespace ===")
+    for ns, f in per_ns_unw.items():
+        print(f"  {ns:25s}: {f:.4f}")
+    print(f"  {'OVERALL MEAN F_max (unweighted)':35s}: {overall_unw:.4f}")
+
+    overall_w = None
+    if weighted:
+        fdf_w = best.get("f_w")
+        if fdf_w is None:
+            print("[score] WARNING: --ia_file given but no weighted (f_w) dataframe returned")
+        else:
+            fdf_w = fdf_w.reset_index()
+            per_ns_w = {r["ns"]: float(r["f_w"]) for _, r in fdf_w.iterrows()}
+            overall_w = sum(per_ns_w.values()) / len(per_ns_w) if per_ns_w else 0.0
+            print("\n=== F_max (WEIGHTED) by namespace ===")
+            for ns, f in per_ns_w.items():
+                print(f"  {ns:25s}: {f:.4f}")
+            print(f"  {'OVERALL MEAN F_max (weighted)':35s}: {overall_w:.4f}")
+
+    print(
+        f"\n[score] proteins_with_preds={len(preds)} proteins_with_gt={len(gts)} "
+        f"weighted={weighted} "
+        f"f_unweighted={overall_unw:.4f} f_weighted={overall_w if overall_w is None else f'{overall_w:.4f}'}"
+    )
     return 0
 
 
