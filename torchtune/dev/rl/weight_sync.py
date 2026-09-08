@@ -37,6 +37,36 @@ class _NullCtx:
         return False
 
 
+def _fsdp1_own_submodules(module, fsdp_cls):
+    """Yield module itself plus every descendant NOT inside a nested FSDP unit
+    (stopping at nested FSDP boundaries at any depth).
+
+    Shared by every per-unit-summon caller (the merged-weight gather in
+    _xccl_gather_fsdp1, the one-time LoRA-base cache, and the per-step LoRA-delta
+    extraction) — all need the identical "does this unit's own
+    summon_full_params(recurse=False) call actually unshard this thing" boundary,
+    or one caller will read a still-sharded tensor. Extracted from
+    _xccl_gather_fsdp1's original inline closure (this session's per-unit-summon
+    fix) so new per-unit callers don't reimplement/drift from it.
+    """
+    yield module
+    for _n, _c in module.named_children():
+        if isinstance(_c, fsdp_cls):
+            continue
+        yield from _fsdp1_own_submodules(_c, fsdp_cls)
+
+
+def _fsdp1_own_params(module, fsdp_cls):
+    """Own (non-nested-FSDP-owned) parameters of an FSDP unit, recursing through
+    child submodules. A wrapped decoder layer's actual weight tensors
+    (q_proj.weight etc.) live on CHILD submodules, not the layer module itself —
+    module.parameters(recurse=False) is always empty for it (confirmed on HW:
+    job 8809095/v24 staged 0 params with a non-recursive .parameters(recurse=False)
+    here)."""
+    for _m in _fsdp1_own_submodules(module, fsdp_cls):
+        yield from _m.parameters(recurse=False)
+
+
 def _backbone_param_iter(self, policy=None):
     """Generic fallback for backbone weight iteration.
 
@@ -1416,6 +1446,14 @@ def _init_sender_pool(self) -> None:
 
     if pool_size <= 0:
         self._wsync_sender_pool = None
+        # Flush pending device ops from the just-completed backward+optimizer
+        # step on EVERY rank BEFORE any rank starts distributed/XCCL activity
+        # (leader's _init_xccl_weight_sync, or any rank's barrier below). See
+        # the barrier's own comment (~10 lines down) for the full root-cause
+        # history — moved here (function entry, unconditional on all ranks)
+        # after the gloo-barrier-only fix (v44) still reproduced ur_die.
+        if self._device.type == "xpu" and torch.xpu.is_available():
+            torch.xpu.synchronize()
         # WS3.5: only ONE rank (global rank 0) drives the XCCL wsync init.
         # With dp_replicate>1, _is_shard_leader is true on multiple ranks
         # which would race to bind TCPStore is_master=True on the same port.
@@ -1427,6 +1465,60 @@ def _init_sender_pool(self) -> None:
         # path, pool_size=0) get the same PGs as the multi-sender branch.
         if _ws10_should_build:
             self._build_ws10_sharded_pgs()
+        # LOAD-BEARING at 32B per-layer FSDP1: without this barrier, ranks
+        # other than the leader return from this (once-per-run) init
+        # immediately and race ahead into _xccl_gather_fsdp1's per-unit
+        # summon_full_params loop — a training-group COLLECTIVE — while rank
+        # 0 is still blocked inside _init_xccl_weight_sync doing a real
+        # cross-node XCCL PG handshake with vLLM (POST + PG constructor, no
+        # barrier of its own). At 4B a single whole-model summon was fast
+        # enough that this race rarely mattered; at 32B the per-unit loop
+        # makes 64 sequential summon_full_params calls, widening the window.
+        # Confirmed on HW (jobs 8809134/8809198, v26-v29, reproduced 4x,
+        # IDENTICAL rank (1) every time — not a race, a deterministic
+        # cross-PG ordering bug): fatal Level Zero driver assertion
+        # (`ur_die: urEventWait must not be called for an internal event`).
+        #
+        # CORRECTED 2026-09-07 (jobs 8810079/8810147/8810186, v40-v43): an
+        # XCCL-backed barrier here is NOT sufficient — it reproduced the exact
+        # same ur_die 4/4 times across TWO different physical node pairs
+        # (ruling out node-specific hardware), because barriering on
+        # `self._training_pg` (xccl) or even the plain default
+        # `torch.distributed.barrier()` (also xccl on XPU — confirmed via
+        # `torchtune.training.xpu_utils.get_xpu_distributed_backend()`, which
+        # returns "xccl" for the WORLD group absent CPU offload) is STILL a
+        # Level-Zero-touching collective. It can race with rank 0's concurrent
+        # `_init_xccl_weight_sync()` call, which constructs a SEPARATE, fresh
+        # `ProcessGroupXCCL` communicator on the same device via its own Gloo
+        # TCPStore handshake with vLLM. Two concurrent XCCL/L0 operations on
+        # one rank's device are not safe to interleave. Fix: use a
+        # gloo-backed barrier group instead (`self._wsync_barrier_pg`,
+        # constructed once in `grpo_bioreason_distributed_xpu.py`'s server-mode
+        # PG setup, mirroring the existing `_wsync_pg`/
+        # `TORCHTUNE_WSYNC_BACKEND=gloo` pattern for dedicated_rank mode) —
+        # gloo never touches Level Zero, so it can order ranks without any
+        # possibility of contending with XCCL/L0 state. Falls back to
+        # `_training_pg` if the gloo group isn't set (e.g. dedicated_rank mode,
+        # which has its own separate ordering via `_wsync_pg`).
+        #
+        # CORRECTED AGAIN 2026-09-07 (job 8810186/v44): the gloo-barrier fix
+        # alone did NOT clear the crash — ur_die reproduced identically even
+        # with a pure-CPU gloo barrier, which can never touch Level Zero. This
+        # means the race isn't in the BARRIER mechanism at all: it's that
+        # non-leader ranks reach this point with PENDING XPU device ops from
+        # the immediately-preceding backward+optimizer step, then sit blocked
+        # for however long rank 0's cross-node handshake takes. Moved the
+        # required `torch.xpu.synchronize()` flush to this function's entry
+        # (before the leader's `_init_xccl_weight_sync()` dispatch — see top
+        # of this `if` block) so EVERY rank flushes before ANY rank starts
+        # distributed/XCCL activity. Kept here too as cheap defense-in-depth
+        # immediately before the barrier itself.
+        if self._device.type == "xpu" and torch.xpu.is_available():
+            torch.xpu.synchronize()
+        _barrier_pg = getattr(self, "_wsync_barrier_pg", None) or getattr(
+            self, "_training_pg", None
+        )
+        torch.distributed.barrier(group=_barrier_pg)
         self._wsync_pool_init_done = True
         return
 
@@ -2083,12 +2175,371 @@ def _ws10_unify_manifests(per_rank_metas: list, sort_key=None) -> list:
 
 
 
+def _cache_bioreason_lora_base_per_unit(self) -> None:
+    """One-time, ALL-RANKS-COLLECTIVE: walk every FSDP unit, summon it
+    (recurse=False), and on the XCCL leader cache each LoRA-target base weight
+    (bf16, CPU) into self._bior_lora_base_cache ({hf_name: cpu_tensor}). None
+    on other ranks.
+
+    Phase 1 of the BioReason delta-publish weight-sync port (see
+    memory/project_bioreason_32b_grpo_fsdp1_per_layer_first_working_path_20260906.md
+    and the "lora_wsync_mode" plan): the current per-step _lora_merge/
+    _per_unit_summon path in _xccl_gather_fsdp1 re-stages the ENTIRE ~61 GiB
+    base to CPU every step before shipping it merged with the adapter delta.
+    Caching the base ONCE here (mirrors the standalone LoRA-GRPO recipe's
+    _cache_lora_base_weights, but per-unit instead of a single
+    state_dict_type(FULL_STATE_DICT) collective — the 32B per-layer wrap
+    cannot afford that single-collective form, same OOM class already fixed
+    for the wsync-layout / prompt-embeds call sites) lets the per-step path
+    ship only the tiny LoRA A/B adapter afterward.
+
+    MUST be called on ALL ranks (it is a collective — every rank enters
+    summon_full_params for every unit) exactly once, right after the FSDP1
+    wrap completes in setup(). Does NOT compute or ship any delta — this is
+    the frozen base only, cached before the first optimizer step ever touches
+    the adapter.
+    """
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+    _is_xccl_leader = getattr(self, "_is_xccl_leader", self._is_shard_leader)
+    if _is_xccl_leader:
+        _bb_param_to_name = {
+            id(p): n for n, p in self._model.backbone.named_parameters()
+        }
+    _fsdp_units = [m for m in self._model.modules() if isinstance(m, FSDP)]
+    _base_cache: dict = {} if _is_xccl_leader else None
+    for _unit in _fsdp_units:
+        with torch.no_grad(), FSDP.summon_full_params(
+            _unit, recurse=False, writeback=False, rank0_only=False
+        ):
+            if not _is_xccl_leader:
+                continue
+            for _p in _fsdp1_own_params(_unit, FSDP):
+                _name = _bb_param_to_name.get(id(_p))
+                if _name is None:
+                    continue
+                _clean_name = _name.replace("_fsdp_wrapped_module.", "")
+                _clean_name = _clean_name.replace("_checkpoint_wrapped_module.", "")
+                hf_name = self._model._peft_name_to_hf(_clean_name)
+                if hf_name is None or hf_name in _base_cache:
+                    continue
+                _base_cache[hf_name] = (
+                    _p.detach().to(torch.bfloat16).cpu().contiguous()
+                )
+    self._bior_lora_base_cache = _base_cache
+    # Set on ALL ranks (unlike _bior_lora_base_cache, which is None on non-leader
+    # ranks by design — the leader is the only one that keeps the actual tensors).
+    # The per-step delta dispatch in _sync_weights_to_vllm_xccl needs a flag every
+    # rank can see: the per-unit summon_full_params loop it drives is a COLLECTIVE,
+    # so non-leader ranks must also enter it every step, even though they never
+    # read anything out of it themselves.
+    self._bior_lora_delta_ready = True
+    if _is_xccl_leader:
+        log.info(
+            "Rank %d: BioReason LoRA base cached once (%d params, %.2f GiB) "
+            "for delta-publish weight sync",
+            self.rank, len(_base_cache),
+            sum(t.numel() * t.element_size() for t in _base_cache.values()) / 1024**3,
+        )
+
+
+def _post_bioreason_collective_rpc(
+    self, method: str, args: list, what: str, timeout: int = 120,
+) -> None:
+    """POST a /collective_rpc {method,args} to all vLLM URLs, fail-fast.
+
+    Module-level counterpart of the standalone LoRA-GRPO recipe's
+    _post_collective_rpc (lora_grpo_full_finetune_distributed_xpu.py) — same
+    fail-fast/ThreadPoolExecutor-fanout contract, extracted here so BioReason's
+    delta-publish path (recipe-agnostic infra, same "Injected method pattern"
+    as everything else in this file) doesn't duplicate or diverge from it.
+    Always raises on any tile failure (BioReason has no existing
+    _fail_on_publish_error-style opt-out) — a failed delta publish must be
+    loud, since a silently-stale weight sync causes the exact
+    "frozen-generator drift -> NaN" failure mode documented in
+    _xccl_gather_fsdp1's own comments.
+
+    timeout defaults to 120s (fine for the tiny per-step adapter RPC), but the
+    one-time ~61 GiB base-ship call MUST pass a much larger value: confirmed
+    on HW (job 8809857/v34) the default timed out with
+    "Read timed out (read timeout=120)" on both tiles while
+    load_lora_base_from_raw was still legitimately reading+caching the file
+    (the SAME-size merged-weight RPC, load_weights_from_raw, already uses
+    timeout=600 elsewhere in this file for exactly this reason).
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def _post_one(url: str):
+        try:
+            r = requests.post(
+                f"{url}/collective_rpc",
+                json={"method": method, "args": args},
+                timeout=timeout,
+            )
+            if r.status_code != 200:
+                return f"{url}: HTTP {r.status_code} {r.text[:200]}"
+            results = r.json().get("results", [{}])
+            first = results[0] if results else {}
+            if isinstance(first, dict) and first.get("status") not in (None, "ok"):
+                return f"{url}: {first}"
+            return None
+        except Exception as _e:
+            return f"{url}: {_e!r}"
+
+    failed = []
+    with ThreadPoolExecutor(max_workers=max(1, len(self._vllm_urls))) as pool:
+        for f in as_completed([pool.submit(_post_one, u) for u in self._vllm_urls]):
+            err = f.result()
+            if err is not None:
+                failed.append(err)
+    if failed:
+        raise RuntimeError(
+            f"{what} publish failed on {len(failed)}/{len(self._vllm_urls)} "
+            f"vLLM tiles: {failed}"
+        )
+
+
+def _publish_bioreason_lora_delta(self, t0) -> None:
+    """Phase 1 delta-publish per-step weight sync: ship the frozen base ONCE
+    (via load_lora_base_from_raw, first call only) then only the tiny LoRA A/B
+    adapter every step (via load_lora_delta_from_raw). Both receiver-side RPCs
+    are already generic (vllm_weight_sync_worker.py) — this function is the
+    BioReason-specific sender.
+
+    Walks every FSDP unit exactly like _cache_bioreason_lora_base_per_unit /
+    _xccl_gather_fsdp1's _lora_merge branch (summon_full_params(recurse=False)
+    per unit — a COLLECTIVE all ranks must enter), but extracts ONLY the raw
+    lora_A/lora_B weights (a few hundred KB per unit, not the ~1.85 GiB base)
+    on the XCCL leader. Scale comes from module.scaling["default"] — PEFT's own
+    per-adapter scale dict, NOT torchtune-LoRALinear's .alpha/.rank scalars
+    (validated bit-exact against get_delta_weight() in
+    tests/torchtune/dev/rl/test_bioreason_lora_peft.py::
+    test_raw_ab_via_scaling_dict_matches_get_delta_weight).
+    """
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+    import json
+
+    # LOAD-BEARING (same fix already applied to _xccl_gather_fsdp1, missed here
+    # on the first pass): _init_sender_pool() runs unconditionally before this
+    # function is dispatched (from _sync_weights_to_vllm_xccl) and constructs
+    # rank 0's XCCL/Gloo cross-PG (_init_xccl_weight_sync) — a real, blocking
+    # cross-node network handshake with vLLM, with no barrier of its own. Every
+    # OTHER rank returns from _init_sender_pool immediately and, without this
+    # synchronize+barrier, races straight into the summon_full_params
+    # collective below while rank 0 is still mid-handshake. Confirmed on HW
+    # (job 8810079/v36): `ur_die: urEventWait must not be called for an
+    # internal event`, SIGABRT on rank 1 — identical signature/site to the bug
+    # this exact fix resolved in _xccl_gather_fsdp1 (jobs 8809134/8809198).
+    # CORRECTED 2026-09-07: use the gloo barrier group, not an XCCL-backed one
+    # — see _init_sender_pool's own comment for the full root-cause writeup
+    # (an XCCL-backed barrier here can race rank 0's concurrent
+    # _init_xccl_weight_sync ProcessGroupXCCL construction; gloo cannot).
+    if self._device.type == "xpu" and torch.xpu.is_available():
+        torch.xpu.synchronize()
+    torch.distributed.barrier(
+        group=getattr(self, "_wsync_barrier_pg", None)
+        or getattr(self, "_training_pg", None)
+    )
+
+    _is_xccl_leader = getattr(self, "_is_xccl_leader", self._is_shard_leader)
+    if _is_xccl_leader:
+        _bb_module_to_name = {
+            id(m): n for n, m in self._model.backbone.named_modules()
+        }
+        tensors: dict = {}
+        entries: list = []
+
+    _fsdp_units = [m for m in self._model.modules() if isinstance(m, FSDP)]
+    for _unit in _fsdp_units:
+        with torch.no_grad(), FSDP.summon_full_params(
+            _unit, recurse=False, writeback=False, rank0_only=False
+        ):
+            if not _is_xccl_leader:
+                continue
+            for _mod in _fsdp1_own_submodules(_unit, FSDP):
+                if not (hasattr(_mod, "base_layer") and hasattr(_mod, "lora_A")):
+                    continue
+                active = getattr(_mod, "active_adapters", [])
+                if "default" not in active:
+                    continue
+                _mod_name = _bb_module_to_name.get(id(_mod))
+                if _mod_name is None:
+                    continue
+                # LOAD-BEARING: _cache_bioreason_lora_base_per_unit strips
+                # "_fsdp_wrapped_module."/"_checkpoint_wrapped_module." from
+                # its param names BEFORE computing hf_name (so the base cache
+                # is keyed on clean HF names) — this call site was missing
+                # the same cleanup, so its hf_name retained the wrapper
+                # substring wherever a per-layer FSDP unit's child module
+                # name embeds it (e.g. "model.layers.0._fsdp_wrapped_module.
+                # self_attn.q_proj"). Confirmed on HW (job 8810079/v38):
+                # KeyError "base weight 'model.layers.0._fsdp_wrapped_module.
+                # self_attn.q_proj.weight' not in cache (707 cached)" on
+                # every vLLM TP worker — the cache had the clean name, this
+                # function queried for the dirty one.
+                _mod_name = _mod_name.replace("_fsdp_wrapped_module.", "")
+                _mod_name = _mod_name.replace("_checkpoint_wrapped_module.", "")
+                hf_name = self._model._peft_name_to_hf(f"{_mod_name}.base_layer.weight")
+                if hf_name is None:
+                    continue
+                a_key = f"{hf_name}::lora_A"
+                b_key = f"{hf_name}::lora_B"
+                tensors[a_key] = (
+                    _mod.lora_A["default"].weight.detach().to(torch.bfloat16).cpu().contiguous()
+                )
+                tensors[b_key] = (
+                    _mod.lora_B["default"].weight.detach().to(torch.bfloat16).cpu().contiguous()
+                )
+                entries.append({
+                    "hf_name": hf_name, "a_key": a_key, "b_key": b_key,
+                    "scale": float(_mod.scaling["default"]),
+                })
+
+    if not _is_xccl_leader:
+        return
+
+    if not entries:
+        raise RuntimeError(
+            "_publish_bioreason_lora_delta: found 0 LoRA-target modules — "
+            "refusing to publish an empty adapter."
+        )
+
+    _t_gather = time.perf_counter() - t0
+
+    # File location: train and vLLM run on DIFFERENT nodes in server mode, so
+    # node-local /dev/shm is NOT visible to the vLLM-side RPC handler — this
+    # crashed the first HW attempt (job 8809857/v33: "Not found:
+    # /dev/shm/torchtune/.../base.bin" on both vLLM tiles, RuntimeError raised
+    # correctly by _post_bioreason_collective_rpc's fail-fast, no silent
+    # partial state). Reuse the SAME shared-FS override the merged raw_bytes
+    # path already documents for exactly this reason
+    # (vllm_backend.py: "/dev/shm is NOT shared — override with
+    # TORCHTUNE_WEIGHT_SYNC_PATH to point at a shared FS path"), but under a
+    # DIFFERENT filename so this never collides with the merged path's own
+    # weight_update.raw (both could theoretically be live if a run toggled
+    # lora_wsync_mode mid-flight, though that is not a supported flow).
+    _wsync_shared_dir = os.path.dirname(
+        os.environ.get(
+            "TORCHTUNE_WEIGHT_SYNC_PATH",
+            "/dev/shm/torchtune/weight_update.raw",
+        )
+    )
+
+    _tp_resident = getattr(self, "_lora_wsync_mode", "merged") == "delta_tp"
+
+    # Legacy delta mode ships the full base once. delta_tp instead snapshots
+    # vLLM's already-loaded TP-local resident shards on its first adapter RPC.
+    if not _tp_resident and not getattr(self, "_bior_lora_base_shipped", False):
+        _t0_base = time.perf_counter()
+        os.makedirs(_wsync_shared_dir, exist_ok=True)
+        _base_path = os.path.join(_wsync_shared_dir, "bioreason_lora_delta_base.raw")
+        _n_base = _save_raw_bytes(self._bior_lora_base_cache, _base_path)
+        _base_gb = os.path.getsize(_base_path) / 1024**3
+        log.info(
+            "Rank %d: BioReason delta base raw_bytes %d params %.2f GiB in "
+            "%.2fs -> %s",
+            self.rank, _n_base, _base_gb, time.perf_counter() - _t0_base, _base_path,
+        )
+        _post_bioreason_collective_rpc(
+            self, "load_lora_base_from_raw", [_base_path], what="BioReason delta base",
+            timeout=600,
+        )
+        self._bior_lora_base_shipped = True
+
+    # Per-step adapter delta.
+    os.makedirs(_wsync_shared_dir, exist_ok=True)
+    _adapter_path = os.path.join(_wsync_shared_dir, "bioreason_lora_delta_adapter.raw")
+    _t_save0 = time.perf_counter()
+    _n_params = _save_raw_bytes(tensors, _adapter_path)
+    _t_save = time.perf_counter() - _t_save0
+    _size_mb = os.path.getsize(_adapter_path) / 1024**2
+
+    _meta = {
+        "entries": entries,
+        "needs_qk_unpermute": bool(_needs_qk_unpermute(self)),
+        "num_heads": int(getattr(self, "_model_num_heads", 0) or 0),
+        "num_kv_heads": int(getattr(self, "_model_num_kv_heads", 0) or 0),
+        "head_dim": int(getattr(self, "_model_head_dim", 0) or 0),
+    }
+    _t_http0 = time.perf_counter()
+    _post_bioreason_collective_rpc(
+        self,
+        "load_lora_delta_tp_from_raw" if _tp_resident else "load_lora_delta_from_raw",
+        [_adapter_path, json.dumps(_meta)],
+        what="BioReason delta adapter",
+        # LOAD-BEARING at 32B with TORCHTUNE_LORA_DELTA_BASE_CPU=1: the default
+        # 120s timeout (fine at 4B, where the CPU merge is ~20s) is too short
+        # once the base is 61 GiB and the merge runs 707 params of scale*(B@A)
+        # entirely on CPU. Confirmed on HW (job 8810147/v39):
+        # ReadTimeout(read timeout=120) on both vLLM tiles while
+        # load_lora_delta_from_raw was still legitimately merging — same
+        # failure class the base-ship RPC already hit once (v34) and fixed
+        # with timeout=600. Use the same 600s budget here.
+        timeout=600,
+    )
+    _t_http = time.perf_counter() - _t_http0
+
+    # Sync-event bookkeeping: unlike _xccl_gather_fsdp1's deferred-broadcast
+    # path (dispatches a background thread, so it clears the done-event at
+    # dispatch time and a LATER thread sets it on completion),
+    # _post_bioreason_collective_rpc above runs SYNCHRONOUSLY and already
+    # raised on any failure — by the time we reach here the publish is known
+    # good. So: never clear the event (there is no async work outstanding),
+    # just record success so the NEXT _wait_for_sync_complete call (start of
+    # the following wsync round) sees a completed, error-free sync and bumps
+    # the weight version. Mirrors _xccl_gather_fsdp1's own comment on why this
+    # bookkeeping is load-bearing: without it, "did the merge actually take
+    # effect" telemetry never fires, and a silently-stale delta merge would
+    # look identical to a working one in the logs (exactly the class of bug
+    # already hit this session — job 8809198/v32's gather+broadcast "succeeded"
+    # while vLLM's load_weights() silently KeyError'd).
+    if not hasattr(self, "_sync_done_event"):
+        self._sync_done_event = threading.Event()
+        self._sync_done_event.set()
+    self._sync_error = None
+    self._sync_id_counter = getattr(self, "_sync_id_counter", 0) + 1
+    self._pending_sync_id = self._sync_id_counter
+
+    log.info(
+        "Rank %d: BioReason delta publish: %d params (%.1f MB) gather=%.2fs "
+        "save=%.2fs http=%.2fs",
+        self.rank, _n_params, _size_mb, _t_gather, _t_save, _t_http,
+    )
+
+
 def _xccl_gather_fsdp1(self, _xccl_accept_and_rename, t0):
     """FSDP1 XCCL weight-sync gather branch, extracted verbatim from
     _sync_weights_to_vllm_xccl (no behavior change). Builds flat_gpu /
     tensors_meta on the XCCL leader. _xccl_accept_and_rename is the
     per-call rename closure; t0 is the wsync-start perf_counter stamp."""
     from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, StateDictType
+    # 32B per-layer FSDP1: the documented _init_sender_pool flush
+    # (torch.xpu.synchronize() right after XCCL PG construction, see that
+    # function's own comment — "ProcessGroupXCCL constructor may leave
+    # pending GPU ops... deadlock the subsequent FSDP2 dp_shard AllGather",
+    # previously observed on x4311 chassis nodes) plus a training_pg-scoped
+    # barrier were NOT sufficient here: `ur_die: urEventWait must not be
+    # called for an internal event` still reproduced 4x on rank 1 on BOTH
+    # x4311 and x4400 chassis nodes, immediately after rank 0's XCCL/Gloo PG
+    # log lines, before this function's own summon_full_params collectives
+    # even start.
+    # ROOT-CAUSED 2026-09-07: the barrier here was ITSELF the problem, not
+    # just insufficient — `self._training_pg` (and even the plain default
+    # process group) is XCCL-backed on XPU, so barriering on it is a
+    # Level-Zero-touching collective that can race rank 0's concurrent
+    # ProcessGroupXCCL construction inside _init_xccl_weight_sync. Switched
+    # to a gloo-backed barrier group (`self._wsync_barrier_pg`, see
+    # _init_sender_pool's full writeup) which can never contend with L0/XCCL
+    # state. Confirmed via the delta-publish path's identical crash (4/4
+    # reproductions, v40-v43, jobs 8810079/8810147/8810186) that an XCCL
+    # barrier here is not a race that "usually" clears — the same mechanism
+    # applies to this merged-path call site.
+    if self._device.type == "xpu" and torch.xpu.is_available():
+        torch.xpu.synchronize()
+    torch.distributed.barrier(
+        group=getattr(self, "_wsync_barrier_pg", None)
+        or getattr(self, "_training_pg", None)
+    )
     hf_state_dict = {}
     # WS3.5: only the XCCL leader (global rank 0) keeps and broadcasts.
     _is_xccl_leader = getattr(self, "_is_xccl_leader", self._is_shard_leader)
@@ -2127,20 +2578,136 @@ def _xccl_gather_fsdp1(self, _xccl_accept_and_rename, t0):
         and getattr(self._model, "_has_lora", False)
     )
     if _lora_merge:
-        with torch.no_grad(), FSDP.summon_full_params(
-            self._model, writeback=False, rank0_only=False
-        ):
+        # 32B per-layer auto_wrap_policy: summon_full_params(self._model) with the
+        # default recurse=True unshards ALL ~64 wrapped decoder-layer units at once
+        # (same OOM class already fixed for the wsync-layout and prompt-embeds call
+        # sites — see fsdp_full_shard_at_rest's header comments). Confirmed on HW
+        # (job 8809095/v23): UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY inside FSDP unshard
+        # during this exact call, right after a clean backward+optimizer step.
+        # Fix: walk each FSDP-wrapped submodule and summon ONE unit at a time
+        # (recurse=False), so only one decoder layer's params are unsharded live —
+        # bounded to ~1/64 of the 65.6 GiB backbone instead of the whole model.
+        _per_unit_summon = getattr(self, "_fsdp_full_shard_at_rest", False)
+        if _per_unit_summon:
+            def _own_submodules(module):
+                return _fsdp1_own_submodules(module, FSDP)
+
+            def _own_params(module):
+                return _fsdp1_own_params(module, FSDP)
+
+            # LOAD-BEARING: get_delta_weight() (weight_B @ weight_A) must run AFTER
+            # the params are unsharded, not before. Computing it globally up front
+            # (the original attempt) calls it on each rank's SHARDED FlatParameter
+            # view — with use_orig_params=True the tensor still reports its original
+            # shape but the backing storage is a truncated per-rank shard, so the
+            # matmul reads garbage/wrong-extent memory. Confirmed on HW (jobs
+            # 8809134 v26+v27, reproduced twice, identical site): a CPU op-fallback
+            # inside that exact matmul immediately preceded a fatal Level Zero
+            # driver assertion (`ur_die: urEventWait must not be called for an
+            # internal event`) on a DIFFERENT rank — consistent with the sharded
+            # matmul feeding a corrupted/mis-shaped tensor into a kernel. Fix:
+            # find each unit's own LoRA-target submodules (base_layer +
+            # get_delta_weight) and compute the delta INSIDE that unit's own
+            # summon_full_params context, where lora_A/lora_B are genuinely whole.
             if _is_xccl_leader:
-                delta_map = self._model.lora_delta_map()  # {hf_name: fp32 delta}
-                for hf_name, param in self._model.vllm_param_iter():
-                    weight = param.detach().to(self._device)
-                    delta = delta_map.get(hf_name)
-                    if delta is not None:
-                        # fp32 accumulate, recast to the base dtype (bf16) once.
-                        weight = (weight.float() + delta.to(self._device).float()).to(param.dtype)
-                    if _unperm_needed_x:
-                        weight = _maybe_unpermute_qk(self, hf_name, weight)
-                    hf_state_dict[hf_name] = weight.contiguous().clone()
+                _bb_param_to_name = {
+                    id(p): n for n, p in self._model.backbone.named_parameters()
+                }
+                _bb_module_to_name = {
+                    id(m): n for n, m in self._model.backbone.named_modules()
+                }
+            _fsdp_units = [
+                m for m in self._model.modules() if isinstance(m, FSDP)
+            ]
+            for _unit in _fsdp_units:
+                with torch.no_grad(), FSDP.summon_full_params(
+                    _unit, recurse=False, writeback=False, rank0_only=False
+                ):
+                    if not _is_xccl_leader:
+                        continue
+                    # Recompute this unit's LoRA deltas now that its params are
+                    # genuinely unsharded (mirrors lora_delta_iter's own module
+                    # scan, but scoped to submodules THIS unit's own summon call
+                    # actually unshards — same boundary as _own_params, so a LoRA
+                    # submodule belonging to a nested FSDP unit is correctly
+                    # skipped here and picked up when that unit is processed).
+                    _unit_delta_map = {}
+                    for _mod in _own_submodules(_unit):
+                        if not (hasattr(_mod, "base_layer") and hasattr(_mod, "get_delta_weight")):
+                            continue
+                        active = getattr(_mod, "active_adapters", [])
+                        if not active:
+                            continue
+                        _mod_name = _bb_module_to_name.get(id(_mod))
+                        if _mod_name is None:
+                            continue
+                        hf_name = self._model._peft_name_to_hf(f"{_mod_name}.base_layer.weight")
+                        if hf_name is None:
+                            continue
+                        delta = None
+                        for a in active:
+                            d = _mod.get_delta_weight(a)
+                            delta = d if delta is None else delta + d
+                        _unit_delta_map[hf_name] = delta
+                    for _p in _own_params(_unit):
+                        _name = _bb_param_to_name.get(id(_p))
+                        if _name is None:
+                            continue
+                        # FSDP1's older wrapping style inserts `_fsdp_wrapped_module`
+                        # (and activation-checkpointing wraps `_checkpoint_wrapped_
+                        # module`) as REAL modules in the hierarchy, so
+                        # named_parameters() picks up these tokens inside the name.
+                        # _peft_name_to_hf only strips the PEFT wrapper prefix, not
+                        # these — every other gather branch in this file strips them
+                        # via _xccl_accept_and_rename's `clean = name.replace(...)`
+                        # before calling _peft_name_to_hf; this per-unit path must
+                        # match or vLLM's load_weights() gets literal names like
+                        # "layers.0._fsdp_wrapped_module.self_attn.qkv_proj.weight"
+                        # and KeyErrors. Confirmed on HW (job 8809198/v32, step 2):
+                        # gather+broadcast succeeded (707 params, 61.02 GiB, correct
+                        # byte count) but the vLLM-side load failed with exactly this
+                        # KeyError on both replicas — a naming bug, not a data bug.
+                        _clean_name = _name.replace("_fsdp_wrapped_module.", "")
+                        _clean_name = _clean_name.replace("_checkpoint_wrapped_module.", "")
+                        hf_name = self._model._peft_name_to_hf(_clean_name)
+                        if hf_name is None or hf_name in hf_state_dict:
+                            continue
+                        weight = _p.detach().to(self._device)
+                        delta = _unit_delta_map.get(hf_name)
+                        if delta is not None:
+                            weight = (weight.float() + delta.to(self._device).float()).to(_p.dtype)
+                        if _unperm_needed_x:
+                            weight = _maybe_unpermute_qk(self, hf_name, weight)
+                        # CPU, not GPU: at 32B, accumulating all 707 params'
+                        # cloned weights on-device before batching for broadcast
+                        # is the FULL ~65.6 GiB bf16 backbone materializing on
+                        # rank 0 alone, on top of its own FSDP shard + optimizer
+                        # state. Confirmed on HW (job 8809198/v31): OOM at 53.48
+                        # GiB already allocated, "Tried to allocate 500.00 MiB",
+                        # right in this assignment. Every other branch in this
+                        # file already stages to CPU for the same reason (see
+                        # the plain FSDP1 state_dict() branch below, and the
+                        # legacy raw_bytes path) — this per-unit path is the
+                        # only one that was left on-device, presumably because
+                        # the original whole-model-summon version never got far
+                        # enough on HW to hit this (it OOM'd earlier, INSIDE
+                        # summon_full_params itself, before ever reaching here).
+                        hf_state_dict[hf_name] = weight.contiguous().to("cpu")
+        else:
+            with torch.no_grad(), FSDP.summon_full_params(
+                self._model, writeback=False, rank0_only=False
+            ):
+                if _is_xccl_leader:
+                    delta_map = self._model.lora_delta_map()  # {hf_name: fp32 delta}
+                    for hf_name, param in self._model.vllm_param_iter():
+                        weight = param.detach().to(self._device)
+                        delta = delta_map.get(hf_name)
+                        if delta is not None:
+                            # fp32 accumulate, recast to the base dtype (bf16) once.
+                            weight = (weight.float() + delta.to(self._device).float()).to(param.dtype)
+                        if _unperm_needed_x:
+                            weight = _maybe_unpermute_qk(self, hf_name, weight)
+                        hf_state_dict[hf_name] = weight.contiguous().clone()
     else:
         # FSDP1: state_dict() handles gathering; result is on CPU already
         with FSDP.state_dict_type(self._model, StateDictType.FULL_STATE_DICT):
@@ -3507,6 +4074,25 @@ def _sync_weights_to_vllm_xccl(self) -> None:
             return clean[len("backbone."):]
         return self._tune_to_hf_map.get(name, name)
 
+    # BioReason delta-publish (opt-in via lora_wsync_mode="delta"/"delta_tp"): ships
+    # the frozen base ONCE (see _cache_bioreason_lora_base_per_unit, called at
+    # setup) then only the tiny LoRA A/B adapter each step, over the HTTP/
+    # raw_bytes transport (NOT this function's XCCL broadcast machinery — the
+    # receiver-side merge logic, load_lora_base_from_raw/load_lora_delta_from_raw
+    # in vllm_weight_sync_worker.py, only exists on that transport). Dispatched
+    # here (ahead of the use_fsdp1 merged-weight branch below) so a BioReason
+    # LoRA run with lora_wsync_mode="delta" never touches the ~61 GiB merged-
+    # weight gather path at all — same guard mirrors _lora_merge's own
+    # `_is_bioreason and _has_lora` gate in _xccl_gather_fsdp1.
+    if (
+        _is_bior
+        and getattr(self._model, "_has_lora", False)
+        and getattr(self, "_lora_wsync_mode", "merged") in ("delta", "delta_tp")
+        and getattr(self, "_bior_lora_delta_ready", False)
+    ):
+        self._publish_bioreason_lora_delta(t0)
+        return
+
     if use_fsdp1:
         self._xccl_gather_fsdp1(_xccl_accept_and_rename, t0)
     else:
@@ -3995,4 +4581,3 @@ def _start_deferred_broadcast(self) -> None:
               tensors_meta, t0, device, pgs, clients),
         kwargs={"bg_ws10_sharded": _ws10_sharded})
     t.start()
-

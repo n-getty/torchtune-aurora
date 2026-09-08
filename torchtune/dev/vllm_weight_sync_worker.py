@@ -343,6 +343,133 @@ class WeightSyncFromFileExtension:
             logger.exception("load_lora_delta_from_raw failed")
             return {"status": "error", "message": str(e)}
 
+    @staticmethod
+    def _lora_resident_param_name(hf_name: str) -> str:
+        """Map an unfused Qwen checkpoint name to vLLM's resident parameter."""
+        return (
+            hf_name.replace(".q_proj.", ".qkv_proj.")
+            .replace(".k_proj.", ".qkv_proj.")
+            .replace(".v_proj.", ".qkv_proj.")
+            .replace(".gate_proj.", ".gate_up_proj.")
+            .replace(".up_proj.", ".gate_up_proj.")
+        )
+
+    def load_lora_delta_tp_from_raw(self, path: str, meta_json: str) -> dict:
+        """Merge a full LoRA adapter into cached TP-local resident base shards.
+
+        vLLM's native ``load_weights`` performs the model-specific TP slicing and
+        packed QKV/gate-up placement. The resident parameters are temporarily
+        backed by fp32 scratch tensors, so the final cast happens only after the
+        local base-shard add, matching the merged sender's arithmetic.
+        """
+        import json
+        import torch
+
+        if not os.path.exists(path):
+            logger.error("LoRA delta file not found: %s", path)
+            return {"status": "error", "message": f"Not found: {path}"}
+        try:
+            t0 = time.perf_counter()
+            adapter = self._read_raw_bytes_file(path)
+            meta = json.loads(meta_json)
+            entries = meta["entries"]
+            needs_unpermute = bool(meta.get("needs_qk_unpermute", False))
+            n_heads = int(meta.get("num_heads", 0) or 0)
+            n_kv_heads = int(meta.get("num_kv_heads", 0) or 0)
+            head_dim = int(meta.get("head_dim", 0) or 0)
+            t_read = time.perf_counter() - t0
+
+            model = self.model_runner.model
+            try:
+                resident = dict(model.named_parameters(remove_duplicate=False))
+            except TypeError:
+                resident = dict(model.named_parameters())
+            target_names = {
+                self._lora_resident_param_name(entry["hf_name"])
+                for entry in entries
+            }
+            missing = sorted(target_names.difference(resident))
+            if missing:
+                raise KeyError(
+                    "load_lora_delta_tp_from_raw: resident parameters missing: "
+                    + ", ".join(missing[:8])
+                )
+            if not hasattr(self, "_lora_tp_base_cache"):
+                self._lora_tp_base_cache = {
+                    name: resident[name].detach().clone() for name in target_names
+                }
+                gb = sum(
+                    tensor.numel() * tensor.element_size()
+                    for tensor in self._lora_tp_base_cache.values()
+                ) / 1024**3
+                logger.info(
+                    "load_lora_delta_tp_from_raw: cached %d TP-local base tensors "
+                    "%.2f GiB from resident vLLM weights",
+                    len(self._lora_tp_base_cache), gb,
+                )
+
+            grouped = {}
+            for entry in entries:
+                resident_name = self._lora_resident_param_name(entry["hf_name"])
+                grouped.setdefault(resident_name, []).append(entry)
+
+            if not grouped:
+                raise ValueError("load_lora_delta_tp_from_raw: adapter has no entries")
+
+            merge_device = next(iter(resident.values())).device
+            t_merge0 = time.perf_counter()
+            loaded_count = 0
+            for resident_name, group in grouped.items():
+                param = resident[resident_name]
+                original_data = param.data
+                scratch = torch.zeros_like(original_data, dtype=torch.float32)
+                param.data = scratch
+                try:
+                    deltas = []
+                    for entry in group:
+                        hf_name = entry["hf_name"]
+                        a_w = adapter[entry["a_key"]].to(
+                            original_data.device, dtype=torch.float32
+                        )
+                        b_w = adapter[entry["b_key"]].to(
+                            original_data.device, dtype=torch.float32
+                        )
+                        delta = (b_w @ a_w).mul_(float(entry["scale"]))
+                        if needs_unpermute and (
+                            ".q_proj." in hf_name or ".k_proj." in hf_name
+                        ):
+                            nh = n_heads if ".q_proj." in hf_name else n_kv_heads
+                            delta = self._qk_unpermute_for_vllm(delta, nh, head_dim)
+                        deltas.append((hf_name, delta))
+                    loaded = model.load_weights(weights=deltas)
+                    if resident_name not in loaded:
+                        raise RuntimeError(
+                            f"native vLLM loader did not report {resident_name!r}; "
+                            f"reported {sorted(loaded)}"
+                        )
+                    base = self._lora_tp_base_cache[resident_name]
+                    original_data.copy_((base.float() + scratch).to(original_data.dtype))
+                    loaded_count += len(group)
+                finally:
+                    param.data = original_data
+            if merge_device.type == "xpu":
+                torch.xpu.synchronize(merge_device)
+            t_merge = time.perf_counter() - t_merge0
+
+            del adapter
+            logger.info(
+                "load_lora_delta_tp_from_raw: %d adapter targets in %.1fs "
+                "(read=%.2fs tp_merge=%.2fs) from %s",
+                loaded_count, time.perf_counter() - t0, t_read, t_merge, path,
+            )
+            return {
+                "status": "ok", "num_params": loaded_count,
+                "merge_s": round(t_merge, 2), "load_s": 0.0,
+            }
+        except Exception as e:
+            logger.exception("load_lora_delta_tp_from_raw failed")
+            return {"status": "error", "message": str(e)}
+
     def debug_param_names(self) -> dict:
         """Return sorted resident param names (validation §0: fused vs unfused)."""
         try:

@@ -408,3 +408,102 @@ def test_real_recipe_sender_roundtrips_to_receiver():
     assert set(captured.keys()) == set(ref.keys())
     for k in ref:
         assert torch.allclose(captured[k].float(), ref[k].float(), atol=2e-2, rtol=1e-2), k
+
+
+class _FakeTPQwenModel(nn.Module):
+    """CPU model that mirrors Qwen's TP=2 packed weight-loader behavior."""
+
+    def __init__(self, full_base, tp_rank=1, tp_size=2):
+        super().__init__()
+        self.tp_rank = tp_rank
+        self.tp_size = tp_size
+        grouped = {}
+        for hf_name, weight in full_base.items():
+            resident_name = WeightSyncFromFileExtension._lora_resident_param_name(hf_name)
+            grouped.setdefault(resident_name, []).append((hf_name, weight))
+        for index, (resident_name, group) in enumerate(sorted(grouped.items())):
+            local = self._pack_local(group)
+            self.register_parameter(f"p{index}", nn.Parameter(local, requires_grad=False))
+            self._resident_names = getattr(self, "_resident_names", {})
+            self._resident_names[resident_name] = f"p{index}"
+
+    def _local(self, hf_name, weight):
+        shard = weight.shape[0] // self.tp_size
+        if ".o_proj." in hf_name or ".down_proj." in hf_name:
+            shard = weight.shape[1] // self.tp_size
+            return weight[:, self.tp_rank * shard:(self.tp_rank + 1) * shard]
+        return weight[self.tp_rank * shard:(self.tp_rank + 1) * shard]
+
+    def _pack_local(self, group):
+        ordered = sorted(
+            group,
+            key=lambda pair: next(
+                (i for i, part in enumerate(
+                    ("q_proj", "k_proj", "v_proj", "gate_proj", "up_proj"))
+                 if part in pair[0]),
+                0,
+            ),
+        )
+        pieces = [self._local(name, weight) for name, weight in ordered]
+        return torch.cat(pieces, dim=0) if len(pieces) > 1 else pieces[0].clone()
+
+    def named_parameters(self, prefix="", recurse=True, remove_duplicate=True):
+        return [
+            (resident_name, getattr(self, attr_name))
+            for resident_name, attr_name in self._resident_names.items()
+        ]
+
+    def load_weights(self, weights):
+        grouped = {}
+        for hf_name, weight in weights:
+            resident_name = WeightSyncFromFileExtension._lora_resident_param_name(hf_name)
+            grouped.setdefault(resident_name, []).append((hf_name, weight))
+        for resident_name, group in grouped.items():
+            param = getattr(self, self._resident_names[resident_name])
+            param.data.copy_(self._pack_local(group))
+        return set(grouped)
+
+
+def test_delta_tp_receiver_uses_native_packed_local_shards_without_drift():
+    model = _ToyLoRA()
+    full_base = _build_base_payload(model)
+    tp_model = _FakeTPQwenModel(full_base, tp_rank=1, tp_size=2)
+    worker = _FakeWorker(tp_model)
+    worker._lora_resident_param_name = staticmethod(
+        WeightSyncFromFileExtension._lora_resident_param_name
+    )
+    worker.load_lora_delta_tp_from_raw = (
+        WeightSyncFromFileExtension.load_lora_delta_tp_from_raw.__get__(worker)
+    )
+
+    with tempfile.TemporaryDirectory() as directory:
+        snapshots = []
+        for seed in (17, 29, 17):
+            _randomize_adapter(model, seed=seed)
+            tensors, meta = _build_payload(model)
+            path = os.path.join(directory, f"adapter_{seed}_{len(snapshots)}.bin")
+            _save_raw_bytes(tensors, path)
+            result = worker.load_lora_delta_tp_from_raw(path, json.dumps(meta))
+            assert result["status"] == "ok", result
+            snapshots.append({
+                name: param.detach().clone()
+                for name, param in tp_model.named_parameters()
+            })
+
+            merged = {}
+            for entry in meta["entries"]:
+                hf_name = entry["hf_name"]
+                delta = (
+                    tensors[entry["b_key"]].float()
+                    @ tensors[entry["a_key"]].float()
+                ).mul_(float(entry["scale"]))
+                merged[hf_name] = (
+                    full_base[hf_name].float() + delta
+                ).to(torch.bfloat16)
+            expected = _FakeTPQwenModel(merged, tp_rank=1, tp_size=2)
+            for name, param in expected.named_parameters():
+                assert torch.equal(snapshots[-1][name], param), name
+
+    assert any(not torch.equal(snapshots[0][k], snapshots[1][k]) for k in snapshots[0])
+    for name in snapshots[0]:
+        assert torch.equal(snapshots[0][name], snapshots[2][name]), name

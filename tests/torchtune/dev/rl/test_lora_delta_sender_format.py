@@ -65,3 +65,39 @@ def test_adapter_payload_is_small():
     assert len(tensors) == 36 * 7 * 2  # 504 adapter tensors
     # bf16 r=16 adapter: well under 200 MB; the merged W_eff would be ~6.77 GiB.
     assert size_mb < 200, f"adapter unexpectedly large: {size_mb:.1f} MB"
+
+
+def test_bioreason_32b_adapter_payload_is_small():
+    """Same size assertion, at BioReason's actual 32B checkpoint dims (64 layers,
+    hidden=5120, intermediate=25600, GQA num_kv_heads=8 head_dim=128 — read from
+    experiments/bioreason/runs/sft_qwen3_32b_lora_r128_lrsched_v8_step1550_snapshot/
+    config.json) and lora_rank=16 (bioreason_32b_lora_grpo_hsdp_xpu.yaml). The
+    merged W_eff for this model is ~61 GiB (measured on HW, job 8809198/v32); the
+    delta-publish payload built from the SAME dims must be tiny in comparison —
+    this is the numeric justification for expecting a large wsync speedup."""
+    rank = 16
+    n_layers = 64
+    hidden = 5120
+    kv_dim = 8 * 128  # num_key_value_heads * head_dim (GQA)
+    intermediate = 25600
+    dims = {
+        "q_proj": (hidden, hidden), "k_proj": (kv_dim, hidden), "v_proj": (kv_dim, hidden),
+        "o_proj": (hidden, hidden), "gate_proj": (intermediate, hidden),
+        "up_proj": (intermediate, hidden), "down_proj": (hidden, intermediate),
+    }
+    tensors = {}
+    for li in range(n_layers):
+        for proj, (out_dim, in_dim) in dims.items():
+            grp = "self_attn" if proj in ("q_proj", "k_proj", "v_proj", "o_proj") else "mlp"
+            hf = f"model.layers.{li}.{grp}.{proj}.weight"
+            tensors[f"{hf}::lora_A"] = torch.zeros(rank, in_dim, dtype=torch.bfloat16)
+            tensors[f"{hf}::lora_B"] = torch.zeros(out_dim, rank, dtype=torch.bfloat16)
+
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "adapter.bin")
+        _save_raw_bytes(tensors, path)
+        size_mb = os.path.getsize(path) / 1024**2
+
+    assert len(tensors) == n_layers * 7 * 2
+    # ~61 GiB merged vs. this: expect well under 1 GiB even at 32B scale.
+    assert size_mb < 1024, f"32B adapter unexpectedly large: {size_mb:.1f} MB"

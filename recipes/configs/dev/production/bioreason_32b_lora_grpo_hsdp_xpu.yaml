@@ -1,0 +1,179 @@
+# BioReason-Pro 32B GRPO RL — multi-node HSDP training + centralized TP=4 vLLM server pool
+#
+# First GRPO config for the 32B BioReason backbone. Adapted from the validated 4B LoRA-GRPO
+# template (bioreason_4b_lora_grpo_2node_server_xpu.yaml, which produced the Gap-7 180-step
+# result: docs/reports/bioreason_ablations_headline_findings_20260730.md) by combining it with
+# the 32B memory/topology envelope already proven for plain Qwen3-32B GRPO
+# (qwen32B_grpo_3node_24way_stable_xpu.yaml) and the TP=4 vLLM serving path already proven for
+# 32B BioReason EVAL (launch_vllm_http_32b_tp2.sh — 32B bf16 weights are 65.6 GiB, which
+# EXCEEDS a single 64 GiB tile; vLLM TP=1 SEGFAULTS at this size, job 8680047).
+#
+# base_model_path is the v8 32B LoRA-SFT campaign's final checkpoint (step1550, merged
+# backbone + protein/GO projections — NOT an adapter; this run trains a FRESH LoRA adapter
+# on top, matching the Gap-7 pattern of RL warm-starting from a converged SFT merge rather
+# than resuming the SFT LoRA itself).
+#
+# add_uniprot_summary: true is REQUIRED here — the v8 SFT config trained with this flag
+# (sft_bioreason_qwen3_32B_lora_r128_lrsched_v8_xpu.yaml), and bioreason_rl_dataset only
+# gained add_uniprot_summary support in the same change that added this config (see
+# torchtune/dev/bioreason/dataset.py, tests/torchtune/dev/rl/test_bioreason_go_pred_prompt.py).
+# Omitting it would repeat the exact RL/SFT prompt-distribution mismatch already root-caused
+# once for inject_go_pred (memory/project_bioreason_eval_fixed_rl_flat_vs_sft_20260626).
+#
+# Launch (from a held >=3-node PBS job; see
+# experiments/bioreason/run_bioreason_32b_Nnode_hsdp.sh):
+#   ENABLE_LORA=1 CONFIG=recipes/configs/dev/production/bioreason_32b_lora_grpo_hsdp_xpu.yaml \
+#       bash experiments/bioreason/run_bioreason_32b_Nnode_hsdp.sh
+
+name: grpo_bioreason_32b_hsdp_lora
+output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/experiments/bioreason/outputs/bioreason_32b_gopred_grpo
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+model_type: bioreason
+base_model_path: /tmp/torchtune/sft_qwen3_32b_lora_r128_lrsched_v8_step1550_snapshot
+
+# ── PEFT-LoRA (fresh adapter on top of the converged SFT merge; matches Gap-7's
+#    "start FRESH from Stage-1 projections, not from an already-converged LoRA" pattern —
+#    the SFT lineage here is a full-FT merge, not a LoRA, so there is no prior adapter to
+#    resume from regardless) ──────────────────────────────────────────────────
+enable_lora: true
+lora_rank: 16
+lora_alpha: 32
+lora_dropout: 0.05
+
+# ── ESM3 pre-encode cache (same cache as the 4B RL path — keyed by sha1(sequence[:2048]),
+#    model-size-independent) ───────────────────────────────────────────────────
+esm3_cache_path: /lus/flare/projects/ModCon/ngetty/datasets/bioreason_rl/esm3_cache_2048.pt
+
+# ── Tokenizer ─────────────────────────────────────────────────────────────────
+tokenizer:
+  _component_: torchtune.dev.bioreason.bioreason_tokenizer
+  ckpt_dir: ${base_model_path}
+
+# ── Dataset ───────────────────────────────────────────────────────────────────
+dataset:
+  _component_: torchtune.dev.bioreason.bioreason_rl_dataset
+  data_files: /lus/flare/projects/ModCon/ngetty/datasets/bioreason_rl
+  max_seq_len: ${max_seq_len}
+  max_protein_len: 2048
+  num_go_tokens: 200
+  # Faithful prompt match to the v8 32B SFT checkpoint (see header note).
+  inject_go_pred: true
+  add_uniprot_summary: true
+
+collate_fn: torchtune.dev.bioreason.dataset.bioreason_collate_fn
+
+seed: 42
+shuffle: True
+resume_from_checkpoint: False
+
+# ── RL Hyperparameters ────────────────────────────────────────────────────────
+grpo_samples: 8
+max_seq_len: 4096
+max_generated_tokens: 1024
+temperature: 0.8
+top_k: null
+
+# ── Training ──────────────────────────────────────────────────────────────────
+epochs: 1
+num_steps: 180
+ppo_epochs: 1
+# batch_size = distinct prompts per step PER REPLICA (launcher's BATCH_SIZE overrides).
+batch_size: 2
+# forward_batch_size=1: mandatory at 32B scale (validated envelope from
+# qwen32B_grpo_3node_24way_stable_xpu.yaml and the v8 SFT campaign — 32B activation
+# footprint is far larger per-sequence than 4B; do not raise without re-validating memory).
+forward_batch_size: 1
+# MUST be >= batch_size*grpo_samples (=16 at batch_size=2) or the no-grad ref forward does
+# num_seqs sequential FSDP allgathers (~500x slowdown trap, CLAUDE.md).
+ref_forward_batch_size: 16
+gradient_accumulation_steps: 1
+
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 3e-6
+  weight_decay: 0.01
+  fused: false
+
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  num_warmup_steps: 50
+
+clip_grad_norm: 1.0
+skip_zero_advantage_step: true
+
+# ── Loss ──────────────────────────────────────────────────────────────────────
+loss:
+  _component_: torchtune.dev.rl.loss.GRPOSimpleLoss
+  kl_coeff: 1e-3
+  epsilon: 0.2
+
+# ── Reward ────────────────────────────────────────────────────────────────────
+reward_mode: bioreason
+
+# ── Distributed ───────────────────────────────────────────────────────────────
+enable_activation_checkpointing: true
+# REQUIRED at 32B scale: forces FSDP1 FULL_SHARD/HYBRID_SHARD (true params-at-rest sharding)
+# instead of the 4B path's default SHARD_GRAD_OP/_HYBRID_SHARD_ZERO2, which keeps the WHOLE
+# frozen backbone resident per rank (~65.6 GiB bf16 for 32B > one 64 GiB tile). See
+# grpo_bioreason_distributed_xpu.py's FSDP-wrap block for the full rationale.
+fsdp_full_shard_at_rest: true
+# False (default) at 32B scale: the ref model is now FSDP2-sharded (fully_shard, per
+# decoder layer) whenever fsdp_full_shard_at_rest=true — the same production mechanism
+# the validated 32B SFT path and the base recipe's 32B dense-Qwen3 GRPO path already use.
+# An earlier version of this config set ref_cpu_offload=true as a stopgap (the ref model
+# is never FSDP1-wrapped, so a bare .to(device) OOM'd — 62.61 GiB, "Tried to allocate 1.45
+# GiB") — CPU offload avoided the crash but made every ref forward take 10s of minutes
+# (confirmed on HW: single-digit tok/s on a 32B CPU forward). FSDP2-sharding the ref model
+# instead keeps the ref forward on XPU at normal speed. Set true only as an explicit,
+# deliberate opt-out (e.g. debugging) — it silently disables the FSDP2 ref-sharding path.
+ref_cpu_offload: false
+
+# ── XPU ───────────────────────────────────────────────────────────────────────
+device: xpu
+dtype: bf16
+compile: false
+force_math_sdpa: false
+
+# ── vLLM rollout (server mode, TP=4 per engine — REQUIRED at 32B: bf16 weights are
+#    65.6 GiB > one 64 GiB tile, TP=1 SEGFAULTS). vllm_url filled in by the launcher. ──
+vllm_mode: server
+vllm_tensor_parallel_size: 4
+vllm_weight_sync: true
+vllm_weight_sync_method: xccl
+vllm_weight_sync_interval: 1
+# prompt ctx (<=max_seq_len=4096) + max_generated_tokens(1024) -> 5120, rounded up.
+vllm_max_model_len: 5120
+
+# "delta_tp" ships only the ~256 MiB LoRA factors each step. Each vLLM worker
+# snapshots its already-resident TP-local base shards once and uses vLLM's native
+# loaders to TP-slice/pack each delta before an on-device fp32 merge. This avoids
+# both the merged path's ~61 GiB/step transfer and legacy "delta" mode's unsharded
+# 61 GiB receiver cache / CPU merge. It remains opt-in pending Aurora validation;
+# "merged" is the HW-validated fallback.
+lora_wsync_mode: merged
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+log_every_n_steps: 1
+log_peak_memory_stats: true
+save_every_n_steps: 20
+
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+
+# ── Profiler ──────────────────────────────────────────────────────────────────
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: false
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: true
+  cuda: false
+  profile_memory: false
+  with_stack: false
+  record_shapes: false
+  with_flops: false
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1

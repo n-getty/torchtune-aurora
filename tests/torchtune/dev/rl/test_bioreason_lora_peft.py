@@ -175,6 +175,34 @@ def test_lora_delta_iter_matches_map():
         torch.testing.assert_close(streamed[k], eager[k], rtol=0, atol=0)
 
 
+def test_raw_ab_via_scaling_dict_matches_get_delta_weight():
+    """Wire-format assumption for the delta-publish weight-sync path: shipping
+    RAW lora_A/lora_B + a scalar scale (instead of a precomputed delta) must be
+    bit-exact to PEFT's own get_delta_weight(), using module.scaling["default"]
+    as the scale source. PEFT layers expose .scaling (a dict keyed by adapter
+    name), NOT the .alpha/.rank scalar attrs torchtune's native LoRALinear has —
+    using the wrong attribute would silently AttributeError or (if a same-named
+    but wrong-semantics attribute existed) ship a wrong scale. This assumption
+    holds only for vanilla LoRA math (no rslora/dora, matching model.py's
+    LoraConfig, which sets neither) — if that config ever changes, this test
+    must be revisited before trusting a raw-A/B wire format.
+    """
+    model, rank, alpha = _tiny_lora_model()
+    for mod in _wrapped_linears(model):
+        torch.nn.init.normal_(mod.lora_B["default"].weight, std=0.1)
+
+    for mod in _wrapped_linears(model):
+        scale = float(mod.scaling["default"])
+        A = mod.lora_A["default"].weight.detach()  # [r, in]
+        B = mod.lora_B["default"].weight.detach()  # [out, r]
+        manual_delta = scale * (B @ A)
+        peft_delta = mod.get_delta_weight("default")
+        torch.testing.assert_close(
+            manual_delta, peft_delta, rtol=1e-5, atol=1e-5,
+            msg="scale*(B@A) via module.scaling['default'] != get_delta_weight()",
+        )
+
+
 def test_weff_via_delta_map_matches_base_plus_scaled_ba():
     """The PRODUCTION server-mode gather forms W_eff = base + lora_delta_map()
     WITHOUT mutating the frozen base. Verify (a) it equals base + (alpha/r)*B@A,

@@ -349,11 +349,10 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
         # the policy is FSDP-wrapped (server/dedicated modes), so save under
         # summon_full_params on all ranks, write on rank 0.
         if hasattr(self._policy, 'vllm_param_iter'):
-            from torch.distributed.fsdp import (
-                FullyShardedDataParallel as FSDP, StateDictType,
-            )
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
             save_dir = os.path.join(self._output_dir, f"epoch_{epoch}")
             _fsdp = getattr(self, "_use_fsdp1", False) and torch.distributed.is_initialized()
+            _has_lora = getattr(self._model, "_has_lora", False)
 
             # GATHER VIA FULL_STATE_DICT, NOT summon_full_params (2026-06-22 fix).
             # summon_full_params materializes the ENTIRE 4B model on-device, allocating
@@ -366,16 +365,52 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
             # state_dict(), which gathers tensor-by-tensor into a CPU dict and releases
             # each gather immediately (no persistent on-device full materialization).
             # We then slice the adapter (lora_*) + projection tensors out of that dict.
-            if _fsdp:
+            if _fsdp and _has_lora:
+                _param_to_name = {id(p): n for n, p in self._model.named_parameters()}
+                _full_sd = {} if self._is_rank_zero else None
+                _fsdp_units = [m for m in self._model.modules() if isinstance(m, FSDP)]
+                for _unit in _fsdp_units:
+                    with torch.no_grad(), FSDP.summon_full_params(
+                        _unit, recurse=False, writeback=False, rank0_only=False
+                    ):
+                        if not self._is_rank_zero:
+                            continue
+                        for _param in _base_module._weight_sync_module._fsdp1_own_params(
+                            _unit, FSDP
+                        ):
+                            if not _param.requires_grad:
+                                continue
+                            _name = _param_to_name.get(id(_param))
+                            if _name is not None and _name not in _full_sd:
+                                _full_sd[_name] = _param.detach().cpu().contiguous()
+                if self._is_rank_zero:
+                    for _name, _param in self._model.named_parameters():
+                        _clean_name = _name.replace("_fsdp_wrapped_module.", "")
+                        _clean_name = _clean_name.replace(
+                            "_checkpoint_wrapped_module.", ""
+                        )
+                        if (
+                            _param.requires_grad
+                            and _name not in _full_sd
+                            and _clean_name.startswith(
+                                ("protein_projection.", "go_projection.")
+                            )
+                        ):
+                            _full_sd[_name] = _param.detach().cpu().contiguous()
+                utils.log_rank_zero(
+                    log,
+                    f"BioReason checkpoint gathered {len(_full_sd or {})} trainable "
+                    "tensors without materializing the frozen 32B backbone",
+                )
+            elif _fsdp:
+                from torch.distributed.fsdp import StateDictType
                 with FSDP.state_dict_type(self._model, StateDictType.FULL_STATE_DICT):
-                    _full_sd = self._model.state_dict()  # COLLECTIVE on all ranks, CPU
+                    _full_sd = self._model.state_dict()
             else:
                 _full_sd = self._model.state_dict()
 
             if self._is_rank_zero:
                 os.makedirs(save_dir, exist_ok=True)
-                _has_lora = getattr(self._model, "_has_lora", False)
-
                 def _strip(name):
                     return (name.replace("_fsdp_wrapped_module.", "")
                                 .replace("_checkpoint_wrapped_module.", ""))
@@ -626,6 +661,23 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
             "BioReason: loading policy model from %s (enable_lora=%s, adapter=%s, proj_resume=%s)",
             ckpt_dir, self._enable_lora, _adapter_path, _proj_resume_dir,
         )
+        # This policy model is about to be FSDP1-wrapped below (server/dedicated_rank/
+        # colocate all set _wrap_fsdp1) — FSDP(..., device_id=self._device) shards and
+        # places each rank's slice on GPU itself. Loading the backbone onto GPU HERE
+        # first (the default path, kept byte-identical for the validated 4B configs)
+        # would materialize the FULL backbone on every rank's single tile before FSDP
+        # ever runs: fine at 4B (~8 GiB), fatal at 32B (~65.6 GiB > one 64 GiB tile —
+        # confirmed on HW, every rank OOM'd inside `.to()` at construction). Gated
+        # behind fsdp_full_shard_at_rest (already the 32B-only opt-in for the FSDP
+        # sharding-strategy override below) rather than made the default everywhere,
+        # so no existing 4B run's load path changes.
+        _force_full_shard = cfg.get("fsdp_full_shard_at_rest", False)
+        self._fsdp_full_shard_at_rest = bool(_force_full_shard)
+        _will_wrap_fsdp1 = _force_full_shard and (
+            (self._vllm_mode == "dedicated_rank" and self._vllm_dedicated_rank is not None)
+            or (self._vllm_mode == "server")
+            or (self._vllm_mode in ("colocate", "colocate_sleep"))
+        )
         self._model = BioReasonModel(
             ckpt_dir=ckpt_dir,
             device=self._device,
@@ -637,6 +689,7 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
             esm3_cache_path=_esm3_cache_path,
             adapter_path=_adapter_path,
             proj_resume_dir=_proj_resume_dir,
+            backbone_cpu_init=_will_wrap_fsdp1,
         )
         _mark("policy:loaded")
         self._model.train()
@@ -647,19 +700,67 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
             log.info("BioReason: gradient checkpointing enabled on backbone")
             _mark("policy:ac_enabled")
 
-        ref_device = torch.device("cpu") if self._ref_cpu_offload else self._device
+        # 32B-scale: FSDP2-shard the ref model instead of CPU-offloading it. The ref
+        # model is frozen and forward-only, so per-layer FSDP2 sharding (fully_shard,
+        # the SAME mechanism the validated 32B SFT path and the base recipe's 32B
+        # dense-Qwen3 GRPO path already use in production) is a strictly better fit
+        # than dragging a 65.6 GiB model through a CPU forward pass every step (10s of
+        # minutes per step on HW, confirmed) or the FSDP1 flatten-buffer OOM a naive
+        # top-level wrap hits (see the policy's own auto_wrap_policy fix above for that
+        # failure mode). ref_cpu_offload stays available as an explicit opt-out for
+        # anyone who wants the old (correct, just slow) behavior.
+        _shard_ref_fsdp2 = bool(_force_full_shard) and not self._ref_cpu_offload
+        ref_device = (
+            torch.device("cpu") if self._ref_cpu_offload
+            else self._device
+        )
         _mark(f"ref:start dev={ref_device}")
-        log.info("BioReason: loading ref model from %s (device=%s)", ckpt_dir, ref_device)
+        log.info("BioReason: loading ref model from %s (device=%s, fsdp2_shard=%s)",
+                  ckpt_dir, ref_device, _shard_ref_fsdp2)
         self._ref_model = BioReasonModel(
             ckpt_dir=ckpt_dir,
             device=ref_device,
             dtype=self._dtype,
             esm3_cache_path=_esm3_cache_path,
+            # Same reasoning as the policy: if this backbone is about to be FSDP2-sharded,
+            # don't materialize the full ~65.6 GiB backbone onto one GPU first — let
+            # fully_shard's meta-init + broadcast path place shards directly.
+            backbone_cpu_init=_shard_ref_fsdp2,
         )
         _mark("ref:loaded")
         self._ref_model.eval()
         for p in self._ref_model.parameters():
             p.requires_grad_(False)
+        if _shard_ref_fsdp2:
+            from torch.distributed._composable.fsdp import fully_shard
+            _ref_decoder_layer_cls = None
+            for _rn, _rm in self._ref_model.backbone.named_modules():
+                if _rn.endswith(".layers.0") or _rn.endswith("layers.0"):
+                    _ref_decoder_layer_cls = type(_rm)
+                    break
+            if _ref_decoder_layer_cls is None:
+                raise RuntimeError(
+                    "fsdp_full_shard_at_rest=true but could not find a '...layers.0' "
+                    "module on the ref model's backbone to FSDP2-shard."
+                )
+            _n_ref_layers_sharded = 0
+            for _rn, _rm in reversed(list(self._ref_model.backbone.named_modules())):
+                if isinstance(_rm, _ref_decoder_layer_cls):
+                    fully_shard(_rm, mesh=None, reshard_after_forward=True)
+                    _n_ref_layers_sharded += 1
+            # Root wrap: mirrors torchtune.training.shard_model's final "shard the
+            # entire model to account for stragglers" step — the ref model has no
+            # optimizer/backward, so a single reshard_after_forward=True root unit is
+            # sufficient (no need for the policy's ignored_modules dance; the ref
+            # model's projections are never trained and never need to be reachable
+            # via a `summon_full_params`-style gather — build_full_embeds only calls
+            # them, it doesn't need to write to them).
+            fully_shard(self._ref_model.backbone, mesh=None, reshard_after_forward=True)
+            log.info(
+                "BioReason: ref model FSDP2-sharded (%d decoder layers + root unit)",
+                _n_ref_layers_sharded,
+            )
+            ref_device = self._device
         self._ref_model_device = ref_device
 
         # BioReasonHFTokenizer exposes pad_id, eos_id, stop_tokens (missing on raw HF tok).
@@ -674,7 +775,15 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
         self._is_bioreason = True
         # Move ref model to XPU only during ref forward, then back to CPU.
         # Saves ~8 GiB HBM during backward while keeping XPU ref forward speed.
-        self._bioreason_dynamic_ref_offload = True
+        # 32B-scale exception: this round-trip materializes the ENTIRE ref model on
+        # one tile via a bare .to(device) call — ~65.6 GiB at 32B (confirmed OOM on
+        # HW, "Tried to allocate 250 MiB" with 63.16 GiB already resident). The "~8
+        # GiB" saving in the comment above is a 4B-scale number; at 32B the ref
+        # model is never FSDP-sharded (ref_cpu_offload keeps it CPU-resident, full
+        # stop), so this optimization is actively harmful, not just unnecessary.
+        # Disabled whenever fsdp_full_shard_at_rest is set (the 32B-only opt-in);
+        # the ref forward instead runs directly on CPU (see ref_cpu_offload).
+        self._bioreason_dynamic_ref_offload = not cfg.get("fsdp_full_shard_at_rest", False)
 
         if self._is_rank_zero:
             trainable = sum(
@@ -709,7 +818,7 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
         )
         if _wrap_fsdp1:
             from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-            from torch.distributed.fsdp import ShardingStrategy, MixedPrecision
+            from torch.distributed.fsdp import ShardingStrategy, MixedPrecision, BackwardPrefetch
             if self._vllm_mode == "dedicated_rank":
                 # Generic PG setup: training_pg (xccl, [0..N-2]) + wsync_pg (gloo, [0, N-1]).
                 # new_group order must match _setup_dedicated_vllm_rank on the vLLM rank.
@@ -721,6 +830,38 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
                 _training_ranks = list(range(self.world_size))
                 self._training_pg = torch.distributed.new_group(_training_ranks, backend="xccl")
                 self._wsync_pg = None
+                # LOAD-BEARING: a gloo-backed barrier group, used ONLY to order
+                # _init_sender_pool's post-init barrier against rank 0's
+                # concurrent _init_xccl_weight_sync() communicator construction.
+                # Root-caused 2026-09-07 (jobs 8810079/8810147/8810186, v40-v43,
+                # 4/4 reproductions across TWO different physical node pairs,
+                # ruling out node-specific hardware corruption): the WORLD
+                # default process group on XPU is ALSO xccl-backed (confirmed —
+                # torchtune.training.xpu_utils.get_xpu_distributed_backend()
+                # returns "xccl" absent CPU offload), so the "plain
+                # torch.distributed.barrier()" that v29 tried and found
+                # ineffective was STILL an XCCL collective under the hood — it
+                # never actually tested a barrier that couldn't contend with
+                # concurrent Level-Zero/XCCL communicator construction. Two
+                # concurrent XCCL-touching operations on the same rank/device
+                # (this barrier on an XCCL group + rank 0's fresh
+                # ProcessGroupXCCL construction inside _init_xccl_weight_sync)
+                # appear unsafe to interleave — `ur_die` reproduced identically
+                # on rank 1 every time. A gloo barrier can never touch
+                # Level-Zero state, so it can safely order ranks without racing
+                # rank 0's XCCL construction. Mirrors the existing
+                # `_wsync_pg`/`TORCHTUNE_WSYNC_BACKEND=gloo` pattern already
+                # used for the dedicated_rank path's cross-PG (vllm_backend.py).
+                import torch.distributed.distributed_c10d as _dc10d
+                _default_pg = _dc10d._get_default_group()
+                _orig_bound = _default_pg.bound_device_id
+                _default_pg.bound_device_id = None
+                try:
+                    self._wsync_barrier_pg = torch.distributed.new_group(
+                        _training_ranks, backend="gloo"
+                    )
+                finally:
+                    _default_pg.bound_device_id = _orig_bound
             _pre_wrap = self._model
             # _embed is already frozen unconditionally in BioReasonModel.__init__
             # (_freeze_embed_copy) regardless of LoRA/full-FT. Re-assert it here
@@ -735,6 +876,48 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
                 reduce_dtype=torch.bfloat16,
                 buffer_dtype=torch.bfloat16,
             )
+            # 32B-scale override: a top-level-only FSDP1 wrap must flatten the ENTIRE
+            # wrapped module into one contiguous buffer on one GPU before it can shard
+            # (FlatParamHandle.flatten_tensors_into_flat_param -> torch.cat) — ~61 GiB for
+            # the 32B backbone, confirmed OOM on HW even with backbone_cpu_init=True and
+            # device_id set (CLAUDE.md's "per-module wrapping causes catastrophic overhead"
+            # warning is about STEP-TIME at 4B scale, not a correctness constraint — at 32B,
+            # a working-but-slower per-layer wrap is required just to fit at all). Only the
+            # transformer decoder layers are wrapped as separate FSDP units (each ~1.85 GiB,
+            # not ~61 GiB) via transformer_auto_wrap_policy; everything else in the backbone
+            # stays inside the outer top-level unit exactly as before. Gated behind
+            # fsdp_full_shard_at_rest so the validated 4B top-level-only path never changes.
+            _auto_wrap_policy = None
+            if _force_full_shard:
+                from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+                import functools
+                # Discover the decoder layer class by scanning named_modules() rather than
+                # calling backbone.get_decoder() directly — PEFT's PeftModel wraps the HF
+                # model and proxies attribute access via __getattr__, which is reliable for
+                # plain attributes but not verified here for a bound-method call chain
+                # (get_decoder().layers[0]); scanning modules is robust regardless of
+                # PEFT/LoRA wrapping.
+                _decoder_layer_cls = None
+                for _name, _mod in _pre_wrap.backbone.named_modules():
+                    if _name.endswith(".layers.0") or _name.endswith("layers.0"):
+                        _decoder_layer_cls = type(_mod)
+                        break
+                if _decoder_layer_cls is None:
+                    raise RuntimeError(
+                        "fsdp_full_shard_at_rest=true but could not find a '...layers.0' "
+                        "module to derive the transformer decoder layer class for "
+                        "auto_wrap_policy — backbone architecture may not match the "
+                        "expected HF decoder-layer-list convention."
+                    )
+                _auto_wrap_policy = functools.partial(
+                    transformer_auto_wrap_policy,
+                    transformer_layer_cls={_decoder_layer_cls},
+                )
+                log.info(
+                    "fsdp_full_shard_at_rest: per-layer auto_wrap_policy on %s "
+                    "(avoids the single ~61 GiB flatten-buffer OOM at 32B scale)",
+                    _decoder_layer_cls,
+                )
             # HSDP (server mode, data_parallel_replicate_dim>1): replicate the model
             # across nodes, FSDP-shard within each node — distinct prompts per replica
             # in PARALLEL (the throughput lever; batch_size only adds SEQUENTIAL prompts).
@@ -746,15 +929,47 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
             _is_hsdp = (
                 self._vllm_mode == "server" and getattr(self, "_dp_replicate", 1) > 1
             )
-            _ignored = [m for m in [_pre_wrap._embed,
-                                    _pre_wrap.protein_encoder,
-                                    _pre_wrap.go_encoder]
+            _ignore_candidates = [_pre_wrap._embed, _pre_wrap.protein_encoder, _pre_wrap.go_encoder]
+            if _force_full_shard:
+                # 32B-scale: also ignore the trainable projectors. At 4B, several call
+                # sites (generate_trajectory's prompt_embeds build, LoRA delta sync) reach
+                # these via a per-step `summon_full_params(self._model)` — cheap there
+                # because it re-gathers the whole ~8 GiB backbone anyway. At 32B, with the
+                # backbone split into 64 per-layer FSDP units (auto_wrap_policy), that same
+                # call cascades into unsharding ALL 64 units simultaneously on every rank —
+                # confirmed OOM on HW (62.5 GiB/rank, "Tried to allocate 936 MiB" inside
+                # FSDP's _alloc_padded_unsharded_flat_param). The projectors are tiny
+                # (tens of MB) and don't need FSDP sharding at all; ignoring them means
+                # they're always fully replicated per rank, so those call sites' `summon`
+                # becomes unnecessary for THIS purpose (it's still needed elsewhere for
+                # backbone params, which callers gate separately).
+                _ignore_candidates += [_pre_wrap.protein_projection, _pre_wrap.go_projection]
+            _ignored = [m for m in _ignore_candidates
                         if m is not None and isinstance(m, torch.nn.Module)]
+            # Recorded so per-step call sites (generate_trajectory's prompt_embeds build,
+            # LoRA delta sync) can skip an otherwise-unnecessary summon_full_params(self._model)
+            # when the modules they actually need are already fully-replicated (ignored),
+            # not FSDP-sharded — see the 32B-scale note above for why summon becomes
+            # catastrophically expensive (not just "free but pointless") once the backbone
+            # is split into many per-layer FSDP units.
+            self._projectors_fsdp_ignored = bool(_force_full_shard)
+            # 32B-scale override: SHARD_GRAD_OP/_HYBRID_SHARD_ZERO2 keep the FULL frozen
+            # backbone resident on every rank (only grad/optimizer state is sharded) — fine
+            # at 4B (~8 GiB bf16) but the 32B backbone alone is ~65.6 GiB bf16, exceeding a
+            # single 64 GiB tile before any activations/KV/LoRA overhead (same failure class
+            # as vLLM TP=1 SEGFAULTing on the 32B eval path, launch_vllm_http_32b_tp2.sh).
+            # fsdp_full_shard_at_rest=true forces true params-at-rest sharding (ZeRO-3
+            # equivalent) so each tile only holds its 1/dp_shard slice of the backbone.
+            # (_force_full_shard is computed once, earlier, near the policy model's
+            # construction — reused here rather than redefined.)
             if _is_hsdp:
-                try:
-                    _shard_strategy = ShardingStrategy._HYBRID_SHARD_ZERO2
-                except AttributeError:
+                if _force_full_shard:
                     _shard_strategy = ShardingStrategy.HYBRID_SHARD
+                else:
+                    try:
+                        _shard_strategy = ShardingStrategy._HYBRID_SHARD_ZERO2
+                    except AttributeError:
+                        _shard_strategy = ShardingStrategy.HYBRID_SHARD
                 # Route the inter-node grad all-reduce over gloo (XCCL cross-node leaks
                 # CXI MR handles -> banned:1 ~step10); base helper, validated on AGPT-2B.
                 try:
@@ -770,6 +985,10 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
                     ignored_modules=_ignored,
                     use_orig_params=True,
                     limit_all_gathers=True,
+                    auto_wrap_policy=_auto_wrap_policy,
+                    backward_prefetch=(
+                        BackwardPrefetch.BACKWARD_POST if _force_full_shard else BackwardPrefetch.BACKWARD_PRE
+                    ),
                 )
                 log.info(
                     "Rank %d: FSDP1 HSDP (%s) over dp_mesh (replicate=%d x shard=%d)",
@@ -779,9 +998,12 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
             else:
                 # colocate: FULL_SHARD (ZeRO-3) shards params at rest → frees ~11/12 of
                 # the 4B footprint for the co-resident vLLM engine. server/dedicated
-                # single-replica keep the validated SHARD_GRAD_OP (ZeRO-2; vLLM off-tile).
+                # single-replica keep the validated SHARD_GRAD_OP (ZeRO-2; vLLM off-tile),
+                # unless fsdp_full_shard_at_rest=true (32B — see the HSDP branch above for
+                # why SHARD_GRAD_OP cannot hold the full backbone on one tile at this scale).
                 _shard_strategy = (
-                    ShardingStrategy.FULL_SHARD if _is_colocate
+                    ShardingStrategy.FULL_SHARD
+                    if (_is_colocate or _force_full_shard)
                     else ShardingStrategy.SHARD_GRAD_OP
                 )
                 self._model = FSDP(
@@ -792,14 +1014,32 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
                     ignored_modules=_ignored,
                     use_orig_params=True,
                     device_id=self._device,
+                    auto_wrap_policy=_auto_wrap_policy,
+                    limit_all_gathers=True,
+                    backward_prefetch=(
+                        BackwardPrefetch.BACKWARD_POST if _force_full_shard else BackwardPrefetch.BACKWARD_PRE
+                    ),
                 )
             self._use_fsdp1 = True
-            # Pre-compute chunked broadcast layout inside summon_full_params.
-            # Outside summon_full_params, use_orig_params=True params reflect SHARD sizes
-            # (not full), so chunk boundaries would be wrong. With rank0_only=True, all
-            # training ranks see the correct full shapes; numel() is consistent.
-            with FSDP.summon_full_params(self._model, writeback=False, rank0_only=True):
-                self._compute_wsync_layout(self._model)
+            # Pre-compute chunked broadcast layout. Two paths:
+            #   - Default (4B, validated): summon_full_params(rank0_only=True) — outside
+            #     it, use_orig_params=True params reflect SHARD sizes (not full), so chunk
+            #     boundaries would be wrong. summon_full_params re-gathers the WHOLE model
+            #     onto rank 0 to read correct full shapes — free at 4B (~8 GiB) but at 32B
+            #     this alone OOMs (confirmed on HW: 60.69 GiB already allocated by the
+            #     per-layer-sharded model, +936 MiB for the gather tips it over on a 64 GiB
+            #     tile). _compute_wsync_layout only reads shape/numel/dtype metadata, never
+            #     tensor data — so at 32B, read it from `_pre_wrap` BEFORE FSDP wrapping
+            #     instead, while the backbone is still whole on CPU (backbone_cpu_init):
+            #     shapes/dtypes are identical whether read pre-wrap or via summon_full_params
+            #     (merge-state and device placement don't affect vllm_param_iter's name/shape
+            #     translation), so this produces a byte-identical layout without ever
+            #     re-gathering the sharded model onto one GPU.
+            if _force_full_shard:
+                self._compute_wsync_layout(_pre_wrap)
+            else:
+                with FSDP.summon_full_params(self._model, writeback=False, rank0_only=True):
+                    self._compute_wsync_layout(self._model)
             _wsync_desc = (
                 f"wsync_pg=[0,{self._vllm_dedicated_rank}]"
                 if self._vllm_mode == "dedicated_rank"
@@ -810,6 +1050,61 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
                 "ignored=[_embed, protein_encoder, go_encoder], %s",
                 self.rank, len(_training_ranks), _wsync_desc,
             )
+            # lora_wsync_mode: "merged" is the HW-validated fallback. "delta"
+            # ships an unsharded base once; "delta_tp" snapshots vLLM's resident
+            # TP-local base and ships only LoRA A/B factors. Delta modes are only
+            # exercised alongside fsdp_full_shard_at_rest (32B). See
+            # memory/project_bioreason_32b_grpo_fsdp1_per_layer_first_working_path_20260906.md
+            # for why the merged path is slow at 32B (~65s/step wsync, job
+            # 8809198/v32: ~31s gather + ~33s broadcast of a ~61 GiB payload).
+            self._lora_wsync_mode = cfg.get("lora_wsync_mode", "merged")
+            if self._lora_wsync_mode not in ("merged", "delta", "delta_tp"):
+                raise ValueError(
+                    f"lora_wsync_mode must be 'merged', 'delta', or 'delta_tp', got "
+                    f"{self._lora_wsync_mode!r}"
+                )
+            if (
+                self._lora_wsync_mode == "delta"
+                and _force_full_shard
+                and getattr(self._model, "_has_lora", False)
+            ):
+                self._cache_bioreason_lora_base_per_unit()
+                # LOAD-BEARING: this is a 64-unit summon_full_params sweep run
+                # during setup(), well before the first _init_sender_pool/
+                # _init_xccl_weight_sync call. Every other call site in this
+                # file that runs a summon_full_params/PG-construction
+                # collective on XPU is followed by a synchronize() to flush
+                # pending device ops (see _init_sender_pool's and
+                # _xccl_gather_fsdp1's own comments: "ProcessGroupXCCL
+                # constructor may leave pending GPU ops that deadlock/crash
+                # the subsequent collective"). This call site was missing
+                # that flush — confirmed on HW (jobs 8810079/v36, v37):
+                # `ur_die: urEventWait must not be called for an internal
+                # event` on rank 1, at the FIRST _init_xccl_weight_sync call
+                # several minutes later in the training loop, reproducing
+                # identically even after the barrier fix was added directly
+                # inside _publish_bioreason_lora_delta and _init_sender_pool
+                # (both already correct) — the corruption predates either of
+                # those functions and comes from this unflushed setup-time
+                # sweep instead.
+                if self._device.type == "xpu" and torch.xpu.is_available():
+                    torch.xpu.synchronize()
+                # Use the gloo barrier group for consistency with the fix
+                # applied to _init_sender_pool (see weight_sync.py) — this
+                # call site runs at setup() time, before _init_xccl_weight_sync
+                # is ever called, so it was never actually implicated in the
+                # ur_die race (0 crashes here across v38-v43), but there's no
+                # reason to leave it on an XCCL-backed group either.
+                torch.distributed.barrier(
+                    group=getattr(self, "_wsync_barrier_pg", None)
+                    or getattr(self, "_training_pg", None)
+                )
+            elif (
+                self._lora_wsync_mode == "delta_tp"
+                and _force_full_shard
+                and getattr(self._model, "_has_lora", False)
+            ):
+                self._bior_lora_delta_ready = True
         else:
             self._training_pg = None
             self._wsync_pg = None
@@ -1072,10 +1367,14 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
         grpo_size = self.grpo_samples
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
         import contextlib
-        _gather_ctx = (
-            FSDP.summon_full_params(self._model, writeback=False)
-            if isinstance(self._model, FSDP) else contextlib.nullcontext()
-        )
+        # See generate_trajectory's identical exception for why 32B skips this gather
+        # entirely when the projectors are already FSDP-ignored (fully replicated).
+        if getattr(self, "_projectors_fsdp_ignored", False):
+            _gather_ctx = contextlib.nullcontext()
+        elif isinstance(self._model, FSDP):
+            _gather_ctx = FSDP.summon_full_params(self._model, writeback=False)
+        else:
+            _gather_ctx = contextlib.nullcontext()
         with torch.no_grad(), _gather_ctx:
             pe_base = self._policy.build_prompt_embeds(input_ids, protein_sequences)  # [B,P,H] CPU
         prompt_embeds = (
@@ -1426,12 +1725,19 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
             # FSDP-sharded at rest; summon_full_params gathers them so the projector
             # forward sees complete weights. (SYNC path — byte-identical to the
             # validated baseline when async is disabled.)
+            # 32B-scale exception: when the projectors are already FSDP-ignored (fully
+            # replicated per rank, not sharded — see the FSDP-wrap block), no gather is
+            # needed to reach them, and summon_full_params(self._model) would instead
+            # cascade into unsharding all 64 per-layer FSDP units at once (OOM, see the
+            # same block's comment). Skip it entirely in that case.
             from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
             import contextlib
-            _gather_ctx = (
-                FSDP.summon_full_params(self._model, writeback=False)
-                if isinstance(self._model, FSDP) else contextlib.nullcontext()
-            )
+            if getattr(self, "_projectors_fsdp_ignored", False):
+                _gather_ctx = contextlib.nullcontext()
+            elif isinstance(self._model, FSDP):
+                _gather_ctx = FSDP.summon_full_params(self._model, writeback=False)
+            else:
+                _gather_ctx = contextlib.nullcontext()
             with torch.no_grad(), _gather_ctx:
                 pe_base = self._policy.build_prompt_embeds(
                     input_ids.to(self._device), protein_sequences
@@ -2173,6 +2479,20 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
                 num_fwd_chunks > 1
                 and self._use_fsdp1
                 and hasattr(self._model, 'no_sync')
+                # 32B per-layer auto_wrap_policy: each FlatParamHandle mixes frozen
+                # base weights with trainable LoRA adapter weights. FSDP1's no_sync()
+                # accumulates the FULL unsharded gradient for every no_sync'd handle
+                # until the eventual synced chunk (see FSDP.no_sync's own docstring:
+                # "accumulate the full model gradients ... until the eventual sync").
+                # With grpo_samples/forward_batch_size forcing 3+ no_sync'd chunks
+                # before the final synced one, that's ~65.6 GiB/64 layers held live
+                # across all 64 layers simultaneously by the last chunk — matches the
+                # observed ~58 GiB backward OOM being CONSTANT regardless of
+                # max_generated_tokens (256 vs 1024 gave nearly identical OOM points,
+                # ruling out activation/sequence-length as the driver). Sync every
+                # chunk instead at this scale — extra reduce-scatters cost time, not
+                # a correctness or memory risk.
+                and not self._fsdp_full_shard_at_rest
             )
             _use_ddp_no_sync = (
                 num_fwd_chunks > 1
