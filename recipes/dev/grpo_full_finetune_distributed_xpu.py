@@ -489,9 +489,33 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
                         _GLOO_DP_REP_PG = _gloo_pg
                 # dp_shard gloo groups (4 ranks each, one per replicate group):
                 # e.g. rep_idx=0: [0,1,2,3], rep_idx=1: [4,5,6,7], rep_idx=2: [8,9,10,11]
+                #
+                # timeout=3600s (60min), NOT the 1800s (30min) gloo default: this group
+                # is ALSO used by BioReason's _broadcast_query_responses (HSDP server
+                # mode) — the 11 non-generating ranks in each replica enter this
+                # broadcast immediately and start their 30-min clock, while the shard
+                # leader may still be inside generate_from_embeds' retry loop (added
+                # 2026-09-09, e0b8f5d6): up to 3 attempts x timeout=600s each = 1800s
+                # worst case, ON TOP OF the leader's actual generation time (observed
+                # 553-950s and RISING with concurrency across 4N->8N->16N scale-up, so
+                # 16N's true generation time is likely higher still), before it even
+                # reaches this broadcast. Root-caused on HW (jobs 8814103/8814221):
+                # torch.distributed.DistStoreError / gloo "Timed out waiting 1800000ms"
+                # hit non-leader ranks in exactly the replicas whose leader logged a
+                # generate_from_embeds retry warning in the same window (verified by
+                # direct rank/timestamp correlation — e.g. rank 48's attempt1->attempt2
+                # gap was 10m21s, comfortably enough to blow a 30-min follower wait
+                # that started before the leader's first attempt even failed). 3600s
+                # covers ~1800s of retry overhead + ~1800s of generation time with
+                # margin; if 16N generation time itself exceeds ~30min this will need
+                # revisiting (check GENTIMING logs on the next HW run).
+                import datetime as _dt2
                 for _rep_idx in range(_n_dp_rep):
                     _gloo_ranks = [_rep_idx * _n_dp_shd + j for j in range(_n_dp_shd)]
-                    _gloo_pg = torch.distributed.new_group(_gloo_ranks, backend="gloo")
+                    _gloo_pg = torch.distributed.new_group(
+                        _gloo_ranks, backend="gloo",
+                        timeout=_dt2.timedelta(seconds=3600),
+                    )
                     if self.rank in _gloo_ranks:
                         _GLOO_DP_SHARD_PG = _gloo_pg
                     # v152: EP dispatch needs its OWN gloo communicator — separate from
@@ -3152,6 +3176,8 @@ class GRPOFullFinetuneDistributedXPU(FTRecipeInterface):
     _build_ws10_sharded_pgs = _weight_sync_module._build_ws10_sharded_pgs
     _sync_weights_to_vllm_xccl = _weight_sync_module._sync_weights_to_vllm_xccl
     _xccl_gather_fsdp1 = _weight_sync_module._xccl_gather_fsdp1
+    _cache_bioreason_lora_base_per_unit = _weight_sync_module._cache_bioreason_lora_base_per_unit
+    _publish_bioreason_lora_delta = _weight_sync_module._publish_bioreason_lora_delta
     _xccl_gather_and_stage_fsdp2 = _weight_sync_module._xccl_gather_and_stage_fsdp2
     _sync_weights_to_vllm_shm = _weight_sync_module._sync_weights_to_vllm_shm
     _wait_for_sync_complete = _weight_sync_module._wait_for_sync_complete
