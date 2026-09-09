@@ -733,6 +733,25 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
             p.requires_grad_(False)
         if _shard_ref_fsdp2:
             from torch.distributed._composable.fsdp import fully_shard
+            # HSDP (dp_replicate>1): scope the ref model's per-layer all-gather to
+            # THIS REPLICA's own dp_shard group, not the world default group.
+            # mesh=None resolves to the default process group, which at
+            # dp_replicate=1 (every 32B smoke test to date: 2N/4N/8N) trivially
+            # equals the dp_shard group (there's only one replica, so "world" and
+            # "shard" are the same ranks) — the bug was invisible until the first
+            # dp_replicate>1 run. At dp_replicate>1 (16N production, dp_replicate=15)
+            # mesh=None makes EVERY layer's unshard a 180-rank collective spanning
+            # all replicas, even though each replica's ref model is independent and
+            # never needs cross-replica sync. Root-caused on job 8813804/8813949:
+            # `torch.distributed.DistStoreError: wait timeout after 600000ms` inside
+            # `self._ref_model(...)`'s first forward, hitting one full replica's
+            # ranks at a time (node 13 then node 14 across two separate runs) —
+            # consistent with the LAST-connecting replica's ranks always being the
+            # ones left waiting on a world-scoped barrier the others already passed.
+            _ref_fsdp2_mesh = (
+                self._dp_mesh["dp_shard"] if getattr(self, "_dp_replicate", 1) > 1
+                else None
+            )
             _ref_decoder_layer_cls = None
             for _rn, _rm in self._ref_model.backbone.named_modules():
                 if _rn.endswith(".layers.0") or _rn.endswith("layers.0"):
@@ -746,7 +765,7 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
             _n_ref_layers_sharded = 0
             for _rn, _rm in reversed(list(self._ref_model.backbone.named_modules())):
                 if isinstance(_rm, _ref_decoder_layer_cls):
-                    fully_shard(_rm, mesh=None, reshard_after_forward=True)
+                    fully_shard(_rm, mesh=_ref_fsdp2_mesh, reshard_after_forward=True)
                     _n_ref_layers_sharded += 1
             # Root wrap: mirrors torchtune.training.shard_model's final "shard the
             # entire model to account for stragglers" step — the ref model has no
@@ -755,7 +774,7 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
             # model's projections are never trained and never need to be reachable
             # via a `summon_full_params`-style gather — build_full_embeds only calls
             # them, it doesn't need to write to them).
-            fully_shard(self._ref_model.backbone, mesh=None, reshard_after_forward=True)
+            fully_shard(self._ref_model.backbone, mesh=_ref_fsdp2_mesh, reshard_after_forward=True)
             log.info(
                 "BioReason: ref model FSDP2-sharded (%d decoder layers + root unit)",
                 _n_ref_layers_sharded,
