@@ -49,22 +49,42 @@ class VLLMClient:
         base_url: str,
         group_port: int = 51216,
         connection_timeout: float = 120.0,
+        pool_maxsize: Optional[int] = None,
     ):
         import requests
         from requests.adapters import HTTPAdapter
         from urllib3.util.retry import Retry
 
         self.session = requests.Session()
+        # ROOT-CAUSED 2026-08-17: read=5 here silently retried a hung/slow generation
+        # request up to 5x, each waiting its own full request-level timeout (600s for
+        # completions) before urllib3 gives up -- a genuinely stuck server could hang a
+        # caller for up to ~50 min with ZERO visible output (retries happen inside
+        # HTTPAdapter.send(), below any of our own logging), which looked identical to
+        # "just slow" until directly inspected. Retrying a read-timeout on a stateful
+        # generation call doesn't help anyway -- if the server's engine is wedged, a retry
+        # just re-queues another doomed request. connect=5 (fast connection-refused
+        # retries, e.g. server mid-restart) is still useful and kept. status=3 (retry on
+        # 500/502/503) kept since those are typically transient. read=0 makes a read
+        # timeout fail immediately and visibly instead of silently multiplying the wait.
         retry = Retry(
             total=5,
             connect=5,
-            read=5,
+            read=0,
             status=3,
             status_forcelist=[500, 502, 503],
             backoff_factor=2,
             allowed_methods=["POST", "GET"],
         )
-        adapter = HTTPAdapter(max_retries=retry)
+        # requests/urllib3 default pool_maxsize is 10 -- a caller dispatching more than 10
+        # concurrent requests per host (e.g. eval_cafa_fmax.py's --concurrency ThreadPoolExecutor)
+        # would silently serialize past that point regardless of server-side capacity. Only
+        # widen it when a caller explicitly asks; default (None) preserves the prior behavior
+        # for the RL recipes' single-request-at-a-time usage.
+        adapter_kwargs = {"max_retries": retry}
+        if pool_maxsize is not None:
+            adapter_kwargs["pool_maxsize"] = pool_maxsize
+        adapter = HTTPAdapter(**adapter_kwargs)
         self.session.mount("http://", adapter)
         self.session.mount("https://", adapter)
 
@@ -282,6 +302,7 @@ class VLLMClient:
         top_k: int = 0,
         top_p: float = 1.0,
         stop_token_ids: Optional[list[int]] = None,
+        repetition_penalty: Optional[float] = None,
     ) -> list[list[int]]:
         """Send pre-computed prompt embeddings to vLLM and return completion token IDs.
 
@@ -309,6 +330,7 @@ class VLLMClient:
 
         import base64
         import io
+        import requests
 
         comp_url = f"{self.base_url}/v1/completions"
         encoded = []
@@ -328,6 +350,12 @@ class VLLMClient:
         }
         if top_k and top_k > 0:
             payload["top_k"] = top_k
+        if repetition_penalty is not None:
+            payload["repetition_penalty"] = repetition_penalty
+        # NOTE: no_repeat_ngram_size is a HF-generate-only concept -- vLLM's
+        # OpenAI /v1/completions has no equivalent field, so it is intentionally
+        # not forwarded here. repetition_penalty is the only anti-repetition
+        # lever vLLM exposes over this API.
         # stop_token_ids: tell vLLM to STOP decoding at EOS/stop tokens server-side.
         # Without this every sequence runs to max_tokens (the recipe only truncated
         # post-hoc on the train side) — measured stop_rate=0.000, trunc_rate~0.5 on
@@ -336,7 +364,33 @@ class VLLMClient:
         if stop_token_ids:
             payload["stop_token_ids"] = list(stop_token_ids)
 
-        r = self.session.post(comp_url, json=payload, timeout=600)
+        # Retry transient connection failures (timeouts, connection resets) —
+        # at high fan-in (e.g. 240 concurrent requests/step across a centralized
+        # vLLM pool at 16-node scale), a single request occasionally times out
+        # even though the server itself is healthy (confirmed via pbsnodes: not
+        # an offline/dead node), and with no retry this raises immediately and
+        # kills the whole multi-hundred-rank MPI job over one transient blip.
+        # See memory/project_bioreason_32b_grpo_fsdp1_per_layer_first_working_path_20260906.md
+        # (16N job 8812775: rank 72 hit MaxRetryError while the vLLM node stayed
+        # job-exclusive/healthy — same pattern as the earlier 2/180-rank failure
+        # at job 8811293). Bounded retries, no backoff needed beyond vLLM's own
+        # queueing — a retry either finds the request scheduled by then or the
+        # server is genuinely down, in which case it fails fast on connect.
+        _max_attempts = 3
+        for _attempt in range(_max_attempts):
+            try:
+                r = self.session.post(comp_url, json=payload, timeout=600)
+                break
+            except requests.exceptions.RequestException as e:
+                if _attempt == _max_attempts - 1:
+                    raise RuntimeError(
+                        f"vLLM /v1/completions (prompt_embeds) failed after "
+                        f"{_max_attempts} attempts: {e}"
+                    ) from e
+                logger.warning(
+                    "generate_from_embeds: request failed (attempt %d/%d): %s — retrying",
+                    _attempt + 1, _max_attempts, e,
+                )
         if r.status_code != 200:
             raise RuntimeError(
                 f"vLLM /v1/completions (prompt_embeds) failed: "
