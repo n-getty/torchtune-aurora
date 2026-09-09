@@ -984,6 +984,7 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
                     device_mesh=self._dp_mesh,
                     ignored_modules=_ignored,
                     use_orig_params=True,
+                    device_id=self._device,
                     limit_all_gathers=True,
                     auto_wrap_policy=_auto_wrap_policy,
                     backward_prefetch=(
