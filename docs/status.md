@@ -24,7 +24,28 @@ is not propagation-specific). KL throttling and a broken loss are both ruled out
 the reward off hierarchy-propagated F1 would trade the 7.2x compression for 17% dead
 groups. It is a learning-config change beyond the one sanctioned ablation, so it is
 reported, not run. Details: `docs/reports/bioreason_32b_grpo_2node_session_20260914.md`
-§ reward propagation; re-runnable via `experiments/bioreason/reward_vs_exact_trend.py`.
+§ reward propagation; re-runnable via `experiments/bioreason/reward_vs_exact_trend.py`
+(now carries `--selftest`, `--block`, `--acf`).
+
+*The choice really is that binary — the two obvious middle grounds were costed offline
+(zero allocation) and both fail.* Scored on the same 3200 Phase 2 rollouts, with the
+pipeline first validated by reproducing the stored reward exactly (mean 0.2589, sd 0.2677,
+32.7% zero):
+
+```
+variant                     mean    dead groups   OLS t   block-perm p
+propagated (current)      0.2589       0.5%       +0.39      0.37   NS
+depth-weighted            0.2122       2.5%       +0.30      --     NS
+IA-weighted (CAFA IA.txt) 0.2228       0.8%       +0.57      0.30   NS
+exact-match               0.0648      17.0%       +2.37      0.02   TREND
+```
+
+Neither softened variant recovers the trend; only full exact-match does, and only it pays
+the 17% dead-group cost. **Two cautions to carry into that decision, both established
+above:** (1) the exact-match series is a **V**, so "it trends" does not mean "it improves
+monotonically"; and (2) the V does not reach F_max, so a reward that tracks the V is not
+yet shown to track the metric we are graded on. That is an argument for treating any
+reward swap as a hypothesis needing its own endpoint eval, not as a fix.
 
 **Corrected 2026-09-16 (late), two items, both from auditing a tool rather than a number:**
 
