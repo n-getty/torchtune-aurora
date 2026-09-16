@@ -1,6 +1,110 @@
 # Project Status — Aurora RL (torchtune XPU)
 
-Last updated: 2026-08-11 late (K3 SINGLE-USER: first direct c=1 measurement 1.041 tok/s; AR fusion +9.3% measured and defaulted ON; and the decisive structural finding — eager mode caps this stack at 7.2 tok/s no matter what else is fixed.)
+Last updated: 2026-09-16 (BioReason 32B GRPO 2N campaign — the 100-step science run has
+READ OUT, and it is a NULL. F_max Δ = **−0.0014w, t=−0.35** (min detectable 0.0079), and
+the reward has **no trend either** (OLS t=+0.38; the apparent +0.0222 half-mean is one
+depressed block landing in half 1 — when half-mean and OLS disagree 4x, the series is not
+trending). We have **NOT** beaten the paper: ours_step100 is −0.0430/−0.0455 behind
+`rel_rl` on two independent draws of the 424-protein intersection. The rebase-to-step1050
+credit (+0.0128) that made the gap look closable **does not replicate** — same-set at
+N=500 it reads **−0.0047 (t=−1.16, n=3, settled)** with all three step1050 reps below the
+step1550 pool mean — so the residual
+after a paper-sized RL step is +0.0162/+0.0187, about 3–3.5σ.
+
+DIAGNOSIS (closed): the policy IS learning — exact-match F1 rises with an OLS-on-step-means
+t=+2.37 — while the propagated reward it optimizes is flat (t=+0.39). Normalized by each
+metric's own sd the same trend is **7.2x weaker in the reward**: propagation expands
+`|pred|` ~6.4x against an unchanged `|gt|`, so 88% of propagated TPs are ancestor credit
+the model never emitted, and real improvement arrives as a small perturbation on a large
+near-stationary component. Two mechanisms inferred from that headline were tested and
+**refuted** (propagation raises advantage spread rather than starving it; length-chasing
+is not propagation-specific). KL throttling and a broken loss are both ruled out.
+
+**DECISION PENDING FOR THE USER** (not acted on, per the plan's escalation rule): moving
+the reward off hierarchy-propagated F1 would trade the 7.2x compression for 17% dead
+groups. It is a learning-config change beyond the one sanctioned ablation, so it is
+reported, not run. Details: `docs/reports/bioreason_32b_grpo_2node_session_20260914.md`
+§ reward propagation; re-runnable via `experiments/bioreason/reward_vs_exact_trend.py`.
+
+**Corrected 2026-09-16 (late), two items, both from auditing a tool rather than a number:**
+
+1. *The word "clustered" above was a mislabel, and my first attempt to earn it was an
+   inert instrument.* A moving-block bootstrap returned p≈0.50 on constructed series with
+   true slopes of 0.000 / 0.010 / 0.024 / **0.050** (naive t=+14.8) — it refit against a
+   renumbered x-axis, destroying the time ordering it was meant to preserve. The verdict
+   I drew from it ("the exact-match trend does not survive clustering") is **retracted**.
+   A block-*permutation* test (shuffle blocks against a FIXED x) calibrates correctly
+   (0.000→0.479, 0.050→0.0002) and says the exact-match trend **does** survive: p=0.010
+   (blk=4) to 0.036 (blk=10), seed-stable; block size pinned from the data's own ACF,
+   whose detrended residuals are white at every lag but one marginal lag-5. Propagated
+   reward is NS at every block size (0.37). **The diagnosis above is unchanged and now
+   rests on a validated tool.**
+2. *But the rollout series is a V, not a trend, and the V does not reach F_max.*
+   Exact-match declines for ~50 steps (t=−2.32), troughs at steps 40–49, then recovers to
+   ~29% above the start (t=+1.91); the fitted positive slope describes no epoch of the
+   run. That V predicts step40 lowest and step100 highest on the held-out metric. The
+   four banked N=500 k=1 arms give the **near-inverse** — `step60 (0.6286) < step100
+   (0.6321) < step0 (0.6335) < step40 (0.6358)` — with the entire spread inside 1.4σ. So
+   the V is a train-set phenomenon the graded metric never sees. This kills the "recovery
+   is underway, just extend the run" reading, and independently corroborates the
+   proxy/metric decoupling. Cost: zero allocation — the arms were already on disk.
+
+**Refuted 2026-09-16 (do not revive):** a subagent reported that GRPO rollouts are "badly
+degenerate" and offered it as the explanation for the null. Measured on the Phase 2
+`rollouts.jsonl` (n=3200): **2 rollouts (0.06%)** carry the cited `<|begin_of_text|>`
+artifact, 0% are empty, 2.2% are <40 chars (all scoring exactly 0.0), median length 4877
+chars, 69% contain a GO id. The degenerate tail contributes ~2pp of the known 34.2%
+zero-score floor — real but minor, not a mechanism for a campaign-wide null. The
+companion claim (GRPO's chat-wrapped prompt diverges from the SFT checkpoint's format) is
+a real difference but a **deliberate** one (`dataset.py:251-253`, targets the
+SFT-canonical template), and `check_grpo_base_prompt_render.py` passes rc=0 on the live
+base, ruling out the empty-user-turn failure mode.
+
+In flight: 8831915 (Phase 4 per-group-advantage ablation, the pre-registered §4c branch —
+note its stated precondition "reward up" did NOT hold), 8831916 (rebase-to-step1050, now
+known to be a null/replication arm). The step1050 step-0 control is **complete at n=3**
+(0.6327 / 0.6238 / 0.6299, mean 0.6288 sd 0.0046). The two GRPO arms must **never** be
+differenced against each other; 8831916's endpoint is differenced only against its own
+step-0 pool (0.6288), not against the step1550 pool.
+
+**Stated (inert) delta to carry into both arms' readouts:** the
+`logprobs_mode=processed_logprobs` wiring landed in `torchtune/dev/rl/vllm_backend.py` at
+15:18, *after* the 8829513 baseline ended at 15:13, so these two arms import it and the
+baseline did not. It is inert here by construction — both run
+`async_generation.enabled=false`, where it changes only which logprobs vLLM *returns*,
+values the sync trainer never reads because it recomputes them. No sampling, scheduling,
+or weight path is touched. Named rather than omitted, because an unmeasured second
+variable is this campaign's recurring burn. Suite after the patch: 1059 passed / 276
+skipped vs the pre-apply 1051 / 276 — exactly the 8 new guard tests.)
+
+**Second (inert) delta, same rule:** the async `weight_lag` off-by-one fix landed
+2026-09-16 in `grpo_full_finetune_distributed_xpu.py`, `grpo_bioreason_distributed_xpu.py`,
+and `vllm_backend.py`, so both queued arms import it and the 8829513 baseline did not.
+Inert by construction: it touches only the METRICS *logging* tail, which is guarded by
+`_prod is not None` — and `async_generation` is absent from
+`bioreason_32b_lora_grpo_hsdp_xpu.yaml`, so `_async_generation_enabled=False` and
+`_rollout_producer` stays `None` on both arms. No tensor, sampling, or weight path is
+touched. Verified by reading the config and the guard, not assumed. (The bug: the tail
+read the weight counter *after* the step's own publish, inflating reported staleness by
+one — which matters because the recipe fail-fasts on `max_staleness > 1`, so a
+cry-wolf readout is exactly what would get a correct async run switched off.) Suite:
+1083 passed / 276 skipped, up from 1077 — the 6 new guard tests.
+
+Previous update: 2026-09-15 late (BioReason 32B GRPO 2N campaign. THE BLOCKING RISK IS THE
+METRIC, NOT THROUGHPUT: on the NeMo baseline reward rose +44% (p<0.001) over 302 steps
+while F_max stayed FLAT (0.0032 spread, 5x below the ±0.016 eval noise floor). Root cause
+identified — the reward is an unranked SET-F1 while F_max is a threshold-swept RANKING
+metric, and the model emits zero confidences, so every term scores 1.0 and the sweep is
+inert. Offline fix VALIDATED: ranking terms by G=8 group frequency gives +0.0349 F_max on
+the SAME term set, 2x the noise floor, 4/4 folds agreeing. Throughput side: ofi transport
+was a −40.4% win (four launchers had been silently hardcoding `mpi` AFTER exporting
+`ofi`), ref_fbs 3→4 −13.1%; MFU 2.15%. Two levers refuted tonight — length-sorted policy
+chunks (deleted 25.6% of padded FLOPs for 0% speed) and ref-prefix sharing (categorical
+OOM). Together they establish the backward is GATHER-bound, not FLOP-bound, and expose an
+~11-12% jitter floor that survives length normalization. In flight: job 8829513, the
+100-step Phase 2 science run that answers whether GRPO moves F_max.)
+
+Previous update: 2026-08-11 late (K3 SINGLE-USER: first direct c=1 measurement 1.041 tok/s; AR fusion +9.3% measured and defaulted ON; and the decisive structural finding — eager mode caps this stack at 7.2 tok/s no matter what else is fixed.)
 
 Previous update: 2026-08-11 (K3 `banned:1` CAUSALLY confirmed to be driven by `max_num_batched_tokens` via a real control — but the leading MoE-allocation explanation for WHY is now REFUTED on hardware. Chunked KDA prefill implemented and HW-validated at 2.15-7.12x.)
 
@@ -9,6 +113,8 @@ Previous update 2026-08-10 (K3 hit 65.20 output tok/s at c=128, 10x the prior be
 Previous update 2026-07-26 (seq4096 isoFLOPs comparison COMPLETE for both models. Dense Qwen3-4B: eager 3.75% MFU -> flash 8.93% MFU (2.38x). MoE Qwen3-30B-A3B: the mem_reserved-ratchet crash that blocked every attempt is FIXED via `checkpoint_experts` — a new, surgical `torch.utils.checkpoint` wrap around ONLY `self.experts(...)` inside `MoE.forward()` (not the router, not EP dispatch/combine — safe by construction, cannot reintroduce the v158 argsort-tie-break bug). CPU-validated (6/6 new tests + 690/695 full suite), then HW-validated with a 10-step steady-state run: `peak_memory_reserved` plateaus flat at 56.43-56.44 GiB from step 2 through step 10 (zero further ratchet, vs. every prior attempt crashing in that exact range within 1-3 steps) — mechanistic proof the fix works, not a lucky single run. **Final MoE seq4096 number: 265.1 tok/s/gpu steady-state (cov=0.032), ~1.27-1.29% MFU.** Compared to dense's 1562.31 tok/s/gpu / 8.93% MFU at the same seq_len/tile-count/flash-on config: dense is ~5.9x faster tok/s/gpu, ~6.9x higher MFU — a gap that did NOT close at the longer, more realistic sequence length (if anything slightly wider than seq1536's 4.56x), confirming this is real EP/collective/kernel overhead rather than an artifact of the seq1536 alpaca corpus's short/padding-heavy length distribution. The user's standing MoE-vs-dense parity goal remains UNMET at both seq_lens tested. One dumb bug fixed along the way: `_setup_model`'s new `checkpoint_experts` gate initially referenced `cfg`, a name never in scope inside that helper (only `cfg_model` is passed) — fixed by threading `checkpoint_experts: bool` through as an explicit parameter, same pattern as every other `_setup_model` flag. Self-review (AskSage quota exhausted, codex-review unavailable) caught one real gap: `checkpoint_experts=true` was a silent no-op on non-EP configs (the non-EP branch never read it) — fixed with an explicit warning log.)
 
 ## Recent changes (newest first)
+
+- **2026-09-15 — BioReason 32B GRPO 2N: the metric, not the throughput, is the blocking risk; and the backward is GATHER-bound, not FLOP-bound.** **(1) THE METRIC IS STRUCTURALLY MISMATCHED TO THE REWARD, and the fix is validated offline.** The NeMo 302-step baseline raised reward **+44% (p<0.001)** while F_max stayed **flat** (0.6991→0.7023, a 0.0032 spread — **5x below the ±0.016 eval noise floor**). Root cause found: the reward is an unranked **set-F1** while F_max is a **threshold-swept ranking** metric, and the model emits **zero confidences** — verified in `score_fmax_scored.py` and by `grep -c` on the rollouts — so every predicted term scores 1.0 and the threshold sweep is inert. Ranking the *same* term set by G=8 group frequency gives **+0.0349 F_max, 2x the noise floor, 4/4 folds agreeing**, and moves the optimal tau from 0.05 to 0.30-0.55, i.e. the sweep starts doing real work. Pooling terms alone *hurts* (−0.006); the gain is pure ranking. Caveat: the proxy used G=4 inference replicates because **the recipe has always discarded its G=8 completions** — now fixed behind `TORCHTUNE_DUMP_ROLLOUTS=1`, enabled on the Phase 2 run so a real rollout dump exists for the first time. **(2) THROUGHPUT: `ofi` transport is −40.4%** (860.7→513.0s; grpo −48.4%, length-matched A/B) — and **four launchers were hardcoding `CCL_ATL_TRANSPORT=mpi` AFTER exporting `ofi`**, so every multi-node RL run in this repo had been on the slow transport. MFU 1.6%→2.9% (later corrected to **2.15%** when a cold step and a nested timer were fixed). `ref_forward_batch_size` 3→4 accepted at **−13.1%**. **(3) TWO LEVERS REFUTED, and the pair is more informative than a win.** Length-sorted policy microbatches deleted **25.6% of padded compute** (52,878→39,363 padded tokens, 20.8%→5.0% waste, 1.4 GiB less held) for **0% speed** — so this backward is not FLOP-bound. Ref-prefix sharing **OOM'd categorically**: the suffix pass needs an explicit bottom-right causal mask and has `q_len != kv_len`, violating both flash-kernel guards, so SDPA materializes `G x heads x q_len x kv_len` ≈ **18-21 GiB** — quadratic in rollout length. The documented mitigation (`RESPONSE_ONLY_LOGITS`) targets logits, not scores, and would not have helped. **Rule added: when a change alters mask shape or q/kv length, ask "does this still hit the fused kernel?" before any tensor-size arithmetic.** Pooling both legs, `bwd ≈ 57.7 + 0.1146·len_mean` (R²=0.60) ⇒ **~30% of the backward is fixed per-chunk cost** (each chunk pays a full FSDP all-gather sweep of the 32B backbone). The lever is **chunk count, not tokens**. **(4) A MEASUREMENT FLOOR that changes how cells must be sized.** The sorted leg held `len_mean` within 4.2% and still swung bwd **11.9%** with a *negative* length slope — so **~11-12% of jitter survives s/ktok normalization**. This is the mechanism behind four wrong verdicts on one knob (`fbs=3` rejected at +7.7%, "corrected" to −3.0%, settled as a wash). `check_run_health.sh --compare` now always prints an **ALL WARM STEPS** aggregate with within-leg spread and a WASH/UNDERPOWERED verdict — the single-step table gave **+13.8% and +0.3% from the same two logs** twenty minutes apart. Sizing rule: **NSTEPS=7 for any cell expected to move <10%**. **(5) Earlier in the campaign:** HSDP replicas grow *global batch*, not update rate, so the headline "19.7x worse per accelerator" was an artifact of dividing by 192 tiles while 91.7% idle-block — the real per-replica gap is ~2.8x; a non-HSDP FSDP wrap passing `ignored_modules` instead of `ignored_states` was sharding LoRA by projection type (backward 786→296s) and masking an `all_reduce` deadlock in a rank-dependent loop. **In flight:** job **8829513** (100-step Phase 2 science run, 36h — answers whether GRPO moves F_max) and **8829514** (fbs=4 chunk-count cell, sized for the jitter floor). See `docs/reports/bioreason_32b_grpo_2node_session_20260914.md` and the `project_bioreason_*_20260915` memory entries.
 
 - **2026-08-11 (late) — K3 single-user: first direct c=1 number, a measured +9.3% win, and an EAGER CEILING that reprioritises the whole workstream.** **(1) BASELINE MEASURED.** c=1, 3 nodes, TP=32/EP-on, stock config, pristine tree: **1.041 tok/s** (1.039/1.040/1.041 over 3 reps, **0.19% spread**, 0 `banned:1`) = **961 ms/token**. The plan had assumed 1249 ms from evaluating the high-concurrency fit `step(c)=1.249+0.00516c` at c=1; that model understates c=1 by 8%. Note per-user this is **2.0x the celebrated 65.20 tok/s @ c=128** (= 0.509 tok/s/user) — the aggregate-optimal config is the *worse* one for a single user. **(2) FIRST MEASURED WIN, +9.3%.** `VLLM_KIMI_FUSE_SHARED_EXPERT_AR=1` fuses the shared-expert and routed all_reduce (`AR(a)+AR(b) == AR(a+b)`, removes 92 of 463 collectives/step): **1.041 -> 1.138 tok/s**, 961 -> 879 ms/token, non-overlapping distributions, engagement verified per-rank (3 ranks logged "enabled" in the fusion leg, 0 in baseline). Pre-registered prediction was +5.8%; actual +9.3%. **Now default ON.** Upstream independently credits the same transformation (`VLLM_ENABLE_K3_LATENT_MOE_TAIL_FUSION`, absent from our checkout) ~7-8%. **(3) THE CEILING — the most consequential finding.** The trace shows **21,293 kernel launches per token**; on-node measurement gives **6.5 us per launch** (identical with `ZE_ENABLE_API_TRACING` on or off, and with 12 concurrent processes — both hypotheses refuted). So the **eager floor is 138 ms/token = 7.2 tok/s** with zero compute, zero collectives, zero everything. Our step is 961 ms, so *every* lever in the original plan — collective removal, host-sync hoisting, kernel tuning — lives above a floor that caps us at 7.2 against a 20-70 target. vLLM reports **118 tok/s at c=1 on GB300 without speculative decoding**; at our launch count that would need 0.40 us/launch, impossible eagerly, so **upstream is not dispatching 21k kernels per token**. The plan's "cut collectives first, graph capture secondary" is therefore backwards. Only two things move the ceiling: fewer launches (kernel fusion) and no per-launch cost (graph capture). **(4) Collectives measured, estimate refuted.** 14 KiB 32-rank all_reduce = **0.557 ms** (assumed 1-2 ms), so 463/step is **20.6%** of the step against the assumed 37-74%; in-situ from the trace is 269 ms (**1.04x** isolated, so no large rendezvous premium). The fabric is **latency-bound in K3's regime** — 37x more bytes costs only 1.25x time — which independently explains the earlier WS6/WS7/FP8-wire nulls, all of which tried to cut bytes rather than count. **(5) Graph capture ENGAGED at TP=32 for the first time** (torch-2.11 venv + a new opt-in `VLLM_XPU_ALLOW_GRAPH_WITH_COMMS` escape hatch around `xpu.py:216`'s blanket `world_size_across_dp > 1` refusal; `--enforce-eager` and the `TORCH_COMPILE_DISABLE` exports are now knobs, not hardcodes). It resolves to **PIECEWISE, not FULL** — `xpu.py:223-232` downgrades because sycl-tla FMHA kernels cannot be captured — so **FULL capture on XPU is blocked on the attention backend**. A perf number was NOT obtained: the run dies in engine init, root-caused to `logger.info_once` inside traced code (its pybind11 closure is unpicklable, killing all 32 Ray workers in `determine_available_memory`). First fix — wrapping it in `@torch._dynamo.disable` — was WRONG and made it worse (calling a disabled function from traced code is unsupported graph break gb0098); the loud pickle error was Ray failing to ship that exception home, two layers from the real cause. Traced logs now removed outright. Third attempt (post-fix) ran **clean end-to-end** -- workers init at `torch=2.11.0+xpu`, `cudagraph_mode=PIECEWISE`, `enforce_eager=False`, **zero errors**, weights 100% loaded -- and was then **killed by walltime seconds before the server accepted a request**. So the capture path is proven functional and only needs a hold with enough time; the harness now refuses a leg that cannot finish (~30 min/leg cold). **Pre-registered bound: even removing 100% of dispatch is +16.7%**, so capture alone is not the answer — launch COUNT matters as much as launch COST. **(6) Instrument failures caught before they produced numbers:** a Kineto trace with zero CPU rows and zero collectives would have returned a confident "CAPTURE" verdict from a 91.5% unattributed gap (the analyzer now refuses such traces); `delay_iterations>0` silently captured nothing; the A/B harness didn't forward `PYTHON`/`RAY_ENV_MODE` and silently ran torch 2.10, which would have read as "capture doesn't help on XPU" (now hard-guarded). See `experiments/kimi_k3_serving/GAP_ANALYSIS_vs_UPSTREAM.md`, `memory/project_k3_eager_ceiling_and_first_win_20260811.md`, `memory/project_k3_collective_latency_measured_20260811.md`, `memory/project_k3_kineto_no_cpu_rows_20260811.md`.
 
