@@ -284,6 +284,67 @@ def mode_bridge(onto: Ontology, eval_dirs) -> int:
     return 0
 
 
+def _score_dir_by_protein(onto: Ontology, d: str) -> dict:
+    """Map protein_id -> mean training-reward score over that protein's generations.
+
+    A directory may hold several generations per protein (the paper's released dirs
+    have 330 files for 250 proteins). Averaging within protein first makes the pairing
+    one-per-protein regardless of how many generations each arm emitted.
+    """
+    acc: dict = {}
+    for fn in sorted(os.listdir(d)):
+        if not fn.endswith(".json"):
+            continue
+        try:
+            j = json.load(open(os.path.join(d, fn)))
+        except Exception:
+            continue
+        item = j[0] if isinstance(j, list) else j
+        if not isinstance(item, dict):
+            continue
+        pid = item.get("protein_id")
+        gt = _eval_gt(item)
+        if not pid or not gt:
+            continue
+        pred = set(GO_RE.findall(item.get("generated_response") or ""))
+        acc.setdefault(pid, []).append(f1(onto.propagate(pred), onto.propagate(gt)))
+    return {k: mean(v) for k, v in acc.items()}
+
+
+def mode_paired(onto: Ontology, before: str, after: str) -> int:
+    """Paired within-arm delta on the training reward.
+
+    This is the statistic that calibrates our RL against the paper's. Cross-ARM
+    *levels* are not comparable when the protein populations differ (ours overlaps the
+    paper's released set by only 3 of 250), but a within-arm paired delta is immune to
+    that: each arm is differenced against itself on an identical protein set.
+
+    See ``memory/project_bioreason_paper_rl_gain_paired_calibration_20260916.md``.
+    """
+    a, b = _score_dir_by_protein(onto, before), _score_dir_by_protein(onto, after)
+    common = sorted(set(a) & set(b))
+    if not common:
+        print("no proteins in common -- these two dirs cannot be paired")
+        return 1
+    deltas = [b[p] - a[p] for p in common]
+    n = len(deltas)
+    m = mean(deltas)
+    if n < 2:
+        print(f"n={n}: too few pairs for a t statistic")
+        return 1
+    sd = math.sqrt(sum((x - m) ** 2 for x in deltas) / (n - 1))
+    t = m / (sd / math.sqrt(n)) if sd > 0 else float("inf")
+    up = sum(1 for x in deltas if x > 1e-12)
+    dn = sum(1 for x in deltas if x < -1e-12)
+    print(f"  before : {os.path.basename(before.rstrip('/')):>44}  mean {mean(a[p] for p in common):.4f}")
+    print(f"  after  : {os.path.basename(after.rstrip('/')):>44}  mean {mean(b[p] for p in common):.4f}")
+    print(f"  paired : n={n}  delta={m:+.4f}  sd={sd:.4f}  t={t:+.2f}")
+    print(f"           improved {up}   worsened {dn}   unchanged {n - up - dn}")
+    print("  NOTE: compare this delta to the paper's +0.0225 (t=+5.72). Do NOT compare")
+    print("        levels across arms with different protein populations.")
+    return 0
+
+
 def self_test(onto: Ontology) -> int:
     """Sanity-check the hand-rolled closure before trusting any score."""
     ok = True
@@ -312,9 +373,11 @@ def self_test(onto: Ontology) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--mode", choices=["rank", "bridge"])
+    ap.add_argument("--mode", choices=["rank", "bridge", "paired"])
     ap.add_argument("--rollouts", help="rollouts.jsonl from a run OUTPUT_DIR")
     ap.add_argument("--eval-dir", action="append", default=[], help="repeatable; an eval_out/<tag> dir")
+    ap.add_argument("--before", help="--mode paired: the earlier eval dir")
+    ap.add_argument("--after", help="--mode paired: the later eval dir")
     ap.add_argument("--obo", default=DEFAULT_OBO)
     ap.add_argument("--ia", default=DEFAULT_IA)
     ap.add_argument("--self-test", action="store_true")
@@ -331,6 +394,10 @@ def main() -> int:
         if not args.eval_dir:
             ap.error("--mode bridge requires at least one --eval-dir")
         return mode_bridge(onto, args.eval_dir)
+    if args.mode == "paired":
+        if not (args.before and args.after):
+            ap.error("--mode paired requires --before and --after")
+        return mode_paired(onto, args.before, args.after)
     ap.error("pass --mode or --self-test")
 
 
