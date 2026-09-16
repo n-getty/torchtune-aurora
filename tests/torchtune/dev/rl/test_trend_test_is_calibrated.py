@@ -109,7 +109,39 @@ def test_shape_check_flags_sign_disagreement():
     assert "ta * tb < 0" in text
 
 
-@pytest.mark.parametrize("flag", ["--selftest", "--acf", "--block"])
+def test_rates_carry_their_window():
+    """A zero-advantage rate must never print without the window it was measured over.
+
+    THE BURN: the Phase 4 de-risking measured 0/184 zero-advantage groups over
+    post-warmup steps 11-56, while the SAME file's full-run rate is 2/400 (both ties
+    inside warmup). Those are one measurement in two windows, and the rate is the number
+    most likely to be quoted in isolation. Banked as "state the window WITH the rate".
+    """
+    text = SCRIPT.read_text(errors="replace")
+    assert "--min-step" in text and "--max-step" in text, (
+        "the window filter is gone; without it the zero-advantage rate can only be "
+        "produced by hand-slicing, which is how the window gets dropped"
+    )
+    assert "WINDOW: steps" in text, "the window must be printed before any statistic"
+    # The rate lines themselves must interpolate the window, not just print it once at
+    # the top where a copy-paste of the rate line alone would lose it.
+    assert "zero-variance groups {win}" in text, (
+        "the zero-variance lines must carry the window inline"
+    )
+
+
+def test_empty_window_fails_loudly():
+    """An out-of-range window must exit nonzero, not report a rate over zero groups."""
+    text = SCRIPT.read_text(errors="replace")
+    assert "no records in window" in text, (
+        "an empty window must sys.exit with a message naming the file's real step "
+        "range -- silently reporting 0/0 would read as 'no dead groups'"
+    )
+
+
+@pytest.mark.parametrize(
+    "flag", ["--selftest", "--acf", "--block", "--min-step", "--max-step"]
+)
 def test_documented_flags_exist(flag):
     text = SCRIPT.read_text(errors="replace")
     assert flag in text, f"{flag} is referenced in the docs/tests but not in the script"
