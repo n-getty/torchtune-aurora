@@ -6,7 +6,12 @@
 #PBS -l walltime=01:00:00
 #PBS -l filesystems=home:flare
 #PBS -j oe
-#PBS -o /lus/flare/projects/ModCon/ngetty/torchtune/experiments/bioreason/logs/pbs_2n_eval_grpo_ckpt.out
+# -o is a DIRECTORY (trailing slash), so PBS names the file br_eval_grpo.o<jobid> and
+# every job gets its own. It used to be a fixed filename, which is fine for one eval at
+# a time but silently destroys the evidence when two run concurrently (e.g. the rep1 and
+# rep2 endpoint arms) -- and a PBS -o collision leaves no trace that it happened.
+# Note ^array_index^ does NOT work here: that token is substituted for job arrays only.
+#PBS -o /lus/flare/projects/ModCon/ngetty/torchtune/experiments/bioreason/logs/
 #
 # PHASE 3 — held-out CAFA F_max eval of a GRPO LoRA checkpoint.
 #
