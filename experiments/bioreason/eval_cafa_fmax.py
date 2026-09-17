@@ -67,6 +67,7 @@ import os
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # GO aspect long-form -> short code, verbatim from BioReason-Pro/eval.py:36.
 GO_ASPECT_CODES = {
@@ -469,8 +470,26 @@ def build_model(args):
                     f"{args.max_protein_len}. Use the matching cache or re-encode."
                 )
 
-    device = torch.device("xpu") if (hasattr(torch, "xpu") and torch.xpu.is_available()) \
+    # ROOT CAUSE (2026-09-03): the vLLM-HTTP client path (--vllm_http_url) was documented
+    # as "backbone-free CPU-only" (see load_backbone below and every launcher's comments)
+    # but this line put it on XPU whenever XPU was available regardless. The client's own
+    # compute -- an embedding-table lookup + a small MLP projection for build_prompt_embeds
+    # -- is genuinely cheap CPU work; there was never a real need for it to touch the GPU.
+    # Putting it on XPU meant every client process opened a real Level-Zero context on
+    # tiles the vLLM servers are ACTIVELY generating on. ZE_AFFINITY_MASK scoping (see the
+    # 2N/4N launchers) only restricts WHICH tiles are visible -- it does not stop the
+    # client from creating a context and competing for shared driver-level resources
+    # (command queues, event pools) with the server's own context on those same tiles.
+    # This is a resource race, not a deterministic bug, which is exactly why evals have
+    # been "sometimes hangs, sometimes not" for dozens of prior runs rather than reliably
+    # reproducing: intermittent UR_RESULT_ERROR_OUT_OF_RESOURCES client errors and vLLM
+    # EngineCore crashes under load, root-caused after two ZE_AFFINITY_MASK-only "fixes"
+    # (this session) failed to make the 2-node harness reliable. Force CPU whenever the
+    # client doesn't own a backbone -- there is no other XPU work on this path.
+    device = torch.device("cpu") if getattr(args, "vllm_http_url", None) else (
+        torch.device("xpu") if (hasattr(torch, "xpu") and torch.xpu.is_available())
         else torch.device("cpu")
+    )
     _adapter = getattr(args, "adapter_path", None)
     # 32B can't fit one tile for generation -> shard the backbone across N tiles via HF
     # device_map. backbone_device_map="auto" lets HF spread layers over all tiles VISIBLE
@@ -600,6 +619,33 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--shard_id", type=int, default=0, help="this shard's index [0,N)")
     ap.add_argument("--max_num_seqs", type=int, default=8)
     ap.add_argument("--temperature", type=float, default=0.0)  # greedy eval
+    ap.add_argument("--k", type=int, default=1,
+                    help="Number of independent completions to sample per protein. k=1 (default) "
+                         "is the historic single-sample behaviour and writes to --out unchanged. "
+                         "k>1 writes k SIBLING replicate dirs <out>/k00 .. <out>/k{N-1}, each "
+                         "containing one _k00.json per protein, which is exactly the layout "
+                         "rescore_by_group_frequency.py consumes (--replicate_dir <out>/k00 ...). "
+                         "That indirection is deliberate: score_fmax_scored.py calls "
+                         "ce.select_best_from_k_samples when it sees _k01+ IN ONE DIR, which picks "
+                         "the highest-F1 sample AGAINST GROUND TRUTH -- oracle selection that would "
+                         "invalidate the number. Keeping each sample in its own dir makes that "
+                         "impossible by construction and reuses the already-validated rescorer "
+                         "(it reproduces the published 0.6737/0.6417 exactly) instead of adding a "
+                         "second scoring path. Motivation: frequency ranking (count/k as the "
+                         "confidence) is worth +0.0349 F_max offline, ~2x the +-0.016 noise floor, "
+                         "but F_max's threshold sweep is inert without confidences -- see "
+                         "memory/project_bioreason_freq_ranking_beats_flat_confidence_20260915.md. "
+                         "COST: k-sample eval is ~k x the generation work.")
+    ap.add_argument("--repetition_penalty", type=float, default=1.0,
+                    help="vLLM repetition_penalty (1.0=off). WARNING: on the --vllm_http_url "
+                         "prompt_embeds path (no real prompt_token_ids -- the prompt comes from "
+                         "ESM3/GO embeddings), any value != 1.0 crashes the vLLM EngineCore with "
+                         "an XPU 'scatter gather kernel index out of bounds' assertion in "
+                         "apply_penalties()'s prompt-token bin-count pass (job 8759264, "
+                         "2026-08-16: 3/3 servers, ~all requests failed after the first). "
+                         "This is NOT a config tuning knob for this eval harness until that vLLM "
+                         "bug is fixed upstream -- leave at 1.0. Kept only so a future retry "
+                         "against a patched vLLM doesn't require re-adding this plumbing.")
     ap.add_argument("--enable_thinking", action="store_true", default=True)
     ap.add_argument("--no_vllm", action="store_true",
                     help="generate via native HF backbone.generate(inputs_embeds=...) + KV "
@@ -612,6 +658,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          "hosts the sharded backbone; the client builds prompt_embeds "
                          "(backbone-free) and POSTs them. Mutually exclusive with --no_vllm and "
                          "the in-process LLM() path. Uses VLLMClient.generate_from_embeds.")
+    ap.add_argument("--concurrency", type=int, default=1,
+                    help="Number of samples to process concurrently within this shard "
+                         "process, ONLY on the --vllm_http_url path. build_prompt_embeds is "
+                         "CPU-only on this path (backbone deleted before the client loop; "
+                         "see pbs_1n_eval_vllm_tp2.sh's client launch comment) and the actual "
+                         "generation happens server-side, so a thread pool here lets multiple "
+                         "HTTP requests be in flight at once against a server's MAX_NUM_SEQS "
+                         "budget, instead of one request/shard at a time. ROOT-CAUSED "
+                         "2026-08-17: prior evals saw ZERO speedup from raising vLLM's "
+                         "MAX_NUM_SEQS (2->16) because this client loop only ever had 1 "
+                         "in-flight request per shard regardless of the server's setting --"
+                         "see memory/project_bioreason_vllm_max_num_seqs_16_validated_20260816.md. "
+                         "Ignored (forced to 1) on --no_vllm / in-process LLM() paths -- those "
+                         "are GPU-resident per-process and NOT safe to parallelize this way.")
     ap.add_argument("--vllm_max_model_len", type=int, default=8192,
                     help="MUST match --max-model-len on the vLLM server (launch_vllm_http_32b_"
                          "tp2.sh default 4808). Used to clamp the per-request max_tokens to "
@@ -647,11 +707,108 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return ap
 
 
+def validate_k_sampling(k: int, temperature: float, no_vllm: bool) -> None:
+    """Reject --k configurations that would silently produce a degenerate group.
+
+    Pure and separately callable so the guard can be tested by CALLING it. An earlier
+    version of this check lived inline in main() and its test asserted on source text;
+    a mutation that disabled the guard entirely still passed, because the substrings it
+    grepped for also appeared in the adjacent check and in the error message. Behaviour
+    is the only thing worth asserting on.
+
+    Raises:
+        SystemExit: on k < 1, on k > 1 without sampling, or on k > 1 with --no_vllm.
+    """
+    if k < 1:
+        raise SystemExit(f"[eval] --k must be >= 1, got {k}")
+    if k == 1:
+        return
+    if temperature <= 0.0:
+        # k identical greedy completions make count/k == 1.0 for every term -- exactly
+        # the flat-confidence baseline this path exists to escape, but reported as a
+        # k-sample run.
+        raise SystemExit(
+            f"[eval] --k {k} requires --temperature > 0 (got {temperature}). Greedy "
+            "sampling returns the same completion k times, so count/k is 1.0 for every "
+            "term and frequency ranking degenerates to the flat-1.0 baseline it is meant "
+            "to replace. Pass e.g. --temperature 0.7, or leave --k 1 for greedy eval."
+        )
+    if no_vllm:
+        # That branch calls backbone.generate(do_sample=False, num_beams=1) -- greedy
+        # REGARDLESS of --temperature. Wiring do_sample through is doable but unexercised
+        # by any current launcher (32B evals go over --vllm_http_url), so refuse loudly
+        # rather than ship an untested sampling path returning k identical strings.
+        raise SystemExit(
+            "[eval] --k > 1 is not supported on the --no_vllm path: that branch hardcodes "
+            "backbone.generate(do_sample=False), so it would return k identical greedy "
+            "completions no matter what --temperature says. Use --vllm_http_url (the 32B "
+            "path) or the in-process vLLM path."
+        )
+
+
+def apply_k_provenance(rec: dict, k_index: int, k_total: int, temperature: float,
+                       n_real: int) -> dict:
+    """Stamp k-sample provenance, and mark padded placeholders unsuccessful.
+
+    Pure and separately callable so the padding contract can be tested by CALLING it
+    (see validate_k_sampling for why source-grep tests are not trusted here).
+
+    `n_real` is how many completions the server actually returned; indices >= n_real are
+    empty padding, not predictions. `make_record` hardcodes ``success: True``, and
+    ``rescore_by_group_frequency.load_replicate`` only drops ``success=False`` rows --
+    so a padded row would be KEPT as a sample that voted for zero terms, while
+    ``build_arms`` fixes the denominator at ``g = len(replicate_dirs)``. Every frequency
+    in that group would come out scaled by ``n_real/k``, silently, and only in the
+    ``freq`` arm -- the arm under test. Marking it unsuccessful makes the loader drop the
+    row, which drops the key from the replicate intersection and so drops the whole
+    protein: the rescorer's existing "lose the protein rather than bias it" contract,
+    not a new one.
+    """
+    rec["k_index"] = int(k_index)
+    rec["k_total"] = int(k_total)
+    rec["eval_temperature"] = float(temperature)
+    if k_index >= n_real:
+        rec["success"] = False
+        rec["k_padded"] = True
+    return rec
+
+
+def k_output_dirs(out: str, k: int) -> list:
+    """Replicate dirs for a k-sample eval.
+
+    k=1 returns [out] unchanged so every existing launcher, resume-skip check and
+    scoring invocation is untouched. k>1 returns sibling <out>/k00 .. <out>/k{N-1},
+    each holding one _k00.json per protein -- the layout rescore_by_group_frequency.py
+    consumes, and the one layout in which ce.select_best_from_k_samples (which picks the
+    best sample AGAINST GROUND TRUTH) cannot fire.
+    """
+    if k == 1:
+        return [out]
+    return [os.path.join(out, f"k{i:02d}") for i in range(k)]
+
+
+def _sp_with_n(sp, k: int):
+    """Clone an in-process vLLM SamplingParams with n=k.
+
+    Built by copy so every other field (max_tokens, temperature, repetition_penalty,
+    detokenize) stays exactly as the single-sample path set it -- re-listing them here
+    would silently drift the two paths apart the next time one is edited.
+    """
+    import copy
+    sp2 = copy.copy(sp)
+    sp2.n = k
+    return sp2
+
+
 def main() -> int:
     ap = build_arg_parser()
     args = ap.parse_args()
 
-    os.makedirs(args.out, exist_ok=True)
+    validate_k_sampling(args.k, args.temperature, bool(args.no_vllm))
+
+    _out_dirs = k_output_dirs(args.out, args.k)
+    for _d in _out_dirs:
+        os.makedirs(_d, exist_ok=True)
     import torch
 
     LLM = SamplingParams = None
@@ -661,7 +818,14 @@ def main() -> int:
         # owns the transformer. We only build prompt_embeds locally (backbone-free) and POST
         # them via VLLMClient.generate_from_embeds. No in-process vLLM, no LLM import here.
         from torchtune.dev.rl.vllm_client import VLLMClient
-        _http_client = VLLMClient(base_url=args.vllm_http_url, connection_timeout=1800.0)
+        # pool_maxsize must cover this process's own --concurrency (one shared Session, one
+        # HTTPAdapter per scheme) or requests/urllib3's default cap of 10 connections/host
+        # silently serializes past that point even though the server has far more headroom
+        # (vLLM itself reports ~160-180x safe concurrency on these TP=4 servers).
+        _pool_size = max(10, max(1, args.concurrency) + 2)
+        _http_client = VLLMClient(
+            base_url=args.vllm_http_url, connection_timeout=1800.0, pool_maxsize=_pool_size
+        )
         print(f"[eval] vLLM-HTTP client connected to {args.vllm_http_url} "
               f"(api={_http_client._api_type}, model={_http_client._model_name})", flush=True)
     elif not args.no_vllm:
@@ -724,6 +888,7 @@ def main() -> int:
         max_tokens=args.max_new_tokens,
         temperature=args.temperature,      # 0 → greedy
         top_k=-1,
+        repetition_penalty=args.repetition_penalty,
         detokenize=True,
     )
 
@@ -744,18 +909,34 @@ def main() -> int:
 
     t0 = time.perf_counter()
     n = 0
-    for s in samples:
+
+    # ROOT-CAUSED 2026-08-17: this loop used to be strictly sequential (one HTTP request in
+    # flight per shard process, regardless of the vLLM server's --max-num-seqs setting).
+    # Raising MAX_NUM_SEQS 2->16 measured ZERO speedup because the server was never sent more
+    # than 1 concurrent request per shard to begin with -- see
+    # memory/project_bioreason_vllm_max_num_seqs_16_validated_20260816.md. On the
+    # --vllm_http_url path, build_prompt_embeds is CPU-only (backbone is deleted before this
+    # loop runs -- see pbs_1n_eval_vllm_tp2.sh's client launch comment) and the actual
+    # generation work happens server-side, so a thread pool here is safe: while one thread
+    # blocks on its HTTP call, others can build embeds and issue their own requests, actually
+    # exercising the server's concurrency budget. NOT enabled on --no_vllm / in-process LLM()
+    # -- those hold GPU-resident state per-process and are not safe to parallelize this way.
+    _concurrency = max(1, args.concurrency) if args.vllm_http_url else 1
+
+    def _process_one(s):
+        """Runs one sample end-to-end: build embeds, generate, write JSON. Returns
+        (protein_id, ok: bool) for progress tracking; never raises (isolates one
+        bad protein from the rest of the shard, matching the historic single-threaded
+        per-sample try/except — job 8680415 lost ~47 samples/shard before this existed)."""
         seq = s["sequence"]
         # Resume across walltime-limited slots: skip proteins already predicted.
         # Filename must match the write below (protein_id + aspect_code + _k00.json).
+        # Under k>1 the protein is only done when ALL k replicate dirs have it: a protein
+        # present in 3 of 8 dirs would otherwise be scored as a 3-sample group, silently
+        # mixing group sizes across the eval set and biasing count/k.
         _fn = f"{s['protein_id']}_{aspect_code(s['go_aspect'])}_k00.json"
-        if os.path.exists(os.path.join(args.out, _fn)):
-            n += 1
-            continue
-        # Per-sample try: one bad protein (malformed prompt, transient HTTP error, a budget
-        # edge case) must NOT kill the whole shard — that dropped ~47 samples per crash in job
-        # 8680415 (N=280, 2 shards died on one bad protein each via an unhandled 400 from
-        # vLLM). Log + skip; keep the process, and the shard, alive for the rest.
+        if all(os.path.exists(os.path.join(_d, _fn)) for _d in _out_dirs):
+            return s["protein_id"], True
         try:
             _effective_max_new_tokens = args.max_new_tokens
             if getattr(args, "native_prompt", False):
@@ -808,7 +989,8 @@ def main() -> int:
                         use_cache=True,
                     )
                 # With inputs_embeds (no input_ids), HF returns ONLY the generated token ids.
-                resp = model.tokenizer.decode(gen_ids[0], skip_special_tokens=True)
+                # Always k==1 here: --k > 1 is rejected up front on this greedy-only path.
+                resps = [model.tokenizer.decode(gen_ids[0], skip_special_tokens=True)]
             elif args.vllm_http_url:
                 # vLLM-HTTP: POST prompt_embeds ([P, H] on CPU) to the OpenAI server, get back
                 # completion token IDs, decode with the HF tokenizer (same as the no_vllm path).
@@ -840,48 +1022,106 @@ def main() -> int:
                     print(f"[eval] WARNING: prompt_len={_prompt_len} >= vllm_max_model_len="
                           f"{args.vllm_max_model_len} for {s['protein_id']} — skipping (no "
                           f"budget for any generation)", flush=True)
-                    resp = ""
+                    resps = [""] * args.k
                 else:
+                    # n=args.k: the server samples k completions from ONE prompt in a single
+                    # request, so the prompt_embeds payload (~41 MiB for BioReason) crosses
+                    # the wire once, not k times.
                     comp_ids = _http_client.generate_from_embeds(
                         [pe[0]],
+                        n=args.k,
                         max_tokens=_req_max_tokens,
                         temperature=args.temperature,      # 0 → greedy
                         top_k=0,
                         stop_token_ids=[_eos] if _eos is not None else None,
+                        repetition_penalty=args.repetition_penalty,
                     )
-                    resp = model.tokenizer.decode(comp_ids[0], skip_special_tokens=True) \
-                        if comp_ids and comp_ids[0] else ""
+                    resps = [
+                        model.tokenizer.decode(c, skip_special_tokens=True) if c else ""
+                        for c in (comp_ids or [])
+                    ]
             else:
-                out = llm.generate([{"prompt_embeds": pe[0]}], sampling_params=sp)
-                resp = out[0].outputs[0].text if out and out[0].outputs else ""
+                out = llm.generate(
+                    [{"prompt_embeds": pe[0]}],
+                    sampling_params=(sp if args.k == 1 else _sp_with_n(sp, args.k)),
+                )
+                resps = [o.text for o in out[0].outputs] if out and out[0].outputs else []
 
-            rec = make_record(s, resp)
-            rec["input_prompt"] = prompt_string
-            rec["native_keep_list_prefix"] = bool(
-                getattr(args, "native_keep_list_prefix", False)
-            )
-            rec["requested_max_new_tokens"] = int(args.max_new_tokens)
-            rec["effective_max_new_tokens"] = int(_effective_max_new_tokens)
-            rec["generation_backend"] = (
-                "vllm_http" if args.vllm_http_url else "hf_generate" if args.no_vllm else "vllm"
-            )
+            # The server can legitimately return fewer than k sequences (a finish-reason
+            # edge, a dropped candidate). Pad rather than write a short group: a missing
+            # replicate file would make this protein's resume-skip fail forever, and a
+            # ragged group silently changes the count/k denominator per protein.
+            _n_real = len(resps)
+            if _n_real < args.k:
+                print(f"[eval] WARNING: k={args.k} requested but {_n_real} completions "
+                      f"returned for {s['protein_id']} — padding with empty "
+                      f"(success=False; this protein will be DROPPED from the scored set. "
+                      f"Delete its files under {args.out} and re-run to recover it.)",
+                      flush=True)
+                resps = list(resps) + [""] * (args.k - _n_real)
+
             fn = f"{s['protein_id']}_{aspect_code(s['go_aspect'])}_k00.json"
-            with open(os.path.join(args.out, fn), "w") as f:
-                json.dump(rec, f, indent=2)
+            for _i, _d in enumerate(_out_dirs):
+                rec = make_record(s, resps[_i])
+                rec["input_prompt"] = prompt_string
+                rec["native_keep_list_prefix"] = bool(
+                    getattr(args, "native_keep_list_prefix", False)
+                )
+                rec["requested_max_new_tokens"] = int(args.max_new_tokens)
+                rec["effective_max_new_tokens"] = int(_effective_max_new_tokens)
+                rec["generation_backend"] = (
+                    "vllm_http" if args.vllm_http_url
+                    else "hf_generate" if args.no_vllm else "vllm"
+                )
+                if args.k > 1:
+                    apply_k_provenance(rec, _i, args.k, args.temperature, _n_real)
+                # Write to a temp file + atomic rename: with --concurrency>1, multiple threads
+                # write to the SAME dir concurrently, and a partial/interleaved write to
+                # the final filename would corrupt a JSON that a concurrent resume-skip check
+                # (os.path.exists) might read before this write completes.
+                _tmp = os.path.join(_d, f".{fn}.tmp{os.getpid()}.{_i}")
+                with open(_tmp, "w") as f:
+                    json.dump(rec, f, indent=2)
+                os.replace(_tmp, os.path.join(_d, fn))
+            return s["protein_id"], True
         except Exception as e:  # noqa: BLE001
             print(f"[eval] SAMPLE FAILED protein_id={s.get('protein_id')}: "
                   f"{type(e).__name__}: {e}", flush=True)
-            continue
-        n += 1
-        if n % 50 == 0:
-            print(f"[eval] {n} samples, {n/(time.perf_counter()-t0):.2f}/s", flush=True)
+            return s.get("protein_id"), False
 
-    print(f"[eval] DONE: {n} prediction JSONs → {args.out}", flush=True)
-    print("[eval] score with: python BioReason-Pro/evals/cafa_evals.py "
-          f"--input_dir {args.out} "
-          "--ontology BioReason-Pro/bioreason2/dataset/go-basic.obo "
-          "--ia_file BioReason-Pro/data/IA.txt "
-          "--reasoning_mode True --final_answer_only False --threads 0", flush=True)
+    if _concurrency <= 1:
+        for s in samples:
+            _, ok = _process_one(s)
+            if ok:
+                n += 1
+                if n % 50 == 0:
+                    print(f"[eval] {n} samples, {n/(time.perf_counter()-t0):.2f}/s", flush=True)
+    else:
+        print(f"[eval] dispatching with concurrency={_concurrency}", flush=True)
+        with ThreadPoolExecutor(max_workers=_concurrency) as pool:
+            futures = [pool.submit(_process_one, s) for s in samples]
+            for fut in as_completed(futures):
+                _, ok = fut.result()
+                if ok:
+                    n += 1
+                    if n % 50 == 0:
+                        print(f"[eval] {n} samples, {n/(time.perf_counter()-t0):.2f}/s",
+                              flush=True)
+
+    if args.k > 1:
+        print(f"[eval] DONE: {n} proteins x k={args.k} → {len(_out_dirs)} replicate dirs "
+              f"under {args.out}", flush=True)
+        print("[eval] score with (frequency ranking; do NOT point a scorer at the parent "
+              "dir): python experiments/bioreason/rescore_by_group_frequency.py "
+              f"--replicate_dir {' '.join(_out_dirs)} "
+              f"--out_root {os.path.join(args.out, 'arms')}", flush=True)
+    else:
+        print(f"[eval] DONE: {n} prediction JSONs → {args.out}", flush=True)
+        print("[eval] score with: python BioReason-Pro/evals/cafa_evals.py "
+              f"--input_dir {args.out} "
+              "--ontology BioReason-Pro/bioreason2/dataset/go-basic.obo "
+              "--ia_file BioReason-Pro/data/IA.txt "
+              "--reasoning_mode True --final_answer_only False --threads 0", flush=True)
     return 0
 
 

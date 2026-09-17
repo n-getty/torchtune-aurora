@@ -75,7 +75,23 @@ unset ADAPTER_DIR
 # Conditional, so the existing grpo_step0_rep{1,2,3} paths keep their exact names.
 _N_SUFFIX=""
 [ "${N:-150}" != "150" ] && _N_SUFFIX="_n${N}"
-export TAG="grpo_step0_rep${REP}${_N_SUFFIX}"
+
+# EPOCH is overridable but the default TAG does NOT encode which base was scored.
+# A `EPOCH=<step1050> REP=5 N=500 qsub` would therefore write a step1050 reading
+# into `grpo_step0_rep5_n500`, a name that reads as another step1550 step-0 rep,
+# and it would be pooled with the n=4 step-0 baseline by anyone reading names
+# rather than provenance. (fmax_endpoint_contrast.py's gate would catch the pool
+# via coverage.txt's base_ckpt, but a name that lies is a trap regardless.)
+# So: a non-default EPOCH must be accompanied by an explicit TAG.
+_DEFAULT_EPOCH=/lus/flare/projects/ModCon/ngetty/torchtune/experiments/bioreason/runs/sft_qwen3_32b_lora_r128_lrsched_v8_step1550_snapshot
+if [ "${EPOCH%/}" != "${_DEFAULT_EPOCH}" ] && [ -z "${TAG:-}" ]; then
+    echo "FATAL: EPOCH overridden to ${EPOCH} but no TAG given."
+    echo "       The default TAG (grpo_step0_rep${REP}${_N_SUFFIX}) does not name the base and"
+    echo "       would be mistaken for a step1550 step-0 rep. Pass an explicit TAG, e.g."
+    echo "       TAG=step0_base1050_rep${REP}${_N_SUFFIX}"
+    exit 2
+fi
+export TAG="${TAG:-grpo_step0_rep${REP}${_N_SUFFIX}}"
 export N=${N:-150}
 export SEED=7
 export PARITY=0

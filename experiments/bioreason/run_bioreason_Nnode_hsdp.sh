@@ -463,8 +463,18 @@ export MASTER_PORT
 
 # Full multinode CCL block (production multi-node row from CLAUDE.md).
 export CCL_PROCESS_LAUNCHER=pmix
-export CCL_ATL_TRANSPORT=mpi
-export CCL_KVS_MODE=mpi
+# TRANSPORT OVERRIDABLE (2026-09-15). This line previously hardcoded mpi, silently
+# overriding the `ofi` export earlier in this same file (last assignment wins), so
+# every multi-node run here used mpi. On 2N BioReason 32B GRPO, ofi cut the warm step
+# 860.7 -> 513.0s (-40.4%), grpo -48.4% (job 8828343, len-matched A/B); CLAUDE.md
+# records a comparable ~2.3x for 32B HSDP SFT. Default stays mpi (unvalidated for THIS
+# workload); set CCL_ATL_TRANSPORT_OVERRIDE=ofi to opt in. ofi REQUIRES KVS_MODE=pmi.
+export CCL_ATL_TRANSPORT=${CCL_ATL_TRANSPORT_OVERRIDE:-mpi}
+if [ "${CCL_ATL_TRANSPORT}" = "ofi" ]; then
+    export CCL_KVS_MODE=pmi
+else
+    export CCL_KVS_MODE=mpi
+fi
 export CCL_KVS_USE_MPI_RANKS=1
 export CCL_CONFIGURATION=cpu_gpu_dpcpp
 export CCL_KVS_CONNECTION_TIMEOUT=600
