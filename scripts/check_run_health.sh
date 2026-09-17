@@ -1,4 +1,10 @@
 #!/usr/bin/env bash
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 # check_run_health.sh — RUN-HEALTH GATE for torchtune Aurora/XPU GRPO runs.
 #
 # WHY THIS EXISTS (motivating incident, 2026-06-17):
@@ -46,13 +52,18 @@ baseline_lookup() {
     # $1 = size token (case-insensitive substring match against keys below)
     local key
     key=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+    # NOTE: order matters — bash `case` takes the first match, and substrings like "2b"/"3b"
+    # are contained in "32b"/"a3b". More-specific (longer) size tokens MUST be checked before
+    # their shorter substrings, or e.g. a 32B run silently matches the "*2b*" (AGPT-2B) branch
+    # and gets held to a 20s ceiling instead of 32B's 80s (found via a live false-positive WARN
+    # on job 8754767, a 32B run, 2026-08-14).
     case "$key" in
+        *32b*)                 echo "Qwen3-32B-2N|80|33-67s/step 2N (status.md)";;
+        *30b*|*a3b*|*moe*)     echo "Qwen3-30B-A3B|70|54.8s/step G=8 (status.md)";;
         *agpt*2b*|*2b*)        echo "AGPT-2B|20|~13s/step 2N GSM8K (status.md 2026-06-13)";;
         *3b*)                  echo "Qwen2.5-3B|30|~21s/step 10+2 SHM (status.md)";;
         *4b*)                  echo "dense-4B|75|must be < 32B-2N ceiling (33-67s); AGPT-2B 13s, 3B 21s, LoRA-4B ~54.5s (status.md)";;
         *8b*)                  echo "Qwen3-8B|60|~27s colocate / varies (status.md)";;
-        *30b*|*a3b*|*moe*)     echo "Qwen3-30B-A3B|70|54.8s/step G=8 (status.md)";;
-        *32b*)                 echo "Qwen3-32B-2N|80|33-67s/step 2N (status.md)";;
         *)                     echo "";;
     esac
 }
@@ -83,26 +94,65 @@ analyze_log() {
     local norm
     norm=$(normalize "$LOG")
 
+    # Multi-node launchers write the actual rank output to a separate timestamped
+    # training log and leave only the path + mpiexec status in the wrapper log.
+    # Fold that log in before classifying the run; otherwise a rank OOM can be
+    # invisible here and an unrelated nearby SFT metric file can produce GREEN.
+    local train_log
+    train_log=$(printf '%s\n' "$norm" | sed -nE 's/.*train log:[[:space:]]*([^ )]+).*/\1/p' | tail -1)
+    if [ -n "$train_log" ] && [ -f "$train_log" ] && [ "$train_log" != "$LOG" ]; then
+        norm="$norm"$'\n'"$(normalize "$train_log")"
+        notes+=("Nested training log folded in: $train_log")
+    fi
+
+    local nonzero_exit runtime_oom
+    nonzero_exit=$(printf '%s\n' "$norm" | grep -iE '(^|[[:space:]])(mpiexec|[^ ]+ gate) rc=[1-9][0-9]*|exit rc=[1-9][0-9]*' | head -5)
+    if [ -n "$nonzero_exit" ]; then
+        degraded=1
+        findings+=("NONZERO launcher/training exit detected:")
+        while IFS= read -r line; do [ -n "$line" ] && findings+=("    $line"); done <<< "$nonzero_exit"
+    fi
+    runtime_oom=$(printf '%s\n' "$norm" | grep -iE 'OutOfMemoryError|out of memory|OOM kill' | grep -viE '^#|document|comment|known|would|could|may' | head -5)
+    if [ -n "$runtime_oom" ]; then
+        degraded=1
+        findings+=("RUNTIME OOM detected:")
+        while IFS= read -r line; do [ -n "$line" ] && findings+=("    $line"); done <<< "$runtime_oom"
+    fi
+
     # SFT recipes emit per-step timing ("Step N | ... time_per_step_s:...") only
     # to the DiskLogger file, NOT to the stdout/cell log this gate is usually
     # pointed at. If the given log has no timing of either format, fold in a
     # sibling DiskLogger metric file so SFT runs get a real verdict instead of a
     # false DEGRADED. Search common locations relative to the given log.
-    if ! printf '%s\n' "$norm" | grep -qE "TIMING step=|time_per_step_s:[0-9.]+"; then
-        local logdir metricf
+    if [ -z "$train_log" ] && ! printf '%s\n' "$norm" | grep -qE "TIMING step=|time_per_step_s:[0-9.]+"; then
+        local logdir metricf all_candidates log_mtime best_metricf best_delta delta mtime
         logdir=$(dirname "$LOG")
-        for cand in \
-            "$logdir"/run_out/logs/log_*.txt \
-            "$logdir"/logs/log_*.txt \
-            "$logdir"/*/run_out/logs/log_*.txt; do
-            for metricf in $cand; do
-                if [ -f "$metricf" ] && grep -qE "time_per_step_s:[0-9.]+" "$metricf"; then
-                    norm="$norm"$'\n'"$(normalize "$metricf")"
-                    notes+=("SFT metric log folded in: $metricf")
-                    break 2
-                fi
-            done
+        # A multi-segment run dir accumulates one logs/log_*.txt per segment/topology
+        # (e.g. a 4N segment then a resumed 16N segment side by side). Picking the first
+        # glob match, OR always picking the globally-newest metric file, is WRONG — an
+        # older segment log being (re-)checked would fold in a LATER segment's numbers.
+        # The correct match is the metric file whose mtime is CLOSEST to $LOG's mtime
+        # (each segment writes its own log_<epoch>.txt at roughly the same wall-clock
+        # window as its segment_*.log). Found live 2026-08-14: checking a 4N segment log
+        # folded in the newer 16N metric log under a naive "always newest" fix — the
+        # opposite bug from the original "always first glob match".
+        log_mtime=$(stat -c '%Y' "$LOG" 2>/dev/null || echo 0)
+        all_candidates=$(ls "$logdir"/run_out/logs/log_*.txt "$logdir"/logs/log_*.txt \
+            "$logdir"/*/run_out/logs/log_*.txt 2>/dev/null)
+        best_metricf=""; best_delta=""
+        for metricf in $all_candidates; do
+            [ -f "$metricf" ] || continue
+            grep -qE "time_per_step_s:[0-9.]+" "$metricf" || continue
+            mtime=$(stat -c '%Y' "$metricf" 2>/dev/null || echo 0)
+            delta=$(( mtime > log_mtime ? mtime - log_mtime : log_mtime - mtime ))
+            if [ -z "$best_delta" ] || [ "$delta" -lt "$best_delta" ]; then
+                best_delta="$delta"; best_metricf="$metricf"
+            fi
         done
+        if [ -n "$best_metricf" ]; then
+            norm="$norm"$'\n'"$(normalize "$best_metricf")"
+            notes+=("SFT metric log folded in: $best_metricf")
+        fi
     fi
 
     # --- grpo_step path (one-shot rank-0 line) -------------------------------
@@ -135,6 +185,15 @@ analyze_log() {
     # (banned:1) — the gloo CPU-bounce is the CORRECT, intended path there, not
     # the single-node 274s incident. Detect it so we annotate rather than fail.
     mn_colocate=$(printf '%s\n' "$norm" | grep -c "Multi-node colocate.*built explicit 1D dp_shard mesh")
+    # Counted with grep -c (same idiom as every other probe here), NOT `grep -q` in an
+    # elif. Under `set -o pipefail` a `printf | grep -q` pipeline is unreliable in this
+    # script: grep -q exits at the first match and printf then dies on SIGPIPE, so the
+    # pipeline status can be non-zero even though the pattern matched. That made the
+    # branch silently not-taken and reported a healthy run (job 8827944) as DEGRADED
+    # while the very same grep matched when run standalone. grep -c consumes all input,
+    # so there is no early exit and no SIGPIPE.
+    local bypass_active
+    bypass_active=$(printf '%s\n' "$norm" | grep -c "chunked backward: non-EP reduce_scatter bypass ACTIVE")
     cnt_patched=$patched
 
     if [ "$v206" -gt 0 ]; then
@@ -145,6 +204,15 @@ analyze_log() {
             notes+=("reduce_scatter: gloo CPU-bounce PG active (v206) on MULTI-NODE colocate run -- EXPECTED (native XCCL reduce_scatter leaks CXI handles cross-node); correct path, not the single-node 274s incident. Step-time reflects the gloo bounce; ACCURACY metrics are unaffected.")
         elif [ "$gpath" = "SINGLE_BACKWARD" ]; then
             notes+=("reduce_scatter: gloo CPU-bounce PG present (v206) but SINGLE_BACKWARD bypasses it (recipe:3796) -- timing OK.")
+        elif [ "$gpath" = "CHUNKED_BACKWARD" ] && [ "$bypass_active" -gt 0 ]; then
+            # CHUNKED_BACKWARD *with* the bypass marker is healthy. This ordering is
+            # load-bearing: before 2026-09-16 the BioReason recipe emitted no
+            # "grpo_step path:" line, so healthy chunked BioReason runs fell through
+            # to the bypass_active branch below. Now that the subclass emits the line
+            # (grpo_bioreason_distributed_xpu.py ~3455), an unguarded CHUNKED_BACKWARD
+            # branch here would flag every one of them DEGRADED. Trust the ACTIVE
+            # marker -- it is printed at the swap site, not inferred.
+            notes+=("reduce_scatter: gloo CPU-bounce PG present (v206) on CHUNKED_BACKWARD, but the chunked-backward bypass logged ACTIVE (native XCCL) -- timing OK.")
         elif [ "$gpath" = "CHUNKED_BACKWARD" ]; then
             degraded=1
             findings+=("GLOO CPU-BOUNCE reduce_scatter ACTIVE on CHUNKED_BACKWARD non-EP run (v206 PG built, ep_degree=${ep_degree:-1}).")
@@ -153,6 +221,15 @@ analyze_log() {
             findings+=("  -> This is EXACTLY the 2026-06-17 274s/step incident. The step-time number is CORRUPTED.")
             findings+=("  -> Note: gloo reduce_scatter is expected ONLY on EP runs; on non-EP it corrupts timing.")
             findings+=("  -> Fix: run SINGLE_BACKWARD (TORCHTUNE_USE_CHUNKED_LOSS=1) or use the bypass on chunked.")
+        elif [ "$bypass_active" -gt 0 ]; then
+            # The BioReason recipe does not emit a "grpo_step path:" line, so $gpath is
+            # '(none)' and the branches above cannot classify it. But the chunked bypass
+            # prints its own unambiguous marker when it swaps in the native
+            # _orig_reduce_scatter_tensor. Trust that marker: it is emitted at the swap
+            # site itself, not inferred. Without this branch every healthy BioReason 2N
+            # run is reported DEGRADED (observed on job 8827805, whose log carries the
+            # ACTIVE marker and completed two clean steps).
+            notes+=("reduce_scatter: gloo CPU-bounce PG present (v206) but the chunked-backward bypass logged ACTIVE (native XCCL) -- timing OK.")
         else
             # PACKED or unknown path with v206 active on non-EP: suspicious, flag.
             degraded=1
@@ -179,6 +256,36 @@ analyze_log() {
         notes+=("varlen: engaged ($varlen_eng markers).")
     fi
 
+    # --- ignored-trainable grad sync: collective-mismatch early warning ------
+    # SOURCE: grpo_bioreason_distributed_xpu.py::_sync_ignored_trainable_grads
+    #   "Averaged %d/%d ignored trainable gradients across %d x %d HSDP ranks"
+    # Job 8826889 (2026-09-14, dp_replicate=1) hung 1800s and completed ZERO steps
+    # because that function called all_reduce inside a loop whose iteration count
+    # depended on local grad presence: rank 0 had 0 grads -> 0 collectives -> fell
+    # through, peers blocked -> gloo timeout -> Exit_status=143.
+    #
+    # The "Averaged 0" / "Averaged 0/N" line is the visible precursor. It is emitted
+    # BEFORE the peers time out, so catching it turns a 30-minute hang into an
+    # immediate verdict. Also catch the explicit disagreement error the fixed code
+    # now logs when ranks differ about which params carry grads.
+    # See memory/bugs/project_bioreason_sync_ignored_grads_deadlock_dp_replicate1_20260914.md
+    grad_zero=$(printf '%s\n' "$norm" | grep -cE "Averaged 0(/[0-9]+)? ignored trainable gradients")
+    grad_disagree=$(printf '%s\n' "$norm" | grep -c "GRAD PRESENCE DISAGREEMENT")
+    if [ "$grad_zero" -gt 0 ]; then
+        degraded=1
+        findings+=("IGNORED-GRAD SYNC averaged ZERO gradients ($grad_zero occurrences) while replicated trainables exist.")
+        findings+=("  -> rank 0 found no grads for FSDP-ignored trainable params. Under the pre-2026-09-14 code this")
+        findings+=("     DEADLOCKS the other ranks in all_reduce (1800s gloo timeout, Exit_status=143, zero steps).")
+        findings+=("     Even with the fixed rank-independent path, 0 grads on rank 0 means its LoRA grads went missing")
+        findings+=("     -- the update is not what you think it is. Investigate before trusting this run.")
+    fi
+    if [ "$grad_disagree" -gt 0 ]; then
+        degraded=1
+        findings+=("GRAD PRESENCE DISAGREEMENT across ranks ($grad_disagree occurrences) -- some ranks lost grads for")
+        findings+=("  replicated params. Averaging fell back to contributing-ranks-only; the effective batch differs")
+        findings+=("  from the nominal one. Do not trust this run's updates.")
+    fi
+
     # --- banned:1 / PDE / SIGABRT (runtime crash) ----------------------------
     # SOURCE: known XPU L0 crash signatures (CLAUDE.md empty_cache/banned notes,
     #         distributed.py:851 UR_RESULT_ERROR_OUT_OF_RESOURCES).
@@ -198,6 +305,78 @@ analyze_log() {
     ec=$(printf '%s\n' "$norm" | grep -c "empty_cache gen[0-9].*start")
     if [ "$ec" -gt 4 ]; then
         notes+=("empty_cache: $ec serialized empty_cache markers seen (per-gen serialization, expected on some paths; only a concern if it correlates with banned:1).")
+    fi
+
+    # --- allocator plateau headroom (banned:1 RISK INDICATOR) ----------------
+    # SOURCE: memory/project_bioreason_banned1_predicted_by_plateau_headroom_20260917.
+    # On BioReason 32B 2N B4/G8 fbs=2 the rank-0 "post-ref-fwd alloc=... resv=..." probe
+    # orders the three banned:1 deaths below the one clean 100-step arm:
+    #     60.09 GiB resv (3.91 GiB headroom) -> 100/100 clean
+    #     62.41 (1.58)  -> died step 13
+    #     63.55/63.57 (0.45/0.43) -> died step 9 (x2, different node pairs)
+    #
+    # THE THRESHOLD IS n=1 ON THE SURVIVOR SIDE. Other clean G=8 arms plateaued just as
+    # high (62.80, 63.11, 60.87) but are CENSORED -- they ended at their planned NSTEPS
+    # of 4-7 and log a checkpoint save plus a clean PG abort, so they are not survivals.
+    # And two G=2-envelope arms faulted at 58.72 (5.28 free) and 51.29 (12.71 free),
+    # which this check calls fine. Hence: a NOTE either way, and worded as risk.
+    #
+    # THE MECHANISM IS BETTER SUPPORTED THAN THE THRESHOLD. With
+    # PYTORCH_ALLOC_CONF=garbage_collection_threshold:0.8 armed (the launcher sets it), a
+    # step whose transient peak exceeds remaining headroom makes the caching allocator
+    # RELEASE cached segments -- resv drops 16-19 GiB with alloc flat on the probe line
+    # immediately BEFORE the first fault, in 3/3 G=8 deaths and 0/2 G=2 deaths. That is
+    # the empty_cache()-equivalent L0 UR-handle poisoning reached declaratively, with
+    # nobody calling empty_cache(). It is post-hoc (one probe before the fault);
+    # experiments/bioreason/check_alloc_headroom.sh --reclaim classifies a dead arm by it.
+    #
+    # Reported as a NOTE, never as DEGRADED: it concerns the arm's FUTURE, not the
+    # validity of numbers already produced. A short clean arm at low headroom has
+    # perfectly citable numbers -- it just should not be extended on that basis.
+    # Tile size is read from the log when present rather than assumed.
+    local hr_resv hr_tile hr_free hr_n
+    hr_n=$(printf '%s\n' "$norm" | grep -c "post-ref-fwd alloc=")
+    if [ "${hr_n:-0}" -ge 3 ]; then
+        # Max over probes, NOT a fixed probe index.
+        #
+        # This read `sed -n '3p'` until 2026-09-17, on the theory that the plateau has
+        # settled by step 2. That theory is false and it failed in the FALSE-SAFE
+        # direction. A/B control arm 8834067 probed 48.95 / 54.85 / 54.86 / 62.34 --
+        # +7.48 higher at probe 4, three steps after it had supposedly settled -- and the
+        # sibling gate (experiments/bioreason/check_alloc_headroom.sh, same bug) announced
+        # "SAFE ... 9.14 free" for a run actually at 1.66. On a banned:1 early-warning
+        # check that is the failure direction that costs node-hours.
+        #
+        # What governs the plateau is the longest rollout generated so far, not the step
+        # index: the jump lands on the step that first hits the max_gen cap. Most arms hit
+        # the cap at step 0-1, so their plateau locked immediately and the fixed index
+        # looked sound. (Only 2 of 4 large late jumps across 30 arms coincide with a new
+        # running max length, so treat that as a plausible driver, not an established
+        # rule -- max-over-probes does not depend on it being true.)
+        #
+        # CALIBRATION-SAFE, checked before changing a fitted threshold: on all seven arms
+        # the 2.0 constant was fitted to, max differs from probe 3 by <= 0.02
+        # (60.09/60.11, 62.41/62.42, 63.57/63.57, 63.55/63.55, 62.80/62.81, 63.11/63.11,
+        # 60.87/60.87). Every fitted verdict is preserved; only late-jumping arms change,
+        # and they change from a wrong answer to a right one. See
+        # memory/feedback_a_plateau_fitted_on_a_prefix_is_a_prefix_not_a_plateau.md.
+        #
+        # NB the post-fault probe on a dead arm reads LOW (44-46, the reclaim drop), so
+        # taking the max cannot be fooled by it -- whereas taking the LAST probe would
+        # invert the gate on exactly the runs that died.
+        hr_resv=$(printf '%s\n' "$norm" | grep -oE "post-ref-fwd alloc=[0-9.]+ GiB resv=[0-9.]+ GiB" \
+                  | grep -oE "resv=[0-9.]+" | sed 's/resv=//' | sort -g | tail -1)
+        hr_tile=$(printf '%s\n' "$norm" | grep -oE "total capacity[^0-9]*([0-9.]+) ?GiB" \
+                  | grep -oE "[0-9.]+" | head -1)
+        hr_tile=${hr_tile:-64}
+        if [ -n "$hr_resv" ]; then
+            hr_free=$(awk -v t="$hr_tile" -v r="$hr_resv" 'BEGIN{printf "%.2f", t-r}')
+            if awk -v f="$hr_free" 'BEGIN{exit !(f < 2.0)}'; then
+                notes+=("ALLOCATOR HEADROOM: plateau resv=${hr_resv} GiB of ${hr_tile} GiB leaves only ${hr_free} GiB. All 3 observed B4/G8 fbs=2 banned:1 deaths sat below the ~2 GiB line (0.43/0.45/1.59) vs the one clean 100-step arm at 3.91 -- but n=1 on the survivor side (the other high-plateau clean arms are CENSORED at 4-7 planned steps, not survivals), so this is elevated risk, not a verdict. If extending this arm, treat the risk as real; if it already died, run experiments/bioreason/check_alloc_headroom.sh --reclaim on it to confirm the allocator mode. Retrying on another node pair was tried 3x and failed 3x; lower the footprint instead.")
+            else
+                notes+=("ALLOCATOR HEADROOM: plateau resv=${hr_resv} GiB of ${hr_tile} GiB, ${hr_free} GiB free (>=2 GiB; the 100/100 clean arm ran at 3.91). NOT an all-clear -- two G=2-envelope arms faulted at 5.28 and 12.71 GiB free via a different mechanism (no reclaim drop).")
+            fi
+        fi
     fi
 
     # --- TIMING completeness -------------------------------------------------
@@ -275,7 +454,230 @@ monotonicity_check() {
 }
 
 # ----------------------------------------------------------------------------
-# Compare mode: assert both legs took same grpo_step path AND same RS transport.
+# Per-step phase extraction, PAIRED WITH ROLLOUT LENGTH.
+#
+# WHY (motivating incident, 2026-09-15): forward_batch_size=3 was REJECTED on a raw
+# backward delta of +7.7% (223.9s vs the fbs=2 baseline's 207.9s). But that leg's
+# rollouts were 13.5% longer (len_mean 1249.6 vs 1100.8). Per token it INVERTS:
+# 0.1792 vs 0.1889 s/tok, i.e. fbs=3 is 5.1% FASTER. A real throughput win was thrown
+# away because a raw phase time was compared across two runs with different rollout
+# lengths. The same confound had been correctly caught on another cell hours earlier
+# and still slipped through here -- which is exactly why it has to be mechanical.
+# See memory/project_bioreason_fbs3_rejection_was_length_confounded_20260915.md.
+#
+# GRPO rollout length is SAMPLED, so it varies run to run even at identical config.
+# Nearly every phase time (bwd, grpo, ref_fwd, vllm decode) is ~linear in tokens.
+# Therefore a raw s/step comparison between two GRPO legs is meaningless unless
+# len_mean matches; the token-normalized number is the only valid one.
+#
+# Emission order per step (verified on job 8828343):
+#   GENTIMING ... -> BIOREASON_DIAG step=N ... len_mean=L -> grpo_step bwd= -> TIMING step=N
+# so we buffer GENTIMING, latch len_mean at the DIAG, and attach the rest.
+#
+# Echoes one "step|len_mean|bwd|total|gen|grpo|vllm|ref_fwd" record per step.
+# ----------------------------------------------------------------------------
+extract_steps() {
+    normalize "$1" | awk '
+        /GENTIMING/ {
+            if (match($0, /vllm=[0-9.]+/))    { v = substr($0, RSTART+5, RLENGTH-5) }
+            if (match($0, /ref_fwd=[0-9.]+/)) { r = substr($0, RSTART+8, RLENGTH-8) }
+            next
+        }
+        /BIOREASON_DIAG step=/ {
+            if (match($0, /step=[0-9]+/))     { s = substr($0, RSTART+5, RLENGTH-5) }
+            if (match($0, /len_mean=[0-9.]+/)){ L = substr($0, RSTART+9, RLENGTH-9) }
+            vllm = v; ref = r; bwd = ""
+            next
+        }
+        /grpo_step bwd=/ {
+            if (bwd == "" && match($0, /bwd=[0-9.]+/)) { bwd = substr($0, RSTART+4, RLENGTH-4) }
+            next
+        }
+        /TIMING step=/ {
+            if (match($0, /step=[0-9]+/))  { ts = substr($0, RSTART+5, RLENGTH-5) }
+            if (match($0, /total=[0-9.]+/)){ tot = substr($0, RSTART+6, RLENGTH-6) }
+            if (match($0, /[^_]gen=[0-9.]+/)) { g = substr($0, RSTART+5, RLENGTH-5) }
+            if (match($0, /grpo=[0-9.]+/)) { gr = substr($0, RSTART+5, RLENGTH-5) }
+            if (L != "") {
+                printf "%s|%s|%s|%s|%s|%s|%s|%s\n", ts, L, bwd, tot, g, gr, vllm, ref
+            }
+            L = ""; bwd = ""
+            next
+        }
+    '
+}
+
+# Last WARM step (i.e. not step 0 -- cold pays Triton JIT + vLLM graph capture).
+# Falls back to the only step present if a log has just one.
+warm_step_record() {
+    local recs; recs=$(extract_steps "$1")
+    [ -z "$recs" ] && return 1
+    local n; n=$(printf '%s\n' "$recs" | wc -l)
+    if [ "$n" -ge 2 ]; then printf '%s\n' "$recs" | tail -1
+    else printf '%s\n' "$recs" | tail -1; fi
+}
+
+# ----------------------------------------------------------------------------
+# Mean per-token cost over ALL warm steps of a leg, with the within-leg spread.
+#
+# Why this is separate from (and more trustworthy than) the single-step table:
+# a delta smaller than a leg's own step-to-step spread is not a measurement. On
+# BioReason 32B 2N the observed within-leg bwd spread is 11-13.5% across only
+# 3-4 steps, so a "+13.8%" from n=1 and a "+2.5%" from n=3 are the same null
+# result seen twice. Prints n, mean, and spread so the reader cannot miss it.
+#
+# Echoes "n|mean_bwd_sktok|spread_bwd_pct|mean_grpo_sktok|spread_grpo_pct".
+# ----------------------------------------------------------------------------
+warm_mean_record() {
+    local recs; recs=$(extract_steps "$1")
+    [ -z "$recs" ] && return 1
+    # Drop step 0 (cold: Triton JIT + vLLM graph capture) when >1 step exists.
+    local n; n=$(printf '%s\n' "$recs" | wc -l)
+    [ "$n" -ge 2 ] && recs=$(printf '%s\n' "$recs" | tail -n +2)
+    printf '%s\n' "$recs" | awk -F'|' '
+        $2 > 0 && $3 != "" {
+            b = $3/($2/1000.0); sb += b; nb++
+            if (mnb == 0 || b < mnb) mnb = b
+            if (b > mxb) mxb = b
+        }
+        $2 > 0 && $6 != "" {
+            g = $6/($2/1000.0); sg += g; ng++
+            if (mng == 0 || g < mng) mng = g
+            if (g > mxg) mxg = g
+        }
+        END {
+            if (nb == 0) exit 1
+            printf "%d|%.2f|%.1f|%.2f|%.1f\n", nb, sb/nb, (mnb>0 ? (mxb/mnb-1)*100 : 0),
+                   (ng ? sg/ng : 0), (mng>0 ? (mxg/mng-1)*100 : 0)
+        }'
+}
+
+# Print the all-warm-steps comparison. Never fatal on its own -- it is a
+# readability aid whose job is to stop a sub-noise delta being cited as a result.
+compare_warm_mean() {
+    local ma mb
+    ma=$(warm_mean_record "$1") || ma=""
+    mb=$(warm_mean_record "$2") || mb=""
+    [ -z "$ma" ] && return 0
+    [ -z "$mb" ] && return 0
+
+    local na mba spa mqa spq_a
+    local nb mbb spb mqb spq_b
+    IFS='|' read -r na mba spa mqa spq_a <<<"$ma"
+    IFS='|' read -r nb mbb spb mqb spq_b <<<"$mb"
+
+    echo ""
+    echo "  ---- ALL WARM STEPS (mean s/ktok; the single-step table above is n=1) ----"
+    printf "  %-10s %6s %12s %12s %10s\n" "phase" "n" "A mean" "B mean" "mean d%"
+    awk -v na="$na" -v nb="$nb" -v a="$mba" -v b="$mbb" 'BEGIN{
+        printf "  %-10s %3d/%-2d %12.2f %12.2f %+9.1f%%\n", "bwd", na, nb, a, b, (a>0?(b-a)/a*100:0) }'
+    awk -v na="$na" -v nb="$nb" -v a="$mqa" -v b="$mqb" 'BEGIN{
+        if (a>0 && b>0) printf "  %-10s %3d/%-2d %12.2f %12.2f %+9.1f%%\n", "grpo", na, nb, a, b, (b-a)/a*100 }'
+    printf "  within-leg spread  : A bwd %.1f%%  B bwd %.1f%%\n" "$spa" "$spb"
+
+    # The gate: is the observed delta even bigger than the legs' own noise?
+    awk -v a="$mba" -v b="$mbb" -v sa="$spa" -v sb="$spb" -v na="$na" -v nb="$nb" '
+        BEGIN{
+            d = (a>0) ? (b-a)/a*100 : 0; if (d<0) d = -d
+            noise = (sa>sb) ? sa : sb
+            if (na < 3 || nb < 3)
+                printf "  VERDICT: UNDERPOWERED -- only %d/%d warm steps. Need >=3 per leg.\n", na, nb
+            if (d <= noise)
+                printf "  VERDICT: WASH -- |delta| %.1f%% is inside the within-leg spread %.1f%%. NOT a result.\n", d, noise
+            else
+                printf "  VERDICT: delta %.1f%% exceeds within-leg spread %.1f%% -- readable, still check n.\n", d, noise
+        }'
+}
+
+# ----------------------------------------------------------------------------
+# Length-normalized A/B of the phase timers. Prints raw AND per-1k-token deltas,
+# and marks the raw column unusable when the two legs' len_mean disagree.
+# Returns 1 if the raw numbers must not be cited (length skew over threshold).
+# ----------------------------------------------------------------------------
+LEN_SKEW_PCT_MAX=5
+
+compare_normalized() {
+    local A="$1" B="$2"
+    local ra rb
+    ra=$(warm_step_record "$A") || ra=""
+    rb=$(warm_step_record "$B") || rb=""
+
+    if [ -z "$ra" ] || [ -z "$rb" ]; then
+        # Non-BioReason logs have no len_mean. Say so rather than silently skipping:
+        # a comparison with no length control is not a clean comparison, it is an
+        # unverified one.
+        echo "${YEL}[length-norm] SKIPPED: no BIOREASON_DIAG len_mean in $([ -z "$ra" ] && echo A)$([ -z "$ra" ] && [ -z "$rb" ] && echo " and ")$([ -z "$rb" ] && echo B).${RST}"
+        echo "${YEL}              Raw phase times are only comparable if you have INDEPENDENTLY"
+        echo "              confirmed both legs produced the same token count. GRPO rollout"
+        echo "              length is sampled and varies run to run.${RST}"
+        return 0
+    fi
+
+    local sa la ba ta ga qa va fa
+    local sb lb bb tb gb qb vb fb
+    IFS='|' read -r sa la ba ta ga qa va fa <<<"$ra"
+    IFS='|' read -r sb lb bb tb gb qb vb fb <<<"$rb"
+
+    echo "------------------- LENGTH-NORMALIZED -------------------"
+    printf "  warm step compared : A=step%s  B=step%s\n" "$sa" "$sb"
+    printf "  len_mean (tok/seq) : A=%s  B=%s\n" "$la" "$lb"
+
+    local skew
+    skew=$(awk -v a="$la" -v b="$lb" 'BEGIN{ if(a>0) printf "%.1f", (b-a)/a*100; else print "nan" }')
+    printf "  rollout-length skew: %+.1f%% (threshold +/-%s%%)\n" "$skew" "$LEN_SKEW_PCT_MAX"
+
+    local confounded=0
+    awk -v s="$skew" -v m="$LEN_SKEW_PCT_MAX" 'BEGIN{ exit !(s<-m || s>m) }' && confounded=1
+
+    printf "\n  %-10s %10s %10s %8s  |  %12s %12s %8s\n" \
+        "phase" "A raw(s)" "B raw(s)" "raw d%" "A s/ktok" "B s/ktok" "norm d%"
+    _row() {
+        local name="$1" av="$2" bv="$3"
+        [ -z "$av" ] && return 0
+        [ -z "$bv" ] && return 0
+        awk -v n="$name" -v av="$av" -v bv="$bv" -v la="$la" -v lb="$lb" 'BEGIN{
+            rawd = (av>0) ? (bv-av)/av*100 : 0;
+            na = av/(la/1000.0); nb = bv/(lb/1000.0);
+            nd = (na>0) ? (nb-na)/na*100 : 0;
+            printf "  %-10s %10.1f %10.1f %+7.1f%%  |  %12.4f %12.4f %+7.1f%%\n", n, av, bv, rawd, na, nb, nd;
+        }'
+    }
+    _row "bwd"     "$ba" "$bb"
+    _row "grpo"    "$qa" "$qb"
+    _row "ref_fwd" "$fa" "$fb"
+    _row "vllm"    "$va" "$vb"
+    _row "gen"     "$ga" "$gb"
+    _row "total"   "$ta" "$tb"
+
+    # ------------------------------------------------------------------
+    # ALL WARM STEPS, not just the last one. The single-step table above is
+    # the shape that produced FOUR wrong verdicts on this workload (three on
+    # fbs=3, then lensort on 2026-09-15, read as a "+13.8% regression" from
+    # one step and settling at +2.5% -- a wash -- once a second warm step
+    # landed). The within-leg bwd spread here is 11-13.5%, so any single-step
+    # delta below that is unreadable noise. This block exists so the spread is
+    # always in front of you next to the delta.
+    # ------------------------------------------------------------------
+    compare_warm_mean "$A" "$B"
+
+    if [ "$confounded" -eq 1 ]; then
+        echo ""
+        echo "${RED}RAW COLUMN IS CONFOUNDED -- DO NOT CITE IT.${RST}"
+        echo "${RED}  len_mean differs by ${skew}% (> ${LEN_SKEW_PCT_MAX}%). Phase time is ~linear in tokens,"
+        echo "  so the raw delta is measuring the rollout-length draw, not the change under test."
+        echo "  Read the 's/ktok' columns. This is the 2026-09-15 fbs=3 mistake: a raw +7.7%"
+        echo "  'regression' was a -5.1% per-token WIN.${RST}"
+        echo "${YEL}  To get a citable raw number, re-run with more steps so length averages out,"
+        echo "  or fix the sampled length (max_gen_tokens / temperature) across legs.${RST}"
+        return 1
+    fi
+    echo "${GRN}  Lengths match within ${LEN_SKEW_PCT_MAX}% -- raw and normalized agree; either is citable.${RST}"
+    return 0
+}
+
+# ----------------------------------------------------------------------------
+# Compare mode: assert both legs took same grpo_step path AND same RS transport,
+# AND that any phase-time delta survives rollout-length normalization.
 # ----------------------------------------------------------------------------
 compare_logs() {
     local A="$1" B="$2"
@@ -301,22 +703,88 @@ compare_logs() {
         fi
     }
 
-    local pA pB tA tB
+    # A leg whose binary predates the diagnostic emits NOTHING. That is BLIND,
+    # not DIFFERENT -- and conflating the two is how a valid A/B (2026-09-16
+    # async probe) was reported INVALID: leg A ran 09-15 21:47, the BioReason
+    # subclass only gained the `grpo_step path` line at 09-16 01:25, so the
+    # checker read an absence as a mismatch and told the reader to re-run two
+    # node-hours of HW. Blind legs fall through to the config-derived inference
+    # below; only a genuine PATH-vs-PATH disagreement is a mismatch.
+    #
+    # Config-derived fallback: the path is a pure function of the launch point
+    # (matching grpo_step's own branch), so when the line is missing we can
+    # still decide parity from the config echo -- with the verdict clearly
+    # labelled INFERRED so no reader mistakes it for an observation.
+    infer_path() {
+        local n; n=$(normalize "$1")
+        local chunked packing
+        chunked=$(printf '%s\n' "$n" | grep -m1 -oE 'TORCHTUNE_USE_CHUNKED_LOSS=[0-9]+' | cut -d= -f2)
+        packing=$(printf '%s\n' "$n" | grep -m1 -oE 'packing=(True|False)' | cut -d= -f2)
+        if [ "$packing" = "True" ]; then echo "PACKED"
+        elif [ "${chunked:-0}" = "1" ]; then echo "SINGLE_BACKWARD"
+        else echo "CHUNKED_BACKWARD"; fi
+    }
+    # One path-determining knob, or empty if this leg never echoed it.
+    # EMPTY MEANS UNKNOWN, NOT ZERO. An older leg omits the newer echoes, so
+    # comparing a missing field against a present one as if both were values
+    # reproduces the very blind-vs-fail conflation this block exists to fix
+    # (caught 2026-09-16: empty-vs-'0' on TORCHTUNE_USE_CHUNKED_LOSS turned an
+    # agreeing pair into a MISMATCH one level below the one just fixed).
+    path_field() {
+        local n="$1" f="$2"
+        case "$f" in
+            chunked) printf '%s\n' "$n" | grep -m1 -oE 'TORCHTUNE_USE_CHUNKED_LOSS=[0-9]+' | cut -d= -f2;;
+            packing) printf '%s\n' "$n" | grep -m1 -oE 'packing=(True|False)' | cut -d= -f2;;
+            fbs)     printf '%s\n' "$n" | grep -m1 -oE '^forward_batch_size: [0-9]+' | awk '{print $2}';;
+            bs)      printf '%s\n' "$n" | grep -m1 -oE '^batch_size: [0-9]+' | awk '{print $2}';;
+            g)       printf '%s\n' "$n" | grep -m1 -oE '^grpo_samples: [0-9]+' | awk '{print $2}';;
+        esac
+    }
+
+    local pA pB tA tB blindA=0 blindB=0
     pA=$(extract_path "$A"); pB=$(extract_path "$B")
     tA=$(extract_transport "$A"); tB=$(extract_transport "$B")
-    [ -z "$pA" ] && pA="(none)"; [ -z "$pB" ] && pB="(none)"
+    [ -z "$pA" ] && { pA="$(infer_path "$A")"; blindA=1; }
+    [ -z "$pB" ] && { pB="$(infer_path "$B")"; blindB=1; }
 
     echo "==================== A/B COMPARE ===================="
     echo "  A: $A"
-    echo "       grpo_step path : ${pA}"
+    echo "       grpo_step path : ${pA}$([ "$blindA" -eq 1 ] && echo '  [INFERRED from config -- leg emitted no diagnostic]')"
     echo "       RS transport   : ${tA}"
     echo "  B: $B"
-    echo "       grpo_step path : ${pB}"
+    echo "       grpo_step path : ${pB}$([ "$blindB" -eq 1 ] && echo '  [INFERRED from config -- leg emitted no diagnostic]')"
     echo "       RS transport   : ${tB}"
     echo "----------------------------------------------------"
 
     local fail=0
-    if [ "$pA" != "$pB" ]; then
+    if [ "$blindA" -eq 1 ] || [ "$blindB" -eq 1 ]; then
+        local nA nB f vA vB conflict=0 unknown=0 shown_a="" shown_b=""
+        nA=$(normalize "$A"); nB=$(normalize "$B")
+        echo "${YEL}BLIND: at least one leg predates the 'grpo_step path' diagnostic.${RST}"
+        for f in chunked packing fbs bs g; do
+            vA=$(path_field "$nA" "$f"); vB=$(path_field "$nB" "$f")
+            shown_a="${shown_a}${f}=${vA:-?} "; shown_b="${shown_b}${f}=${vB:-?} "
+            # Only two PRESENT values that DISAGREE are a conflict. A field absent
+            # from one leg is unknown -- it weakens the inference, it is not evidence
+            # of a difference.
+            if [ -n "$vA" ] && [ -n "$vB" ] && [ "$vA" != "$vB" ]; then conflict=1
+            elif [ -z "$vA" ] || [ -z "$vB" ]; then unknown=1; fi
+        done
+        echo "       A config: ${shown_a}"
+        echo "       B config: ${shown_b}"
+        if [ "$conflict" -eq 1 ]; then
+            fail=1
+            echo "${RED}MISMATCH: path-determining config differs between legs.${RST}"
+        elif [ "$pA" != "$pB" ]; then
+            fail=1
+            echo "${RED}MISMATCH: grpo_step path differs ('${pA}' vs '${pB}').${RST}"
+        else
+            echo "${YEL}No observed config field disagrees => same path by construction.${RST}"
+            [ "$unknown" -eq 1 ] && echo "${YEL}(Some fields marked '?' were never echoed by one leg -- unknown, not zero.)${RST}"
+            echo "${YEL}Parity accepted on INFERENCE, not on an observation. Prefer re-running${RST}"
+            echo "${YEL}the older leg on a binary that emits the line before citing this A/B.${RST}"
+        fi
+    elif [ "$pA" != "$pB" ]; then
         fail=1
         echo "${RED}MISMATCH: grpo_step path differs ('${pA}' vs '${pB}').${RST}"
     fi
@@ -330,7 +798,18 @@ compare_logs() {
         echo "${RED}This is the exact 2026-06-17 mistake (LoRA bypassed gloo, dense did not). Re-run both legs in the same mode.${RST}"
         return 1
     fi
-    echo "${GRN}A/B parity OK: both legs same path + same transport. Comparison is valid.${RST}"
+    echo "${GRN}Execution-mode parity OK: both legs same path + same transport.${RST}"
+
+    # Mode parity is necessary but NOT sufficient. The second way an A/B lies is
+    # rollout-length skew (2026-09-15 fbs=3). Check it before declaring validity.
+    compare_normalized "$A" "$B" || fail=1
+
+    echo "----------------------------------------------------"
+    if [ "$fail" -eq 1 ]; then
+        echo "${RED}A/B INVALID: cite the per-token column only, or re-run length-matched.${RST}"
+        return 1
+    fi
+    echo "${GRN}A/B VALID: same execution mode, lengths matched. Comparison is citable.${RST}"
     return 0
 }
 
