@@ -1,32 +1,44 @@
-# BioReason multimodal SFT — STAGE 2 (LoRA finetune on aligned projector), Qwen3-32B / XPU
+# BioReason multimodal SFT — Aurora Stage 2, v6: LoRA r128/a256 + real warmup->cosine LR
+# schedule, testing whether v5's SFT-vs-paper-SFT gap (0.6227w vs paper's own 0.6483w,
+# see memory/project_bioreason_training_recipe_gap_root_cause_20260818.md) is explained by
+# under-provisioned LoRA capacity + missing LR schedule + too few training steps.
 #
-# ★ Two-stage (LLaVA) recipe, Stage 2. Loads the Stage-1-aligned protein/GO projector
-# (stage1_proj_dir) then LoRA-finetunes the backbone on top of it. Stage 1 froze the backbone
-# and aligned the projector into embedding space using LAYER-37 ESM3 features (the scale fix:
-# layer-(-1) norm ~10600 is unbridgeable -> ':' collapse; layer-37 ~551 works). Stage 2 now
-# teaches the backbone to REASON from those aligned features.
-#   Published Stage 2: text_model_finetune=True, LoRA r=128/a=256, loads Stage-1 projector,
-#   up to 10 epochs, lr=1e-4. (scripts/sh_train_protein_qwen_staged.sh)
+# ★★ WHY: a dedicated investigation (2026-08-18) found our v5 Stage-2 recipe trainable
+# fraction (0.42% of the 32B model) is 15.6x SMALLER than the paper's own Stage-2 recipe
+# (6.57% of their 4B model, rank=128/alpha=256 — BioReason-Pro/scripts/sh_train_protein_qwen_staged.sh),
+# v5 has NO lr_scheduler at all (flat 2e-5, vs the paper's warmup->1e-4 peak->cosine decay),
+# and v5's ~300-1000-step plateau is 5-20x fewer steps than the paper's own ~18,300-step
+# Stage-2 run. This config raises rank/alpha to match the paper, wires in the same
+# get_cosine_schedule_with_warmup already used elsewhere in this repo
+# (torchtune/training/lr_schedulers.py, e.g. qwen3_4b_lora_sft_throughput_aurora_xpu.yaml),
+# and raises peak LR toward the paper's 1e-4 (5x v5's flat 2e-5). Everything else (Stage-1
+# base, layer -1 + unbounded projector, freeze_projector, dataset flags) is held IDENTICAL
+# to v5 so this is a clean, single-hypothesis test of capacity+schedule+depth.
 #
-# PREREQUISITE: a completed Stage-1 run. Set stage1_proj_dir to its epoch_N dir (holding
-# protein_projection.pt / go_projection.pt). Default points at the 4N Stage-1 full run.
+# NOTE on freeze_projector: kept True (matches v5), NOT changed here — the paper trains its
+# projector jointly, but unfreezing ours requires re-pairing with projector_output_norm=true
+# to avoid the known norm-drift collapse mode (see feedback_bioreason_esm3_layer37_scale_fix.md).
+# That is a SEPARATE experiment (memory doc's ranked action #2), not conflated with this one.
+#
+# ⚠️ COLLAPSE GATE (mandatory, MORE important than usual here): a 5x higher peak LR is
+# exactly the kind of "fast-saturating lr" this recipe family's known collapse mode
+# (LoRA + unbounded projector) has triggered on before (v1/v2). Train SAVE_EVERY=10, run
+# experiments/bioreason/probe_generation_health.py against the step-~10-20 checkpoint BEFORE
+# scaling to more nodes or a longer run. Do not skip this because v5/v4 passed clean before —
+# this config changes both rank AND peak LR simultaneously relative to those.
 #
 # Recipe: recipes/dev/sft_bioreason_distributed_xpu.py
 
-name: sft_bioreason_qwen3_32b_stage2_xpu
+name: sft_bioreason_qwen3_32b_lora_r128_lrsched_v6_xpu
 output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/experiments/bioreason/runs/${name}
 base_model_path: /lus/flare/projects/ModCon/ngetty/models/Qwen3-32B
 sft_data_dir: /lus/flare/projects/ModCon/ngetty/datasets/bioreason_sft_reasoning/data
-esm3_cache_path: /lus/flare/projects/ModCon/ngetty/datasets/bioreason_sft_reasoning/esm3_cache_2048_l37.safetensors
+esm3_cache_path: /lus/flare/projects/ModCon/ngetty/datasets/bioreason_sft_reasoning/esm3_cache_2048.safetensors
 go_embedding_path: /lus/flare/projects/ModCon/ngetty/models/bioreason-pro-sft/go_embedding.pt
 
-# Stage-1-aligned projector to load before LoRA finetune.
-# ★ Use the EARLY (step-10) projector, NOT a long Stage-1 run: with the go_pred text leak,
-# Stage-1 loss saturates ~0 by step 40 and the projector then OVER-AMPLIFIES (proj-out norm
-# 721@step10 -> 1629@step80) and reverts to ':' collapse (step-80 eval = 6/6 ':' vs step-10 =
-# 6/6 real text). The step-10 projector (norm 721, near text scale) is the validated-working
-# aligned projector. See feedback_bioreason_esm3_layer37_scale_fix.
-stage1_proj_dir: /lus/flare/projects/ModCon/ngetty/torchtune/experiments/bioreason/runs/stage1_aligned_projector_step10
+# Same Stage-1 base as v5 — step-450 snapshot of sft_qwen3_32b_stage1_layerneg1_full_v2
+# (job 8758738, 2026-08-16), the deepest/most-converged layer-1/unbounded-projector base.
+stage1_proj_dir: /lus/flare/projects/ModCon/ngetty/torchtune/experiments/bioreason/runs/sft_qwen3_32b_stage1_layerneg1_step450_snapshot
 
 # ── Tokenizer (Qwen3) ─────────────────────────────────────────────────────────
 tokenizer:
@@ -35,7 +47,7 @@ tokenizer:
   merges_file: ${base_model_path}/merges.txt
   max_seq_len: 6144
 
-# ── Model — STAGE 2: LoRA-enabled backbone + aligned projector ──────────────────
+# ── Model — LoRA r128/a256/dropout0.05 (matches paper's own Stage-2 rank/alpha) ────
 model:
   _component_: torchtune.dev.bioreason.model_native.BioReasonNativeModel
   backbone_builder: qwen3_32b
@@ -44,12 +56,11 @@ model:
   go_token_id: 151644
   enable_lora: true          # Stage 2: LoRA-finetune the backbone
   freeze_backbone: false     # (ignored under LoRA; base frozen except adapters)
-  freeze_projector: true     # LOCK the Stage-1-aligned projector. A trainable
-                             # projector over-amplifies once loss saturates (721->1044 in 10
-                             # steps) and re-breaks the scale -> ':' collapse. Only LoRA trains.
-  projector_output_norm: true # stage1_aligned_projector_step10 includes LayerNorm.
-  lora_rank: 32
-  lora_alpha: 64
+  freeze_projector: true     # unchanged from v5 — see note above, joint-training is a separate experiment
+  projector_output_norm: false  # unchanged from v5: layer -1, NO LayerNorm
+  lora_rank: 128
+  lora_alpha: 256
+  lora_dropout: 0.05
   apply_lora_to_mlp: true
   esm3_cache_path: ${esm3_cache_path}
   go_embedding_path: ${go_embedding_path}
@@ -73,9 +84,10 @@ checkpointer:
   model_type: QWEN2
 
 resume_from_checkpoint: false
+save_every_n_steps: 10
 save_every_n_epochs: 1
 
-# ── Dataset (identical distribution to Stage 1 + eval) ──────────────────────────
+# ── Dataset (identical to v5, INCLUDING add_uniprot_summary) ──
 dataset:
   _component_: torchtune.dev.bioreason.dataset_sft.bioreason_sft_dataset
   data_files: ${sft_data_dir}
@@ -86,13 +98,14 @@ dataset:
   go_token_id: 151644
   train_on_reasoning: true
   inject_go_pred: true
+  add_uniprot_summary: true
 seed: 1234
 shuffle: true
 collate_fn: torchtune.dev.bioreason.dataset_sft.bioreason_sft_collate_fn
 dataloader_num_workers: 0
 
-# ── Training envelope — Stage 2: conservative lr after the unbounded-projector collapse ──
-epochs: 1
+# ── Training envelope — real warmup->cosine schedule, peak lr toward the paper's 1e-4 ──
+epochs: 50
 max_steps_per_epoch: null
 batch_size: 1
 gradient_accumulation_steps: 4
@@ -100,9 +113,19 @@ clip_grad_norm: 1.0
 
 optimizer:
   _component_: torch.optim.AdamW
-  lr: 2.0e-5
+  lr: 1.0e-4
   weight_decay: 0.0
   fused: true
+
+# num_training_steps is computed by the recipe as total_epochs * steps_per_epoch at
+# runtime (depends on actual dp_degree of whatever topology this is launched on) — see
+# full_finetune_distributed_xpu.py:641-645. num_warmup_steps=50 is a small, fixed warmup
+# (the paper uses ~5% of ~18,300 ~= 915 steps; 50 is deliberately conservative here since
+# a fast LR ramp is exactly the known collapse trigger for this recipe family — extend if
+# the smoke/collapse gate passes clean and a longer run is warranted).
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  num_warmup_steps: 50
 
 loss:
   _component_: torchtune.modules.loss.LinearCrossEntropyLoss

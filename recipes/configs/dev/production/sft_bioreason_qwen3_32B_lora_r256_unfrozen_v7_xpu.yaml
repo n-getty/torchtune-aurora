@@ -1,0 +1,198 @@
+# BioReason multimodal SFT — Aurora Stage 2, v7: LoRA r256/a512 (trainable fraction MATCHED
+# to the paper's own 6.57%) + UNFROZEN projector (jointly trained, matching the paper's own
+# recipe) + LayerNorm-bounded projector output (required for unfreezing to be collapse-safe).
+#
+# ★★ WHY: v6 (recipes/configs/dev/production/sft_bioreason_qwen3_32B_lora_r128_lrsched_v6_xpu.yaml)
+# raised LoRA rank to 128/alpha256 to match the paper's RAW rank number, but this only bought
+# 3.36% trainable fraction of the 32B base — still ~2x smaller than the paper's 6.57% on their
+# 4B base (LoRA param count scales with rank*(in_dim+out_dim) per matrix, and the 32B's
+# matrices are ~2x wider than the 4B's, so matching raw rank does NOT match trainable
+# fraction). v6 peaked at step 1500 (0.6552u/0.6196w, beats v5's peak unweighted but ties
+# weighted) then DECLINED at step 2000 (0.6298u/0.5960w) — never closed the gap to the
+# paper's own SFT baseline (0.6752u/0.6483w). See
+# memory/project_bioreason_v6_rank128_lrsched_step300_trails_v5_20260818.md.
+#
+# rank=256/alpha=512 gives 6.71% trainable fraction of the 32B base (2147.5M params) — matches
+# the paper's 6.57% almost exactly, computed directly from the Qwen3 architecture dims
+# (embed_dim=5120, num_heads=64, head_dim=128, num_kv_heads=8, intermediate_dim=25600,
+# num_layers=64) rather than just copying the raw rank number. alpha/rank ratio (2x) held
+# identical to v6.
+#
+# ★★★ freeze_projector=false: the paper ALWAYS trains its projector jointly during Stage 2
+# (never freezes it) — v5/v6 both deviated from this (freeze_projector=true) as a defensive
+# fix for a real collapse mode (unfrozen+unbounded projector norm-drifts 721->1044 within 10
+# Stage-2 steps and re-triggers ':' collapse, see feedback_bioreason_esm3_layer37_scale_fix.md).
+# That collapse mode is specifically an UNBOUNDED-projector failure — bounding the projector
+# output with LayerNorm (projector_output_norm=true) is the established fix
+# (project_bioreason_stage2norm_gate_passed_20260702: the EXACT protein that ':'-collapsed
+# under LoRA+unbounded-projector Stage-2 reasons coherently under LoRA+LayerNorm-projector
+# Stage-2). This config unfreezes the projector while pairing it with that fix, rather than
+# working around the collapse mode by disabling the encoder->model bridge from learning
+# further.
+#
+# ★★★★ BASE CHECKPOINT CHANGE (layer -1 -> layer 37): unfreezing safely requires a
+# LayerNorm-bounded projector, but NO layer-(-1)+LayerNorm Stage-1 checkpoint exists (v5/v6's
+# lineage is layer-(-1) WITHOUT LayerNorm). The only LayerNorm-bounded Stage-1 base on disk
+# (sft_qwen3_32b_stage1norm/epoch_0) was trained on ESM3 LAYER 37, not layer -1. Switching to
+# it is not a compromise — layer 37 is the paper's OWN published choice
+# (BioReason-Pro/scripts/sh_train_protein_qwen_staged.sh: --protein_embedding_layer 37); layer
+# -1 was Aurora's own deviation. Prior internal A/B found layer37-frozen vs layer(-1)-LoRA
+# close to a wash (0.6144u/0.5486w vs 0.6076u/0.5489w), so this is not expected to cost
+# anything and moves closer to faithfully reproducing the paper's recipe on two axes at once
+# (projector layer AND joint projector training). The stage1norm base already cleared its own
+# collapse-free milestone at F_max 0.6008 (frozen backbone, no LoRA) — see
+# project_bioreason_stage1norm_fmax_beats_floor_20260701.md.
+#
+# ⚠️⚠️ COLLAPSE GATE (mandatory, THIS IS A GENUINELY NEW COMBINATION never tested before —
+# every prior stage2norm run kept freeze_projector=true even on this LayerNorm base). Train
+# a 2N smoke at SAVE_EVERY=10, run experiments/bioreason/probe_generation_health.py against
+# the step-~10-20 checkpoint BEFORE scaling to more nodes or a longer run. If ':' collapse
+# reappears, the fix is NOT to re-freeze the projector (that reverts to the v5/v6 capability
+# ceiling this run exists to break past) — diagnose the actual cause (e.g. LR too high for
+# the now much-larger trainable set, warmup too short, LayerNorm not actually loaded/applied)
+# and re-gate. Do not skip this step because stage2norm (frozen projector) or v6 (layer -1)
+# passed clean before — neither tested this exact combination.
+#
+# Recipe: recipes/dev/sft_bioreason_distributed_xpu.py
+
+name: sft_bioreason_qwen3_32b_lora_r256_unfrozen_v7_xpu
+output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/experiments/bioreason/runs/${name}
+base_model_path: /lus/flare/projects/ModCon/ngetty/models/Qwen3-32B
+sft_data_dir: /lus/flare/projects/ModCon/ngetty/datasets/bioreason_sft_reasoning/data
+# LAYER 37 (the paper's own published choice) — NOT the layer-(-1) cache v5/v6 used. See note
+# above: unfreezing requires the LayerNorm-bounded base, which only exists at layer 37.
+esm3_cache_path: /lus/flare/projects/ModCon/ngetty/datasets/bioreason_sft_reasoning/esm3_cache_2048_l37.safetensors
+go_embedding_path: /lus/flare/projects/ModCon/ngetty/models/bioreason-pro-sft/go_embedding.pt
+
+# CLEAN Stage-1 projector: frozen-backbone + LayerNorm, layer-37 (F_max 0.6008 frozen-backbone
+# milestone, 280/280 coherent generation, 0 collapse — project_bioreason_stage1norm_fmax_beats_floor_20260701).
+# Its protein_projection.pt/go_projection.pt carry the index-3 LayerNorm keys, so
+# projector_output_norm MUST be true below (load fails otherwise — key mismatch).
+stage1_proj_dir: /lus/flare/projects/ModCon/ngetty/torchtune/experiments/bioreason/runs/sft_qwen3_32b_stage1norm/epoch_0
+
+# ── Tokenizer (Qwen3) ─────────────────────────────────────────────────────────
+tokenizer:
+  _component_: torchtune.models.qwen3.qwen3_tokenizer
+  path: ${base_model_path}/vocab.json
+  merges_file: ${base_model_path}/merges.txt
+  max_seq_len: 6144
+
+# ── Model — LoRA r256/a512 (6.71% trainable, matches paper's 6.57%), UNFROZEN LayerNorm projector ──
+model:
+  _component_: torchtune.dev.bioreason.model_native.BioReasonNativeModel
+  backbone_builder: qwen3_32b
+  hidden_size: 5120
+  protein_token_id: 151643
+  go_token_id: 151644
+  enable_lora: true          # Stage 2: LoRA-finetune the backbone
+  freeze_backbone: false     # (ignored under LoRA; base frozen except adapters)
+  freeze_projector: false    # ★ UNFROZEN — jointly trains with the LoRA backbone (matches paper)
+  projector_output_norm: true  # ★ REQUIRED pairing for unfreezing — bounds spliced-feature magnitude,
+                                # prevents the norm-drift collapse mode. MUST match the loaded
+                                # stage1norm projector's index-3 LayerNorm or the load fails.
+  lora_rank: 256
+  lora_alpha: 512
+  lora_dropout: 0.05
+  apply_lora_to_mlp: true
+  esm3_cache_path: ${esm3_cache_path}
+  go_embedding_path: ${go_embedding_path}
+
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [
+    model-00001-of-00017.safetensors, model-00002-of-00017.safetensors,
+    model-00003-of-00017.safetensors, model-00004-of-00017.safetensors,
+    model-00005-of-00017.safetensors, model-00006-of-00017.safetensors,
+    model-00007-of-00017.safetensors, model-00008-of-00017.safetensors,
+    model-00009-of-00017.safetensors, model-00010-of-00017.safetensors,
+    model-00011-of-00017.safetensors, model-00012-of-00017.safetensors,
+    model-00013-of-00017.safetensors, model-00014-of-00017.safetensors,
+    model-00015-of-00017.safetensors, model-00016-of-00017.safetensors,
+    model-00017-of-00017.safetensors,
+  ]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: QWEN2
+
+resume_from_checkpoint: false
+save_every_n_steps: 10
+save_every_n_epochs: 1
+
+# ── Dataset (identical to v6, INCLUDING add_uniprot_summary) ──
+dataset:
+  _component_: torchtune.dev.bioreason.dataset_sft.bioreason_sft_dataset
+  data_files: ${sft_data_dir}
+  max_seq_len: 6144
+  max_protein_len: 2048
+  num_go_tokens: 200
+  protein_token_id: 151643
+  go_token_id: 151644
+  train_on_reasoning: true
+  inject_go_pred: true
+  add_uniprot_summary: true
+seed: 1234
+shuffle: true
+collate_fn: torchtune.dev.bioreason.dataset_sft.bioreason_sft_collate_fn
+dataloader_num_workers: 0
+
+# ── Training envelope — same warmup->cosine schedule as v6 (unchanged control) ──
+epochs: 50
+max_steps_per_epoch: null
+batch_size: 1
+gradient_accumulation_steps: 4
+clip_grad_norm: 1.0
+
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 1.0e-4
+  weight_decay: 0.0
+  fused: true
+
+# Same conservative num_warmup_steps=50 as v6 — a larger trainable set (LoRA r256 + full
+# projector, vs v6's LoRA r128 only) is, if anything, MORE prone to the fast-saturating-LR
+# collapse trigger, not less, so keep warmup unchanged rather than also varying it here.
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  num_warmup_steps: 50
+
+loss:
+  _component_: torchtune.modules.loss.LinearCrossEntropyLoss
+
+# ── Distributed / FSDP — full 12-way shard ──────────────────────────────────────
+enable_activation_checkpointing: true
+enable_activation_offloading: false
+fsdp_cpu_offload: false
+fsdp_reshard_after_forward: true
+data_parallel_replicate_dim: 1
+data_parallel_shard_dim: -1
+tensor_parallel_dim: 1
+pad_to_fixed: true
+
+# ── XPU ───────────────────────────────────────────────────────────────────────
+device: xpu
+dtype: bf16
+compile: false
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+log_level: INFO
+log_every_n_steps: 1
+log_peak_memory_stats: true
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: false
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: true
+  cuda: false
+  profile_memory: false
+  with_stack: false
+  record_shapes: false
+  with_flops: false
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1

@@ -1,32 +1,44 @@
-# BioReason multimodal SFT — STAGE 2 (LoRA finetune on aligned projector), Qwen3-32B / XPU
+# BioReason multimodal SFT — Aurora Stage 2, v5: LoRA r16/a32/dropout0.05 on rbdgx3's real
+# recipe (layer -1, UNBOUNDED projector), built on the MOST-CONVERGED Stage-1 checkpoint yet
+# (step 450 of sft_qwen3_32b_stage1_layerneg1_full_v2, job 8758738, 2026-08-16).
 #
-# ★ Two-stage (LLaVA) recipe, Stage 2. Loads the Stage-1-aligned protein/GO projector
-# (stage1_proj_dir) then LoRA-finetunes the backbone on top of it. Stage 1 froze the backbone
-# and aligned the projector into embedding space using LAYER-37 ESM3 features (the scale fix:
-# layer-(-1) norm ~10600 is unbridgeable -> ':' collapse; layer-37 ~551 works). Stage 2 now
-# teaches the backbone to REASON from those aligned features.
-#   Published Stage 2: text_model_finetune=True, LoRA r=128/a=256, loads Stage-1 projector,
-#   up to 10 epochs, lr=1e-4. (scripts/sh_train_protein_qwen_staged.sh)
+# ★★ WHY: v4 (step-40 Stage-1 snapshot) passed the collapse gate (5/5 clean, no ':'/loop
+# collapse) and tied the frozen-backbone Leg A1 on F_max (0.6076u/0.5489w vs 0.6144u/0.5486w)
+# — but that comparison was built on a barely-trained Stage-1 base. Meanwhile, continuing
+# Stage-1 alone past step 200 has NOT improved F_max (step 200: 0.6371u/0.5782w -> step ~300:
+# 0.6155u/0.5571w) and shows a GROWING repetition-loop rate under greedy eval decoding as
+# training progresses (3/150 -> 8/150; see
+# memory/project_bioreason_bothfixes_stopped_rerank_sft_launched_20260806.md and the
+# 2026-08-16 investigation in this session). Per the paper's own two-stage methodology
+# (BioReason-Pro/scripts/sh_train_protein_qwen_staged.sh), frozen-backbone Stage 1 was never
+# meant to be the final generation-quality checkpoint -- Stage 2 (backbone adaptation) is
+# where the model learns to actually reason/terminate cleanly from the aligned features, not
+# just match a curated trace's token distribution. This config moves off Stage-1-forever and
+# onto Stage 2, built on the deepest Stage-1 base trained so far (step 450, loss plateaued
+# ~0.89-0.94 across steps 400-455) instead of the step-40 base used for v4.
 #
-# PREREQUISITE: a completed Stage-1 run. Set stage1_proj_dir to its epoch_N dir (holding
-# protein_projection.pt / go_projection.pt). Default points at the 4N Stage-1 full run.
+# stage1_proj_dir is a STABLE SNAPSHOT (not the live, still-training output_dir) taken via
+# rsync on 2026-08-16 -- reading a live dir mid-write races exactly like the v2 collapse-gate
+# incident (RuntimeError: unable to open file).
+#
+# ⚠️ COLLAPSE GATE (still mandatory): train SAVE_EVERY=10, then run
+# experiments/bioreason/probe_generation_health.py against the checkpoint BEFORE any eval.
+# The known collapse failure mode (LoRA + unbounded projector + fast-saturating lr) has
+# reappeared before on this recipe family -- do not skip the gate because v4 passed once.
 #
 # Recipe: recipes/dev/sft_bioreason_distributed_xpu.py
 
-name: sft_bioreason_qwen3_32b_stage2_xpu
+name: sft_bioreason_qwen3_32b_lora_r16_parity_v5_step450_xpu
 output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/experiments/bioreason/runs/${name}
 base_model_path: /lus/flare/projects/ModCon/ngetty/models/Qwen3-32B
 sft_data_dir: /lus/flare/projects/ModCon/ngetty/datasets/bioreason_sft_reasoning/data
-esm3_cache_path: /lus/flare/projects/ModCon/ngetty/datasets/bioreason_sft_reasoning/esm3_cache_2048_l37.safetensors
+esm3_cache_path: /lus/flare/projects/ModCon/ngetty/datasets/bioreason_sft_reasoning/esm3_cache_2048.safetensors
 go_embedding_path: /lus/flare/projects/ModCon/ngetty/models/bioreason-pro-sft/go_embedding.pt
 
-# Stage-1-aligned projector to load before LoRA finetune.
-# ★ Use the EARLY (step-10) projector, NOT a long Stage-1 run: with the go_pred text leak,
-# Stage-1 loss saturates ~0 by step 40 and the projector then OVER-AMPLIFIES (proj-out norm
-# 721@step10 -> 1629@step80) and reverts to ':' collapse (step-80 eval = 6/6 ':' vs step-10 =
-# 6/6 real text). The step-10 projector (norm 721, near text scale) is the validated-working
-# aligned projector. See feedback_bioreason_esm3_layer37_scale_fix.
-stage1_proj_dir: /lus/flare/projects/ModCon/ngetty/torchtune/experiments/bioreason/runs/stage1_aligned_projector_step10
+# Step-450 snapshot of sft_qwen3_32b_stage1_layerneg1_full_v2 (job 8758738, 16N capacity
+# segment ending 2026-08-16 01:34 UTC). Loss plateaued ~0.89-0.94 across steps 400-455 --
+# the deepest, most-converged layer-1/unbounded-projector Stage-1 base trained on Aurora yet.
+stage1_proj_dir: /lus/flare/projects/ModCon/ngetty/torchtune/experiments/bioreason/runs/sft_qwen3_32b_stage1_layerneg1_step450_snapshot
 
 # ── Tokenizer (Qwen3) ─────────────────────────────────────────────────────────
 tokenizer:
@@ -35,7 +47,7 @@ tokenizer:
   merges_file: ${base_model_path}/merges.txt
   max_seq_len: 6144
 
-# ── Model — STAGE 2: LoRA-enabled backbone + aligned projector ──────────────────
+# ── Model — LoRA r16/a32/dropout0.05, layer -1, NO projector LayerNorm ──────────
 model:
   _component_: torchtune.dev.bioreason.model_native.BioReasonNativeModel
   backbone_builder: qwen3_32b
@@ -44,12 +56,11 @@ model:
   go_token_id: 151644
   enable_lora: true          # Stage 2: LoRA-finetune the backbone
   freeze_backbone: false     # (ignored under LoRA; base frozen except adapters)
-  freeze_projector: true     # LOCK the Stage-1-aligned projector. A trainable
-                             # projector over-amplifies once loss saturates (721->1044 in 10
-                             # steps) and re-breaks the scale -> ':' collapse. Only LoRA trains.
-  projector_output_norm: true # stage1_aligned_projector_step10 includes LayerNorm.
-  lora_rank: 32
-  lora_alpha: 64
+  freeze_projector: true     # LOCK the Stage-1-aligned (unbounded) projector.
+  projector_output_norm: false  # rbdgx3's real recipe: NO LayerNorm.
+  lora_rank: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
   apply_lora_to_mlp: true
   esm3_cache_path: ${esm3_cache_path}
   go_embedding_path: ${go_embedding_path}
@@ -73,9 +84,10 @@ checkpointer:
   model_type: QWEN2
 
 resume_from_checkpoint: false
+save_every_n_steps: 10
 save_every_n_epochs: 1
 
-# ── Dataset (identical distribution to Stage 1 + eval) ──────────────────────────
+# ── Dataset (identical distribution to Stage 1 + eval, INCLUDING add_uniprot_summary) ──
 dataset:
   _component_: torchtune.dev.bioreason.dataset_sft.bioreason_sft_dataset
   data_files: ${sft_data_dir}
@@ -86,13 +98,14 @@ dataset:
   go_token_id: 151644
   train_on_reasoning: true
   inject_go_pred: true
+  add_uniprot_summary: true
 seed: 1234
 shuffle: true
 collate_fn: torchtune.dev.bioreason.dataset_sft.bioreason_sft_collate_fn
 dataloader_num_workers: 0
 
-# ── Training envelope — Stage 2: conservative lr after the unbounded-projector collapse ──
-epochs: 1
+# ── Training envelope — conservative lr, mirrors Aurora's stage2 config ────────
+epochs: 50
 max_steps_per_epoch: null
 batch_size: 1
 gradient_accumulation_steps: 4

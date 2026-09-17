@@ -1,0 +1,174 @@
+# Qwen3-8B LoRA-GRPO — per-rank COLOCATE, cloned from the validated Qwen3-4B
+# colocate config (qwen3_4b_lora_grpo_colocate_xpu.yaml) for the cross-machine
+# GRPO benchmarking campaign's Aurora native-leg 8B cell. Same envelope, model
+# swapped 4B -> 8B.
+#
+# Recipe:   recipes/dev/lora_grpo_full_finetune_distributed_xpu.py (vllm_mode=colocate)
+#
+# REQUIRED launch env: TORCHTUNE_COLOCATE_NO_FSDP=1 -- without it, this config
+# OOMs deterministically (FSDP1's mandatory full-model unshard on a top-level-
+# only wrap topology gathers ~15.26 GiB per forward, which this tile cannot
+# spare alongside vLLM colocate at 8B). Validated GREEN with the env var set:
+# 4.9s/step, 78.45% MFU, 10/10 steps, results/aurora_native_8b_lora.json.
+# See benchmarks/grpo_cross_machine/REPORT.md's "Aurora 8B LoRA colocate:
+# FIXED" section for the full investigation trail.
+
+name: lora_grpo_qwen3_8b_colocate
+output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/outputs/lora_grpo_qwen3_8b_colocate_v1
+base_model_path: /lus/flare/projects/ModCon/ngetty/models/Qwen3-8B
+
+vllm_mode: colocate
+vllm_tensor_parallel_size: 1
+vllm_enforce_eager: true
+vllm_gpu_memory_utilization: 0.45    # Real fix is TORCHTUNE_COLOCATE_NO_FSDP=1 (env, set by the
+                                      # launcher), not this value -- see the note below. 5 FSDP-path
+                                      # config-tuning attempts (this knob at 0.55/0.45/0.35, plus
+                                      # forward_batch_size and ref_forward_batch_size) all either hit
+                                      # the same fixed ~15.26 GiB FSDP unshard() OOM (a full 8B flat-
+                                      # param gather during _warmup_at_max()'s ref-forward -- NOT
+                                      # batch-scaled, so those knobs can't touch it) or broke vLLM's
+                                      # own KV reservation instead. Root cause: FULL_SHARD FSDP1 must
+                                      # gather the WHOLE unsharded model for every forward on this
+                                      # top-level-only-wrap topology (CLAUDE.md: per-module wrapping
+                                      # is catastrophic on XPU) -- for LoRA colocate the base model is
+                                      # frozen anyway, so FSDP's sharding buys nothing but the
+                                      # unshard-then-OOM risk. NO_FSDP skips FSDP1 entirely (full base
+                                      # resident per-rank, ~16 GiB, replicated not sharded) and
+                                      # re-enables real torch.xpu.empty_cache() reclaim between steps
+                                      # (normally banned under FSDP -- see CLAUDE.md's empty_cache+FSDP
+                                      # UR-handle-leak note) -- this is the documented, HW-validated
+                                      # fix for exactly this failure class
+                                      # (memory/project_nofsdp_colocate_reclaim_20260623.md): 4B/mg256
+                                      # cleared 25/25 steps with empty_cache reclaiming a full 8 GiB/step
+                                      # transient (L0 free measured RISING, impossible under FSDP).
+                                      # vllm_gpu_memory_utilization is a fraction of TOTAL device
+                                      # memory for vLLM's own budget, not "free after other
+                                      # allocations" -- it must clear vLLM's own model-weight residency
+                                      # (~19.1 GiB peak incl. non-torch overhead, measured on this HW)
+                                      # before any KV blocks are available. 0.20 undershot this
+                                      # (13.1 GiB budget < 19.1 GiB peak -> "No available memory for
+                                      # the cache blocks"). 0.45 (29.5 GiB budget) leaves ~10 GiB for
+                                      # KV, matching the working 4B ratio scaled for 8B's larger
+                                      # resident weights.
+vllm_max_model_len: 1152             # max_seq_len(1024) + max_generated_tokens(128)
+vllm_max_num_seqs: 16                # matches grpo_samples with headroom; no longer needs to be
+                                      # starved to compensate for FSDP's unshard spike (removed).
+reshard_after_forward: true
+
+model:
+  _component_: torchtune.models.qwen3.lora_qwen3_8b_base
+  lora_attn_modules: ['q_proj', 'k_proj', 'v_proj', 'output_proj']
+  apply_lora_to_mlp: true
+  apply_lora_to_output: false
+  lora_rank: 16
+  lora_alpha: 32
+  lora_dropout: 0.0
+
+tokenizer:
+  _component_: torchtune.models.qwen3.qwen3_tokenizer
+  path: ${base_model_path}/vocab.json
+  merges_file: ${base_model_path}/merges.txt
+  max_seq_len: ${max_seq_len}
+
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [
+    model-00001-of-00005.safetensors,
+    model-00002-of-00005.safetensors,
+    model-00003-of-00005.safetensors,
+    model-00004-of-00005.safetensors,
+    model-00005-of-00005.safetensors,
+  ]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: QWEN3
+
+dataset:
+  _component_: torchtune.dev.rl.gsm8k.gsm8k_dataset
+  partition: 1-9/10
+
+seed: 42
+shuffle: true
+resume_from_checkpoint: false
+
+grpo_samples: 4  # reduced from 8 -- G=8 OOM'd on the 64GiB tile (35.92 GiB allocated, tried +15.26 GiB)
+max_seq_len: 1024
+max_generated_tokens: 128
+temperature: 1.0
+top_k: null
+
+epochs: 1
+num_steps: 10
+ppo_epochs: 1
+batch_size: 1
+forward_batch_size: 4
+ref_forward_batch_size: 4    # == grpo_samples * batch_size (4*1) -- avoids the sequential-ref-fwd
+                             # default trap (CLAUDE.md), one chunk covers the whole batch.
+gen_batch_size: 1
+gradient_accumulation_steps: 1
+
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 3.0e-5
+  weight_decay: 0.01
+  fused: false
+
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  num_warmup_steps: 10
+
+clip_grad_norm: 1.0
+
+loss:
+  _component_: torchtune.dev.rl.loss.GRPOLoss
+  kl_coeff: 1.0e-4
+  epsilon: 0.2
+
+reward_functions:
+  - _component_: torchtune.dev.rl.rewards.FormattedMathCorrectnessReward
+    answer_tag: answer
+    positive_reward: 10.0
+    negative_reward: 0.0
+  - _component_: torchtune.dev.rl.rewards.ThinkingAnswerFormattingReward
+    think_tag: think
+    answer_tag: answer
+    positive_reward: 1.0
+    negative_reward: 0.0
+
+lora:
+  publish_every_steps: 1
+  max_loras: 2
+  log_validation_metrics: true
+
+fsdp_shard_strategy: FULL_SHARD
+enable_activation_checkpointing: true
+save_adapter_weights_only: true
+
+device: xpu
+dtype: bf16
+compile: false
+force_math_sdpa: false
+
+log_every_n_steps: 1
+log_peak_memory_stats: true
+save_every_n_epochs: 1
+
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: false
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: true
+  cuda: false
+  profile_memory: false
+  with_stack: false
+  record_shapes: false
+  with_flops: false
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1

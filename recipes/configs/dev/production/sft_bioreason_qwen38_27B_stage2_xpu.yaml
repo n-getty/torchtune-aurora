@@ -1,0 +1,173 @@
+# BioReason multimodal SFT — STAGE 2 (LoRA finetune on aligned projector), Qwen3.8-27B (HF-wrapper, XPU)
+#
+# ★ Points at the REAL Qwen3.8-27B checkpoint (models/Qwen3.8-27B), not the Qwen3.5-27B
+# stand-in that sft_bioreason_qwen36_27B_stage2_xpu.yaml uses and that this session's Phase
+# 1-3 kernel-validation work (~/.claude/plans/encapsulated-wibbling-nova.md) ran against.
+# Confirmed safe to treat that prior validation as covering this checkpoint too: both
+# checkpoints' model.safetensors.index.json have byte-identical weight-key sets (1199/1199,
+# same shapes) and modeling_qwen3_5.py is functionally unchanged between the transformers
+# version the two checkpoints declare (5.7.0 installed vs 5.8.0 Qwen3.8-27B was authored
+# against — diffed, only decorator-ordering churn, zero gate/attention logic changes).
+# Qwen3.8-27B's config.json additionally declares `attn_output_gate`/`output_gate_type:
+# swish`/`partial_rotary_factor` at the top level; the installed transformers==5.7.0's
+# Qwen3_5Attention hardcodes a sigmoid output gate unconditionally (never reads
+# output_gate_type) and reads partial_rotary_factor from the nested rope_parameters dict
+# (present and identical in both configs) — so these are forward-compat metadata fields,
+# not an architecture difference this stack diverges on.
+#
+# Same tokenizer/vocab as Qwen3.5-27B (vocab.json/tokenizer.json diff by only 7 new
+# multimodal-audio added-token entries above the ones this config's protein/go ids sit
+# below) — protein_token_id/go_token_id below are unchanged from the Qwen3.5-27B config.
+#
+# Same distinctions from the dense-Qwen3-32B Stage 2 config as
+# sft_bioreason_qwen36_27B_stage2_xpu.yaml documents (HF-wrapper backbone_builder,
+# checkpointer is placeholder-only, compile=false is a no-op for this backbone tree).
+#
+# PREREQUISITE: reuses the same Stage-1-aligned projector checkpoint as the Qwen3.5-27B
+# Stage-2 config (stage1_proj_dir below) — the projector's shape only depends on
+# hidden_size=5120 (identical across both checkpoints), not backbone-specific weights, so
+# this is valid for a throughput/mechanics run. Re-point at a real Stage-1 run on THIS
+# checkpoint before trusting any convergence number from this config.
+#
+# ★ ACCELERATION (validated this session, Phase 2/3 of the plan above, real 5-step FSDP2
+# smoke against Qwen3.5-27B — see docs/reports and phase3_fla_gdn_final_20260902.log):
+#   - TORCHTUNE_USE_XPU_FLASH=1  wraps HFQwen35Backbone's forward in the native SYCL-TLA
+#     flash kernel for the full-attention layers ONLY (guarded to head_dim in {64,96,128,192}
+#     — this checkpoint's head_dim=256 is HW-confirmed UNSUPPORTED by the vendor kernel and
+#     falls back to nullcontext()/framework auto-dispatch safely; see hf_qwen35_backbone.py's
+#     _XPU_FLASH_SUPPORTED_HEAD_DIMS guard). Net effect on THIS checkpoint is currently a
+#     no-op until a head_dim=256-compatible kernel exists — kept enabled (harmless) so the
+#     launcher doesn't silently diverge from the validated Phase 3 run's env.
+#   - TORCHTUNE_USE_FLA_GDN=1    routes the 48 Gated-DeltaNet layers through fla's
+#     Intel-XPU-tuned Triton chunk_gated_delta_rule kernel instead of transformers' pure
+#     PyTorch fallback (torch_chunk_gated_delta_rule). PVC correctness gate PASSED (6/6
+#     fwd+bwd parity cells, see check_fla_gdn_pvc_parity.py /
+#     fla_gdn_pvc_parity_20260902.log) — this is the dominant real lever for this
+#     architecture (3-of-4 layers are GDN, not full-attention).
+# These are set by the launcher (pbs_2n/hold_qwen38... scripts), NOT hardcoded here, to
+# keep this config A/B-able against TORCHTUNE_USE_FLA_GDN=0 without editing YAML.
+#
+# Recipe: recipes/dev/sft_bioreason_distributed_xpu.py
+
+name: sft_bioreason_qwen38_27b_stage2_xpu
+output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/experiments/bioreason/runs/${name}
+base_model_path: /lus/flare/projects/ModCon/ngetty/models/Qwen3.8-27B
+sft_data_dir: /lus/flare/projects/ModCon/ngetty/datasets/bioreason_sft_reasoning/data
+esm3_cache_path: /lus/flare/projects/ModCon/ngetty/datasets/bioreason_sft_reasoning/esm3_cache_2048_l37.safetensors
+go_embedding_path: /lus/flare/projects/ModCon/ngetty/models/bioreason-pro-sft/go_embedding.pt
+
+# Same Stage-1 projector checkpoint the Qwen3.5-27B Stage-2 config uses — see header note
+# on why this is valid for a mechanics/throughput run on the Qwen3.8-27B backbone.
+stage1_proj_dir: /lus/flare/projects/ModCon/ngetty/torchtune/experiments/bioreason/logs/step3_stage1_025808/run_out/epoch_0
+
+# ── Tokenizer (Qwen3.8-27B) ──────────────────────────────────────────────────────────────────
+tokenizer:
+  _component_: torchtune.models.qwen3.qwen3_tokenizer
+  path: ${base_model_path}/vocab.json
+  merges_file: ${base_model_path}/merges.txt
+  special_tokens_path: ${base_model_path}/tokenizer.json
+  max_seq_len: 6144
+
+# ── Model — STAGE 2: LoRA-enabled HF-wrapper backbone + aligned projector ───────────────────
+model:
+  _component_: torchtune.dev.bioreason.model_native.BioReasonNativeModel
+  backbone_builder: qwen3_5_27b_hf
+  hf_backbone_config_path: ${base_model_path}/config.json
+  hidden_size: 5120
+  protein_token_id: 248077
+  go_token_id: 248078
+  enable_lora: true          # Stage 2: LoRA-finetune the backbone (via PEFT, see model_native.py)
+  freeze_backbone: false     # (ignored under LoRA; base frozen except adapters)
+  freeze_projector: true     # LOCK the Stage-1-aligned projector
+  projector_output_norm: true
+  lora_rank: 32
+  lora_alpha: 64
+  lora_dropout: 0.0
+  # PEFT/Conv1d incompatible with this checkpoint's shape (groups=10240) — see
+  # sft_bioreason_qwen36_27B_stage2_xpu.yaml's header for the exact error; frozen here too.
+  include_conv1d_lora: false
+  apply_lora_to_mlp: true
+  esm3_cache_path: ${esm3_cache_path}
+  go_embedding_path: ${go_embedding_path}
+
+# Placeholder only — see header comment.
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: []
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: QWEN3
+
+resume_from_checkpoint: false
+save_every_n_epochs: 1
+
+# ── Dataset (identical distribution to Stage 1 + eval) ──────────────────────────
+dataset:
+  _component_: torchtune.dev.bioreason.dataset_sft.bioreason_sft_dataset
+  data_files: ${sft_data_dir}
+  max_seq_len: 6144
+  max_protein_len: 2048
+  num_go_tokens: 200
+  protein_token_id: 248077
+  go_token_id: 248078
+  train_on_reasoning: true
+  inject_go_pred: true
+seed: 1234
+shuffle: true
+collate_fn: torchtune.dev.bioreason.dataset_sft.bioreason_sft_collate_fn
+dataloader_num_workers: 0
+
+# ── Training envelope — Stage 2: lr 1e-4 (published) ────────────────────────────
+epochs: 1
+max_steps_per_epoch: null
+batch_size: 1
+gradient_accumulation_steps: 4
+clip_grad_norm: 1.0
+
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 1.0e-4
+  weight_decay: 0.0
+  fused: true
+
+loss:
+  _component_: torchtune.modules.loss.LinearCrossEntropyLoss
+
+# ── Distributed / FSDP — full 12-way shard per node, replicate across nodes (HSDP) ──────────
+enable_activation_checkpointing: true
+enable_activation_offloading: false
+fsdp_cpu_offload: false
+fsdp_reshard_after_forward: true
+data_parallel_replicate_dim: 1
+data_parallel_shard_dim: -1
+tensor_parallel_dim: 1
+pad_to_fixed: true
+
+# ── XPU ───────────────────────────────────────────────────────────────────────
+device: xpu
+dtype: bf16
+compile: false
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+log_level: INFO
+log_every_n_steps: 1
+log_peak_memory_stats: true
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: false
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: true
+  cuda: false
+  profile_memory: false
+  with_stack: false
+  record_shapes: false
+  with_flops: false
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1

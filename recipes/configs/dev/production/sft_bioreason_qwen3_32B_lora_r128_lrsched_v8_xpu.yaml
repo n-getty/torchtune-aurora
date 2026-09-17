@@ -1,0 +1,183 @@
+# BioReason multimodal SFT — Aurora Stage 2, v8: v6's recipe (LoRA r128/a256 + real
+# warmup->cosine LR schedule) RE-RUN with two LR-schedule bugs fixed. Everything else
+# (Stage-1 base, layer -1 + unbounded projector, freeze_projector, dataset flags) is
+# held IDENTICAL to v6/v5 so this stays a single-hypothesis test: does an LR schedule
+# that actually anneals change the peak-then-decline pattern v6/v7 both showed?
+#
+# ★★ WHY this re-run, not a re-read of v6/v7: two bugs made v6's own schedule a
+# near-null test of "add an LR schedule":
+#   1. (recipes/dev/sft_bioreason_distributed_xpu.py) global_step was restored from
+#      resume_state AFTER super().setup() had already built the LR scheduler with
+#      last_epoch=self.global_step-1 — so last_epoch was always -1 at build time and
+#      every resume segment silently restarted the cosine schedule from warmup. Fixed:
+#      the restore now happens inside _setup_model, before the parent's scheduler
+#      build. v6/v7 ran their ENTIRE multi-thousand-step history flat at ~peak LR.
+#   2. (recipes/dev/full_finetune_distributed_xpu.py) even with #1 fixed, the cosine
+#      horizon (num_training_steps) defaulted to total_epochs * steps_per_epoch, and
+#      this config's epochs:50 is a DELIBERATE allocation-filling value (see
+#      feedback_epochs1_wastes_scaled_node_allocations_20260815.md), not the real
+#      step budget. At 16N that's an 8100-step horizon against a ~1525-step real run —
+#      LR would sit at ~97% of peak for the whole run even with #1 fixed. Fixed: a new,
+#      separate `lr_scheduler_num_training_steps` config key sets the real horizon
+#      without touching what `epochs` is for.
+# See ~/.claude/plans/synthetic-rolling-diffie.md Track A / docs/status.md for the
+# full writeup (memory: project_bioreason_lr_scheduler_resume_restart_bug_20260902).
+#
+# BUDGET: matched to the paper's ~1.17M samples at this run's eff batch (16N, dp=192,
+# batch_size=1 x grad_accum=4 x dp=192 = 768/step) => 1525 steps. num_warmup_steps=50
+# unchanged from v6 (kept conservative — a fast LR ramp is the known collapse trigger
+# for this recipe family, see v1/v2).
+#
+# ⚠️ COLLAPSE GATE (mandatory, same as v6): train SAVE_EVERY=10 initially, run
+# experiments/bioreason/probe_generation_health.py against an early checkpoint BEFORE
+# trusting the full run. This config's peak LR (1e-4) and rank (128) already passed the
+# gate once as v6 — but a genuinely-annealing schedule changes step-to-step LR dynamics,
+# so don't skip the check because v6 passed.
+#
+# Recipe: recipes/dev/sft_bioreason_distributed_xpu.py
+
+name: sft_bioreason_qwen3_32b_lora_r128_lrsched_v8_xpu
+output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/experiments/bioreason/runs/${name}
+base_model_path: /lus/flare/projects/ModCon/ngetty/models/Qwen3-32B
+sft_data_dir: /lus/flare/projects/ModCon/ngetty/datasets/bioreason_sft_reasoning/data
+esm3_cache_path: /lus/flare/projects/ModCon/ngetty/datasets/bioreason_sft_reasoning/esm3_cache_2048.safetensors
+go_embedding_path: /lus/flare/projects/ModCon/ngetty/models/bioreason-pro-sft/go_embedding.pt
+
+# Same Stage-1 base as v5/v6 — step-450 snapshot of sft_qwen3_32b_stage1_layerneg1_full_v2
+# (job 8758738, 2026-08-16), the deepest/most-converged layer-1/unbounded-projector base.
+stage1_proj_dir: /lus/flare/projects/ModCon/ngetty/torchtune/experiments/bioreason/runs/sft_qwen3_32b_stage1_layerneg1_step450_snapshot
+
+# ── Tokenizer (Qwen3) ─────────────────────────────────────────────────────────
+tokenizer:
+  _component_: torchtune.models.qwen3.qwen3_tokenizer
+  path: ${base_model_path}/vocab.json
+  merges_file: ${base_model_path}/merges.txt
+  max_seq_len: 6144
+
+# ── Model — LoRA r128/a256/dropout0.05 (matches paper's own Stage-2 rank/alpha) ────
+model:
+  _component_: torchtune.dev.bioreason.model_native.BioReasonNativeModel
+  backbone_builder: qwen3_32b
+  hidden_size: 5120
+  protein_token_id: 151643
+  go_token_id: 151644
+  enable_lora: true          # Stage 2: LoRA-finetune the backbone
+  freeze_backbone: false     # (ignored under LoRA; base frozen except adapters)
+  freeze_projector: true     # unchanged from v5/v6 — joint-training is a separate experiment
+  projector_output_norm: false  # unchanged from v5/v6: layer -1, NO LayerNorm
+  lora_rank: 128
+  lora_alpha: 256
+  lora_dropout: 0.05
+  apply_lora_to_mlp: true
+  esm3_cache_path: ${esm3_cache_path}
+  go_embedding_path: ${go_embedding_path}
+
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: ${base_model_path}
+  checkpoint_files: [
+    model-00001-of-00017.safetensors, model-00002-of-00017.safetensors,
+    model-00003-of-00017.safetensors, model-00004-of-00017.safetensors,
+    model-00005-of-00017.safetensors, model-00006-of-00017.safetensors,
+    model-00007-of-00017.safetensors, model-00008-of-00017.safetensors,
+    model-00009-of-00017.safetensors, model-00010-of-00017.safetensors,
+    model-00011-of-00017.safetensors, model-00012-of-00017.safetensors,
+    model-00013-of-00017.safetensors, model-00014-of-00017.safetensors,
+    model-00015-of-00017.safetensors, model-00016-of-00017.safetensors,
+    model-00017-of-00017.safetensors,
+  ]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: QWEN2
+
+resume_from_checkpoint: false
+save_every_n_steps: 10
+save_every_n_epochs: 1
+
+# ── Dataset (identical to v5/v6, INCLUDING add_uniprot_summary) ──
+dataset:
+  _component_: torchtune.dev.bioreason.dataset_sft.bioreason_sft_dataset
+  data_files: ${sft_data_dir}
+  max_seq_len: 6144
+  max_protein_len: 2048
+  num_go_tokens: 200
+  protein_token_id: 151643
+  go_token_id: 151644
+  train_on_reasoning: true
+  inject_go_pred: true
+  add_uniprot_summary: true
+seed: 1234
+shuffle: true
+collate_fn: torchtune.dev.bioreason.dataset_sft.bioreason_sft_collate_fn
+dataloader_num_workers: 0
+
+# ── Training envelope — real warmup->cosine schedule, peak lr toward the paper's 1e-4 ──
+# epochs:50 remains an ALLOCATION-FILLING value (guards against exiting early on a
+# scaled-up node count — see feedback_epochs1_wastes_scaled_node_allocations_20260815.md)
+# and is DELIBERATELY NOT the LR schedule horizon — see lr_scheduler_num_training_steps
+# below, which is what actually governs annealing on this run.
+epochs: 50
+max_steps_per_epoch: null
+batch_size: 1
+gradient_accumulation_steps: 4
+clip_grad_norm: 1.0
+
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 1.0e-4
+  weight_decay: 0.0
+  fused: true
+
+# lr_scheduler_num_training_steps is the REAL step budget (1525, matched to the paper's
+# ~1.17M samples at this run's eff batch of 768/step — 16N, dp=192, batch_size=1 x
+# grad_accum=4), decoupled from epochs:50 above (see full_finetune_distributed_xpu.py's
+# _setup_lr_scheduler call site). Without this key the recipe falls back to
+# total_epochs * steps_per_epoch, which is what made v6/v7's schedule a near-null test.
+lr_scheduler_num_training_steps: 1525
+# num_warmup_steps=50 unchanged from v6 (deliberately conservative — a fast LR ramp is
+# the known collapse trigger for this recipe family; extend only after the collapse
+# gate below passes clean).
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  num_warmup_steps: 50
+
+loss:
+  _component_: torchtune.modules.loss.LinearCrossEntropyLoss
+
+# ── Distributed / FSDP — full 12-way shard ──────────────────────────────────────
+enable_activation_checkpointing: true
+enable_activation_offloading: false
+fsdp_cpu_offload: false
+fsdp_reshard_after_forward: true
+data_parallel_replicate_dim: 1
+data_parallel_shard_dim: -1
+tensor_parallel_dim: 1
+pad_to_fixed: true
+
+# ── XPU ───────────────────────────────────────────────────────────────────────
+device: xpu
+dtype: bf16
+compile: false
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+log_level: INFO
+log_every_n_steps: 1
+log_peak_memory_stats: true
+metric_logger:
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: false
+  output_dir: ${output_dir}/profiling_outputs
+  cpu: true
+  cuda: false
+  profile_memory: false
+  with_stack: false
+  record_shapes: false
+  with_flops: false
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1

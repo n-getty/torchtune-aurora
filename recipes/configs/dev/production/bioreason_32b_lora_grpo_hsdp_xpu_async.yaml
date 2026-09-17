@@ -25,8 +25,37 @@
 #   ENABLE_LORA=1 CONFIG=recipes/configs/dev/production/bioreason_32b_lora_grpo_hsdp_xpu.yaml \
 #       bash experiments/bioreason/run_bioreason_32b_Nnode_hsdp.sh
 
-name: grpo_bioreason_32b_hsdp_lora
-output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/experiments/bioreason/outputs/bioreason_32b_gopred_grpo
+# ══════════════════════════════════════════════════════════════════════════════
+# ASYNC VARIANT of bioreason_32b_lora_grpo_hsdp_xpu.yaml.
+#
+# Derived by copy; the ONLY deltas from the sync parent are the four blocks marked
+# "ASYNC DELTA" below (async_generation, always_compute_rollout_logprobs, loss
+# class, output_dir/name). Everything else is byte-identical so an A/B against the
+# sync parent isolates the overlap, not a config drift.
+#
+# WHAT THIS ENABLES: the rollout HTTP round-trip (the ~240s `vllm=` component of
+# GENTIMING) moves onto a producer daemon thread one step ahead of the consumer,
+# overlapping it with the training backward. See torchtune/dev/rl/async_rollout.py
+# and _async_lookahead_iter_impl in recipes/dev/grpo_bioreason_distributed_xpu.py.
+#
+# WHAT IT COSTS (read before interpreting a step time): enabling async flips
+# _compute_rollout_logprobs_required, which un-skips a rollout-time policy forward
+# that the sync production run does NOT pay (its GENTIMING reads policy_fwd=0.0s).
+# On the live sync baseline that forward is worth roughly the ref forward, ~90s.
+# So the NET win is (overlapped vllm) MINUS (~90s of new policy fwd) — measured,
+# not assumed. The ceiling is NOT the naive total/(total-vllm).
+#
+# WHY THE EXTRA FORWARD IS REQUIRED AND NOT A BUG: GRPOSimpleLoss collapses the IS
+# ratio to exp(pi - pi.detach()) == 1, so it cannot correct for the fact that an
+# async rollout was sampled under weight version v-1 while the update is applied at
+# v. GRPOLoss needs a real pi_old. tests/torchtune/dev/rl/test_async_loss_combo.py
+# enforces the triple (async ⇒ GRPOLoss ⇒ always_compute_rollout_logprobs).
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ASYNC DELTA (1/4): distinct name + output_dir so this never writes into the sync
+# campaign's directory. Two jobs sharing an OUTPUT_DIR silently clobber each other.
+name: grpo_bioreason_32b_hsdp_lora_async
+output_dir: /lus/flare/projects/ModCon/ngetty/torchtune/experiments/bioreason/outputs/bioreason_32b_gopred_grpo_async
 
 # ── Model ─────────────────────────────────────────────────────────────────────
 model_type: bioreason
@@ -80,6 +109,26 @@ max_generated_tokens: 3072
 temperature: 0.8
 top_k: null
 
+# ── ASYNC DELTA (2/4): overlap the rollout HTTP with training ─────────────────
+#
+# Requires vllm_mode=server (set below). dedicated_rank/colocate generation is a
+# world collective and the subclass hard-refuses async on those modes.
+#
+# max_staleness is the producer Queue(maxsize=) capacity, i.e. how many rollout
+# batches may sit finished-but-unconsumed. It is NOT a serialization knob. Both
+# the base recipe and the BioReason subclass raise ValueError on >1, because
+# pi_old is recomputed on the CURRENT weights and the bias in the IS ratio grows
+# with the version gap. 1 is the only regime where train ~= behavior policy.
+async_generation:
+  enabled: true
+  max_staleness: 1
+
+# Forces the rollout-time policy forward so GRPOLoss gets a real pi_old. The
+# recipe derives this implicitly from async_generation.enabled anyway
+# (_compute_rollout_logprobs_required), but it is stated explicitly so the static
+# config invariant test passes by inspection rather than by inference.
+always_compute_rollout_logprobs: true
+
 # ── Training ──────────────────────────────────────────────────────────────────
 epochs: 1
 num_steps: 180
@@ -111,8 +160,16 @@ clip_grad_norm: 1.0
 skip_zero_advantage_step: true
 
 # ── Loss ──────────────────────────────────────────────────────────────────────
+# ASYNC DELTA (3/4): GRPOLoss, not GRPOSimpleLoss. kl_coeff/epsilon carried over
+# unchanged from the sync parent so the only behavioral difference is that the IS
+# ratio is now real (exp(pi - pi_old)) instead of identically 1.
+#
+# WATCH THIS IN THE LOG: ratios should sit at ~1.000 at staleness=1. The 4B async
+# validation logs contain one step with ratios=634599.4, which is a blown-up ratio,
+# not a benign outlier — if that recurs at 32B the run is not trustworthy and the
+# async path is not ready, regardless of what the step time says.
 loss:
-  _component_: torchtune.dev.rl.loss.GRPOSimpleLoss
+  _component_: torchtune.dev.rl.loss.GRPOLoss
   kl_coeff: 1e-3
   epsilon: 0.2
 
