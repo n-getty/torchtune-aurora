@@ -48,6 +48,7 @@ __all__ = [
     "require_processed_mode",
     "rows_needing_fallback",
     "build_behavior_logprobs",
+    "broadcast_behavior_logprobs",
 ]
 
 PROCESSED_LOGPROBS_MODE = "processed_logprobs"
@@ -194,3 +195,79 @@ def build_behavior_logprobs(
                 list(lp[:used]), dtype=dtype, device=device
             )
     return out
+
+
+# Sentinel row prepended to the broadcast payload. Row 0 column 0 carries 1.0 when the
+# leader HAS usable behavior logprobs and 0.0 when the whole batch must fall back. It
+# travels INSIDE the broadcast tensor rather than as a separate collective because a
+# second collective is a second place the ranks can disagree about whether to call it.
+_HAVE_ROW = 1
+
+
+def broadcast_behavior_logprobs(
+    behavior_logprobs: Optional[torch.Tensor],
+    *,
+    num_seqs: int,
+    max_generated_tokens: int,
+    is_leader: bool,
+    broadcast_fn,
+    device: Optional[torch.device] = None,
+    dtype: torch.dtype = torch.float32,
+) -> Optional[torch.Tensor]:
+    """Give every training rank the leader's behavior logprobs, or give them all ``None``.
+
+    THE HAZARD THIS EXISTS FOR. Only the shard leader issues the vLLM HTTP request, so
+    only the leader can build ``pi_old`` from the response -- exactly the provenance of
+    ``query_responses``, which is why that tensor is broadcast
+    (``_broadcast_query_responses``). If the logprobs are NOT broadcast, followers see
+    ``None`` and take the policy-forward branch while the leader skips it. That is not a
+    crash and not a wrong number: it is **divergent collective participation**, i.e. a
+    hang or a wrong-shaped all-reduce, which at 2N costs an allocation to diagnose.
+
+    The fallback decision must also be identical on every rank, so it is carried in the
+    payload rather than decided locally. A rank that decided for itself could disagree
+    with the leader about whether a batch was usable and reintroduce the same divergence.
+
+    Args:
+        behavior_logprobs: the leader's ``[num_seqs, max_generated_tokens]`` tensor, or
+            ``None`` if any row needed the fallback. Ignored on followers.
+        num_seqs: rows the trajectory expects (``B*G``).
+        max_generated_tokens: response-length cap; the tensor width.
+        is_leader: whether this rank produced the values.
+        broadcast_fn: callable taking the payload tensor and broadcasting it in place
+            from the leader. The caller supplies this so the two branches of
+            ``_broadcast_query_responses`` (node-local gloo CPU bounce under HSDP,
+            world/``_training_pg`` otherwise) are mirrored exactly -- this function must
+            not re-derive that routing.
+        device: device for the payload buffer.
+        dtype: payload dtype; matches the tensor being carried.
+
+    Returns:
+        The logprobs tensor on every rank, or ``None`` on every rank.
+
+    Raises:
+        ValueError: if the leader passes a tensor of the wrong shape (a follower would
+            allocate the declared shape and silently mis-parse a different one).
+    """
+    if is_leader and behavior_logprobs is not None:
+        expected = (num_seqs, max_generated_tokens)
+        if tuple(behavior_logprobs.shape) != expected:
+            raise ValueError(
+                f"leader's behavior logprobs have shape "
+                f"{tuple(behavior_logprobs.shape)}, expected {expected}; followers "
+                f"pre-allocate the expected shape, so a mismatch here is a silent "
+                f"misparse on every other rank"
+            )
+
+    payload = torch.zeros(
+        (num_seqs + _HAVE_ROW, max_generated_tokens), dtype=dtype, device=device
+    )
+    if is_leader and behavior_logprobs is not None:
+        payload[0, 0] = 1.0
+        payload[_HAVE_ROW:] = behavior_logprobs.to(device=payload.device, dtype=dtype)
+
+    payload = broadcast_fn(payload)
+
+    if float(payload[0, 0]) != 1.0:
+        return None
+    return payload[_HAVE_ROW:].clone()

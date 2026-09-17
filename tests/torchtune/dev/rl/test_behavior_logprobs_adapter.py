@@ -225,3 +225,144 @@ def test_engine_sets_processed_mode_at_every_llm_site():
         "the helper exists but is applied at no engine site"
     )
     assert PROCESSED_LOGPROBS_MODE in src
+
+
+# ------------------------------------------------- site-3 hazard: the broadcast
+#
+# Only the shard leader issues the vLLM HTTP, so only the leader can build pi_old.
+# If it is not broadcast, followers see None and run the policy forward while the leader
+# skips it -- divergent collective participation, i.e. a HANG, not an error message.
+# These tests simulate a multi-rank broadcast on CPU so that hazard cannot reach HW.
+
+
+def _fake_broadcast(ranks_payloads, leader_idx):
+    """Simulate an in-place broadcast: every rank ends up with the leader's buffer."""
+    src = ranks_payloads[leader_idx].clone()
+    return [src.clone() for _ in ranks_payloads]
+
+
+def _run_ranks(leader_tensor, world, num_seqs, ctok, leader_idx=0):
+    """Drive broadcast_behavior_logprobs on `world` simulated ranks; return their results.
+
+    A real collective requires every rank to enter before any leaves, so this runs two
+    passes: first capture what each rank puts on the wire, then resolve the broadcast and
+    let each rank parse the delivered buffer.
+    """
+    from torchtune.dev.rl.behavior_logprobs import broadcast_behavior_logprobs
+
+    bufs = [(r == leader_idx, leader_tensor if r == leader_idx else None)
+            for r in range(world)]
+
+    def _call(is_leader, tensor, fn):
+        return broadcast_behavior_logprobs(
+            tensor,
+            num_seqs=num_seqs,
+            max_generated_tokens=ctok,
+            is_leader=is_leader,
+            broadcast_fn=fn,
+        )
+
+    # Pass 1 -- capture each rank's outgoing payload (identity "broadcast").
+    sent = []
+    for is_leader, t in bufs:
+        captured = []
+        _call(is_leader, t, lambda p: (captured.append(p), p)[1])
+        sent.append(captured[0].clone())
+
+    # Pass 2 -- deliver the leader's buffer to everyone, then parse on each rank.
+    delivered = _fake_broadcast(sent, leader_idx)
+    return [
+        _call(is_leader, t, lambda _p, _r=r: delivered[_r])
+        for r, (is_leader, t) in enumerate(bufs)
+    ]
+
+
+def test_followers_receive_the_leaders_logprobs():
+    """The site-3 hazard: a follower left holding None takes a branch the leader skips."""
+    torch.manual_seed(2)
+    num_seqs, ctok, world = 6, 5, 4
+    leader = torch.randn(num_seqs, ctok) - 2.0  # plausible logprobs, all < 0
+
+    results = _run_ranks(leader, world, num_seqs, ctok)
+
+    assert len(results) == world
+    for r, got in enumerate(results):
+        assert got is not None, (
+            f"rank {r} got None while the leader has values -- it would run the policy "
+            f"forward while the leader skips it: divergent collectives, i.e. a hang"
+        )
+        torch.testing.assert_close(got, leader)
+
+
+def test_fallback_decision_is_unanimous():
+    """If the leader falls back, EVERY rank must fall back -- not just the leader."""
+    num_seqs, ctok, world = 6, 5, 4
+    results = _run_ranks(None, world, num_seqs, ctok)
+    assert all(g is None for g in results), (
+        "a rank kept vLLM logprobs while the leader fell back to the policy forward"
+    )
+
+
+def test_a_dropped_broadcast_is_caught_by_these_tests():
+    """Negative control: the no-broadcast implementation must FAIL the test above.
+
+    Without this, `test_followers_receive_the_leaders_logprobs` could pass against a
+    harness that never actually moved data between ranks.
+    """
+    num_seqs, ctok, world = 6, 5, 4
+    leader = torch.randn(num_seqs, ctok) - 2.0
+    # The bug: each rank keeps its OWN buffer (no data movement).
+    from torchtune.dev.rl.behavior_logprobs import broadcast_behavior_logprobs
+
+    got = [
+        broadcast_behavior_logprobs(
+            leader if r == 0 else None,
+            num_seqs=num_seqs,
+            max_generated_tokens=ctok,
+            is_leader=(r == 0),
+            broadcast_fn=lambda p: p,  # no-op "broadcast"
+        )
+        for r in range(world)
+    ]
+    assert got[0] is not None
+    assert all(g is None for g in got[1:]), (
+        "a no-op broadcast still delivered values to followers -- the passing test "
+        "above proves nothing about the broadcast"
+    )
+
+
+def test_leader_shape_mismatch_refused():
+    """A follower pre-allocates the declared shape; a mismatch is a silent misparse."""
+    from torchtune.dev.rl.behavior_logprobs import broadcast_behavior_logprobs
+
+    with pytest.raises(ValueError, match="silent"):
+        broadcast_behavior_logprobs(
+            torch.zeros(3, 5),
+            num_seqs=6,
+            max_generated_tokens=5,
+            is_leader=True,
+            broadcast_fn=lambda p: p,
+        )
+
+
+def test_have_flag_cannot_collide_with_a_real_logprob():
+    """Row 0 is a sentinel row, never data -- payload is num_seqs+1 rows wide."""
+    from torchtune.dev.rl.behavior_logprobs import broadcast_behavior_logprobs
+
+    seen = {}
+
+    def cap(p):
+        seen["shape"] = tuple(p.shape)
+        return p
+
+    broadcast_behavior_logprobs(
+        torch.zeros(6, 5),
+        num_seqs=6,
+        max_generated_tokens=5,
+        is_leader=True,
+        broadcast_fn=cap,
+    )
+    assert seen["shape"] == (7, 5), (
+        "the have-flag must occupy its own row; packing it into a data row would make "
+        "a real logprob of exactly 1.0 indistinguishable from the flag"
+    )
