@@ -1077,29 +1077,50 @@ class GRPOFullFinetuneRecipeDistributed(FTRecipeInterface):
 
                 _, context_length = tokens.shape
 
+                _step_t0 = time.perf_counter()
                 trajectory = self.generate_trajectory_batched(tokens, answers)
                 torch.distributed.barrier()
+                _gen_time = time.perf_counter() - _step_t0
 
                 grpo_stats: list[GRPOStats] = []
+                _grpo_time = 0.0
+                _clip_time = 0.0
+                _opt_time = 0.0
                 for _ in range(self._ppo_epochs):
+                    _grpo_t0 = time.perf_counter()
                     step_stats = self.grpo_step(trajectory, context_length)
+                    _grpo_time += time.perf_counter() - _grpo_t0
 
                     grpo_stats.append(step_stats)
 
+                    _clip_t0 = time.perf_counter()
                     if self._clip_grad_norm is not None:
                         grad_norm = torch.nn.utils.clip_grad_norm_(
                             self._model.parameters(),
                             max_norm=float(self._clip_grad_norm),
                         )
                     torch.distributed.barrier()
+                    _clip_time += time.perf_counter() - _clip_t0
+
+                    _opt_t0 = time.perf_counter()
                     self._optimizer.step()
                     self._optimizer.zero_grad(set_to_none=True)
                     torch.distributed.barrier()
+                    _opt_time += time.perf_counter() - _opt_t0
 
                     self.global_step += 1
 
                     if self._lr_scheduler is not None:
                         self._lr_scheduler.step()
+
+                _step_time = time.perf_counter() - _step_t0
+                if self._is_rank_zero:
+                    log.info(
+                        "TIMING step=%d  total=%.1fs  gen=%.1fs  grpo=%.1fs  clip=%.1fs  opt=%.1fs  other=%.1fs",
+                        self._steps_run, _step_time, _gen_time, _grpo_time,
+                        _clip_time, _opt_time,
+                        _step_time - _gen_time - _grpo_time - _clip_time - _opt_time,
+                    )
 
                 # Stop tracking CUDA memory now that active steps are complete
                 if (

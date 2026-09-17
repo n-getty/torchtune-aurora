@@ -18,11 +18,11 @@
 #       recipes/dev/grpo_bioreason_distributed_xpu.py \
 #       --config recipes/configs/dev/production/bioreason_4b_grpo_xpu.yaml
 
+import json
+import logging
 import os
 import sys
 import time
-import json
-import logging
 from typing import Any, Optional
 
 # Ensure all module-level loggers (including torchtune.dev.bioreason.model) emit
@@ -36,18 +36,46 @@ logging.basicConfig(
     force=True,
 )
 
-import torch
-from omegaconf import DictConfig
-
-from torchtune import config, rlhf, training, utils
-from torchtune.dev.rl.types import GRPOStats, GRPOTrajectory
-from torchtune.dev.rl.distributed import device_empty_cache, _slice_trajectory
-from torchtune.dev.rl.rewards import gene_recall_batched_rewards, batched_rewards
-
 # Import the base recipe — it handles all the XPU/XCCL shim setup at import time.
 # `recipes/__init__.py` deliberately raises on import (to keep tests from picking
 # up the recipes package), so we load the sibling base recipe by file path.
 import importlib.util as _importlib_util
+
+import torch
+from omegaconf import DictConfig
+
+from torchtune import config, rlhf, training, utils
+from torchtune.dev.bioreason.rollout_dump import (
+    dump_rollout_groups,
+    rollout_dump_path,
+)
+from torchtune.dev.rl.distributed import _slice_trajectory, device_empty_cache
+from torchtune.dev.rl.generation import (
+    compact_prompt_completion_batch,
+    finish_response_logits,
+    gather_response_logits,
+    get_descending_response_chunk_ranges,
+    get_length_sorted_response_chunks,
+    get_right_padded_response_length,
+    pad_response_logprobs,
+    response_only_logits_kwargs,
+    trim_query_responses_to_global_max,
+)
+from torchtune.dev.rl.ref_prefix_share import (
+    prefix_share_supported,
+    ref_prefix_share_enabled,
+    shared_prefix_ref_logprobs,
+)
+from torchtune.dev.rl.rewards import batched_rewards, gene_recall_batched_rewards
+from torchtune.dev.rl.behavior_logprobs import (
+    audit_behavior_logprobs,
+    broadcast_behavior_logprobs,
+    build_behavior_logprobs,
+    fit_behavior_logprobs_width,
+    require_processed_mode,
+    rows_needing_fallback,
+)
+from torchtune.dev.rl.types import GRPOStats, GRPOTrajectory
 
 _BASE_RECIPE_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
@@ -62,6 +90,45 @@ _spec.loader.exec_module(_base_module)
 GRPOFullFinetuneDistributedXPU = _base_module.GRPOFullFinetuneDistributedXPU
 log = _base_module.log
 _colocate_vllm_mode = _base_module._colocate_vllm_mode
+
+
+def _split_prompt_n_request_plan(
+    request_plan: list[tuple[int, list[int], int]],
+    num_clients: int,
+    engine_stride: int,
+    engine_phase: int = 0,
+    prompts_per_request: int = 1,
+) -> list[tuple[int, list[int], int]]:
+    prompts_per_request = max(1, prompts_per_request)
+    return [
+        (
+            (engine_id + engine_phase + split_idx * engine_stride) % num_clients,
+            indices[start : start + request_n * prompts_per_request],
+            request_n,
+        )
+        for engine_id, indices, request_n in request_plan
+        for split_idx, start in enumerate(
+            range(0, len(indices), request_n * prompts_per_request)
+        )
+    ]
+
+
+def _split_choice_request_plan(
+    request_plan: list[tuple[int, list[int], int]],
+    num_clients: int,
+    engine_stride: int,
+) -> list[tuple[int, list[int], int]]:
+    if engine_stride == 0:
+        return request_plan
+    return [
+        (
+            (engine_id + (choice_idx % request_n) * engine_stride) % num_clients,
+            [index],
+            1,
+        )
+        for engine_id, indices, request_n in request_plan
+        for choice_idx, index in enumerate(indices)
+    ]
 
 
 class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
@@ -121,6 +188,23 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
         self._max_generated_tokens = cfg.max_generated_tokens
         self.batch_size = cfg.batch_size
         self._forward_batch_size = cfg.forward_batch_size
+        self._ref_forward_batch_size = cfg.get(
+            "ref_forward_batch_size", cfg.forward_batch_size
+        )
+        self._trim_chunk_width = (
+            os.environ.get("TORCHTUNE_TRIM_CHUNK_WIDTH", "0") == "1"
+        )
+        self._sort_policy_chunks_by_length = (
+            os.environ.get("TORCHTUNE_SORT_POLICY_CHUNKS_BY_LENGTH", "0") == "1"
+        )
+        self._compact_prompt_chunks = (
+            os.environ.get("TORCHTUNE_COMPACT_PROMPT_CHUNKS", "0") == "1"
+        )
+        self._skip_nonfinite_grad_step = cfg.get("skip_nonfinite_grad_step", True)
+        if self._trim_chunk_width and self._is_rank_zero:
+            log.info("BioReason per-microbatch sequence-width trimming ENABLED")
+        if self._sort_policy_chunks_by_length and self._is_rank_zero:
+            log.info("BioReason policy microbatches length sorting ENABLED")
         self._ppo_epochs = cfg.ppo_epochs
         self._total_steps = cfg.num_steps
         self._reward_mode = cfg.get("reward_mode", "bioreason")
@@ -131,18 +215,21 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
         # too flat to learn; propagation makes it dense (mean 0.04 -> 0.23 on real
         # rollouts) AND aligns reward with eval. obo ships in the ckpt/source dir.
         self._reward_propagate_hierarchy = cfg.get(
-            "reward_propagate_hierarchy", self._reward_mode == "bioreason",
+            "reward_propagate_hierarchy",
+            self._reward_mode == "bioreason",
         )
         # obo for reward propagation: explicit config, else the checkpoint dir (each
         # bioreason ckpt ships go-basic.obo), else reward.py's env/source fallback.
         self._reward_obo_path = cfg.get(
-            "reward_obo_path", cfg.get("base_model_path", None),
+            "reward_obo_path",
+            cfg.get("base_model_path", None),
         )
         # Pool advantage normalization across the full batch (BioReason-Pro fix).
         # Default true for bioreason mode (matches the upstream paper's GRPO setup);
         # explicit override possible via config field.
         self._batch_level_advantages = cfg.get(
-            "batch_level_advantages", self._reward_mode == "bioreason",
+            "batch_level_advantages",
+            self._reward_mode == "bioreason",
         )
         self._enable_packing = cfg.get("enable_packing", False)
         self._expert_parallel_degree = cfg.get("expert_parallel_degree", 1)
@@ -219,9 +306,37 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
         # Rollout-time logprobs are required when async (off-policy by k>=1) OR when
         # explicitly requested. Mirrors the base recipe's coupling.
         self._compute_rollout_logprobs_required = (
-            self._always_compute_rollout_logprobs
-            or self._async_generation_enabled
+            self._always_compute_rollout_logprobs or self._async_generation_enabled
         )
+
+        # Use vLLM's own sampler logprobs as pi_old instead of paying a second
+        # no-grad forward over the whole [B*G, P+C] batch. Async-only: the policy
+        # forward it removes does not run at all when async is off and ppo_epochs==1.
+        self._use_vllm_behavior_logprobs = (
+            bool(cfg.get("use_vllm_behavior_logprobs", False))
+            and self._async_generation_enabled
+        )
+        if self._use_vllm_behavior_logprobs:
+            # WHAT THIS CAN AND CANNOT CHECK. api_server exposes only /load and
+            # /version -- neither reports engine config -- so this asserts the mode
+            # the LAUNCHER was told to pass, never one the server confirmed. If the
+            # spawn line in run_bioreason_32b_Nnode_hsdp.sh lacks
+            # --logprobs-mode processed_logprobs, this check still passes and the
+            # ratios are silently wrong. Keep the two in sync by hand.
+            require_processed_mode(cfg.get("vllm_logprobs_mode"))
+        self._pending_async_behavior_logprobs = None
+
+        # TORCHTUNE_BLP_AUDIT=N: for the first N steps, compute pi_old BOTH ways and
+        # log the disagreement, then use the trainer's recompute. The substitution's
+        # correctness cannot be established by the CPU tests (they pin alignment, not
+        # numerics -- vLLM uses different kernels and TP sharding) and its failure is
+        # silent, so this is the only instrument that can tell a working substitution
+        # from a biased one. Costs the policy forward it exists to remove, hence a
+        # step budget rather than a bool. 0 = off.
+        try:
+            self._blp_audit_steps = int(os.environ.get("TORCHTUNE_BLP_AUDIT", "0"))
+        except ValueError:
+            self._blp_audit_steps = 0
 
         self._save_every_n_epochs = cfg.get("save_every_n_epochs", 1)
         self._eval_every_n_steps = cfg.get("eval_every_n_steps", 0)
@@ -229,7 +344,7 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
 
         stop_token_ids = (
             list(self._tokenizer.stop_tokens)
-            if hasattr(self._tokenizer, 'stop_tokens') and self._tokenizer.stop_tokens
+            if hasattr(self._tokenizer, "stop_tokens") and self._tokenizer.stop_tokens
             else [self._tokenizer.eos_id]
         )
         self._stop_token_ids = torch.tensor(stop_token_ids, device=self._device)
@@ -242,8 +357,10 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
             self._stop_token_ids_list = [int(t) for t in stop_token_ids]
         else:
             self._stop_token_ids_list = None
-            log.warning("TORCHTUNE_VLLM_STOP_TOKENS=0: vLLM will NOT stop at EOS "
-                        "(every rollout decodes to max_tokens). A/B-only setting.")
+            log.warning(
+                "TORCHTUNE_VLLM_STOP_TOKENS=0: vLLM will NOT stop at EOS "
+                "(every rollout decodes to max_tokens). A/B-only setting."
+            )
 
         # Optimizer, loss, dataloader
         self._optimizer = self._setup_optimizer(
@@ -333,7 +450,7 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
 
     def _build_tune_to_hf_map(self) -> None:
         """BioReason params are already in HF format — no remapping needed."""
-        if getattr(self, '_is_bioreason', False):
+        if getattr(self, "_is_bioreason", False):
             # _tune_to_hf_map is set to {} in _setup_bioreason_models.
             # weight-sync .get(k, k) calls fall back to identity.
             return
@@ -348,10 +465,30 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
         # PEFT merge_and_unload at load time. Full params must be gathered first:
         # the policy is FSDP-wrapped (server/dedicated modes), so save under
         # summon_full_params on all ranks, write on rank 0.
-        if hasattr(self._policy, 'vllm_param_iter'):
+        if hasattr(self._policy, "vllm_param_iter"):
             from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-            save_dir = os.path.join(self._output_dir, f"epoch_{epoch}")
-            _fsdp = getattr(self, "_use_fsdp1", False) and torch.distributed.is_initialized()
+
+            # Step-stamped, NOT bare epoch_{epoch} (2026-09-14 fix). This recipe runs
+            # with epochs=1, so curr_epoch stayed 0 for the whole run and EVERY
+            # save_every_n_steps save rewrote the same epoch_0/ in place. The write is
+            # non-atomic (a ~268 MiB safetensors + two ~70 MiB torch.saves, no
+            # temp-then-rename), and this dir is the ONLY artifact — BioReason's
+            # save_checkpoint short-circuits the base, so there is no recipe_state.pt
+            # to fall back on (no optimizer/step/dataloader state is saved at all).
+            # Consequences that bit us: (1) a kill mid-write leaves the sole copy torn;
+            # (2) no rollback to an earlier step if the policy degrades; (3) a trend
+            # eval reading the live dir races the trainer and cannot tell which step it
+            # got. Embedding _steps_run gives one directory per save. Same root cause as
+            # memory/feedback_epoch_dir_overwritten_within_same_epoch_20260817.md, but
+            # strictly worse here because that path at least kept resume_state.pt.
+            # Pinned by tests/torchtune/dev/rl/test_bioreason_checkpoint_step_stamped.py.
+            save_dir = os.path.join(
+                self._output_dir, f"epoch_{epoch}_step{getattr(self, '_steps_run', 0)}"
+            )
+            _fsdp = (
+                getattr(self, "_use_fsdp1", False)
+                and torch.distributed.is_initialized()
+            )
             _has_lora = getattr(self._model, "_has_lora", False)
 
             # GATHER VIA FULL_STATE_DICT, NOT summon_full_params (2026-06-22 fix).
@@ -375,7 +512,9 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
                     ):
                         if not self._is_rank_zero:
                             continue
-                        for _param in _base_module._weight_sync_module._fsdp1_own_params(
+                        for (
+                            _param
+                        ) in _base_module._weight_sync_module._fsdp1_own_params(
                             _unit, FSDP
                         ):
                             if not _param.requires_grad:
@@ -404,6 +543,7 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
                 )
             elif _fsdp:
                 from torch.distributed.fsdp import StateDictType
+
                 with FSDP.state_dict_type(self._model, StateDictType.FULL_STATE_DICT):
                     _full_sd = self._model.state_dict()
             else:
@@ -411,9 +551,11 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
 
             if self._is_rank_zero:
                 os.makedirs(save_dir, exist_ok=True)
+
                 def _strip(name):
-                    return (name.replace("_fsdp_wrapped_module.", "")
-                                .replace("_checkpoint_wrapped_module.", ""))
+                    return name.replace("_fsdp_wrapped_module.", "").replace(
+                        "_checkpoint_wrapped_module.", ""
+                    )
 
                 # Projections: pull protein_projection.* / go_projection.* (already full
                 # tensors in the gathered CPU dict — clone to detach from any shared store).
@@ -422,12 +564,13 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
                     for k, v in _full_sd.items():
                         ck = _strip(k)
                         if ck.startswith(_pname + "."):
-                            _sub[ck[len(_pname) + 1:]] = v.detach().clone()
+                            _sub[ck[len(_pname) + 1 :]] = v.detach().clone()
                     torch.save(_sub, os.path.join(save_dir, f"{_pname}.pt"))
 
                 if _has_lora:
                     # Extract the LoRA adapter (lora_A/lora_B) into PEFT adapter format.
                     from safetensors.torch import save_file
+
                     _adir = os.path.join(save_dir, "adapter")
                     os.makedirs(_adir, exist_ok=True)
                     _adapter = {}
@@ -440,22 +583,35 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
                             # match what set_peft_model_state_dict expects on resume
                             # (matches _sync_weights_to_vllm's backbone-prefix handling).
                             if ck.startswith("backbone."):
-                                ck = ck[len("backbone."):]
+                                ck = ck[len("backbone.") :]
                             _adapter[ck] = v.detach().clone().contiguous()
-                    save_file(_adapter, os.path.join(_adir, "adapter_model.safetensors"))
+                    save_file(
+                        _adapter, os.path.join(_adir, "adapter_model.safetensors")
+                    )
                     # adapter_config.json (PEFT loader needs it; mirror the ctor config).
                     try:
-                        self._policy.backbone.peft_config["default"].save_pretrained(_adir)
+                        self._policy.backbone.peft_config["default"].save_pretrained(
+                            _adir
+                        )
                     except Exception:
                         import json as _json
-                        with open(os.path.join(_adir, "adapter_config.json"), "w") as _f:
+
+                        with open(
+                            os.path.join(_adir, "adapter_config.json"), "w"
+                        ) as _f:
                             _json.dump({"peft_type": "LORA"}, _f)
-                    log.info("BioReason checkpoint saved to %s (adapter, %d lora tensors)",
-                             save_dir, len(_adapter))
+                    log.info(
+                        "BioReason checkpoint saved to %s (adapter, %d lora tensors)",
+                        save_dir,
+                        len(_adapter),
+                    )
                 else:
                     # Full backbone: save the (stripped) backbone.* tensors.
-                    _bk = {_strip(k)[len("backbone."):]: v.detach().clone()
-                           for k, v in _full_sd.items() if _strip(k).startswith("backbone.")}
+                    _bk = {
+                        _strip(k)[len("backbone.") :]: v.detach().clone()
+                        for k, v in _full_sd.items()
+                        if _strip(k).startswith("backbone.")
+                    }
                     torch.save(_bk, os.path.join(save_dir, "backbone.pt"))
                     log.info("BioReason checkpoint saved to %s (backbone)", save_dir)
 
@@ -464,6 +620,7 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
             # handles under FSDP). FULL_STATE_DICT shouldn't churn on-device like summon
             # did, but keep the barrier so ranks resync after rank-0's Lustre writes.
             import gc as _gc
+
             _gc.collect()
             if self._device.type == "xpu":
                 torch.xpu.synchronize()
@@ -494,8 +651,9 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
         bf16 buffer, freed each iter. In colocate the model is NOT FSDP-wrapped (full
         per-rank), so no summon is needed — the base param is read directly.
         """
-        import gc
         import contextlib
+        import gc
+
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
         t0 = time.perf_counter()
@@ -507,7 +665,8 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
         # Only summon if actually FSDP-wrapped (server/dedicated); colocate is not.
         _summon = (
             FSDP.summon_full_params(self._model, writeback=False, rank0_only=False)
-            if isinstance(self._model, FSDP) else contextlib.nullcontext()
+            if isinstance(self._model, FSDP)
+            else contextlib.nullcontext()
         )
         n_synced = 0
         with torch.no_grad(), _summon:
@@ -530,14 +689,18 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
             torch.xpu.synchronize(self._device)
         log.info(
             "Rank %d: colocate LoRA W_eff sync %d params in %.2fs",
-            self.rank, n_synced, time.perf_counter() - t0,
+            self.rank,
+            n_synced,
+            time.perf_counter() - t0,
         )
 
     # Bind the base (inherited) colocate sync under a private name so the LoRA
     # override below can fall back to it for the non-LoRA (full-FT) path. The base
     # method is a class attribute (bound from the weight_sync module at the base
     # class body), so reference it via the base CLASS, not the module.
-    _sync_colocated_weights_base = GRPOFullFinetuneDistributedXPU._sync_colocated_weights
+    _sync_colocated_weights_base = (
+        GRPOFullFinetuneDistributedXPU._sync_colocated_weights
+    )
 
     def _sync_colocated_weights(self) -> None:
         """Override: route plain-colocate weight sync (called by the base train()
@@ -569,7 +732,9 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
         from torchtune.dev.bioreason.model import BioReasonModel
 
         ckpt_dir = cfg.base_model_path
-        log.info("Rank %d (vLLM server): loading embed model from %s", self.rank, ckpt_dir)
+        log.info(
+            "Rank %d (vLLM server): loading embed model from %s", self.rank, ckpt_dir
+        )
         self._embed_model = BioReasonModel(
             ckpt_dir=ckpt_dir,
             device=self._device,
@@ -584,9 +749,9 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
         self._compute_wsync_layout(self._embed_model)
 
         # vLLM engine already created in _init_vllm_early_dedicated — verify it exists.
-        assert self._vllm_llm is not None, (
-            "vLLM LLM should have been initialized in _init_vllm_early_dedicated"
-        )
+        assert (
+            self._vllm_llm is not None
+        ), "vLLM LLM should have been initialized in _init_vllm_early_dedicated"
 
         # Generic PG setup (training_pg + wsync_pg) + gen param seeding.
         # Must be called in same new_group order as _setup_bioreason_models on training ranks.
@@ -595,7 +760,8 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
         log.info(
             "Rank %d (vLLM server): setup complete — embed_model loaded, wsync_pg created, "
             "num_steps=%d",
-            self.rank, self._total_steps,
+            self.rank,
+            self._total_steps,
         )
 
     def _setup_bioreason_models(self, cfg: DictConfig) -> None:
@@ -627,7 +793,9 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
         # dataset's max_protein_len is visible.
         if _esm3_cache_path is not None:
             _ds_cfg = cfg.get("dataset", None)
-            _cfg_mpl = _ds_cfg.get("max_protein_len", None) if _ds_cfg is not None else None
+            _cfg_mpl = (
+                _ds_cfg.get("max_protein_len", None) if _ds_cfg is not None else None
+            )
             _sidecar = _esm3_cache_path + ".json"
             if _cfg_mpl is not None and os.path.exists(_sidecar):
                 with open(_sidecar) as _f:
@@ -640,8 +808,10 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
                         f"{_cfg_mpl}, or point esm3_cache_path at the matching cache."
                     )
         _r = int(os.environ.get("RANK", "?"))
+
         def _mark(tag):
             print(f"[BIOMARK r{_r}] {tag}", file=sys.stderr, flush=True)
+
         # Resume a trained LoRA adapter (e.g. continue a 4N run at 8N). Points at a
         # dir with adapter_model.safetensors (what save_checkpoint writes). Only the
         # POLICY loads it; the ref stays the frozen full SFT model. None = fresh init.
@@ -655,11 +825,15 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
         _proj_resume_dir = cfg.get("proj_resume_dir", None)
         if _proj_resume_dir is None and _adapter_path is not None:
             import os as _os
+
             _proj_resume_dir = _os.path.dirname(_adapter_path.rstrip("/"))
         _mark("policy:start")
         log.info(
             "BioReason: loading policy model from %s (enable_lora=%s, adapter=%s, proj_resume=%s)",
-            ckpt_dir, self._enable_lora, _adapter_path, _proj_resume_dir,
+            ckpt_dir,
+            self._enable_lora,
+            _adapter_path,
+            _proj_resume_dir,
         )
         # This policy model is about to be FSDP1-wrapped below (server/dedicated_rank/
         # colocate all set _wrap_fsdp1) — FSDP(..., device_id=self._device) shards and
@@ -674,7 +848,10 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
         _force_full_shard = cfg.get("fsdp_full_shard_at_rest", False)
         self._fsdp_full_shard_at_rest = bool(_force_full_shard)
         _will_wrap_fsdp1 = _force_full_shard and (
-            (self._vllm_mode == "dedicated_rank" and self._vllm_dedicated_rank is not None)
+            (
+                self._vllm_mode == "dedicated_rank"
+                and self._vllm_dedicated_rank is not None
+            )
             or (self._vllm_mode == "server")
             or (self._vllm_mode in ("colocate", "colocate_sleep"))
         )
@@ -710,13 +887,14 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
         # failure mode). ref_cpu_offload stays available as an explicit opt-out for
         # anyone who wants the old (correct, just slow) behavior.
         _shard_ref_fsdp2 = bool(_force_full_shard) and not self._ref_cpu_offload
-        ref_device = (
-            torch.device("cpu") if self._ref_cpu_offload
-            else self._device
-        )
+        ref_device = torch.device("cpu") if self._ref_cpu_offload else self._device
         _mark(f"ref:start dev={ref_device}")
-        log.info("BioReason: loading ref model from %s (device=%s, fsdp2_shard=%s)",
-                  ckpt_dir, ref_device, _shard_ref_fsdp2)
+        log.info(
+            "BioReason: loading ref model from %s (device=%s, fsdp2_shard=%s)",
+            ckpt_dir,
+            ref_device,
+            _shard_ref_fsdp2,
+        )
         self._ref_model = BioReasonModel(
             ckpt_dir=ckpt_dir,
             device=ref_device,
@@ -733,6 +911,7 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
             p.requires_grad_(False)
         if _shard_ref_fsdp2:
             from torch.distributed._composable.fsdp import fully_shard
+
             # HSDP (dp_replicate>1): scope the ref model's per-layer all-gather to
             # THIS REPLICA's own dp_shard group, not the world default group.
             # mesh=None resolves to the default process group, which at
@@ -749,7 +928,8 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
             # consistent with the LAST-connecting replica's ranks always being the
             # ones left waiting on a world-scoped barrier the others already passed.
             _ref_fsdp2_mesh = (
-                self._dp_mesh["dp_shard"] if getattr(self, "_dp_replicate", 1) > 1
+                self._dp_mesh["dp_shard"]
+                if getattr(self, "_dp_replicate", 1) > 1
                 else None
             )
             _ref_decoder_layer_cls = None
@@ -774,7 +954,11 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
             # model's projections are never trained and never need to be reachable
             # via a `summon_full_params`-style gather — build_full_embeds only calls
             # them, it doesn't need to write to them).
-            fully_shard(self._ref_model.backbone, mesh=_ref_fsdp2_mesh, reshard_after_forward=True)
+            fully_shard(
+                self._ref_model.backbone,
+                mesh=_ref_fsdp2_mesh,
+                reshard_after_forward=True,
+            )
             log.info(
                 "BioReason: ref model FSDP2-sharded (%d decoder layers + root unit)",
                 _n_ref_layers_sharded,
@@ -784,6 +968,7 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
 
         # BioReasonHFTokenizer exposes pad_id, eos_id, stop_tokens (missing on raw HF tok).
         from torchtune.dev.bioreason.dataset import BioReasonHFTokenizer
+
         self._tokenizer = BioReasonHFTokenizer(ckpt_dir=ckpt_dir)
 
         self._use_fsdp1 = False
@@ -802,7 +987,9 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
         # stop), so this optimization is actively harmful, not just unnecessary.
         # Disabled whenever fsdp_full_shard_at_rest is set (the 32B-only opt-in);
         # the ref forward instead runs directly on CPU (see ref_cpu_offload).
-        self._bioreason_dynamic_ref_offload = not cfg.get("fsdp_full_shard_at_rest", False)
+        self._bioreason_dynamic_ref_offload = not cfg.get(
+            "fsdp_full_shard_at_rest", False
+        )
 
         if self._is_rank_zero:
             trainable = sum(
@@ -831,13 +1018,21 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
         # "reshard_after_forward MANDATORY for colocate; ZeRO-2 default OOMs").
         _is_colocate = self._vllm_mode in ("colocate", "colocate_sleep")
         _wrap_fsdp1 = (
-            (self._vllm_mode == "dedicated_rank" and self._vllm_dedicated_rank is not None)
+            (
+                self._vllm_mode == "dedicated_rank"
+                and self._vllm_dedicated_rank is not None
+            )
             or (self._vllm_mode == "server")
             or _is_colocate
         )
         if _wrap_fsdp1:
-            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-            from torch.distributed.fsdp import ShardingStrategy, MixedPrecision, BackwardPrefetch
+            from torch.distributed.fsdp import (
+                BackwardPrefetch,
+                FullyShardedDataParallel as FSDP,
+                MixedPrecision,
+                ShardingStrategy,
+            )
+
             if self._vllm_mode == "dedicated_rank":
                 # Generic PG setup: training_pg (xccl, [0..N-2]) + wsync_pg (gloo, [0, N-1]).
                 # new_group order must match _setup_dedicated_vllm_rank on the vLLM rank.
@@ -847,7 +1042,9 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
                 # is on a separate node; colocate's vLLM is in-process per rank. Either
                 # way no wsync PG (server ships over HTTP; colocate loads in-process).
                 _training_ranks = list(range(self.world_size))
-                self._training_pg = torch.distributed.new_group(_training_ranks, backend="xccl")
+                self._training_pg = torch.distributed.new_group(
+                    _training_ranks, backend="xccl"
+                )
                 self._wsync_pg = None
                 # LOAD-BEARING: a gloo-backed barrier group, used ONLY to order
                 # _init_sender_pool's post-init barrier against rank 0's
@@ -872,6 +1069,7 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
                 # `_wsync_pg`/`TORCHTUNE_WSYNC_BACKEND=gloo` pattern already
                 # used for the dedicated_rank path's cross-PG (vllm_backend.py).
                 import torch.distributed.distributed_c10d as _dc10d
+
                 _default_pg = _dc10d._get_default_group()
                 _orig_bound = _default_pg.bound_device_id
                 _default_pg.bound_device_id = None
@@ -908,8 +1106,10 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
             # fsdp_full_shard_at_rest so the validated 4B top-level-only path never changes.
             _auto_wrap_policy = None
             if _force_full_shard:
-                from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
                 import functools
+
+                from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+
                 # Discover the decoder layer class by scanning named_modules() rather than
                 # calling backbone.get_decoder() directly — PEFT's PeftModel wraps the HF
                 # model and proxies attribute access via __getattr__, which is reliable for
@@ -948,7 +1148,11 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
             _is_hsdp = (
                 self._vllm_mode == "server" and getattr(self, "_dp_replicate", 1) > 1
             )
-            _ignore_candidates = [_pre_wrap._embed, _pre_wrap.protein_encoder, _pre_wrap.go_encoder]
+            _ignore_candidates = [
+                _pre_wrap._embed,
+                _pre_wrap.protein_encoder,
+                _pre_wrap.go_encoder,
+            ]
             if _force_full_shard:
                 # 32B-scale: also ignore the trainable projectors. At 4B, several call
                 # sites (generate_trajectory's prompt_embeds build, LoRA delta sync) reach
@@ -962,9 +1166,53 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
                 # they're always fully replicated per rank, so those call sites' `summon`
                 # becomes unnecessary for THIS purpose (it's still needed elsewhere for
                 # backbone params, which callers gate separately).
-                _ignore_candidates += [_pre_wrap.protein_projection, _pre_wrap.go_projection]
-            _ignored = [m for m in _ignore_candidates
-                        if m is not None and isinstance(m, torch.nn.Module)]
+                _ignore_candidates += [
+                    _pre_wrap.protein_projection,
+                    _pre_wrap.go_projection,
+                ]
+            _ignored = [
+                m
+                for m in _ignore_candidates
+                if m is not None and isinstance(m, torch.nn.Module)
+            ]
+            _replicate_trainables = bool(
+                _force_full_shard
+                and self._enable_lora
+                and os.environ.get("TORCHTUNE_FSDP_REPLICATE_TRAINABLES", "0") == "1"
+            )
+            _ignored_states = None
+            if _replicate_trainables:
+                _ignored_states = list(
+                    {
+                        *(
+                            param
+                            for module in _ignored
+                            for param in module.parameters()
+                        ),
+                        *(
+                            param
+                            for param in _pre_wrap.parameters()
+                            if param.requires_grad
+                        ),
+                    }
+                )
+                for param in _ignored_states:
+                    if param.requires_grad and param.device != self._device:
+                        param.data = param.data.to(self._device)
+                # Says BUILT, not ACTIVE. The previous wording ("ignored_states ACTIVE
+                # for N trainable parameters") was emitted here, at list-construction
+                # time, and read as proof that FSDP had received the list — which is
+                # exactly how a correct diagnosis got discarded on 2026-09-15 (the
+                # non-HSDP branch built the list and then passed `ignored_modules`
+                # instead). Whether it is actually honored is logged after the wrap.
+                log.info(
+                    "Rank %d: FSDP parameter-level ignored_states BUILT for %d "
+                    "trainable parameters on %s (not yet passed to FSDP — see the "
+                    "post-wrap ignored_states check)",
+                    self.rank,
+                    sum(param.requires_grad for param in _ignored_states),
+                    self._device,
+                )
             # Recorded so per-step call sites (generate_trajectory's prompt_embeds build,
             # LoRA delta sync) can skip an otherwise-unnecessary summon_full_params(self._model)
             # when the modules they actually need are already fully-replicated (ignored),
@@ -972,6 +1220,26 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
             # catastrophically expensive (not just "free but pointless") once the backbone
             # is split into many per-layer FSDP units.
             self._projectors_fsdp_ignored = bool(_force_full_shard)
+            self._ignored_trainable_params = (
+                [
+                    param
+                    for param in _pre_wrap.parameters()
+                    if param.requires_grad
+                    and (
+                        _replicate_trainables
+                        or any(
+                            param is projector_param
+                            for module in (
+                                _pre_wrap.protein_projection,
+                                _pre_wrap.go_projection,
+                            )
+                            for projector_param in module.parameters()
+                        )
+                    )
+                ]
+                if _force_full_shard
+                else []
+            )
             # 32B-scale override: SHARD_GRAD_OP/_HYBRID_SHARD_ZERO2 keep the FULL frozen
             # backbone resident on every rank (only grad/optimizer state is sharded) — fine
             # at 4B (~8 GiB bf16) but the 32B backbone alone is ~65.6 GiB bf16, exceeding a
@@ -992,28 +1260,102 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
                 # Route the inter-node grad all-reduce over gloo (XCCL cross-node leaks
                 # CXI MR handles -> banned:1 ~step10); base helper, validated on AGPT-2B.
                 try:
-                    from torchtune.dev.rl.distributed import enable_fsdp1_hsdp_inter_node_gloo
+                    from torchtune.dev.rl.distributed import (
+                        enable_fsdp1_hsdp_inter_node_gloo,
+                    )
+
                     enable_fsdp1_hsdp_inter_node_gloo()
                 except Exception as _e:
                     log.warning("enable_fsdp1_hsdp_inter_node_gloo unavailable: %s", _e)
+                _fsdp_ignore_kwargs = (
+                    {"ignored_states": _ignored_states}
+                    if _ignored_states is not None
+                    else {"ignored_modules": _ignored}
+                )
                 self._model = FSDP(
                     _pre_wrap,
                     sharding_strategy=_shard_strategy,
                     mixed_precision=_mp_policy,
                     device_mesh=self._dp_mesh,
-                    ignored_modules=_ignored,
+                    **_fsdp_ignore_kwargs,
                     use_orig_params=True,
                     device_id=self._device,
                     limit_all_gathers=True,
                     auto_wrap_policy=_auto_wrap_policy,
                     backward_prefetch=(
-                        BackwardPrefetch.BACKWARD_POST if _force_full_shard else BackwardPrefetch.BACKWARD_PRE
+                        BackwardPrefetch.BACKWARD_POST
+                        if _force_full_shard
+                        else BackwardPrefetch.BACKWARD_PRE
                     ),
                 )
+                if (
+                    _force_full_shard
+                    and os.environ.get("TORCHTUNE_FSDP_POSTDIVIDE_ONLY", "0") == "1"
+                ):
+                    _adjusted_states = 0
+                    _original_factors = set()
+                    for _fsdp_state in FSDP.fsdp_modules(self._model):
+                        _predivide = float(_fsdp_state._gradient_predivide_factor)
+                        _postdivide = float(_fsdp_state._gradient_postdivide_factor)
+                        _original_factors.add((_predivide, _postdivide))
+                        _fsdp_state._gradient_predivide_factor = 1.0
+                        _fsdp_state._gradient_postdivide_factor = (
+                            _predivide * _postdivide
+                        )
+                        _adjusted_states += 1
+                    if _adjusted_states == 0:
+                        raise RuntimeError(
+                            "TORCHTUNE_FSDP_POSTDIVIDE_ONLY=1 found no FSDP1 states"
+                        )
+                    log.info(
+                        "Rank %d: FSDP postdivide-only ACTIVE for %d states "
+                        "(original factors=%s; avoids full-gradient div_ on XPU)",
+                        self.rank,
+                        _adjusted_states,
+                        sorted(_original_factors),
+                    )
+                if (
+                    _force_full_shard
+                    and os.environ.get("TORCHTUNE_FSDP_CPU_POSTDIVIDE", "0") == "1"
+                ):
+                    if os.environ.get("TORCHTUNE_FSDP_POSTDIVIDE_ONLY", "0") == "1":
+                        raise RuntimeError(
+                            "TORCHTUNE_FSDP_CPU_POSTDIVIDE and "
+                            "TORCHTUNE_FSDP_POSTDIVIDE_ONLY are mutually exclusive"
+                        )
+                    _adjusted_states = 0
+                    _total_divisors = set()
+                    for _fsdp_state in FSDP.fsdp_modules(self._model):
+                        _predivide = float(_fsdp_state._gradient_predivide_factor)
+                        _postdivide = float(_fsdp_state._gradient_postdivide_factor)
+                        _total_divisors.add(_predivide * _postdivide)
+                        _fsdp_state._gradient_predivide_factor = 1.0
+                        _fsdp_state._gradient_postdivide_factor = 1.0
+                        _adjusted_states += 1
+                    if _adjusted_states == 0 or len(_total_divisors) != 1:
+                        raise RuntimeError(
+                            "TORCHTUNE_FSDP_CPU_POSTDIVIDE=1 requires one consistent "
+                            "FSDP1 gradient divisor"
+                        )
+                    _cpu_postdivide = _total_divisors.pop()
+                    from torchtune.dev.rl.distributed import (
+                        set_fsdp1_hsdp_cpu_postdivide,
+                    )
+
+                    set_fsdp1_hsdp_cpu_postdivide(_cpu_postdivide)
+                    log.info(
+                        "Rank %d: FSDP CPU postdivide ACTIVE for %d states "
+                        "(CPU divisor=%s; XPU pre/post factors=1)",
+                        self.rank,
+                        _adjusted_states,
+                        _cpu_postdivide,
+                    )
                 log.info(
                     "Rank %d: FSDP1 HSDP (%s) over dp_mesh (replicate=%d x shard=%d)",
-                    self.rank, _shard_strategy.name,
-                    self._dp_replicate, self._dp_shard,
+                    self.rank,
+                    _shard_strategy.name,
+                    self._dp_replicate,
+                    self._dp_shard,
                 )
             else:
                 # colocate: FULL_SHARD (ZeRO-3) shards params at rest → frees ~11/12 of
@@ -1026,21 +1368,110 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
                     if (_is_colocate or _force_full_shard)
                     else ShardingStrategy.SHARD_GRAD_OP
                 )
+                # FIX 2026-09-15 (jobs 8827075 / 8827354 / 8827618). This branch used a
+                # hardcoded `ignored_modules=_ignored`, which excludes only the ENCODER
+                # MODULES (_embed, protein_encoder, go_encoder). The HSDP branch above
+                # instead passes `**_fsdp_ignore_kwargs`, which becomes
+                # `ignored_states=_ignored_states` (parameter-level) whenever
+                # `_replicate_trainables` is set — so at 16N the LoRA adapters were kept
+                # OUT of the per-layer flat params and stayed replicated, while at
+                # dp_replicate=1 they were swept INTO the wrapped decoder layers.
+                #
+                # Symptom: the named grad census showed each rank holding grads for
+                # exactly one or three PROJECTION TYPES across all 64 layers
+                # (rank1: q,k,v | rank2: o | rank5: gate | rank8: up | rank11: down;
+                # 7 ranks with none), counts 0/128/384 summing to exactly 896. The param
+                # names carry `_fsdp_wrapped_module` TWICE —
+                # `..._fsdp_wrapped_module.backbone...layers.N._fsdp_wrapped_module.mlp.down_proj.lora_A...`
+                # — proving the adapters sat inside an FSDP-wrapped decoder layer.
+                #
+                # The `ignored_states ACTIVE for 904` log line does NOT prove the list was
+                # passed: it fires when the list is BUILT. That line is why an earlier,
+                # correct hypothesis was wrongly discarded — the log was necessary but not
+                # sufficient evidence.
+                #
+                # Reusing the same kwargs construction as the HSDP branch keeps the two
+                # paths honest and restores replicated adapters at dp_replicate=1.
+                _fsdp_ignore_kwargs_nonhsdp = (
+                    {"ignored_states": _ignored_states}
+                    if _ignored_states is not None
+                    else {"ignored_modules": _ignored}
+                )
                 self._model = FSDP(
                     _pre_wrap,
                     sharding_strategy=_shard_strategy,
                     mixed_precision=_mp_policy,
                     process_group=self._training_pg,
-                    ignored_modules=_ignored,
+                    **_fsdp_ignore_kwargs_nonhsdp,
                     use_orig_params=True,
                     device_id=self._device,
                     auto_wrap_policy=_auto_wrap_policy,
                     limit_all_gathers=True,
                     backward_prefetch=(
-                        BackwardPrefetch.BACKWARD_POST if _force_full_shard else BackwardPrefetch.BACKWARD_PRE
+                        BackwardPrefetch.BACKWARD_POST
+                        if _force_full_shard
+                        else BackwardPrefetch.BACKWARD_PRE
                     ),
                 )
             self._use_fsdp1 = True
+
+            # POST-WRAP VERIFICATION (2026-09-15). The pre-wrap log says the ignored
+            # list was BUILT; this says whether FSDP actually honored it. A LoRA param
+            # that ended up inside a wrapped decoder layer has `_fsdp_wrapped_module`
+            # appearing a SECOND time after its `layers.N` segment — that is precisely
+            # the signature the named grad census found when the non-HSDP branch was
+            # passing `ignored_modules` instead of `ignored_states` (each rank then
+            # held grads for only 1-3 projection types; 7 of 12 ranks had none).
+            # Cheap (one pass over names at setup) and it converts a silent,
+            # 3-job-to-diagnose misconfiguration into an immediate warning.
+            # Ask FSDP DIRECTLY. An earlier version of this check inferred "swept in"
+            # from the qualified name containing `_fsdp_wrapped_module` after the
+            # `layers.N` segment — that is a FALSE POSITIVE generator: `ignored_states`
+            # excludes a param from FLATTENING, not from the module TREE, so an ignored
+            # adapter still lives under a wrapped decoder layer and its qualified name
+            # picks up `_fsdp_wrapped_module` either way. It cannot distinguish
+            # "flattened into the layer's FlatParameter" from "ignored but nested".
+            #
+            # `_ignored_params` is the set FSDP actually resolved and honored
+            # (torch/distributed/fsdp/_init_utils.py: `state._ignored_params = ...`,
+            # then `managed_params = _get_orig_params(module, state._ignored_params)`),
+            # and FSDP propagates it to auto-wrapped children via root_kwargs
+            # (fully_sharded_data_parallel.py: `"ignored_states": self._ignored_params`).
+            # Membership in that set is ground truth; names are not.
+            if getattr(self, "_projectors_fsdp_ignored", False):
+                try:
+                    _ign = set()
+                    for _mod in self._model.modules():
+                        _ign |= {
+                            id(_p) for _p in getattr(_mod, "_ignored_params", set())
+                        }
+                    _lora = [
+                        (_n, _p)
+                        for _n, _p in self._model.named_parameters()
+                        if _p.requires_grad and ".lora_" in _n
+                    ]
+                    _missed = [_n for _n, _p in _lora if id(_p) not in _ign]
+                    if _missed:
+                        log.warning(
+                            "FSDP ignored_states NOT honored for %d/%d trainable LoRA "
+                            "params (e.g. %s): they are absent from FSDP's resolved "
+                            "_ignored_params, so they are flattened and sharded. "
+                            "Per-rank grads will then cover only a subset of "
+                            "projections and _sync_ignored_trainable_grads will average "
+                            "disjoint shards. Check this FSDP() call passes "
+                            "ignored_states, not ignored_modules.",
+                            len(_missed),
+                            len(_lora),
+                            _missed[0],
+                        )
+                    else:
+                        log.info(
+                            "FSDP ignored_states honored: all %d trainable LoRA params "
+                            "are in FSDP's _ignored_params (replicated, not flattened).",
+                            len(_lora),
+                        )
+                except Exception:  # diagnostics must never break setup
+                    pass
             # Pre-compute chunked broadcast layout. Two paths:
             #   - Default (4B, validated): summon_full_params(rank0_only=True) — outside
             #     it, use_orig_params=True params reflect SHARD sizes (not full), so chunk
@@ -1058,7 +1489,9 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
             if _force_full_shard:
                 self._compute_wsync_layout(_pre_wrap)
             else:
-                with FSDP.summon_full_params(self._model, writeback=False, rank0_only=True):
+                with FSDP.summon_full_params(
+                    self._model, writeback=False, rank0_only=True
+                ):
                     self._compute_wsync_layout(self._model)
             _wsync_desc = (
                 f"wsync_pg=[0,{self._vllm_dedicated_rank}]"
@@ -1066,9 +1499,13 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
                 else "wsync=HTTP raw_bytes (no PG)"
             )
             log.info(
-                "Rank %d: FSDP1 " + _shard_strategy.name + " wrapped over training_pg (%d ranks), "
+                "Rank %d: FSDP1 "
+                + _shard_strategy.name
+                + " wrapped over training_pg (%d ranks), "
                 "ignored=[_embed, protein_encoder, go_encoder], %s",
-                self.rank, len(_training_ranks), _wsync_desc,
+                self.rank,
+                len(_training_ranks),
+                _wsync_desc,
             )
             # lora_wsync_mode: "merged" is the HW-validated fallback. "delta"
             # ships an unsharded base once; "delta_tp" snapshots vLLM's resident
@@ -1136,7 +1573,8 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
         embeds_list: list,
         batch_input_ids_cpu: torch.Tensor,
         context_length: int,
-    ) -> torch.Tensor:
+        return_logprobs: bool = False,
+    ):
         """Pure vLLM HTTP round-trip from a pre-built CPU embeds list.
 
         THREAD-SAFE / XPU-FREE: this is the only part of BioReason generation
@@ -1170,7 +1608,7 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
         )
         t0 = time.perf_counter()
         num_clients = len(self._vllm_clients)
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from concurrent.futures import as_completed, ThreadPoolExecutor
 
         _seqs_per_engine = int(os.environ.get("TORCHTUNE_VLLM_SEQS_PER_ENGINE", "4"))
         _seqs_per_engine = max(1, _seqs_per_engine)
@@ -1187,10 +1625,14 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
         _bands_on = os.environ.get("TORCHTUNE_VLLM_REPLICA_BANDS", "1") != "0"
         _replica_idx = (self.rank // self._dp_shard) if _n_rep > 1 else 0
         if _bands_on:
-            _band = max(1, num_clients // _n_rep)
-            _eng_base = (_replica_idx % _n_rep) * _band
-            _is_last_band = (_replica_idx == _n_rep - 1)
-            _band_size = (num_clients - _eng_base) if _is_last_band else _band
+            if num_clients < _n_rep:
+                _eng_base = _replica_idx % num_clients
+                _band_size = 1
+            else:
+                _band = num_clients // _n_rep
+                _eng_base = _replica_idx * _band
+                _is_last_band = _replica_idx == _n_rep - 1
+                _band_size = (num_clients - _eng_base) if _is_last_band else _band
         else:
             _eng_base = 0
             _band_size = num_clients
@@ -1200,20 +1642,106 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
         for _i in range(bsz):
             _groups[_i % _n_engines].append(_i)
 
-        def _call_group(client, idxs):
-            embeds = [embeds_list[j] for j in idxs]
-            out = client.generate_from_embeds(prompt_embeds=embeds, **gen_kwargs)
-            return {idxs[k]: (out[k] if out and k < len(out) else []) for k in range(len(idxs))}
+        _prompt_n = (
+            self.grpo_samples
+            if os.environ.get("TORCHTUNE_VLLM_PROMPT_N", "0") == "1"
+            and _n_engines == 1
+            and bsz % self.grpo_samples == 0
+            else 1
+        )
+
+        request_plan = [
+            (_engine_ids[group_idx], indices, _prompt_n)
+            for group_idx, indices in enumerate(_groups)
+            if indices
+        ]
+        if (
+            os.environ.get("TORCHTUNE_VLLM_SPLIT_PROMPT_N", "0") == "1"
+            and _prompt_n > 1
+        ):
+            request_plan = _split_prompt_n_request_plan(
+                request_plan,
+                num_clients,
+                int(os.environ.get("TORCHTUNE_VLLM_SPLIT_ENGINE_STRIDE", "0")),
+                _replica_idx
+                * int(
+                    os.environ.get("TORCHTUNE_VLLM_SPLIT_ENGINE_PHASE_PER_REPLICA", "0")
+                ),
+            )
+        request_plan = _split_choice_request_plan(
+            request_plan,
+            num_clients,
+            int(os.environ.get("TORCHTUNE_VLLM_SPLIT_CHOICE_ENGINE_STRIDE", "0")),
+        )
+
+        def _call_group(engine_id, client, idxs, request_n):
+            request_idxs = idxs[::request_n]
+            embeds = [embeds_list[j] for j in request_idxs]
+            request_t0 = time.perf_counter()
+            out = client.generate_from_embeds(
+                prompt_embeds=embeds,
+                n=request_n,
+                return_logprobs=return_logprobs,
+                **gen_kwargs,
+            )
+            # With return_logprobs the client returns a TUPLE. Unpacking it
+            # explicitly matters: the old `out[k]` indexing would silently take the
+            # token-id list as the whole result and the logprobs would vanish
+            # without an error.
+            if return_logprobs:
+                out, out_lp = out
+            else:
+                out_lp = None
+            # Emit the SAME "request done" record the synchronous generation path
+            # emits (see the sibling _call_group in _generate_with_vllm_fanout).
+            # This path is the ASYNC one: it runs on the RolloutProducer thread and
+            # used to log nothing at all, so `rolog_token_totals.sh` exited 3 BLIND
+            # on every async log and the async-vs-sync A/B had exactly ONE token
+            # estimator (BIOREASON_DIAG) with no independent cross-check -- the
+            # single-estimator setup that produced the arity burn. The grammar is
+            # copied verbatim from the sync site so one parser serves both arms; do
+            # not "improve" the wording without updating rolog_token_totals.sh.
+            _out_lens = [len(tokens) for tokens in (out or [])]
+            _out_tokens = sum(_out_lens)
+            _elapsed = time.perf_counter() - request_t0
+            log.info(
+                "Rank %d: vLLM engine=%d request done sequences=%d "
+                "output_tokens=%d output_length_min=%d output_length_max=%d "
+                "elapsed=%.1fs tok/s=%.1f",
+                self.rank,
+                engine_id,
+                len(idxs),
+                _out_tokens,
+                min(_out_lens, default=0),
+                max(_out_lens, default=0),
+                _elapsed,
+                _out_tokens / max(_elapsed, 0.01),
+            )
+            return {
+                idxs[k]: (
+                    out[k] if out and k < len(out) else [],
+                    out_lp[k] if out_lp and k < len(out_lp) else None,
+                )
+                for k in range(len(idxs))
+            }
 
         completions = [None] * bsz
-        with ThreadPoolExecutor(max_workers=_n_engines) as pool:
+        completion_lps = [None] * bsz
+        with ThreadPoolExecutor(max_workers=len(request_plan)) as pool:
             futures = [
-                pool.submit(_call_group, self._vllm_clients[_engine_ids[g]], _groups[g])
-                for g in range(_n_engines) if _groups[g]
+                pool.submit(
+                    _call_group,
+                    engine_id,
+                    self._vllm_clients[engine_id],
+                    indices,
+                    request_n,
+                )
+                for engine_id, indices, request_n in request_plan
             ]
             for future in as_completed(futures):
-                for _gi, _comp in future.result().items():
+                for _gi, (_comp, _lp) in future.result().items():
                     completions[_gi] = _comp
+                    completion_lps[_gi] = _lp
         gen_time = time.perf_counter() - t0
 
         # CPU assembly — NO XPU. Consumer moves to device.
@@ -1224,17 +1752,44 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
         for i, comp in enumerate(completions):
             length = min(len(comp), self._max_generated_tokens)
             if length:
-                query_responses[i, context_length : context_length + length] = torch.tensor(
-                    comp[:length], dtype=batch_input_ids_cpu.dtype
-                )
+                query_responses[
+                    i, context_length : context_length + length
+                ] = torch.tensor(comp[:length], dtype=batch_input_ids_cpu.dtype)
         total_tokens = sum(len(c) for c in completions)
         log.info(
             "Rank %d: vLLM-embeds HTTP: %d seqs over %d engines (ids=%s), %d tokens in "
             "%.1fs (%.1f tok/s)",
-            self.rank, bsz, _n_engines, _engine_ids, total_tokens, gen_time,
+            self.rank,
+            bsz,
+            _n_engines,
+            _engine_ids,
+            total_tokens,
+            gen_time,
             total_tokens / max(gen_time, 0.01),
         )
-        return query_responses
+        if not return_logprobs:
+            return query_responses, None
+        # WHOLE-BATCH fallback, never per-row repair. vLLM logprobs and a recomputed
+        # forward differ by recompute noise (ratios up to 1.0739 on a healthy run),
+        # so a batch mixing the two sources carries a per-row systematic difference
+        # correlated with exactly the rows that failed -- a confound no downstream
+        # statistic could detect.
+        _bad = rows_needing_fallback(
+            completion_lps, completions, self._max_generated_tokens
+        )
+        if _bad:
+            log.warning(
+                "Rank %d: %d/%d rows lack usable vLLM logprobs (first few: %s); "
+                "falling back to the policy forward for the WHOLE batch",
+                self.rank,
+                len(_bad),
+                bsz,
+                _bad[:8],
+            )
+            return query_responses, None
+        return query_responses, build_behavior_logprobs(
+            completion_lps, completions, bsz, self._max_generated_tokens
+        )
 
     def _generate_with_vllm_server_embeds(
         self,
@@ -1264,7 +1819,9 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
                 f"prompt_embeds required for vllm_server_embeds; got "
                 f"{None if prompt_embeds is None else prompt_embeds.shape}, bsz={bsz}"
             )
-            embeds_list = [prompt_embeds[i].detach().cpu().contiguous() for i in range(bsz)]
+            embeds_list = [
+                prompt_embeds[i].detach().cpu().contiguous() for i in range(bsz)
+            ]
             gen_kwargs = dict(
                 max_tokens=self._max_generated_tokens,
                 temperature=self._temperature,
@@ -1275,7 +1832,7 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
 
             t0 = time.perf_counter()
             num_clients = len(self._vllm_clients)
-            from concurrent.futures import ThreadPoolExecutor, as_completed
+            from concurrent.futures import as_completed, ThreadPoolExecutor
 
             # GENERATION BATCHING (2026-06-22): the old path submitted ONE request per
             # prompt round-robin'd across all 12 engines -> ~1 seq/engine -> SINGLE-STREAM
@@ -1288,7 +1845,9 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
             # (fewer in-flight HTTP -> fewer simultaneous IPC handles, the old banned:1
             # risk at G>=16). Set TORCHTUNE_VLLM_SEQS_PER_ENGINE=1 to restore the old
             # spread-thin behavior.
-            _seqs_per_engine = int(os.environ.get("TORCHTUNE_VLLM_SEQS_PER_ENGINE", "4"))
+            _seqs_per_engine = int(
+                os.environ.get("TORCHTUNE_VLLM_SEQS_PER_ENGINE", "4")
+            )
             _seqs_per_engine = max(1, _seqs_per_engine)
             # Number of engines THIS leader wants = ceil(bsz / seqs_per_engine).
             _want_engines = max(1, (bsz + _seqs_per_engine - 1) // _seqs_per_engine)
@@ -1309,12 +1868,16 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
             _n_rep = max(1, getattr(self, "_dp_replicate", 1))
             _replica_idx = (self.rank // self._dp_shard) if _n_rep > 1 else 0
             # Engines available to THIS replica: an even contiguous band of the pool.
-            _band = max(1, num_clients // _n_rep)
-            _eng_base = (_replica_idx % _n_rep) * _band
-            # This leader uses min(want, band) engines from its band (capped so two
-            # replicas never share an engine; the last band absorbs the remainder).
-            _is_last_band = (_replica_idx == _n_rep - 1)
-            _band_size = (num_clients - _eng_base) if _is_last_band else _band
+            if num_clients < _n_rep:
+                _eng_base = _replica_idx % num_clients
+                _band_size = 1
+            else:
+                _band = num_clients // _n_rep
+                _eng_base = _replica_idx * _band
+                # This leader uses min(want, band) engines from its band (capped so two
+                # replicas never share an engine; the last band absorbs the remainder).
+                _is_last_band = _replica_idx == _n_rep - 1
+                _band_size = (num_clients - _eng_base) if _is_last_band else _band
             _n_engines = max(1, min(_want_engines, _band_size))
             # Global engine indices this leader will hit (disjoint across replicas).
             _engine_ids = [(_eng_base + e) % num_clients for e in range(_n_engines)]
@@ -1323,17 +1886,105 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
             for _i in range(bsz):
                 _groups[_i % _n_engines].append(_i)
 
-            def _call_group(client, idxs):
-                embeds = [embeds_list[j] for j in idxs]
-                out = client.generate_from_embeds(prompt_embeds=embeds, **gen_kwargs)
+            _prompt_n = (
+                self.grpo_samples
+                if os.environ.get("TORCHTUNE_VLLM_PROMPT_N", "0") == "1"
+                and _n_engines == 1
+                and bsz % self.grpo_samples == 0
+                else 1
+            )
+
+            request_plan = [
+                (_engine_ids[group_idx], indices, _prompt_n)
+                for group_idx, indices in enumerate(_groups)
+                if indices
+            ]
+            if (
+                os.environ.get("TORCHTUNE_VLLM_SPLIT_PROMPT_N", "0") == "1"
+                and _prompt_n > 1
+            ):
+                request_plan = _split_prompt_n_request_plan(
+                    request_plan,
+                    num_clients,
+                    int(os.environ.get("TORCHTUNE_VLLM_SPLIT_ENGINE_STRIDE", "0")),
+                    _replica_idx
+                    * int(
+                        os.environ.get(
+                            "TORCHTUNE_VLLM_SPLIT_ENGINE_PHASE_PER_REPLICA", "0"
+                        )
+                    ),
+                    int(
+                        os.environ.get("TORCHTUNE_VLLM_SPLIT_PROMPTS_PER_REQUEST", "1")
+                    ),
+                )
+            request_plan = _split_choice_request_plan(
+                request_plan,
+                num_clients,
+                int(os.environ.get("TORCHTUNE_VLLM_SPLIT_CHOICE_ENGINE_STRIDE", "0")),
+            )
+
+            log.info(
+                "Rank %d: vLLM-embeds submit start: %d sequences requests=%s "
+                "max_tokens=%d",
+                self.rank,
+                bsz,
+                [
+                    (engine_id, len(indices), request_n)
+                    for engine_id, indices, request_n in request_plan
+                ],
+                self._max_generated_tokens,
+            )
+
+            def _call_group(engine_id, client, idxs, request_n):
+                request_idxs = idxs[::request_n]
+                embeds = [embeds_list[j] for j in request_idxs]
+                request_t0 = time.perf_counter()
+                log.info(
+                    "Rank %d: vLLM engine=%d request start prompts=%d n=%d sequences=%d",
+                    self.rank,
+                    engine_id,
+                    len(request_idxs),
+                    request_n,
+                    len(request_idxs) * request_n,
+                )
+                out = client.generate_from_embeds(
+                    prompt_embeds=embeds,
+                    n=request_n,
+                    **gen_kwargs,
+                )
+                output_lengths = [len(tokens) for tokens in (out or [])]
+                output_tokens = sum(output_lengths)
+                request_elapsed = time.perf_counter() - request_t0
+                log.info(
+                    "Rank %d: vLLM engine=%d request done sequences=%d "
+                    "output_tokens=%d output_length_min=%d output_length_max=%d "
+                    "elapsed=%.1fs tok/s=%.1f",
+                    self.rank,
+                    engine_id,
+                    len(idxs),
+                    output_tokens,
+                    min(output_lengths, default=0),
+                    max(output_lengths, default=0),
+                    request_elapsed,
+                    output_tokens / max(request_elapsed, 0.01),
+                )
                 # out is list aligned with embeds; map back to global indices.
-                return {idxs[k]: (out[k] if out and k < len(out) else []) for k in range(len(idxs))}
+                return {
+                    idxs[k]: (out[k] if out and k < len(out) else [])
+                    for k in range(len(idxs))
+                }
 
             completions = [None] * bsz
-            with ThreadPoolExecutor(max_workers=_n_engines) as pool:
+            with ThreadPoolExecutor(max_workers=len(request_plan)) as pool:
                 futures = [
-                    pool.submit(_call_group, self._vllm_clients[_engine_ids[g]], _groups[g])
-                    for g in range(_n_engines) if _groups[g]
+                    pool.submit(
+                        _call_group,
+                        engine_id,
+                        self._vllm_clients[engine_id],
+                        indices,
+                        request_n,
+                    )
+                    for engine_id, indices, request_n in request_plan
                 ]
                 for future in as_completed(futures):
                     for _gi, _comp in future.result().items():
@@ -1343,14 +1994,23 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
                 log.info(
                     "Rank 0: gen fan-out: bsz=%d over %d engines (ids=%s, %d seqs/engine "
                     "target, replica=%d/%d) -> batched decode",
-                    bsz, _n_engines, _engine_ids, _seqs_per_engine, _replica_idx, _n_rep,
+                    bsz,
+                    _n_engines,
+                    _engine_ids,
+                    _seqs_per_engine,
+                    _replica_idx,
+                    _n_rep,
                 )
 
-            query_responses = batch_input_ids.new_full((bsz, total_len), self._tokenizer.pad_id)
+            query_responses = batch_input_ids.new_full(
+                (bsz, total_len), self._tokenizer.pad_id
+            )
             query_responses[:, :context_length] = batch_input_ids
             for i, comp in enumerate(completions):
                 length = min(len(comp), self._max_generated_tokens)
-                query_responses[i, context_length : context_length + length] = torch.tensor(
+                query_responses[
+                    i, context_length : context_length + length
+                ] = torch.tensor(
                     comp[:length], dtype=batch_input_ids.dtype, device=self._device
                 )
 
@@ -1358,7 +2018,11 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
             log.info(
                 "Rank %d: vLLM-embeds generation: %d sequences (%d clients), %d tokens in "
                 "%.1fs (%.1f tok/s)",
-                self.rank, bsz, num_clients, total_tokens, gen_time,
+                self.rank,
+                bsz,
+                num_clients,
+                total_tokens,
+                gen_time,
                 total_tokens / max(gen_time, 0.01),
             )
         else:
@@ -1380,13 +2044,17 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
         slice it produces is then handed to the pure-HTTP producer thread.
         """
         protein_sequences = batch.get("protein_sequences", None)
-        if protein_sequences is None or not hasattr(self._policy, "build_prompt_embeds"):
+        if protein_sequences is None or not hasattr(
+            self._policy, "build_prompt_embeds"
+        ):
             return None
         input_ids = batch["tokens"].to(self._device)
         batch_size = input_ids.shape[0]
         grpo_size = self.grpo_samples
-        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
         import contextlib
+
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
         # See generate_trajectory's identical exception for why 32B skips this gather
         # entirely when the projectors are already FSDP-ignored (fully replicated).
         if getattr(self, "_projectors_fsdp_ignored", False):
@@ -1396,7 +2064,9 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
         else:
             _gather_ctx = contextlib.nullcontext()
         with torch.no_grad(), _gather_ctx:
-            pe_base = self._policy.build_prompt_embeds(input_ids, protein_sequences)  # [B,P,H] CPU
+            pe_base = self._policy.build_prompt_embeds(
+                input_ids, protein_sequences
+            )  # [B,P,H] CPU
         prompt_embeds = (
             pe_base.unsqueeze(1)
             .expand(-1, grpo_size, -1, -1)
@@ -1473,10 +2143,19 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
         def _produce_one(work):
             # Runs in the producer thread. `work` is the mailbox dict posted by the
             # main thread. Pure HTTP + CPU assembly — NO XPU, NO collective.
-            qr_cpu = self._http_generate_from_embeds_cpu(
-                work["embeds_list"], work["bii_cpu"], work["ctx"]
+            #
+            # The behavior logprobs ride back in the TELEMETRY dict, which
+            # RolloutProducer merges into item.batch_meta. They must not be written
+            # onto `self` here: this runs on the producer thread, one step ahead of
+            # the consumer, so a `self` attribute would be overwritten by the NEXT
+            # batch before the current one is consumed.
+            qr_cpu, blp_cpu = self._http_generate_from_embeds_cpu(
+                work["embeds_list"],
+                work["bii_cpu"],
+                work["ctx"],
+                return_logprobs=self._use_vllm_behavior_logprobs,
             )
-            return qr_cpu, {}
+            return qr_cpu, {"behavior_logprobs": blp_cpu}
 
         producer = RolloutProducer(
             produce_fn=_produce_one,
@@ -1499,7 +2178,8 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
                 "Rank %d (replica leader): BioReason rollout producer started "
                 "(max_staleness=%d, HTTP-only overlap; embeds built on main "
                 "thread; dp_replicate=%d).",
-                self.rank, self._async_generation_max_staleness,
+                self.rank,
+                self._async_generation_max_staleness,
                 getattr(self, "_dp_replicate", 1),
             )
 
@@ -1528,20 +2208,34 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
                 item = producer.get()
                 if item is None:
                     return False  # producer exhausted unexpectedly
-                self._pending_async_query_responses = (
-                    item.batch_meta["rollout_payload"].to(self._device)
+                self._pending_async_query_responses = item.batch_meta[
+                    "rollout_payload"
+                ].to(self._device)
+                # May be None (feature off, or a row needed the fallback). The
+                # follower ranks cannot know which, so the decision is broadcast
+                # with the data -- see broadcast_behavior_logprobs.
+                self._pending_async_behavior_logprobs = item.batch_meta.get(
+                    "behavior_logprobs"
                 )
                 self._last_rollout_item = item
                 _w_now = self._weight_versions.version
+                # Stash the CONSUME-time version for the METRICS async tail,
+                # which would otherwise read the counter after this step's own
+                # publish and over-report the lag by one (2026-09-16).
+                self._last_rollout_consume_wver = _w_now
                 log.info(
                     "Rank %d: async consume (producer_latency=%.1fs, qsize=%d, "
                     "rollout_w_ver=%d, cur_w_ver=%d, lag=%d)",
-                    self.rank, item.produce_latency_s, producer.qsize(),
-                    item.weight_version, _w_now,
+                    self.rank,
+                    item.produce_latency_s,
+                    producer.qsize(),
+                    item.weight_version,
+                    _w_now,
                     max(0, _w_now - item.weight_version),
                 )
             else:
                 self._pending_async_query_responses = None
+                self._pending_async_behavior_logprobs = None
             return True
 
         try:
@@ -1566,21 +2260,26 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
                     continue
                 if _is_leader:
                     bsz = prompt_embeds.shape[0]
-                    bii_cpu = batch["tokens"][:, None, :].expand(
-                        -1, self.grpo_samples, -1
-                    ).reshape(bsz, -1).cpu()
+                    bii_cpu = (
+                        batch["tokens"][:, None, :]
+                        .expand(-1, self.grpo_samples, -1)
+                        .reshape(bsz, -1)
+                        .cpu()
+                    )
                     ctx = batch["tokens"].shape[1]
                     embeds_list = [prompt_embeds[i].contiguous() for i in range(bsz)]
                     # STALENESS PIN: snapshot the weight version on the MAIN thread
                     # at post time (deterministically ordered w.r.t. the per-step
                     # bumps) and hand it to the producer so it does NOT drift at
                     # pickup. Lag == 1 at consume. See RolloutProducer._run.
-                    _http_inbox.put({
-                        "embeds_list": embeds_list,
-                        "bii_cpu": bii_cpu,
-                        "ctx": ctx,
-                        "_weight_version": self._weight_versions.version,
-                    })
+                    _http_inbox.put(
+                        {
+                            "embeds_list": embeds_list,
+                            "bii_cpu": bii_cpu,
+                            "ctx": ctx,
+                            "_weight_version": self._weight_versions.version,
+                        }
+                    )
 
                 if _pending is not None:
                     if not _consume(*_pending):
@@ -1647,7 +2346,9 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
         outputs = self._vllm_llm.generate(vllm_prompts, sampling_params=sampling_params)
         gen_time = time.perf_counter() - t0
 
-        query_responses = batch_input_ids.new_full((bsz, total_len), self._tokenizer.pad_id)
+        query_responses = batch_input_ids.new_full(
+            (bsz, total_len), self._tokenizer.pad_id
+        )
         query_responses[:, :context_length] = batch_input_ids
         for i, out in enumerate(outputs):
             ids = out.outputs[0].token_ids
@@ -1659,9 +2360,25 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
         total_tokens = sum(len(o.outputs[0].token_ids) for o in outputs)
         log.info(
             "Rank %d: colocated vLLM generation: %d sequences, %d tokens in %.1fs (%.1f tok/s)",
-            self.rank, bsz, total_tokens, gen_time, total_tokens / max(gen_time, 0.01),
+            self.rank,
+            bsz,
+            total_tokens,
+            gen_time,
+            total_tokens / max(gen_time, 0.01),
         )
         return query_responses
+
+    def _blp_audit_active(self) -> bool:
+        """True while the behavior-logprobs audit should still run.
+
+        Gating on the step counter rather than a bool is deliberate: the audit pays
+        exactly the policy forward the feature exists to remove, so leaving it on for
+        a whole run would hide the speedup it is meant to qualify.
+        """
+        return (
+            getattr(self, "_blp_audit_steps", 0) > 0
+            and getattr(self, "_steps_run", 0) < self._blp_audit_steps
+        )
 
     # ── Trajectory generation override ────────────────────────────────────────
 
@@ -1678,15 +2395,21 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
         and uses the inputs_embeds path for policy/ref forward passes.
         """
         from torchtune import generation as torchtune_generation
-        from torchtune.modules import local_kv_cache
         from torchtune.dev.rl.generation import generate
+        from torchtune.modules import local_kv_cache
 
         if self._device.type == "xpu":
             torch.xpu.synchronize()
         if not _colocate_vllm_mode:
             device_empty_cache(self._device)
-        elif self._vllm_mode == "colocate_sleep" and self._vllm_llm is not None and hasattr(self, '_vllm_is_sleeping') and self._vllm_is_sleeping:
+        elif (
+            self._vllm_mode == "colocate_sleep"
+            and self._vllm_llm is not None
+            and hasattr(self, "_vllm_is_sleeping")
+            and self._vllm_is_sleeping
+        ):
             import gc
+
             gc.collect()
             torch.xpu.synchronize()
             torch.distributed.barrier()
@@ -1700,19 +2423,25 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
             self._sync_colocated_weights()
             self._vllm_llm.wake_up(tags=["kv_cache"])
             self._vllm_is_sleeping = False
-            log.info("Rank %d: vLLM wake_up + weight sync completed in %.2fs",
-                     self.rank, time.perf_counter() - t_wake)
+            log.info(
+                "Rank %d: vLLM wake_up + weight sync completed in %.2fs",
+                self.rank,
+                time.perf_counter() - t_wake,
+            )
         elif self._vllm_mode == "colocate" and self._vllm_llm is not None:
             # Plain colocate (vLLM resident, no sleep): the WEIGHT sync runs in the
             # base train() loop (_run_wsync_block → _sync_colocated_weights, which
             # BioReason overrides to the LoRA merge). Here we only restore KV cache
             # shapes (if a prior step zeroed them) + reset prefix cache before gen.
             import gc
+
             gc.collect()
             torch.xpu.synchronize()
             torch.distributed.barrier()
-            if hasattr(self, '_vllm_kv_cache_shapes'):
-                kv_caches = self._vllm_llm.llm_engine.model_executor.driver_worker.model_runner.kv_caches
+            if hasattr(self, "_vllm_kv_cache_shapes"):
+                kv_caches = (
+                    self._vllm_llm.llm_engine.model_executor.driver_worker.model_runner.kv_caches
+                )
                 for i, (shape, dtype) in enumerate(self._vllm_kv_cache_shapes):
                     kv_caches[i] = torch.zeros(shape, dtype=dtype, device=self._device)
                 del self._vllm_kv_cache_shapes
@@ -1735,10 +2464,17 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
         # the consume-active flag are still set so the path stays symmetric.
         _async_consume = getattr(self, "_async_consume_active", False)
         prompt_embeds = None
-        if _async_consume and getattr(self, "_pending_async_prompt_embeds", None) is not None:
+        if (
+            _async_consume
+            and getattr(self, "_pending_async_prompt_embeds", None) is not None
+        ):
             prompt_embeds = self._pending_async_prompt_embeds
             self._pending_async_prompt_embeds = None
-        elif protein_sequences is not None and hasattr(self._policy, 'build_prompt_embeds'):
+        elif protein_sequences is not None and hasattr(
+            self._policy, "build_prompt_embeds"
+        ):
+            import contextlib
+
             # Multimodal: build prompt embeddings once per unique prompt, then expand
             # to B*G. build_prompt_embeds(input_ids [B,P], protein_sequences [B]) ->
             # [B,P,H] on CPU. protein_projection and go_projection are trainable ->
@@ -1751,13 +2487,23 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
             # cascade into unsharding all 64 per-layer FSDP units at once (OOM, see the
             # same block's comment). Skip it entirely in that case.
             from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-            import contextlib
+
             if getattr(self, "_projectors_fsdp_ignored", False):
                 _gather_ctx = contextlib.nullcontext()
             elif isinstance(self._model, FSDP):
                 _gather_ctx = FSDP.summon_full_params(self._model, writeback=False)
             else:
                 _gather_ctx = contextlib.nullcontext()
+            _embed_t0 = time.perf_counter()
+            if getattr(self, "_is_shard_leader", self._is_rank_zero):
+                log.info(
+                    "Rank %d: prompt-embeds build start batch=%d grpo=%d "
+                    "projectors_ignored=%s",
+                    self.rank,
+                    batch_size,
+                    grpo_size,
+                    getattr(self, "_projectors_fsdp_ignored", False),
+                )
             with torch.no_grad(), _gather_ctx:
                 pe_base = self._policy.build_prompt_embeds(
                     input_ids.to(self._device), protein_sequences
@@ -1768,8 +2514,22 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
                 .reshape(batch_size * grpo_size, pe_base.shape[1], pe_base.shape[2])
                 .contiguous()
             )  # [B*G, P, H] CPU
+            if getattr(self, "_is_shard_leader", self._is_rank_zero):
+                log.info(
+                    "Rank %d: prompt-embeds build done base_shape=%s expanded_shape=%s "
+                    "elapsed=%.1fs",
+                    self.rank,
+                    tuple(pe_base.shape),
+                    tuple(prompt_embeds.shape),
+                    time.perf_counter() - _embed_t0,
+                )
 
         # step 1: generate responses
+        # Declared ABOVE the vllm_mode dispatch, not inside the "server" branch:
+        # the site-4 gate below reads this name unconditionally, so a declaration
+        # scoped to one mode would raise UnboundLocalError under colocate /
+        # dedicated_rank. Only the async-consume path ever sets it to a tensor.
+        _behavior_logprobs = None
         _vllm_t0 = time.perf_counter()
         if self._vllm_mode in ("colocate", "colocate_sleep"):
             query_responses = self._generate_with_colocated_vllm(
@@ -1813,9 +2573,9 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
                 _is_leader = getattr(self, "_is_shard_leader", self._is_rank_zero)
                 if _is_leader:
                     query_responses = self._pending_async_query_responses
-                    assert query_responses is not None, (
-                        "async consume active but no shard-leader query_responses stashed"
-                    )
+                    assert (
+                        query_responses is not None
+                    ), "async consume active but no shard-leader query_responses stashed"
                     assert query_responses.shape == (bsz, total_len), (
                         f"async qr shape mismatch: got {tuple(query_responses.shape)}, "
                         f"expected ({bsz}, {total_len})"
@@ -1824,16 +2584,35 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
                     query_responses = batch_input_ids.new_empty(bsz, total_len)
                 self._pending_async_query_responses = None
                 query_responses = self._broadcast_query_responses(query_responses)
+                # SAME PROVENANCE, SAME BROADCAST. Only the leader issued the HTTP,
+                # so only the leader can hold pi_old. Skipping this broadcast is not
+                # a crash: followers would take the policy-forward branch while the
+                # leader skipped it -- divergent collective participation, i.e. a
+                # hang. broadcast_fn is _broadcast_query_responses ITSELF so both of
+                # its branches (node-local gloo under HSDP, world/_training_pg
+                # otherwise) are mirrored exactly rather than re-derived.
+                if self._use_vllm_behavior_logprobs:
+                    _blp = self._pending_async_behavior_logprobs
+                    self._pending_async_behavior_logprobs = None
+                    _behavior_logprobs = broadcast_behavior_logprobs(
+                        _blp.to(self._device) if _blp is not None else None,
+                        num_seqs=bsz,
+                        max_generated_tokens=self._max_generated_tokens,
+                        is_leader=_is_leader,
+                        broadcast_fn=self._broadcast_query_responses,
+                        device=self._device,
+                    )
             elif getattr(self, "_is_bioreason", False) and prompt_embeds is not None:
                 query_responses = self._generate_with_vllm_server_embeds(
                     batch_input_ids, context_length, prompt_embeds
                 )
             else:
-                query_responses = self._generate_with_vllm(batch_input_ids, context_length)
+                query_responses = self._generate_with_vllm(
+                    batch_input_ids, context_length
+                )
         else:
             _stop_tokens = (
-                None if self._dp_replicate > 1
-                else self._tokenizer.stop_tokens
+                None if self._dp_replicate > 1 else self._tokenizer.stop_tokens
             )
             with local_kv_cache(
                 model=self._model,
@@ -1858,45 +2637,88 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
             torch.xpu.synchronize()
         _vllm_time = time.perf_counter() - _vllm_t0
 
-        if self._vllm_mode not in ("server", "dedicated_rank") and not self._production_mode:
+        if (
+            self._vllm_mode not in ("server", "dedicated_rank")
+            and not self._production_mode
+        ):
             torch.distributed.barrier()
+
+        if getattr(self, "_dp_replicate", 1) > 1:
+            _trim_pg = self._gloo_dp_shard_pg
+        elif self._vllm_mode == "dedicated_rank":
+            _trim_pg = self._training_pg
+        else:
+            _trim_pg = None
+        _untrimmed_response_length = query_responses.shape[1] - context_length
+        query_responses, _active_response_length = trim_query_responses_to_global_max(
+            query_responses,
+            context_length,
+            self._tokenizer.pad_id,
+            process_group=_trim_pg,
+        )
+        if self._is_rank_zero and _active_response_length < _untrimmed_response_length:
+            log.info(
+                "BIOREASON_TRIM response_tokens=%d->%d sequence_tokens=%d",
+                _untrimmed_response_length,
+                _active_response_length,
+                query_responses.shape[1],
+            )
 
         # Free vLLM GPU memory for training forward/backward passes.
         if _colocate_vllm_mode and self._vllm_llm is not None:
             if torch.xpu.is_available():
                 mem_before = torch.xpu.memory_allocated(self._device) / 1024**3
             if self._vllm_mode == "colocate_sleep":
-                log.info("Rank %d: sleeping vLLM (weights + KV cache) for training", self.rank)
+                log.info(
+                    "Rank %d: sleeping vLLM (weights + KV cache) for training",
+                    self.rank,
+                )
                 t_free = time.perf_counter()
                 self._vllm_llm.sleep(level=1)
                 self._vllm_is_sleeping = True
             else:
                 log.info("Rank %d: freeing vLLM KV cache for training", self.rank)
                 t_free = time.perf_counter()
-                kv_caches = self._vllm_llm.llm_engine.model_executor.driver_worker.model_runner.kv_caches
+                kv_caches = (
+                    self._vllm_llm.llm_engine.model_executor.driver_worker.model_runner.kv_caches
+                )
                 self._vllm_kv_cache_shapes = []
                 for i, cache in enumerate(kv_caches):
                     self._vllm_kv_cache_shapes.append((cache.shape, cache.dtype))
                     kv_caches[i] = torch.empty(0, device="cpu")
             if torch.xpu.is_available():
                 mem_after = torch.xpu.memory_allocated(self._device) / 1024**3
-                log.info("Rank %d: vLLM memory freed in %.1fs (%.2f -> %.2f GiB, freed %.2f GiB)",
-                         self.rank, time.perf_counter() - t_free,
-                         mem_before, mem_after, mem_before - mem_after)
+                log.info(
+                    "Rank %d: vLLM memory freed in %.1fs (%.2f -> %.2f GiB, freed %.2f GiB)",
+                    self.rank,
+                    time.perf_counter() - t_free,
+                    mem_before,
+                    mem_after,
+                    mem_before - mem_after,
+                )
             else:
-                log.info("Rank %d: vLLM memory freed in %.1fs", self.rank,
-                         time.perf_counter() - t_free)
+                log.info(
+                    "Rank %d: vLLM memory freed in %.1fs",
+                    self.rank,
+                    time.perf_counter() - t_free,
+                )
 
         responses = query_responses[:, context_length:].clone()
 
-        vocab_size = getattr(self, '_vocab_size', None)
+        vocab_size = getattr(self, "_vocab_size", None)
         if vocab_size is not None and vocab_size > 0:
             oob_mask = responses >= vocab_size
             if oob_mask.any():
-                log.warning("Clamping %d OOB token IDs (max=%d, vocab=%d)",
-                            oob_mask.sum().item(), responses.max().item(), vocab_size)
+                log.warning(
+                    "Clamping %d OOB token IDs (max=%d, vocab=%d)",
+                    oob_mask.sum().item(),
+                    responses.max().item(),
+                    vocab_size,
+                )
                 responses = responses.clamp(max=vocab_size - 1)
-                query_responses = torch.cat([query_responses[:, :context_length], responses], dim=1)
+                query_responses = torch.cat(
+                    [query_responses[:, :context_length], responses], dim=1
+                )
 
         query_response_padding_masks = query_responses != self._tokenizer.pad_id
         masks = torchtune_generation.get_causal_mask_from_padding_mask(
@@ -1908,58 +2730,222 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
         del query_response_padding_masks
 
         num_seqs = query_responses.shape[0]
-        fwd_bs = self._forward_batch_size
+        ref_fwd_bs = self._ref_forward_batch_size
+        _response_padding_masks_for_width = None
+        if self._trim_chunk_width and ref_fwd_bs < num_seqs:
+            (
+                _response_padding_masks_for_width,
+                _,
+            ) = rlhf.truncate_sequence_at_first_stop_token(
+                responses.clone(),
+                self._stop_token_ids,
+                self._tokenizer.pad_id,
+            )
 
         # step 2: rollout-time policy logprobs (only when needed for IS ratios)
-        if self._ppo_epochs > 1 or self._compute_rollout_logprobs_required:
+        #
+        # ppo_epochs > 1 deliberately still recomputes: later epochs need pi_old under
+        # the CURRENT weights, not the behavior policy that produced the rollout.
+        # BioReason runs ppo_epochs=1 so this does not bite today, but the gate must
+        # not silently change semantics if it ever does.
+        if (
+            _behavior_logprobs is not None
+            and self._ppo_epochs == 1
+            and not self._blp_audit_active()
+        ):
+            # WIDTH, not just values. build_behavior_logprobs pads to the CAP
+            # (max_generated_tokens); `responses` is the batch's ACTUAL longest
+            # generation. They coincide only when some row hit the limit, so a
+            # mismatch appears at the first step where none did -- job 8833972
+            # survived steps 0-1 at width 3072 and died at step 2's 1743.
+            logprobs = fit_behavior_logprobs_width(
+                _behavior_logprobs, responses.shape[1]
+            )
+            # Both sibling branches set _policy_fwd_time and the GENTIMING line at
+            # the end of this method reads it unconditionally. Omitting it here
+            # would UnboundLocalError on exactly the path this feature enables.
+            _policy_fwd_time = 0.0
+            log.info(
+                "Rank %d: pi_old from vLLM sampler (%s) — policy forward skipped",
+                self.rank,
+                list(logprobs.shape),
+            )
+        elif self._ppo_epochs > 1 or self._compute_rollout_logprobs_required:
             _policy_fwd_t0 = time.perf_counter()
             with torch.no_grad():
-                if fwd_bs >= num_seqs:
-                    log.info("Rank %d: policy forward start (shape=%s)",
-                             self.rank, list(query_responses.shape))
+                if ref_fwd_bs >= num_seqs:
+                    log.info(
+                        "Rank %d: policy forward start (shape=%s)",
+                        self.rank,
+                        list(query_responses.shape),
+                    )
+                    _forward_context_length = context_length
                     if prompt_embeds is not None:
-                        _full_emb = self._policy.build_full_embeds(prompt_embeds, responses)
+                        _forward_prompt_embeds = prompt_embeds
                         _attn_mask = (query_responses != self._tokenizer.pad_id).long()
+                        _forward_position_ids = position_ids
+                        if self._compact_prompt_chunks:
+                            (
+                                _forward_prompt_embeds,
+                                _attn_mask,
+                                _forward_position_ids,
+                                _forward_context_length,
+                            ) = compact_prompt_completion_batch(
+                                prompt_embeds,
+                                query_responses[:, :context_length],
+                                responses,
+                                self._tokenizer.pad_id,
+                            )
+                        _full_emb = self._policy.build_full_embeds(
+                            _forward_prompt_embeds,
+                            responses,
+                            _forward_context_length
+                            if isinstance(_forward_context_length, torch.Tensor)
+                            else None,
+                            _attn_mask.shape[1]
+                            if isinstance(_forward_context_length, torch.Tensor)
+                            else None,
+                        )
+                        _ro_kwargs = response_only_logits_kwargs(
+                            self._model,
+                            _forward_context_length,
+                            responses.shape[1],
+                        )
                         logits = self._model(
-                            inputs_embeds=_full_emb, attention_mask=_attn_mask,
-                            position_ids=position_ids,
+                            inputs_embeds=_full_emb,
+                            attention_mask=_attn_mask,
+                            position_ids=_forward_position_ids,
+                            **_ro_kwargs,
                         )
                         del _full_emb, _attn_mask
                     else:
-                        logits = self._model(query_responses, input_pos=position_ids, mask=masks)
+                        _ro_kwargs = {}
+                        logits = self._model(
+                            query_responses, input_pos=position_ids, mask=masks
+                        )
                     log.info("Rank %d: policy forward done", self.rank)
-                    logits = logits[:, context_length - 1:]
-                    logprobs = rlhf.batched_logits_to_logprobs(logits, responses, self._temperature)
+                    logits = finish_response_logits(
+                        logits,
+                        _ro_kwargs,
+                        _forward_context_length,
+                        responses.shape[1],
+                    )
+                    logprobs = rlhf.batched_logits_to_logprobs(
+                        logits, responses, self._temperature
+                    )
                     del logits
                 else:
-                    log.info("Rank %d: policy forward start CHUNKED (total=%d, chunk=%d)",
-                             self.rank, num_seqs, fwd_bs)
-                    logprobs_chunks = []
-                    for cs in range(0, num_seqs, fwd_bs):
-                        ce = min(cs + fwd_bs, num_seqs)
-                        if prompt_embeds is not None:
-                            _full_emb = self._policy.build_full_embeds(
-                                prompt_embeds[cs:ce], responses[cs:ce]
+                    log.info(
+                        "Rank %d: policy forward start CHUNKED (total=%d, chunk=%d)",
+                        self.rank,
+                        num_seqs,
+                        ref_fwd_bs,
+                    )
+                    _chunk_ranges = [
+                        (cs, min(cs + ref_fwd_bs, num_seqs))
+                        for cs in range(0, num_seqs, ref_fwd_bs)
+                    ]
+                    if self._trim_chunk_width:
+                        _chunk_ranges = get_descending_response_chunk_ranges(
+                            _response_padding_masks_for_width, ref_fwd_bs
+                        )
+                    logprobs_chunks = [None] * len(_chunk_ranges)
+                    for cs, ce in _chunk_ranges:
+                        _chunk_response_length = (
+                            get_right_padded_response_length(
+                                _response_padding_masks_for_width[cs:ce]
                             )
-                            _attn_mask = (query_responses[cs:ce] != self._tokenizer.pad_id).long()
+                            if self._trim_chunk_width
+                            else responses.shape[1]
+                        )
+                        _chunk_total_length = context_length + _chunk_response_length
+                        if self._trim_chunk_width and self._is_rank_zero:
+                            log.info(
+                                "BIOREASON_CHUNK_WIDTH phase=rollout_policy chunk=%d:%d "
+                                "response=%d/%d total=%d",
+                                cs,
+                                ce,
+                                _chunk_response_length,
+                                responses.shape[1],
+                                _chunk_total_length,
+                            )
+                        _chunk_query_responses = query_responses[
+                            cs:ce, :_chunk_total_length
+                        ]
+                        _chunk_responses = responses[cs:ce, :_chunk_response_length]
+                        _forward_context_length = context_length
+                        if prompt_embeds is not None:
+                            _forward_prompt_embeds = prompt_embeds[cs:ce]
+                            _attn_mask = (
+                                _chunk_query_responses != self._tokenizer.pad_id
+                            ).long()
+                            _forward_position_ids = position_ids[
+                                cs:ce, :_chunk_total_length
+                            ]
+                            if self._compact_prompt_chunks:
+                                (
+                                    _forward_prompt_embeds,
+                                    _attn_mask,
+                                    _forward_position_ids,
+                                    _forward_context_length,
+                                ) = compact_prompt_completion_batch(
+                                    _forward_prompt_embeds,
+                                    _chunk_query_responses[:, :context_length],
+                                    _chunk_responses,
+                                    self._tokenizer.pad_id,
+                                )
+                            _full_emb = self._policy.build_full_embeds(
+                                _forward_prompt_embeds,
+                                _chunk_responses,
+                                _forward_context_length
+                                if isinstance(_forward_context_length, torch.Tensor)
+                                else None,
+                                _attn_mask.shape[1]
+                                if isinstance(_forward_context_length, torch.Tensor)
+                                else None,
+                            )
+                            _ro_kwargs = response_only_logits_kwargs(
+                                self._model,
+                                _forward_context_length,
+                                _chunk_responses.shape[1],
+                            )
                             chunk_logits = self._model(
-                                inputs_embeds=_full_emb, attention_mask=_attn_mask,
-                                position_ids=position_ids[cs:ce],
+                                inputs_embeds=_full_emb,
+                                attention_mask=_attn_mask,
+                                position_ids=_forward_position_ids,
+                                **_ro_kwargs,
                             )
                             del _full_emb, _attn_mask
                         else:
+                            _ro_kwargs = {}
                             chunk_logits = self._model(
-                                query_responses[cs:ce],
-                                input_pos=position_ids[cs:ce],
-                                mask=masks[cs:ce],
+                                _chunk_query_responses,
+                                input_pos=position_ids[cs:ce, :_chunk_total_length],
+                                mask=masks[
+                                    cs:ce,
+                                    :_chunk_total_length,
+                                    :_chunk_total_length,
+                                ],
                             )
-                        chunk_logits = chunk_logits[:, context_length - 1:]
-                        logprobs_chunks.append(
-                            rlhf.batched_logits_to_logprobs(
-                                chunk_logits, responses[cs:ce], self._temperature
-                            )
+                        chunk_logits = finish_response_logits(
+                            chunk_logits,
+                            _ro_kwargs,
+                            _forward_context_length,
+                            _chunk_responses.shape[1],
                         )
-                        del chunk_logits
+                        logprobs_chunks[cs // ref_fwd_bs] = pad_response_logprobs(
+                            rlhf.batched_logits_to_logprobs(
+                                chunk_logits,
+                                _chunk_responses,
+                                self._temperature,
+                            ),
+                            responses.shape[1],
+                        )
+                        del (
+                            chunk_logits,
+                            _chunk_query_responses,
+                            _chunk_responses,
+                        )
                     logprobs = torch.cat(logprobs_chunks, dim=0)
                     del logprobs_chunks
                     log.info("Rank %d: policy forward done (chunked)", self.rank)
@@ -1970,6 +2956,54 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
             logprobs = None
             _policy_fwd_time = 0.0
 
+        # step 2.05: behavior-logprobs audit (diagnostic; off unless TORCHTUNE_BLP_AUDIT>0)
+        #
+        # Deliberately reports and does NOT act: pi_old stays the trainer's recompute
+        # for every audited step. A threshold that silently switched sources would make
+        # the audited steps differ from the unaudited ones in a way no log records.
+        # Wrapped whole because a diagnostic must never be able to kill a 36h arm.
+        if (
+            self._blp_audit_active()
+            and _behavior_logprobs is not None
+            and logprobs is not None
+        ):
+            try:
+                # Derive the exclusion mask from the response tokens directly rather
+                # than reusing _response_padding_masks_for_width: that one is only
+                # populated under (trim_chunk_width and ref_fwd_bs < num_seqs), so a
+                # reference to it would silently pass None on the common path and let
+                # PAD_FILL sentinels into the statistics. True = exclude.
+                _blp_pad = None
+                if responses.shape == logprobs.shape:
+                    _blp_pad = responses == self._tokenizer.pad_id
+                # Same cap-vs-actual width mismatch the substitution branch fixes. Here
+                # it would not crash the run (the try/except below swallows it) -- it
+                # would silently produce "BLP_AUDIT failed: shape mismatch" on exactly
+                # the steps where no row hit the cap, i.e. an instrument that goes blind
+                # without saying so. Fit first so the audit reads on every step.
+                _blp_stats = audit_behavior_logprobs(
+                    fit_behavior_logprobs_width(
+                        _behavior_logprobs.to(logprobs.device), logprobs.shape[1]
+                    ),
+                    logprobs,
+                    padding_mask=_blp_pad,
+                )
+                log.info(
+                    "Rank %d: BLP_AUDIT step=%d n=%d mean_abs=%.6f p99_abs=%.6f "
+                    "max_abs=%.6f ratio_p99=%.4f ratio_max=%.4f bias=%+.6f",
+                    self.rank,
+                    getattr(self, "_steps_run", -1),
+                    _blp_stats["n_compared"],
+                    _blp_stats["mean_abs"],
+                    _blp_stats["p99_abs"],
+                    _blp_stats["max_abs"],
+                    _blp_stats["ratio_p99"],
+                    _blp_stats["ratio_max"],
+                    _blp_stats["bias"],
+                )
+            except Exception as _blp_exc:  # noqa: BLE001 - diagnostic must not kill a run
+                log.warning("Rank %d: BLP_AUDIT failed: %s", self.rank, _blp_exc)
+
         # step 2.1: ref model logprobs
         _ref_fwd_t0 = time.perf_counter()
         log.info("Rank %d: pre-ref forward", self.rank)
@@ -1977,65 +3011,245 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
             self._training_barrier()
 
         # Dynamic ref offload: move ref model to XPU for fast ref forward.
-        if getattr(self, '_bioreason_dynamic_ref_offload', False):
+        if getattr(self, "_bioreason_dynamic_ref_offload", False):
             self._ref_model.to(self._device)
             log.info("Rank %d: ref model → XPU for ref forward", self.rank)
 
         _ref_dev = next(self._ref_model.parameters()).device
-        log.info("Rank %d: ref model device=%s, position_ids.device=%s",
-                 self.rank, _ref_dev, position_ids.device)
-        if fwd_bs >= num_seqs:
-            log.info("Rank %d: ref forward start", self.rank)
-            if prompt_embeds is not None:
-                _full_emb = self._ref_model.build_full_embeds(prompt_embeds, responses)
-                _attn_mask = (query_responses != self._tokenizer.pad_id).long().to(_ref_dev)
-                ref_logits = self._ref_model(
-                    inputs_embeds=_full_emb, attention_mask=_attn_mask,
+        log.info(
+            "Rank %d: ref model device=%s, position_ids.device=%s",
+            self.rank,
+            _ref_dev,
+            position_ids.device,
+        )
+        # ── EXACT shared-prefix ref forward (opt-in, TORCHTUNE_REF_PREFIX_SHARE=1) ──
+        # The ref model is frozen and this whole block is no-grad, so reusing one
+        # prompt's KV cache across its G continuations is exact rather than an
+        # approximation. Runs each distinct prompt's ~4096-token prefix ONCE instead
+        # of grpo_samples times. Falls through to the unmodified full-recompute path
+        # whenever the preconditions don't hold. See torchtune/dev/rl/ref_prefix_share.py.
+        _prefix_share_done = False
+        if ref_prefix_share_enabled() and prompt_embeds is not None:
+            _ps_ok, _ps_reason = prefix_share_supported(
+                prompt_embeds=prompt_embeds,
+                num_seqs=num_seqs,
+                group_size=self.grpo_samples,
+                # This path uses the uniform full prompt width; row-compaction is a
+                # width optimisation the cached path does not (yet) reproduce, so it
+                # is deliberately not combined with it.
+                compacted_prompt_lengths=None,
+            )
+            if not _ps_ok:
+                if self._is_rank_zero:
+                    log.info(
+                        "REF_PREFIX_SHARE requested-but-skipped: %s", _ps_reason
+                    )
+            elif not hasattr(self._ref_model, "forward_cached"):
+                if self._is_rank_zero:
+                    log.info(
+                        "REF_PREFIX_SHARE requested-but-skipped: ref model %s has no "
+                        "forward_cached()",
+                        type(self._ref_model).__name__,
+                    )
+            else:
+                _ps_mask = (
+                    (query_responses != self._tokenizer.pad_id).long().to(_ref_dev)
+                )
+                ref_logprobs = shared_prefix_ref_logprobs(
+                    self._ref_model,
+                    prompt_embeds,
+                    responses,
+                    group_size=self.grpo_samples,
+                    temperature=self._temperature,
+                    prompt_length=context_length,
+                    attention_mask=_ps_mask,
                     position_ids=position_ids.to(_ref_dev),
+                    logprob_fn=rlhf.batched_logits_to_logprobs,
+                    device=self._device,
+                )
+                del _ps_mask
+                _prefix_share_done = True
+                if self._is_rank_zero:
+                    log.info(
+                        "REF_PREFIX_SHARE engaged: %d groups x G=%d, prefix=%d "
+                        "computed once per group (was %d times)",
+                        num_seqs // self.grpo_samples,
+                        self.grpo_samples,
+                        context_length,
+                        self.grpo_samples,
+                    )
+        if _prefix_share_done:
+            pass
+        elif ref_fwd_bs >= num_seqs:
+            log.info("Rank %d: ref forward start", self.rank)
+            _forward_context_length = context_length
+            if prompt_embeds is not None:
+                _forward_prompt_embeds = prompt_embeds
+                _attn_mask = (
+                    (query_responses != self._tokenizer.pad_id).long().to(_ref_dev)
+                )
+                _forward_position_ids = position_ids.to(_ref_dev)
+                if self._compact_prompt_chunks:
+                    (
+                        _forward_prompt_embeds,
+                        _attn_mask,
+                        _forward_position_ids,
+                        _forward_context_length,
+                    ) = compact_prompt_completion_batch(
+                        prompt_embeds,
+                        query_responses[:, :context_length],
+                        responses,
+                        self._tokenizer.pad_id,
+                    )
+                _full_emb = self._ref_model.build_full_embeds(
+                    _forward_prompt_embeds,
+                    responses,
+                    _forward_context_length
+                    if isinstance(_forward_context_length, torch.Tensor)
+                    else None,
+                    _attn_mask.shape[1]
+                    if isinstance(_forward_context_length, torch.Tensor)
+                    else None,
+                )
+                _ro_kwargs = response_only_logits_kwargs(
+                    self._ref_model, _forward_context_length, responses.shape[1]
+                )
+                ref_logits = self._ref_model(
+                    inputs_embeds=_full_emb,
+                    attention_mask=_attn_mask,
+                    position_ids=_forward_position_ids,
+                    **_ro_kwargs,
                 ).to(self._device)
                 del _full_emb, _attn_mask
             else:
+                _ro_kwargs = {}
                 ref_logits = self._ref_model(
                     query_responses, input_pos=position_ids, mask=masks
                 )
-            ref_logits = rlhf.truncate_sequence_for_logprobs(ref_logits, context_length)
+            ref_logits = finish_response_logits(
+                ref_logits, _ro_kwargs, _forward_context_length, responses.shape[1]
+            )
             ref_logprobs = rlhf.batched_logits_to_logprobs(
                 ref_logits, responses, self._temperature
             )
             del ref_logits
         else:
-            log.info("Rank %d: ref forward start CHUNKED (total=%d, chunk=%d)",
-                     self.rank, num_seqs, fwd_bs)
-            ref_logprobs_chunks = []
-            for cs in range(0, num_seqs, fwd_bs):
-                ce = min(cs + fwd_bs, num_seqs)
-                if prompt_embeds is not None:
-                    _full_emb = self._ref_model.build_full_embeds(
-                        prompt_embeds[cs:ce], responses[cs:ce]
+            log.info(
+                "Rank %d: ref forward start CHUNKED (total=%d, chunk=%d)",
+                self.rank,
+                num_seqs,
+                ref_fwd_bs,
+            )
+            _chunk_ranges = [
+                (cs, min(cs + ref_fwd_bs, num_seqs))
+                for cs in range(0, num_seqs, ref_fwd_bs)
+            ]
+            if self._trim_chunk_width:
+                _chunk_ranges = get_descending_response_chunk_ranges(
+                    _response_padding_masks_for_width, ref_fwd_bs
+                )
+            ref_logprobs_chunks = [None] * len(_chunk_ranges)
+            for cs, ce in _chunk_ranges:
+                _chunk_response_length = (
+                    get_right_padded_response_length(
+                        _response_padding_masks_for_width[cs:ce]
                     )
+                    if self._trim_chunk_width
+                    else responses.shape[1]
+                )
+                _chunk_total_length = context_length + _chunk_response_length
+                if self._trim_chunk_width and self._is_rank_zero:
+                    log.info(
+                        "BIOREASON_CHUNK_WIDTH phase=reference chunk=%d:%d "
+                        "response=%d/%d total=%d",
+                        cs,
+                        ce,
+                        _chunk_response_length,
+                        responses.shape[1],
+                        _chunk_total_length,
+                    )
+                _chunk_query_responses = query_responses[cs:ce, :_chunk_total_length]
+                _chunk_responses = responses[cs:ce, :_chunk_response_length]
+                _forward_context_length = context_length
+                if prompt_embeds is not None:
+                    _forward_prompt_embeds = prompt_embeds[cs:ce]
                     _attn_mask = (
-                        query_responses[cs:ce] != self._tokenizer.pad_id
-                    ).long().to(_ref_dev)
+                        (_chunk_query_responses != self._tokenizer.pad_id)
+                        .long()
+                        .to(_ref_dev)
+                    )
+                    _forward_position_ids = position_ids[
+                        cs:ce, :_chunk_total_length
+                    ].to(_ref_dev)
+                    if self._compact_prompt_chunks:
+                        (
+                            _forward_prompt_embeds,
+                            _attn_mask,
+                            _forward_position_ids,
+                            _forward_context_length,
+                        ) = compact_prompt_completion_batch(
+                            _forward_prompt_embeds,
+                            _chunk_query_responses[:, :context_length],
+                            _chunk_responses,
+                            self._tokenizer.pad_id,
+                        )
+                        if self._is_rank_zero and isinstance(
+                            _forward_context_length, torch.Tensor
+                        ):
+                            log.info(
+                                "BIOREASON_ROW_COMPACT phase=reference "
+                                "prompt_lengths=%s packed_width=%d",
+                                _forward_context_length.tolist(),
+                                _attn_mask.shape[1],
+                            )
+                    _full_emb = self._ref_model.build_full_embeds(
+                        _forward_prompt_embeds,
+                        _chunk_responses,
+                        _forward_context_length
+                        if isinstance(_forward_context_length, torch.Tensor)
+                        else None,
+                        _attn_mask.shape[1]
+                        if isinstance(_forward_context_length, torch.Tensor)
+                        else None,
+                    )
+                    _ro_kwargs = response_only_logits_kwargs(
+                        self._ref_model,
+                        _forward_context_length,
+                        _chunk_responses.shape[1],
+                    )
                     chunk_ref_logits = self._ref_model(
-                        inputs_embeds=_full_emb, attention_mask=_attn_mask,
-                        position_ids=position_ids[cs:ce].to(_ref_dev),
+                        inputs_embeds=_full_emb,
+                        attention_mask=_attn_mask,
+                        position_ids=_forward_position_ids,
+                        **_ro_kwargs,
                     ).to(self._device)
                     del _full_emb, _attn_mask
                 else:
+                    _ro_kwargs = {}
                     chunk_ref_logits = self._ref_model(
-                        query_responses[cs:ce],
-                        input_pos=position_ids[cs:ce],
-                        mask=masks[cs:ce],
+                        _chunk_query_responses,
+                        input_pos=position_ids[cs:ce, :_chunk_total_length],
+                        mask=masks[
+                            cs:ce,
+                            :_chunk_total_length,
+                            :_chunk_total_length,
+                        ],
                     )
-                chunk_ref_logits = rlhf.truncate_sequence_for_logprobs(
-                    chunk_ref_logits, context_length
+                chunk_ref_logits = finish_response_logits(
+                    chunk_ref_logits,
+                    _ro_kwargs,
+                    _forward_context_length,
+                    _chunk_responses.shape[1],
                 )
-                ref_logprobs_chunks.append(
+                ref_logprobs_chunks[cs // ref_fwd_bs] = pad_response_logprobs(
                     rlhf.batched_logits_to_logprobs(
-                        chunk_ref_logits, responses[cs:ce], self._temperature
-                    )
+                        chunk_ref_logits,
+                        _chunk_responses,
+                        self._temperature,
+                    ),
+                    responses.shape[1],
                 )
-                del chunk_ref_logits
+                del chunk_ref_logits, _chunk_query_responses, _chunk_responses
                 # empty_cache leaks UR handles under FSDP + in-process vLLM
                 # (colocate) → banned:1. Safe in server/dedicated modes.
                 if not _colocate_vllm_mode:
@@ -2043,13 +3257,17 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
             ref_logprobs = torch.cat(ref_logprobs_chunks, dim=0)
             del ref_logprobs_chunks
             log.info("Rank %d: ref forward done (chunked)", self.rank)
+        del _response_padding_masks_for_width
         if not _colocate_vllm_mode:
             device_empty_cache(self._device)
 
         # Dynamic ref offload: move ref model back to CPU to free XPU HBM for backward.
-        if getattr(self, '_bioreason_dynamic_ref_offload', False):
-            self._ref_model.to('cpu')
-            log.info("Rank %d: ref model → CPU after ref forward (freed ~8 GiB XPU)", self.rank)
+        if getattr(self, "_bioreason_dynamic_ref_offload", False):
+            self._ref_model.to("cpu")
+            log.info(
+                "Rank %d: ref model → CPU after ref forward (freed ~8 GiB XPU)",
+                self.rank,
+            )
         if self._device.type == "xpu":
             torch.xpu.synchronize()
         if self._is_rank_zero:
@@ -2062,10 +3280,16 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
 
         log.info(
             "Rank %d: GENTIMING vllm=%.1fs policy_fwd=%.1fs ref_fwd=%.1fs",
-            self.rank, _vllm_time, _policy_fwd_time, _ref_fwd_time,
+            self.rank,
+            _vllm_time,
+            _policy_fwd_time,
+            _ref_fwd_time,
         )
 
-        (response_padding_masks, responses) = rlhf.truncate_sequence_at_first_stop_token(
+        (
+            response_padding_masks,
+            responses,
+        ) = rlhf.truncate_sequence_at_first_stop_token(
             responses, self._stop_token_ids, self._tokenizer.pad_id
         )
 
@@ -2073,16 +3297,24 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
         responses = responses.reshape(batch_size, grpo_size, -1)
         if self._reward_mode == "gene_recall":
             rewards, successes, metadata = gene_recall_batched_rewards(
-                self._tokenizer, responses, answers, device=self._device,
+                self._tokenizer,
+                responses,
+                answers,
+                device=self._device,
                 reward_metric=self._gene_reward_metric,
             )
         elif self._reward_mode == "sum_digits":
             from torchtune.dev.rl.rewards import sum_digits_batched_rewards
+
             rewards, successes, metadata = sum_digits_batched_rewards(
-                self._tokenizer, responses, answers, device=self._device,
+                self._tokenizer,
+                responses,
+                answers,
+                device=self._device,
             )
         elif self._reward_mode == "bioreason":
             from torchtune.dev.bioreason.reward import bioreason_reward_fn as _br_reward
+
             _decoded, _expanded_answers = [], []
             _resp_lens = []
             _has_eos = []
@@ -2090,7 +3322,8 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
                 for _g in range(grpo_size):
                     _ids = responses[_b, _g]
                     _non_pad = _ids[_ids != self._tokenizer.pad_id]
-                    _decoded.append(self._tokenizer.decode(_non_pad.cpu().tolist()))
+                    _non_pad_ids = _non_pad.cpu().tolist()
+                    _decoded.append(self._tokenizer.decode(_non_pad_ids))
                     _expanded_answers.append(answers[_b])
                     _rlen = int(_non_pad.numel())
                     _resp_lens.append(_rlen)
@@ -2103,19 +3336,42 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
                     #       False), so case (a) alone reads stop_rate=0.000 even when
                     #       vLLM correctly stopped — case (b) catches that. A seq that
                     #       hit the cap has _rlen >= max_gen and no stop token => not a stop.
-                    _tok_present = bool(torch.isin(
-                        _non_pad, torch.tensor(self._stop_token_ids,
-                                               device=_non_pad.device)).any().item())
+                    _tok_present = any(
+                        token_id in self._stop_token_ids_list
+                        for token_id in _non_pad_ids
+                    )
                     _under_cap = _rlen < int(self._max_generated_tokens)
                     _has_eos.append(_tok_present or _under_cap)
             _rw, _succ, _br_diag = _br_reward(
-                _decoded, _expanded_answers, return_diagnostics=True,
+                _decoded,
+                _expanded_answers,
+                return_diagnostics=True,
                 propagate_hierarchy=self._reward_propagate_hierarchy,
                 obo_path=self._reward_obo_path,
             )
             rewards = _rw.view(batch_size, grpo_size, 1)
             successes = _succ.float().view(batch_size, grpo_size, 1)
             metadata = {}
+            # Persist the G rollouts per prompt before _decoded goes out of scope.
+            # Without this the completions are unrecoverable: only a single 200-char
+            # truncated SAMPLE_RESPONSE per step survives in the log. That gap forced
+            # the group-frequency F_max test to run against a PROXY (four repeated
+            # evals of one checkpoint) instead of real temperature-sampled rollouts
+            # -- see memory/project_bioreason_freq_ranking_beats_flat_confidence_20260915.
+            # Rank 0 only (all ranks hold identical data at dp_replicate=1), OFF unless
+            # TORCHTUNE_DUMP_ROLLOUTS=1, and the helper swallows every exception.
+            if self._is_rank_zero:
+                dump_rollout_groups(
+                    rollout_dump_path(getattr(self, "_output_dir", None)),
+                    step=self._steps_run,
+                    batch_size=batch_size,
+                    grpo_size=grpo_size,
+                    decoded=_decoded,
+                    answers=answers,
+                    rewards=_rw.reshape(-1).tolist(),
+                    successes=_succ.float().reshape(-1).tolist(),
+                    proteins=protein_sequences,
+                )
             # Aggregate BioReason-specific diagnostics across ranks.
             self._log_bioreason_diagnostics(
                 _br_diag,
@@ -2160,8 +3416,10 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
         # Default on for bioreason reward; opt-out via batch_level_advantages: false.
         if self._batch_level_advantages:
             from torchtune.dev.bioreason.reward import batch_level_advantages
+
             advantages = batch_level_advantages(
-                rewards.reshape(batch_size * grpo_size), group_size=grpo_size,
+                rewards.reshape(batch_size * grpo_size),
+                group_size=grpo_size,
             )
         else:
             advantages = (rewards - rewards.mean(1, keepdim=True)) / (
@@ -2174,7 +3432,9 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
         if self._is_rank_zero:
             log.info(
                 "BIOREASON_ADV step=%d adv_abs_max=%.4f adv_std=%.4f",
-                self._steps_run, advantages.abs().max().item(), advantages.std().item(),
+                self._steps_run,
+                advantages.abs().max().item(),
+                advantages.std().item(),
             )
         # Zero-signal skip lever: decide COLLECTIVELY whether to skip the optimizer
         # step. The base train loop gates optimizer.step() on _skip_optimizer_step
@@ -2185,6 +3445,7 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
         # keeps the step (grads are all-reduced across ranks anyway).
         if getattr(self, "_skip_zero_advantage_step", False):
             import torch.distributed as _dist
+
             _pg = getattr(self, "_training_pg", None)
             _local_max = advantages.abs().max().detach().to(self._device).reshape(1)
             if _dist.is_initialized():
@@ -2193,7 +3454,8 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
             if self._skip_optimizer_step and self._is_rank_zero:
                 log.info(
                     "BIOREASON_SKIP step=%d: global advantage ~0 — optimizer step "
-                    "will be skipped", self._steps_run,
+                    "will be skipped",
+                    self._steps_run,
                 )
         del responses
         if not _colocate_vllm_mode:  # empty_cache leaks UR handles under colocate
@@ -2237,11 +3499,14 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
         """
         try:
             import torch.distributed as _dist
-            # In dedicated_rank mode the vLLM rank is in _run_vllm_generation_server()
-            # and never joins training collectives.  Use _training_pg so only training
-            # ranks participate; None falls back to the default world group (correct for
-            # server/colocate modes where every world rank is a training rank).
-            pg = getattr(self, "_training_pg", None)
+
+            # Under HSDP, reduce across the dp_replicate group for this shard index.
+            # Using the world group races unrelated FSDP collectives across replicas;
+            # reducing over dp_shard would only duplicate one replica's diagnostics.
+            if getattr(self, "_dp_replicate", 1) > 1:
+                pg = self._dp_mesh.get_group("dp_replicate")
+            else:
+                pg = getattr(self, "_training_pg", None)
             ws = _dist.get_world_size(group=pg) if _dist.is_initialized() else 1
             dev = self._device
 
@@ -2260,22 +3525,42 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
             # Truncation: response reached max_generated_tokens AND no stop token.
             max_gen = float(self._max_generated_tokens)
             trunc = ((lens >= max_gen) & (stops == 0)).float()
+            length_thresholds = torch.tensor(
+                [512, 1024, 1536, 2048, 2560, 3072],
+                dtype=torch.float32,
+                device=dev,
+            )
+            length_cdf_counts = (lens[:, None] <= length_thresholds).sum(dim=0).float()
 
             # Reduce sums + sum-of-squares for variance, plus a single scan
             # tensor for length percentile (approximated as max).
             local_n = float(lens.numel())
-            sums = torch.stack([
-                pred.sum(), tp.sum(), has_pred.sum(), nonzero.sum(),
-                lens.sum(), stops.sum(), trunc.sum(),
-                group_stds.sum(), torch.tensor(float(rb.shape[0]), device=dev),
-                rb.sum(), (rb * rb).sum(),
-            ])
+            sums = torch.stack(
+                [
+                    pred.sum(),
+                    tp.sum(),
+                    has_pred.sum(),
+                    nonzero.sum(),
+                    lens.sum(),
+                    stops.sum(),
+                    trunc.sum(),
+                    group_stds.sum(),
+                    torch.tensor(float(rb.shape[0]), device=dev),
+                    rb.sum(),
+                    (rb * rb).sum(),
+                ]
+            )
             count = torch.tensor([local_n], device=dev)
-            len_max = lens.max().unsqueeze(0) if lens.numel() else torch.tensor([0.0], device=dev)
+            len_max = (
+                lens.max().unsqueeze(0)
+                if lens.numel()
+                else torch.tensor([0.0], device=dev)
+            )
             if ws > 1:
                 _dist.all_reduce(sums, op=_dist.ReduceOp.SUM, group=pg)
                 _dist.all_reduce(count, op=_dist.ReduceOp.SUM, group=pg)
                 _dist.all_reduce(len_max, op=_dist.ReduceOp.MAX, group=pg)
+                _dist.all_reduce(length_cdf_counts, op=_dist.ReduceOp.SUM, group=pg)
             n = count.item()
             if n <= 0:
                 return
@@ -2294,17 +3579,24 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
                     "BIOREASON_DIAG step=%d n=%d go_emit=%.3f nonzero_rew=%.3f "
                     "mean_pred=%.2f mean_tp=%.2f len_mean=%.1f len_max=%.0f "
                     "trunc_rate=%.3f stop_rate=%.3f group_std=%.4f batch_std=%.4f",
-                    self._steps_run, int(n),
-                    sums[2].item() / n,        # go_emit
-                    sums[3].item() / n,        # nonzero_rew
-                    sums[0].item() / n,        # mean_pred
-                    sums[1].item() / n,        # mean_tp
-                    sums[4].item() / n,        # len_mean
+                    self._steps_run,
+                    int(n),
+                    sums[2].item() / n,  # go_emit
+                    sums[3].item() / n,  # nonzero_rew
+                    sums[0].item() / n,  # mean_pred
+                    sums[1].item() / n,  # mean_tp
+                    sums[4].item() / n,  # len_mean
                     len_max.item(),
-                    sums[6].item() / n,        # trunc_rate
-                    sums[5].item() / n,        # stop_rate
-                    sums[7].item() / n_groups, # group_std (mean over groups)
-                    batch_var ** 0.5,          # batch_std
+                    sums[6].item() / n,  # trunc_rate
+                    sums[5].item() / n,  # stop_rate
+                    sums[7].item() / n_groups,  # group_std (mean over groups)
+                    batch_var**0.5,  # batch_std
+                )
+                log.info(
+                    "BIOREASON_LENGTH_CDF step=%d le512=%.3f le1024=%.3f "
+                    "le1536=%.3f le2048=%.3f le2560=%.3f le3072=%.3f",
+                    self._steps_run,
+                    *(length_cdf_counts / n).tolist(),
                 )
         except Exception as e:
             log.warning("BIOREASON_DIAG log failed: %s", e)
@@ -2333,14 +3625,17 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
                 batch_answers = answers[batch_start : batch_start + _gen_bs]
                 batch_proteins = (
                     protein_sequences[batch_start : batch_start + _gen_bs]
-                    if protein_sequences is not None else None
+                    if protein_sequences is not None
+                    else None
                 )
                 # empty_cache leaks UR handles under colocate (FSDP + in-process
                 # vLLM); the wake path's gc.collect()+synchronize is the safe sub.
                 if not _colocate_vllm_mode:
                     device_empty_cache(self._device)
                 trajectories.append(
-                    self.generate_trajectory(batch_input_ids, batch_answers, batch_proteins)
+                    self.generate_trajectory(
+                        batch_input_ids, batch_answers, batch_proteins
+                    )
                 )
                 if not _colocate_vllm_mode:
                     device_empty_cache(self._device)
@@ -2387,25 +3682,75 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
         _fwd_t0 = time.perf_counter()
         _multimodal = trajectory.prompt_embeds is not None
 
+        # One-shot per-run rank-0 diagnostic naming the grpo_step path actually
+        # taken. The base recipe emits this (grpo_full_finetune_distributed_xpu.py
+        # ~4150) but this override replaces that code, so every BioReason run was
+        # silently reporting "grpo_step path: NOT EMITTED" to
+        # scripts/check_run_health.sh -- disabling the one discriminator
+        # docs/RESULTS_DISCIPLINE.md relies on to tell a chunked run from a
+        # single-backward one, and disabling --compare's path-match assertion
+        # entirely. Branch conditions below MUST mirror the if/elif chain that
+        # follows; the extra `_multimodal` term is real (packing is skipped on the
+        # embeds path, so enable_packing=true still lands on CHUNKED here).
+        if self._is_rank_zero and not getattr(self, "_grpo_path_logged", False):
+            _env_val = os.environ.get("TORCHTUNE_USE_CHUNKED_LOSS", "<unset>")
+            _num_seqs_init = trajectory.query_responses.shape[0]
+            if self._enable_packing and not _multimodal:
+                _path, _num_chunks = "PACKED", 1
+            elif _env_val == "1" and self._expert_parallel_degree <= 1:
+                _path, _num_chunks = "SINGLE_BACKWARD", 1
+            else:
+                _path = "CHUNKED_BACKWARD"
+                _fbs_init = max(1, self._forward_batch_size)
+                _num_chunks = (_num_seqs_init + _fbs_init - 1) // _fbs_init
+            log.info(
+                "grpo_step path: %s (TORCHTUNE_USE_CHUNKED_LOSS=%s, fbs=%d, "
+                "num_seqs=%d, num_chunks=%d, ep_degree=%d, multimodal=%s, "
+                "enable_packing=%s)",
+                _path,
+                _env_val,
+                self._forward_batch_size,
+                _num_seqs_init,
+                _num_chunks,
+                self._expert_parallel_degree,
+                _multimodal,
+                self._enable_packing,
+            )
+            self._grpo_path_logged = True
+
         if self._enable_packing and not _multimodal:
-            from torchtune.dev.rl.packing import pack_trajectory_for_training, unpack_tensor
-            packed_tokens, packed_positions, packed_masks, bins, actual_lens = (
-                pack_trajectory_for_training(
-                    trajectory.query_responses,
-                    trajectory.position_ids,
-                    self._tokenizer.pad_id,
-                )
+            from torchtune.dev.rl.packing import (
+                pack_trajectory_for_training,
+                unpack_tensor,
+            )
+
+            (
+                packed_tokens,
+                packed_positions,
+                packed_masks,
+                bins,
+                actual_lens,
+            ) = pack_trajectory_for_training(
+                trajectory.query_responses,
+                trajectory.position_ids,
+                self._tokenizer.pad_id,
             )
             log.info(
                 "Rank %d: grpo_step packed forward start (%d seqs -> %d packs)",
-                self.rank, trajectory.query_responses.shape[0], packed_tokens.shape[0],
+                self.rank,
+                trajectory.query_responses.shape[0],
+                packed_tokens.shape[0],
             )
             packed_logits = self._model(
-                packed_tokens, input_pos=packed_positions, mask=packed_masks,
+                packed_tokens,
+                input_pos=packed_positions,
+                mask=packed_masks,
             )
             del packed_tokens, packed_positions, packed_masks
             pi_logits = unpack_tensor(
-                packed_logits, bins, actual_lens,
+                packed_logits,
+                bins,
+                actual_lens,
                 num_sequences=trajectory.query_responses.shape[0],
                 total_len=trajectory.query_responses.shape[1],
             )
@@ -2418,26 +3763,47 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
             total_seqs = trajectory.query_responses.shape[0]
             grad_scale = max(1, self._gradient_accumulation_steps)
 
-            log.info("Rank %d: single-backward forward start (total=%d seqs)",
-                     self.rank, total_seqs)
+            log.info(
+                "Rank %d: single-backward forward start (total=%d seqs)",
+                self.rank,
+                total_seqs,
+            )
             _fwd_t0_sb = time.perf_counter()
             if _multimodal:
                 _comp_ids = trajectory.query_responses[:, context_length:]
-                _full_emb = self._policy.build_full_embeds(trajectory.prompt_embeds, _comp_ids)
-                _attn_mask = (trajectory.query_responses != self._tokenizer.pad_id).long()
+                _full_emb = self._policy.build_full_embeds(
+                    trajectory.prompt_embeds, _comp_ids
+                )
+                _attn_mask = (
+                    trajectory.query_responses != self._tokenizer.pad_id
+                ).long()
+                # truncate_sequence_for_logprobs([:, ctx-1:-1]) is exactly the
+                # scalar-prompt-length case of gather_response_logits, so the
+                # response-only projection applies here unchanged.
+                _sb_response_length = _comp_ids.shape[1]
+                _ro_kwargs = response_only_logits_kwargs(
+                    self._model, context_length, _sb_response_length
+                )
                 pi_logits = self._model(
                     inputs_embeds=_full_emb,
                     attention_mask=_attn_mask,
                     position_ids=trajectory.position_ids,
+                    **_ro_kwargs,
                 )
                 del _full_emb, _attn_mask, _comp_ids
             else:
+                _ro_kwargs = {}
+                _sb_response_length = (
+                    trajectory.query_responses.shape[1] - context_length
+                )
                 pi_logits = self._model(
                     trajectory.query_responses,
                     input_pos=trajectory.position_ids,
                     mask=trajectory.masks,
                 )
-            pi_logits = rlhf.truncate_sequence_for_logprobs(pi_logits, context_length)
+            pi_logits = finish_response_logits(
+                pi_logits, _ro_kwargs, context_length, _sb_response_length
+            )
             pi_logprobs = rlhf.batched_logits_to_logprobs(
                 pi_logits,
                 trajectory.query_responses[:, context_length:],
@@ -2457,7 +3823,9 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
                     "trajectory.logprobs is None"
                 )
             old_logprobs = (
-                trajectory.logprobs if trajectory.logprobs is not None else pi_logprobs.detach()
+                trajectory.logprobs
+                if trajectory.logprobs is not None
+                else pi_logprobs.detach()
             )
             loss, policy_loss, kl_loss, ratios, clipfrac = self._loss_fn(
                 old_logprobs,
@@ -2469,8 +3837,9 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
 
             log.info("Rank %d: single-backward backward start", self.rank)
             _bwd_t0_sb = time.perf_counter()
-            from torchtune.dev.rl.distributed import _orig_reduce_scatter_tensor
             import torch.distributed as _tdist_sb_fix
+            from torchtune.dev.rl.distributed import _orig_reduce_scatter_tensor
+
             _rsc_patch_saved = _tdist_sb_fix.reduce_scatter_tensor
             _tdist_sb_fix.reduce_scatter_tensor = _orig_reduce_scatter_tensor
             try:
@@ -2488,17 +3857,16 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
             total_seqs = trajectory.query_responses.shape[0]
             fwd_bs = self._forward_batch_size
             num_fwd_chunks = (total_seqs + fwd_bs - 1) // fwd_bs
-            grad_scale = num_fwd_chunks * max(1, self._gradient_accumulation_steps)
 
             _use_fsdp2_grad_sync = (
                 num_fwd_chunks > 1
-                and hasattr(self._model, 'set_requires_gradient_sync')
+                and hasattr(self._model, "set_requires_gradient_sync")
                 and not self._use_fsdp1
             )
             _use_fsdp1_no_sync = (
                 num_fwd_chunks > 1
                 and self._use_fsdp1
-                and hasattr(self._model, 'no_sync')
+                and hasattr(self._model, "no_sync")
                 # 32B per-layer auto_wrap_policy: each FlatParamHandle mixes frozen
                 # base weights with trainable LoRA adapter weights. FSDP1's no_sync()
                 # accumulates the FULL unsharded gradient for every no_sync'd handle
@@ -2517,60 +3885,150 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
             _use_ddp_no_sync = (
                 num_fwd_chunks > 1
                 and not self._use_fsdp1
-                and not hasattr(self._model, 'set_requires_gradient_sync')
+                and not hasattr(self._model, "set_requires_gradient_sync")
                 and isinstance(self._model, torch.nn.parallel.DistributedDataParallel)
             )
 
             _chunk_losses, _chunk_policy_losses, _chunk_kl_losses = [], [], []
-            _chunk_ratios, _chunk_clipfracs, _chunk_pi_logprobs = [], [], []
+            _chunk_ratios, _chunk_clipfracs = [], []
+            _chunk_weights = []
+            _chunk_pi_logprobs = [None] * total_seqs
             _bwd_total = 0.0
 
-            for _cs in range(0, total_seqs, fwd_bs):
-                _is_last_chunk = (_cs + fwd_bs >= total_seqs)
-                _ce = min(_cs + fwd_bs, total_seqs)
-                if self._device.type == "xpu" and self._is_rank_zero:
+            if self._sort_policy_chunks_by_length:
+                _chunk_rows = get_length_sorted_response_chunks(
+                    trajectory.response_padding_masks, fwd_bs
+                )
+            else:
+                _chunk_ranges = [
+                    (_cs, min(_cs + fwd_bs, total_seqs))
+                    for _cs in range(0, total_seqs, fwd_bs)
+                ]
+                if self._trim_chunk_width:
+                    _chunk_ranges = get_descending_response_chunk_ranges(
+                        trajectory.response_padding_masks, fwd_bs
+                    )
+                _chunk_rows = [list(range(_cs, _ce)) for _cs, _ce in _chunk_ranges]
+            for _chunk_index, _rows in enumerate(_chunk_rows):
+                _is_last_chunk = _chunk_index + 1 == num_fwd_chunks
+                _trajectory_response_length = trajectory.response_padding_masks.shape[1]
+                _chunk_response_length = (
+                    get_right_padded_response_length(
+                        trajectory.response_padding_masks[_rows]
+                    )
+                    if self._trim_chunk_width
+                    else _trajectory_response_length
+                )
+                _chunk_total_length = context_length + _chunk_response_length
+                if self._trim_chunk_width and self._is_rank_zero:
                     log.info(
-                        "Rank 0: PRE-train-fwd[%d:%d] alloc=%.2f GiB, resv=%.2f GiB",
-                        _cs, _ce,
+                        "BIOREASON_CHUNK_WIDTH phase=train_policy rows=%s "
+                        "response=%d/%d total=%d",
+                        _rows,
+                        _chunk_response_length,
+                        _trajectory_response_length,
+                        _chunk_total_length,
+                    )
+                _chunk_query_responses = trajectory.query_responses[
+                    _rows, :_chunk_total_length
+                ]
+                _chunk_padding_masks = trajectory.response_padding_masks[
+                    _rows, :_chunk_response_length
+                ]
+                if self._device.type == "xpu" and self._is_rank_zero:
+                    _chunk_token_counts = (
+                        ~trajectory.response_padding_masks[_rows]
+                    ).sum(dim=-1)
+                    log.info(
+                        "Rank 0: PRE-train-fwd rows=%s response_tokens=%s "
+                        "alloc=%.2f GiB, resv=%.2f GiB",
+                        _rows,
+                        _chunk_token_counts.tolist(),
                         torch.xpu.memory_allocated() / 1024**3,
                         torch.xpu.memory_reserved() / 1024**3,
                     )
-                log.info("Rank %d: grpo_step chunk[%d:%d] fwd", self.rank, _cs, _ce)
+                log.info("Rank %d: grpo_step rows=%s fwd", self.rank, _rows)
+                _forward_context_length = context_length
                 if _multimodal:
-                    _chunk_comp_ids = trajectory.query_responses[_cs:_ce, context_length:]
-                    _chunk_full_emb = self._policy.build_full_embeds(
-                        trajectory.prompt_embeds[_cs:_ce], _chunk_comp_ids
-                    )
+                    _chunk_comp_ids = _chunk_query_responses[:, context_length:]
+                    _forward_prompt_embeds = trajectory.prompt_embeds[_rows]
                     _chunk_attn_mask = (
-                        trajectory.query_responses[_cs:_ce] != self._tokenizer.pad_id
+                        _chunk_query_responses != self._tokenizer.pad_id
                     ).long()
+                    _forward_position_ids = trajectory.position_ids[
+                        _rows, :_chunk_total_length
+                    ]
+                    if self._compact_prompt_chunks:
+                        (
+                            _forward_prompt_embeds,
+                            _chunk_attn_mask,
+                            _forward_position_ids,
+                            _forward_context_length,
+                        ) = compact_prompt_completion_batch(
+                            _forward_prompt_embeds,
+                            _chunk_query_responses[:, :context_length],
+                            _chunk_comp_ids,
+                            self._tokenizer.pad_id,
+                        )
+                    _chunk_full_emb = self._policy.build_full_embeds(
+                        _forward_prompt_embeds,
+                        _chunk_comp_ids,
+                        _forward_context_length
+                        if isinstance(_forward_context_length, torch.Tensor)
+                        else None,
+                        _chunk_attn_mask.shape[1]
+                        if isinstance(_forward_context_length, torch.Tensor)
+                        else None,
+                    )
+                    _ro_kwargs = response_only_logits_kwargs(
+                        self._model,
+                        _forward_context_length,
+                        _chunk_comp_ids.shape[1],
+                    )
+                    _c_response_length = _chunk_comp_ids.shape[1]
                     _c_logits = self._model(
                         inputs_embeds=_chunk_full_emb,
                         attention_mask=_chunk_attn_mask,
-                        position_ids=trajectory.position_ids[_cs:_ce],
+                        position_ids=_forward_position_ids,
+                        **_ro_kwargs,
                     )
-                    del _chunk_full_emb, _chunk_attn_mask, _chunk_comp_ids
+                    del _chunk_full_emb, _chunk_attn_mask
                 else:
+                    _ro_kwargs = {}
+                    _c_response_length = _chunk_response_length
                     _c_logits = self._model(
-                        trajectory.query_responses[_cs:_ce],
-                        input_pos=trajectory.position_ids[_cs:_ce],
-                        mask=trajectory.masks[_cs:_ce],
+                        _chunk_query_responses,
+                        input_pos=trajectory.position_ids[
+                            _rows, :_chunk_total_length
+                        ],
+                        mask=trajectory.masks[
+                            _rows,
+                            :_chunk_total_length,
+                            :_chunk_total_length,
+                        ],
                     )
-                _c_logits = rlhf.truncate_sequence_for_logprobs(_c_logits, context_length)
+                _c_logits = finish_response_logits(
+                    _c_logits,
+                    _ro_kwargs,
+                    _forward_context_length,
+                    _c_response_length,
+                )
+                if _multimodal:
+                    del _chunk_comp_ids
                 _c_pi_lp = rlhf.batched_logits_to_logprobs(
                     _c_logits,
-                    trajectory.query_responses[_cs:_ce, context_length:],
+                    _chunk_query_responses[:, context_length:],
                     self._temperature,
                     chunk_size=1,
                 )
-                _c_pi_lp.masked_fill_(trajectory.response_padding_masks[_cs:_ce], 1.0)
+                _c_pi_lp.masked_fill_(_chunk_padding_masks, 1.0)
                 del _c_logits
                 if self._device.type == "xpu":
                     torch.xpu.synchronize()
                 if self._device.type == "xpu" and self._is_rank_zero:
                     log.info(
-                        "Rank 0: POST-train-fwd[%d:%d] alloc=%.2f GiB, resv=%.2f GiB",
-                        _cs, _ce,
+                        "Rank 0: POST-train-fwd rows=%s alloc=%.2f GiB, resv=%.2f GiB",
+                        _rows,
                         torch.xpu.memory_allocated() / 1024**3,
                         torch.xpu.memory_reserved() / 1024**3,
                     )
@@ -2581,23 +4039,32 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
                         "trajectory.logprobs is None"
                     )
                 _c_old_lp = (
-                    trajectory.logprobs[_cs:_ce]
+                    trajectory.logprobs[_rows, :_chunk_response_length]
                     if trajectory.logprobs is not None
                     else _c_pi_lp.detach()
                 )
                 _c_loss, _c_pol, _c_kl, _c_rat, _c_clip = self._loss_fn(
                     _c_old_lp,
                     _c_pi_lp,
-                    trajectory.ref_logprobs[_cs:_ce],
-                    trajectory.advantages[_cs:_ce],
-                    padding_masks=~trajectory.response_padding_masks[_cs:_ce],
+                    trajectory.ref_logprobs[_rows, :_chunk_response_length],
+                    trajectory.advantages[_rows],
+                    padding_masks=~_chunk_padding_masks,
                 )
                 _chunk_losses.append(_c_loss.detach())
                 _chunk_policy_losses.append(_c_pol.detach())
                 _chunk_kl_losses.append(_c_kl.detach())
                 _chunk_ratios.append(_c_rat.detach())
                 _chunk_clipfracs.append(_c_clip.detach())
-                _chunk_pi_logprobs.append(_c_pi_lp.detach())
+                _chunk_weight = len(_rows) / total_seqs
+                _chunk_weights.append(_chunk_weight)
+                _padded_pi_logprobs = pad_response_logprobs(
+                    _c_pi_lp.detach(), _trajectory_response_length
+                )
+                for _row_offset, _row in enumerate(_rows):
+                    _chunk_pi_logprobs[_row] = _padded_pi_logprobs[
+                        _row_offset : _row_offset + 1
+                    ]
+                del _chunk_query_responses, _chunk_padding_masks
 
                 _bwd_t0 = time.perf_counter()
                 if _use_fsdp2_grad_sync and not _is_last_chunk:
@@ -2608,31 +4075,111 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
                     _bwd_ctx = self._model.no_sync()
                 else:
                     import contextlib
+
                     _bwd_ctx = contextlib.nullcontext()
-                with _bwd_ctx:
-                    (_c_loss / grad_scale).backward()
+                _rsc_bypass_chunk = self._expert_parallel_degree <= 1
+                _rsc_patch_saved_ck = None
+                import torch.distributed as _tdist_ck_fix
+                from torchtune.dev.rl.distributed import _orig_reduce_scatter_tensor
+
+                if _rsc_bypass_chunk:
+                    _rsc_patch_saved_ck = _tdist_ck_fix.reduce_scatter_tensor
+                    _tdist_ck_fix.reduce_scatter_tensor = _orig_reduce_scatter_tensor
+                    if self._is_rank_zero and not getattr(
+                        self, "_chunked_rsc_bypass_logged", False
+                    ):
+                        log.info(
+                            "chunked backward: non-EP reduce_scatter bypass ACTIVE "
+                            "(native XCCL; avoids gloo CPU-bounce)"
+                        )
+                        self._chunked_rsc_bypass_logged = True
+                try:
+                    with _bwd_ctx:
+                        (
+                            _c_loss
+                            * _chunk_weight
+                            / max(1, self._gradient_accumulation_steps)
+                        ).backward()
+                finally:
+                    if _rsc_bypass_chunk:
+                        _tdist_ck_fix.reduce_scatter_tensor = _rsc_patch_saved_ck
                 if _use_fsdp2_grad_sync and _is_last_chunk:
                     self._model.set_requires_gradient_sync(True)
                 if self._device.type == "xpu":
                     torch.xpu.synchronize()
                 _bwd_total += time.perf_counter() - _bwd_t0
 
-            loss = torch.stack(_chunk_losses).mean()
-            policy_loss = torch.stack(_chunk_policy_losses).mean()
-            kl_loss = torch.stack(_chunk_kl_losses).mean()
+            # Grad census IMMEDIATELY after the last backward, before anything else can
+            # touch .grad. Paired with the census in _sync_ignored_trainable_grads, this
+            # brackets the window in which grads go missing at dp_replicate=1 (job
+            # 8827075: 7 of 12 ranks reported 0/904 there, counts summing to exactly 896).
+            # If the two counts AGREE, the grads never existed and the cause is in
+            # backward/FSDP; if they DIFFER, something between the two call sites clears
+            # them. Costs one int comparison per step; only logs on the anomaly.
+            if getattr(self, "_projectors_fsdp_ignored", False) and getattr(
+                self, "_ignored_trainable_params", None
+            ):
+                _pb = sum(
+                    1 for p in self._ignored_trainable_params if p.grad is not None
+                )
+                # Same calibration as the sync-site census: the 8 projector params never
+                # get grads (embeds built under no_grad and cached), so the healthy count
+                # is 896/904 at 32B, not 904/904. Alarm only on MISSING LORA grads.
+                _npj = sum(
+                    1
+                    for _m in (
+                        self._model.protein_projection,
+                        self._model.go_projection,
+                    )
+                    for _ in _m.parameters()
+                ) if hasattr(self._model, "protein_projection") else 0
+                if _pb < len(self._ignored_trainable_params) - _npj:
+                    log.warning(
+                        "IGNORED_GRAD_CENSUS_POSTBWD rank=%d present=%d/%d "
+                        "(measured at end of grpo_step backward; compare with the "
+                        "IGNORED_GRAD_CENSUS line from _sync_ignored_trainable_grads)",
+                        self.rank,
+                        _pb,
+                        len(self._ignored_trainable_params),
+                    )
+
+            loss = torch.stack(
+                [value * weight for value, weight in zip(_chunk_losses, _chunk_weights)]
+            ).sum()
+            policy_loss = torch.stack(
+                [
+                    value * weight
+                    for value, weight in zip(_chunk_policy_losses, _chunk_weights)
+                ]
+            ).sum()
+            kl_loss = torch.stack(
+                [
+                    value * weight
+                    for value, weight in zip(_chunk_kl_losses, _chunk_weights)
+                ]
+            ).sum()
             # stack().mean() not cat(): GRPOSimpleLoss returns ratios as a 0-dim
             # scalar (torch.tensor(1.0)); torch.cat can't concatenate 0-dim tensors
             # (crashes only on the chunked path, fbs < num_seqs). Mirrors the base
             # recipe (grpo_full_finetune_distributed_xpu.py:4294).
-            ratios = torch.stack(_chunk_ratios).mean()
-            clipfrac = torch.stack(_chunk_clipfracs).mean()
+            ratios = torch.stack(
+                [value * weight for value, weight in zip(_chunk_ratios, _chunk_weights)]
+            ).sum()
+            clipfrac = torch.stack(
+                [
+                    value * weight
+                    for value, weight in zip(_chunk_clipfracs, _chunk_weights)
+                ]
+            ).sum()
             pi_logprobs = torch.cat(_chunk_pi_logprobs)
             _fwd_time = time.perf_counter() - _fwd_t0 - _bwd_total
 
         log.info("Rank %d: grpo_step bwd=%.1fs", self.rank, _bwd_total)
 
         with torch.no_grad():
-            _old_lp = trajectory.logprobs if trajectory.logprobs is not None else pi_logprobs
+            _old_lp = (
+                trajectory.logprobs if trajectory.logprobs is not None else pi_logprobs
+            )
             approx_policy_kls = (0.5 * (pi_logprobs - _old_lp).pow(2)).mean()
 
         return GRPOStats(
@@ -2646,6 +4193,187 @@ class GRPOBioReasonDistributedXPU(GRPOFullFinetuneDistributedXPU):
         )
 
     # ── Hooks (subclass extension points; train() lives in base) ──────────────
+
+    def _sync_ignored_trainable_grads(self) -> None:
+        if not getattr(self, "_projectors_fsdp_ignored", False):
+            return
+        shard_pg = getattr(self, "_gloo_dp_shard_pg", None)
+        replicate_pg = getattr(self, "_gloo_dp_replicate_pg", None)
+        if shard_pg is None:
+            return
+
+        # DEADLOCK FIX (2026-09-14, job 8826889). The previous implementation bucketed
+        # by `param.grad.dtype` and looped over the resulting dict, calling all_reduce
+        # INSIDE that loop. Both the bucket set and the iteration count were therefore
+        # functions of LOCAL state (`param.grad is not None`), so a rank with no grads
+        # made ZERO collective calls while its peers made one -- a guaranteed hang.
+        #
+        # Observed at dp_replicate=1: rank 0 logged "Averaged 0 ignored trainable
+        # gradients" (empty dict -> zero iterations -> fell through and continued) while
+        # ranks 1-11 blocked in all_reduce until the 1800s gloo timeout; PBS
+        # Exit_status=143, zero steps completed. It never fired at 16N only because rank
+        # 0 happened to have the same 896 grads as everyone else.
+        #
+        # Fix: iterate a FIXED, rank-independent list. `_ignored_trainable_params` is
+        # built from model structure and is identical on every rank, and `param.dtype`
+        # is structural too (unlike `param.grad.dtype`, which does not exist when the
+        # grad is missing). Every rank therefore performs exactly the same number of
+        # collectives in the same order, whatever its local grads look like.
+        params_by_dtype: dict = {}
+        for param in self._ignored_trainable_params:
+            params_by_dtype.setdefault(param.dtype, []).append(param)
+
+        # Per-rank grad-presence census, logged BEFORE any collective. Job 8826889 left
+        # an open question the logs could not answer: rank 0 reported 0 grads while its
+        # peers had some, but nothing recorded WHICH ranks were missing WHAT. The fixed
+        # collective no longer hangs, so a recurrence would otherwise pass silently as a
+        # GRAD PRESENCE DISAGREEMENT with no forensic detail. One line per rank, once
+        # per step, is cheap and makes the next occurrence self-diagnosing.
+        _local_present = sum(
+            1 for p in self._ignored_trainable_params if p.grad is not None
+        )
+        _local_total = len(self._ignored_trainable_params)
+        # THRESHOLD CALIBRATION (2026-09-15): the healthy state is NOT total/total.
+        # `_ignored_trainable_params` = 896 LoRA + 8 projector at 32B, and the 8
+        # projector params NEVER receive grads: build_prompt_embeds runs under
+        # torch.no_grad() and the training forward consumes the CACHED
+        # trajectory.prompt_embeds, so the projectors are not in the autograd graph.
+        # Confirmed on the healthy 16N run, which logs exactly "Averaged 896".
+        # Warning on `present != total` would therefore fire on every healthy run.
+        # Alarm only when LoRA grads are missing, which is the real defect
+        # (2N: rank 0 had 0/904, rank 1 had 384/904).
+        _n_projector = sum(
+            1
+            for _m in (self._model.protein_projection, self._model.go_projection)
+            for _ in _m.parameters()
+        ) if hasattr(self._model, "protein_projection") else 0
+        _expected = _local_total - _n_projector
+        if _local_present < _expected:
+            # NAME the params that DO have grads. Two runs (8827075, 8827354) produced
+            # byte-identical per-rank counts (0/128/384, summing to exactly 896), and the
+            # POSTBWD census matched the sync-site census exactly -- so nothing clears
+            # them, backward simply never produces them, deterministically. Counts alone
+            # cannot say WHICH params those are; 128 == 1 projection type x 2 x 64 layers
+            # is consistent with a projection-type partition but that is inference, not
+            # evidence. This logs the actual names so the next run settles it.
+            _named = []
+            try:
+                _id2name = {
+                    id(p): n for n, p in self._model.named_parameters()
+                }
+                _named = sorted(
+                    {
+                        _id2name.get(id(p), "<unmapped>")
+                        for p in self._ignored_trainable_params
+                        if p.grad is not None
+                    }
+                )
+            except Exception:  # never let diagnostics break the step
+                pass
+            # Collapse "...layers.N.<rest>" -> "<rest>" so 64 layers of one projection
+            # show up as ONE entry; that is exactly the distinction we need.
+            import re as _re
+
+            _kinds = sorted({_re.sub(r"\.layers\.\d+\.", ".layers.N.", n) for n in _named})
+            log.warning(
+                "IGNORED_GRAD_CENSUS rank=%d present=%d/%d distinct_kinds=%d "
+                "kinds=%s (missing grads on this rank; if ranks disagree the update "
+                "is averaged over contributors only)",
+                self.rank,
+                _local_present,
+                _local_total,
+                len(_kinds),
+                _kinds[:12],
+            )
+
+        _n_present_total = 0
+        _n_total = 0
+        _disagree: list = []
+        # sorted() for a deterministic bucket order across ranks; insertion order is
+        # already identical, but an explicit total order costs nothing and removes any
+        # dependence on dict-ordering subtleties.
+        for dtype in sorted(params_by_dtype, key=str):
+            params = params_by_dtype[dtype]
+            sizes = [param.numel() for param in params]
+
+            # Zero-fill missing grads so the buffer shape is rank-independent. A missing
+            # grad contributes nothing to the sum, which is the correct neutral element.
+            flat_cpu = torch.cat(
+                [
+                    (
+                        param.grad.detach()
+                        .reshape(-1)
+                        .to(device="cpu", dtype=dtype)  # no-op when grad.dtype == dtype
+                        if param.grad is not None
+                        else torch.zeros(param.numel(), dtype=dtype, device="cpu")
+                    )
+                    for param in params
+                ]
+            )
+            # Per-param presence, reduced alongside the grads: this is what lets us tell
+            # "all ranks contributed" (the validated case) from "some ranks silently had
+            # no grad" (a real bug that used to present only as a hang).
+            present = torch.tensor(
+                [1.0 if param.grad is not None else 0.0 for param in params],
+                dtype=torch.float32,
+                device="cpu",
+            )
+
+            torch.distributed.all_reduce(flat_cpu, group=shard_pg)
+            torch.distributed.all_reduce(present, group=shard_pg)
+            _divisor = float(self._dp_shard)
+            if replicate_pg is not None and self._dp_replicate > 1:
+                torch.distributed.all_reduce(flat_cpu, group=replicate_pg)
+                torch.distributed.all_reduce(present, group=replicate_pg)
+                _divisor *= float(self._dp_replicate)
+
+            _n_total += len(params)
+            _n_present_total += int(present.eq(_divisor).sum().item())
+
+            offset = 0
+            for param, size, n_present in zip(params, sizes, present.tolist()):
+                chunk = flat_cpu[offset : offset + size]
+                offset += size
+                if n_present == _divisor:
+                    # Every rank contributed: plain mean. BYTE-IDENTICAL to the
+                    # pre-fix path, so validated 16N numerics are unchanged.
+                    chunk = chunk / _divisor
+                elif n_present > 0:
+                    # Partial: mean over the ranks that actually had a grad. Dividing by
+                    # the full world here would silently scale the update down by
+                    # n_present/_divisor -- a wrong-but-plausible training run.
+                    chunk = chunk / n_present
+                    _disagree.append((param.shape, int(n_present), int(_divisor)))
+                else:
+                    # No rank had this grad (e.g. the 8 projector params, whose embeds
+                    # are built under no_grad and cached). Nothing to write back.
+                    continue
+                if param.grad is None:
+                    param.grad = torch.zeros_like(param)
+                param.grad.copy_(chunk.view_as(param.grad))
+
+        if _disagree and self._is_rank_zero:
+            # Loud: rank-dependent grad presence is the signature of a real upstream
+            # bug (it is what made the old code deadlock). Surface it instead of
+            # quietly training on a diluted or partial gradient.
+            log.error(
+                "GRAD PRESENCE DISAGREEMENT across ranks for %d/%d ignored trainable "
+                "params (first 3: %s). Averaged over the contributing ranks only. This "
+                "indicates some ranks lost grads for replicated params -- investigate; "
+                "do not trust this run's updates.",
+                len(_disagree),
+                _n_total,
+                _disagree[:3],
+            )
+
+        if self._is_rank_zero:
+            log.info(
+                "Averaged %d/%d ignored trainable gradients across %d x %d HSDP ranks",
+                _n_present_total,
+                _n_total,
+                self._dp_replicate,
+                self._dp_shard,
+            )
 
     def _extract_batch_kwargs(self, batch: dict) -> dict:
         """Forward multimodal protein_sequences into ``generate_trajectory_batched``.

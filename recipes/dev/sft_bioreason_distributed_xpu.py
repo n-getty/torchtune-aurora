@@ -147,6 +147,7 @@ class BioReasonSFTRecipeDistributedXPU(FullFinetuneRecipeDistributedXPU):
         self._current_side_inputs: dict = {}
         # Stash the LoRA rank/alpha for checkpoint-time merge (parent doesn't keep cfg).
         _m = cfg.get("model", {})
+        self._backbone_builder = _m.get("backbone_builder", "gemma4_31b")
         self._lora_rank = int(_m.get("lora_rank", 32))
         self._lora_alpha = float(_m.get("lora_alpha", 64.0))
         self._lora_dropout = float(_m.get("lora_dropout", 0.0))
@@ -160,7 +161,7 @@ class BioReasonSFTRecipeDistributedXPU(FullFinetuneRecipeDistributedXPU):
         # a stub checkpointer NOW (before setup() ever calls load_base_checkpoint via
         # CheckpointClient._get_checkpointer()'s `if not self._checkpointer:` guard) so
         # the parent's cfg.checkpointer-configured checkpointer is never constructed.
-        self._is_hf_backbone = _m.get("backbone_builder", None) in _HF_BACKBONES
+        self._is_hf_backbone = self._backbone_builder in _HF_BACKBONES
         if self._is_hf_backbone:
             self._checkpoint_client._checkpointer = _NullBaseCheckpointer()
         # Placeholder ids (used to keep token padding from colliding with them — see _setup_data).
@@ -213,6 +214,17 @@ class BioReasonSFTRecipeDistributedXPU(FullFinetuneRecipeDistributedXPU):
         # resume_state.pt. Force the parent flag off so its checkpointer doesn't look for a
         # recipe_state.pt we never write.
         self._bioreason_resume = bool(cfg.get("bioreason_resume", False))
+        self._bioreason_save_only = bool(cfg.get("bioreason_save_only", False))
+        # Set true when resuming into a DIFFERENT data_parallel topology than the one that
+        # wrote resume_state.pt (e.g. 4N/dp_degree=48 -> 16N/dp_degree=192). The saved
+        # StatefulDistributedSampler position is a raw `yielded` count into THAT topology's
+        # per-rank partition (torchdata's DistributedSampler derives per-rank indices from
+        # num_replicas+seed+epoch) — restoring it under a different num_replicas silently
+        # replays a different, wrong subset of the data, not "the same training position".
+        # Model/optimizer/global_step are unaffected by this and still restore normally.
+        self._bioreason_resume_reset_dataloader = bool(
+            cfg.get("bioreason_resume_reset_dataloader", False)
+        )
         if self._bioreason_resume:
             self._resume_from_checkpoint = False  # parent flag — keep its HF loader on base
         # Stage-2 handoff: load the Stage-1-aligned projector weights (protein_projection.pt /
@@ -240,7 +252,15 @@ class BioReasonSFTRecipeDistributedXPU(FullFinetuneRecipeDistributedXPU):
             )
             utils.log_rank_zero(self._logger, "RESUMED optimizer state.")
         # Dataloader position (StatefulDataLoader). The wrapper proxies load_state_dict.
-        if blob.get("dataloader") is not None:
+        if self._bioreason_resume_reset_dataloader:
+            utils.log_rank_zero(
+                self._logger,
+                "bioreason_resume_reset_dataloader=True: SKIPPING dataloader position "
+                "restore (topology changed since the checkpoint was saved) — dataset "
+                "starts fresh under the new data_parallel_shard_dim/replicate_dim; "
+                "model/optimizer/global_step restore unaffected.",
+            )
+        elif blob.get("dataloader") is not None:
             try:
                 self._dataloader.load_state_dict(blob["dataloader"])
                 utils.log_rank_zero(self._logger, "RESUMED dataloader position.")
@@ -250,7 +270,9 @@ class BioReasonSFTRecipeDistributedXPU(FullFinetuneRecipeDistributedXPU):
                     f"WARNING: could not restore dataloader position ({e}); "
                     f"continuing from dataset start (step counter still correct).",
                 )
-        # Training progress.
+        # Training progress. Already restored early in _setup_model (before the parent's
+        # scheduler build at line 641 needs it) — idempotent no-op here, kept so this
+        # method still fully restores state from `blob` on its own if ever called again.
         self.global_step = int(blob.get(training.STEPS_KEY, self.global_step))
         self.epochs_run = int(blob.get(training.EPOCHS_KEY, self.epochs_run))
         utils.log_rank_zero(
@@ -499,7 +521,7 @@ class BioReasonSFTRecipeDistributedXPU(FullFinetuneRecipeDistributedXPU):
         else:
             _prefixed = {f"backbone.{k}": v for k, v in model_state_dict.items()}
             _n_base_tensors = len(model_state_dict)
-            _base_label = "GEMMA4"
+            _base_label = self._backbone_builder
         base_missing, base_unexpected = training.load_from_full_model_state_dict(
             model,
             _prefixed,
@@ -530,6 +552,21 @@ class BioReasonSFTRecipeDistributedXPU(FullFinetuneRecipeDistributedXPU):
                     f"(Eval checkpoints alone cannot resume training.)"
                 )
             self._resume_blob = torch.load(rpath, map_location="cpu", weights_only=False)
+            # Restore progress EARLY, here inside _setup_model — the parent's setup()
+            # builds the LR scheduler at full_finetune_distributed_xpu.py:641-644 with
+            # last_epoch=self.global_step-1 BEFORE control ever returns to this
+            # subclass's own setup() override below. Restoring global_step only in that
+            # override (as before) leaves it 0 at scheduler-build time, so last_epoch=-1
+            # and the cosine schedule silently restarts from warmup on every resume
+            # segment. The setup()-level restore further down is now an idempotent
+            # no-op (same blob, same keys) kept for symmetry with the other restores
+            # (optimizer/dataloader) that legitimately must happen there.
+            self.global_step = int(
+                self._resume_blob.get(training.STEPS_KEY, self.global_step)
+            )
+            self.epochs_run = int(
+                self._resume_blob.get(training.EPOCHS_KEY, self.epochs_run)
+            )
             trainable = self._resume_blob["trainable"]  # stripped keys
             # Re-prefix to match the wrapper's (unwrapped) module names and load as a full
             # state dict into the sharded model (DTensor-aware), strict=False (base+buffers
@@ -1052,6 +1089,10 @@ def recipe_main(cfg: DictConfig) -> None:
     config.log_config(recipe_name="BioReasonSFTRecipeDistributedXPU", cfg=cfg)
     recipe = BioReasonSFTRecipeDistributedXPU(cfg=cfg)
     recipe.setup(cfg=cfg)
+    if bool(cfg.get("bioreason_save_only", False)):
+        recipe.save_checkpoint(epoch=0, full_tensors=False)
+        recipe.cleanup()
+        return
     recipe.train()
     recipe.cleanup()
 

@@ -538,6 +538,9 @@ class FullFinetuneRecipeDistributedXPU(FTRecipeInterface):
         if cfg.get("resize_token_embeddings", False):
             resize_token_embeddings(self._model, self._tokenizer.vocab_size)
 
+        # Captured before optimizer construction/checkpoint-load so _setup_lr_scheduler
+        # can recover the true peak LR on resume — see that method's initial_lr handling.
+        self._optimizer_peak_lr = cfg.optimizer.lr
         self._optimizer = self._setup_optimizer(
             cfg_optimizer=cfg.optimizer,
             optimizer_in_bwd=self._optimizer_in_bwd,
@@ -637,10 +640,21 @@ class FullFinetuneRecipeDistributedXPU(FTRecipeInterface):
         ):
             list(self._dataloader)
 
-        # Setup lr scheduler
+        # Setup lr scheduler. num_training_steps defaults to total_epochs *
+        # steps_per_epoch, but `epochs` is sometimes set well above the steps a run will
+        # actually execute (e.g. deliberately, to fill a scaled-up node allocation
+        # without exiting early — see feedback_epochs1_wastes_scaled_node_allocations).
+        # In that case the cosine horizon computed from `epochs` is far longer than the
+        # real run, and the schedule never meaningfully anneals. lr_scheduler_num_training_steps
+        # lets a config set the schedule horizon to the real step budget independently
+        # of `epochs`, without changing epochs' own (unrelated) job of bounding when the
+        # run exits.
         self._lr_scheduler = self._setup_lr_scheduler(
             cfg_lr_scheduler=cfg.get("lr_scheduler", None),
-            num_training_steps=self.total_epochs * self._steps_per_epoch,
+            num_training_steps=cfg.get(
+                "lr_scheduler_num_training_steps",
+                self.total_epochs * self._steps_per_epoch,
+            ),
             last_epoch=self.global_step - 1,
         )
 
@@ -679,6 +693,28 @@ class FullFinetuneRecipeDistributedXPU(FTRecipeInterface):
         else:
             # Standard case: use the single optimizer
             optimizer = self._optimizer
+
+        # torch's LRScheduler requires 'initial_lr' in every param_group when
+        # constructed with last_epoch >= 0 (i.e. on any resume, since last_epoch is
+        # self.global_step - 1). A freshly-constructed optimizer never has this key on
+        # a fresh run (last_epoch=-1, so LRScheduler doesn't check it) — but on resume,
+        # load_from_full_optimizer_state_dict's set_optimizer_state_dict round-trip does
+        # not guarantee 'initial_lr' survives into the new optimizer's param_groups, so
+        # scheduler construction crashes here with "param 'initial_lr' is not specified
+        # in param_groups[0]" on every rank (confirmed on real hardware, job 8799523,
+        # 2026-09-03 — the first-ever resume of a run with
+        # lr_scheduler_num_training_steps set, since that's what makes last_epoch >= 0
+        # actually happen on resume).
+        #
+        # CRITICAL: must use the config's declared peak LR (self._optimizer_lr, captured
+        # in setup() before any checkpoint load) as initial_lr, NOT the live
+        # group["lr"] — by this point group["lr"] already holds the CURRENT (decayed)
+        # value restored from the checkpoint. Using the decayed value as initial_lr
+        # would make the scheduler treat the already-decayed LR as the new peak and
+        # decay a second time from there, silently corrupting the schedule.
+        if last_epoch >= 0:
+            for group in optimizer.param_groups:
+                group.setdefault("initial_lr", self._optimizer_peak_lr)
 
         # Instantiate the learning rate scheduler
         lr_scheduler = config.instantiate(

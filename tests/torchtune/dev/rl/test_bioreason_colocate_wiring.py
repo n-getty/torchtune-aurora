@@ -39,6 +39,17 @@ def _method(name):
     return None
 
 
+def _method_node(name):
+    """The parsed AST node for a method, for tests that assert on structure rather
+    than source text. Prefer this over `_method` + substring matching: a text guard
+    fires on correct refactors that preserve behavior, which teaches people to
+    ignore it."""
+    for node in ast.walk(TREE):
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return node
+    return None
+
+
 def test_recipe_module_imports():
     """Import the recipe file (catches class-body errors like a bad base-method
     reference that only surface at import — e.g. the 2026-06-18
@@ -162,14 +173,44 @@ def test_chunked_grpo_step_stacks_scalar_ratios_not_cat():
     with torch.cat crashes ('zero-dimensional tensor cannot be concatenated' —
     hit on the first colocate run, fbs=2). Must use torch.stack like the base
     recipe. Only pi_logprobs (1-dim) may use cat.
+
+    Asserted via AST over *which collection each call consumes*, not over source
+    text. The original substring form (`"torch.stack(_chunk_ratios)" in gs`) broke
+    on 2026-09-15 when the reduction became a token-weighted
+    `torch.stack([v * w for v, w in zip(_chunk_ratios, _chunk_weights)])` — behavior
+    unchanged, still stack, still no cat, but the literal no longer appeared. A
+    guard that fails on a correct refactor trains people to ignore it.
     """
-    gs = _method("grpo_step")
-    assert gs is not None
-    assert "torch.cat(_chunk_ratios)" not in gs, (
-        "chunked ratios must use torch.stack (0-dim scalars), not torch.cat"
-    )
-    assert "torch.stack(_chunk_ratios)" in gs
-    assert "torch.cat(_chunk_clipfracs)" not in gs
+    tree = _method_node("grpo_step")
+    assert tree is not None
+
+    scalar_lists = {"_chunk_ratios", "_chunk_clipfracs"}
+    # name of every torch.* call that mentions a given list anywhere in its args
+    consumers: dict[str, set[str]] = {n: set() for n in scalar_lists}
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+            continue
+        if not (
+            isinstance(node.func.value, ast.Name) and node.func.value.id == "torch"
+        ):
+            continue
+        mentioned = {
+            sub.id
+            for sub in ast.walk(node)
+            if isinstance(sub, ast.Name) and sub.id in scalar_lists
+        }
+        for name in mentioned:
+            consumers[name].add(node.func.attr)
+
+    for name in scalar_lists:
+        assert consumers[name], f"{name} is never reduced by a torch.* call"
+        assert "cat" not in consumers[name], (
+            f"{name} holds 0-dim scalars; torch.cat raises "
+            f"'zero-dimensional tensor cannot be concatenated' on the chunked path"
+        )
+        assert "stack" in consumers[name], (
+            f"{name} must be combined with torch.stack; saw {consumers[name]}"
+        )
 
 
 # (e) the module-level _colocate_vllm_mode flag is set from the RUNTIME mode ---
