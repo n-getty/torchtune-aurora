@@ -395,8 +395,14 @@ class WeightSyncFromFileExtension:
                     + ", ".join(missing[:8])
                 )
             if not hasattr(self, "_lora_tp_base_cache"):
+                cache_on_cpu = (
+                    os.environ.get("TORCHTUNE_LORA_DELTA_TP_BASE_CPU", "0") == "1"
+                )
                 self._lora_tp_base_cache = {
-                    name: resident[name].detach().clone() for name in target_names
+                    name: resident[name].detach().to("cpu").clone()
+                    if cache_on_cpu
+                    else resident[name].detach().clone()
+                    for name in target_names
                 }
                 gb = sum(
                     tensor.numel() * tensor.element_size()
@@ -404,8 +410,9 @@ class WeightSyncFromFileExtension:
                 ) / 1024**3
                 logger.info(
                     "load_lora_delta_tp_from_raw: cached %d TP-local base tensors "
-                    "%.2f GiB from resident vLLM weights",
+                    "%.2f GiB on %s from resident vLLM weights",
                     len(self._lora_tp_base_cache), gb,
+                    "cpu" if cache_on_cpu else "xpu",
                 )
 
             grouped = {}
@@ -447,8 +454,11 @@ class WeightSyncFromFileExtension:
                             f"native vLLM loader did not report {resident_name!r}; "
                             f"reported {sorted(loaded)}"
                         )
-                    base = self._lora_tp_base_cache[resident_name]
+                    base = self._lora_tp_base_cache[resident_name].to(
+                        original_data.device
+                    )
                     original_data.copy_((base.float() + scratch).to(original_data.dtype))
+                    del base
                     loaded_count += len(group)
                 finally:
                     param.data = original_data

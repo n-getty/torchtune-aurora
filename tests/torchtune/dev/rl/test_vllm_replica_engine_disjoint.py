@@ -144,8 +144,8 @@ def test_recipe_wires_replica_banded_selection():
     assert "self._vllm_clients[g % num_clients]" not in src, (
         "recipe still uses the buggy g % num_clients selection (all leaders collide on 0..)"
     )
-    assert "self._vllm_clients[_engine_ids[g]]" in src, (
-        "recipe must select clients via the per-replica disjoint _engine_ids band"
+    assert "self._vllm_clients[engine_id]" in src, (
+        "recipe must select clients via each entry in the planned engine band"
     )
 
 

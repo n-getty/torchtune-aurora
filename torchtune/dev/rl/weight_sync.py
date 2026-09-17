@@ -2395,89 +2395,129 @@ def _publish_bioreason_lora_delta(self, t0) -> None:
                     "scale": float(_mod.scaling["default"]),
                 })
 
+    _publish_error = None
+    if _is_xccl_leader:
+        try:
+            if not entries:
+                raise RuntimeError(
+                    "_publish_bioreason_lora_delta: found 0 LoRA-target modules — "
+                    "refusing to publish an empty adapter."
+                )
+
+            _t_gather = time.perf_counter() - t0
+            _wsync_shared_dir = os.path.dirname(
+                os.environ.get(
+                    "TORCHTUNE_WEIGHT_SYNC_PATH",
+                    "/dev/shm/torchtune/weight_update.raw",
+                )
+            )
+            _tp_resident = (
+                getattr(self, "_lora_wsync_mode", "merged") == "delta_tp"
+            )
+
+            if not _tp_resident and not getattr(
+                self, "_bior_lora_base_shipped", False
+            ):
+                _t0_base = time.perf_counter()
+                os.makedirs(_wsync_shared_dir, exist_ok=True)
+                _base_path = os.path.join(
+                    _wsync_shared_dir, "bioreason_lora_delta_base.raw"
+                )
+                _n_base = _save_raw_bytes(self._bior_lora_base_cache, _base_path)
+                _base_gb = os.path.getsize(_base_path) / 1024**3
+                log.info(
+                    "Rank %d: BioReason delta base raw_bytes %d params %.2f GiB in "
+                    "%.2fs -> %s",
+                    self.rank,
+                    _n_base,
+                    _base_gb,
+                    time.perf_counter() - _t0_base,
+                    _base_path,
+                )
+                _post_bioreason_collective_rpc(
+                    self,
+                    "load_lora_base_from_raw",
+                    [_base_path],
+                    what="BioReason delta base",
+                    timeout=600,
+                )
+                self._bior_lora_base_shipped = True
+
+            os.makedirs(_wsync_shared_dir, exist_ok=True)
+            _adapter_path = os.path.join(
+                _wsync_shared_dir, "bioreason_lora_delta_adapter.raw"
+            )
+            _t_save0 = time.perf_counter()
+            _n_params = _save_raw_bytes(tensors, _adapter_path)
+            _t_save = time.perf_counter() - _t_save0
+            _size_mb = os.path.getsize(_adapter_path) / 1024**2
+
+            _meta = {
+                "entries": entries,
+                "needs_qk_unpermute": bool(_needs_qk_unpermute(self)),
+                "num_heads": int(getattr(self, "_model_num_heads", 0) or 0),
+                "num_kv_heads": int(getattr(self, "_model_num_kv_heads", 0) or 0),
+                "head_dim": int(getattr(self, "_model_head_dim", 0) or 0),
+            }
+            _t_http0 = time.perf_counter()
+            _post_bioreason_collective_rpc(
+                self,
+                "load_lora_delta_tp_from_raw"
+                if _tp_resident
+                else "load_lora_delta_from_raw",
+                [_adapter_path, json.dumps(_meta)],
+                what="BioReason delta adapter",
+                timeout=600,
+            )
+            # reset_running_requests=True PREEMPTS every in-flight vLLM request.
+            #
+            # Under SYNCHRONOUS generation that is free: no request is in flight at
+            # publish time, so the flag only guarantees that no sequence continues
+            # decoding across a weight change.
+            #
+            # Under ASYNC generation it is NOT free. The producer thread posts step
+            # N+1's rollout before the consumer finishes step N, and the publish
+            # fires at the END of step N (_run_wsync_block) — so the producer's
+            # request is mid-decode when the reset lands. vLLM 0.15.0's scheduler
+            # (v1/core/sched/scheduler.py reset_prefix_cache -> _preempt_request)
+            # frees the KV blocks and zeroes num_computed_tokens, but it does NOT
+            # clear _output_token_ids and it PREPENDS the request to the waiting
+            # queue, so it auto-resumes and re-prefills prompt + tokens-emitted-so-
+            # far under the new weights. The cost is therefore a re-prefill, not a
+            # lost or truncated completion — but at prompt~4096 + n=8 that re-prefill
+            # is exactly the work async was supposed to hide, and the resumed tokens
+            # are then continued under weights the prefix was not sampled from.
+            #
+            # Setting =0 keeps the prefix-cache invalidation (which is what actually
+            # matters for correctness: stale cached blocks must not be reused across
+            # a weight change) while letting the in-flight rollout finish cleanly
+            # under the weights it started with. That is strictly BETTER for the
+            # staleness=1 behavior-policy assumption, not worse: the completion stays
+            # attributable to exactly one weight version.
+            _reset_running = (
+                os.environ.get("TORCHTUNE_WSYNC_RESET_RUNNING_REQUESTS", "1") == "1"
+            )
+            for client in self._vllm_clients:
+                client.reset_prefix_cache(
+                    fail_on_error=True, reset_running_requests=_reset_running
+                )
+            _t_http = time.perf_counter() - _t_http0
+        except Exception as exc:
+            _publish_error = f"{type(exc).__name__}: {exc}"
+
+    _publish_status = [_publish_error]
+    torch.distributed.broadcast_object_list(
+        _publish_status,
+        src=0,
+        group=getattr(self, "_wsync_barrier_pg", None)
+        or getattr(self, "_training_pg", None),
+    )
+    if _publish_status[0] is not None:
+        raise RuntimeError(
+            f"BioReason delta publication failed collectively: {_publish_status[0]}"
+        )
     if not _is_xccl_leader:
         return
-
-    if not entries:
-        raise RuntimeError(
-            "_publish_bioreason_lora_delta: found 0 LoRA-target modules — "
-            "refusing to publish an empty adapter."
-        )
-
-    _t_gather = time.perf_counter() - t0
-
-    # File location: train and vLLM run on DIFFERENT nodes in server mode, so
-    # node-local /dev/shm is NOT visible to the vLLM-side RPC handler — this
-    # crashed the first HW attempt (job 8809857/v33: "Not found:
-    # /dev/shm/torchtune/.../base.bin" on both vLLM tiles, RuntimeError raised
-    # correctly by _post_bioreason_collective_rpc's fail-fast, no silent
-    # partial state). Reuse the SAME shared-FS override the merged raw_bytes
-    # path already documents for exactly this reason
-    # (vllm_backend.py: "/dev/shm is NOT shared — override with
-    # TORCHTUNE_WEIGHT_SYNC_PATH to point at a shared FS path"), but under a
-    # DIFFERENT filename so this never collides with the merged path's own
-    # weight_update.raw (both could theoretically be live if a run toggled
-    # lora_wsync_mode mid-flight, though that is not a supported flow).
-    _wsync_shared_dir = os.path.dirname(
-        os.environ.get(
-            "TORCHTUNE_WEIGHT_SYNC_PATH",
-            "/dev/shm/torchtune/weight_update.raw",
-        )
-    )
-
-    _tp_resident = getattr(self, "_lora_wsync_mode", "merged") == "delta_tp"
-
-    # Legacy delta mode ships the full base once. delta_tp instead snapshots
-    # vLLM's already-loaded TP-local resident shards on its first adapter RPC.
-    if not _tp_resident and not getattr(self, "_bior_lora_base_shipped", False):
-        _t0_base = time.perf_counter()
-        os.makedirs(_wsync_shared_dir, exist_ok=True)
-        _base_path = os.path.join(_wsync_shared_dir, "bioreason_lora_delta_base.raw")
-        _n_base = _save_raw_bytes(self._bior_lora_base_cache, _base_path)
-        _base_gb = os.path.getsize(_base_path) / 1024**3
-        log.info(
-            "Rank %d: BioReason delta base raw_bytes %d params %.2f GiB in "
-            "%.2fs -> %s",
-            self.rank, _n_base, _base_gb, time.perf_counter() - _t0_base, _base_path,
-        )
-        _post_bioreason_collective_rpc(
-            self, "load_lora_base_from_raw", [_base_path], what="BioReason delta base",
-            timeout=600,
-        )
-        self._bior_lora_base_shipped = True
-
-    # Per-step adapter delta.
-    os.makedirs(_wsync_shared_dir, exist_ok=True)
-    _adapter_path = os.path.join(_wsync_shared_dir, "bioreason_lora_delta_adapter.raw")
-    _t_save0 = time.perf_counter()
-    _n_params = _save_raw_bytes(tensors, _adapter_path)
-    _t_save = time.perf_counter() - _t_save0
-    _size_mb = os.path.getsize(_adapter_path) / 1024**2
-
-    _meta = {
-        "entries": entries,
-        "needs_qk_unpermute": bool(_needs_qk_unpermute(self)),
-        "num_heads": int(getattr(self, "_model_num_heads", 0) or 0),
-        "num_kv_heads": int(getattr(self, "_model_num_kv_heads", 0) or 0),
-        "head_dim": int(getattr(self, "_model_head_dim", 0) or 0),
-    }
-    _t_http0 = time.perf_counter()
-    _post_bioreason_collective_rpc(
-        self,
-        "load_lora_delta_tp_from_raw" if _tp_resident else "load_lora_delta_from_raw",
-        [_adapter_path, json.dumps(_meta)],
-        what="BioReason delta adapter",
-        # LOAD-BEARING at 32B with TORCHTUNE_LORA_DELTA_BASE_CPU=1: the default
-        # 120s timeout (fine at 4B, where the CPU merge is ~20s) is too short
-        # once the base is 61 GiB and the merge runs 707 params of scale*(B@A)
-        # entirely on CPU. Confirmed on HW (job 8810147/v39):
-        # ReadTimeout(read timeout=120) on both vLLM tiles while
-        # load_lora_delta_from_raw was still legitimately merging — same
-        # failure class the base-ship RPC already hit once (v34) and fixed
-        # with timeout=600. Use the same 600s budget here.
-        timeout=600,
-    )
-    _t_http = time.perf_counter() - _t_http0
 
     # Sync-event bookkeeping: unlike _xccl_gather_fsdp1's deferred-broadcast
     # path (dispatches a background thread, so it clears the done-event at

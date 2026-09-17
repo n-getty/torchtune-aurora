@@ -103,6 +103,117 @@ class TestProbeHasPositiveControl:
         )
 
 
+GQA_FOLD_PROBE = PROBE.parent / "probe_split_sdpa_gqa_fold.py"
+
+
+@pytest.fixture(scope="module")
+def gqa_fold_probe():
+    if not GQA_FOLD_PROBE.exists():
+        pytest.skip(f"probe not present at {GQA_FOLD_PROBE}")
+    src = GQA_FOLD_PROBE.read_text()
+    return ast.parse(src), src
+
+
+class TestGqaFoldProbeGateIsolation:
+    """Jobs 8830248/8830291/8830313: three debug runs, one crash discovered per run.
+
+    The gate #3b probe wrapped its whole ladder in a single ``try``. Gate 3's negative
+    control threw on a ``.view()``, and gate 4 -- which asks an independent question
+    (does the prefix KV stay ``B`` rows?) and shares no code with gate 3 -- never ran on
+    any of the three allocations. See
+    ``memory/feedback_probe_gates_need_independent_exception_boundaries_20260916.md``.
+    """
+
+    def test_gate_4_has_its_own_exception_boundary(self, gqa_fold_probe):
+        tree, _ = gqa_fold_probe
+        main = next(
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.FunctionDef) and n.name == "main"
+        )
+        guarded = {
+            node.func.id
+            for handler_parent in ast.walk(main)
+            if isinstance(handler_parent, ast.Try)
+            for node in ast.walk(handler_parent)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id.startswith("gate_")
+            # the call must be inside a Try whose body is NOT the whole ladder: a Try
+            # containing more than one distinct gate call is the coupling we are banning
+            and len(
+                {
+                    c.func.id
+                    for c in ast.walk(handler_parent)
+                    if isinstance(c, ast.Call)
+                    and isinstance(c.func, ast.Name)
+                    and c.func.id.startswith("gate_")
+                }
+            )
+            == 1
+        }
+        assert "gate_4_kv_memory_is_b_rows" in guarded, (
+            "gate 4 asks an independent question and must not be able to be skipped by "
+            "a crash in gate 3; give it its own try/except"
+        )
+
+    def test_crashed_gate_is_reported_as_a_failure(self, gqa_fold_probe):
+        """A bare ``traceback.print_exc()`` leaves the verdict silent about the gate."""
+        tree, _ = gqa_fold_probe
+        main = next(
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.FunctionDef) and n.name == "main"
+        )
+        inner = [
+            h
+            for t in ast.walk(main)
+            if isinstance(t, ast.Try)
+            for h in t.handlers
+            if any(
+                isinstance(c, ast.Call)
+                and isinstance(c.func, ast.Name)
+                and c.func.id.startswith("gate_")
+                for c in ast.walk(t)
+            )
+        ]
+        reporting = [
+            h
+            for h in inner
+            if any(
+                isinstance(c, ast.Call)
+                and isinstance(c.func, ast.Name)
+                and c.func.id == "_report"
+                for c in ast.walk(h)
+            )
+        ]
+        assert reporting, (
+            "at least one per-gate handler must call _report(False, ...) so a crash "
+            "shows up as a named FAILED gate rather than as an absent line"
+        )
+
+    def test_no_bare_view_calls_on_folded_tensors(self, gqa_fold_probe):
+        """``view`` cannot fold non-adjacent axes of a BSHD tensor; ``reshape`` can.
+
+        Two of the three wasted runs were a ``.view()`` raising "size is not compatible
+        with input tensor's size and stride". The two surviving calls are the ones that
+        demonstrably executed on HW (job 8830313); any NEW one is almost certainly the
+        same bug, so this pins the count rather than banning the construct outright.
+        """
+        tree, _ = gqa_fold_probe
+        views = [
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "view"
+        ]
+        assert len(views) <= 2, (
+            f"found {len(views)} .view() calls; only the 2 HW-validated ones are "
+            "expected. Prefer .reshape() in probe code -- see jobs 8830291/8830313"
+        )
+
+
 class TestSplitMergeMath:
     """The decomposition itself is sound -- only the dispatch was wrong."""
 

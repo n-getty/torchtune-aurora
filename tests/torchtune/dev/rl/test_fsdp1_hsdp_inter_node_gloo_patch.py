@@ -1,3 +1,9 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 """Unit test for the FSDP1 HSDP inter-node all_reduce gloo reroute.
 
 Pins the gating contract of `_xpu_all_reduce_inter_node_gloo` (distributed.py):
@@ -36,9 +42,9 @@ def patched(monkeypatch):
     which group each original-all_reduce call targeted."""
     calls = {"orig": []}
 
-    _REP_PG = object()    # sentinel for the gloo replicate PG
+    _REP_PG = object()  # sentinel for the gloo replicate PG
     _XCCL_REP = object()  # sentinel for the XCCL replicate group (the FSDP arg)
-    _OTHER = object()     # some other (e.g. shard / world) group
+    _OTHER = object()  # some other (e.g. shard / world) group
 
     def fake_orig_all_reduce(tensor, op=None, group=None, async_op=False):
         calls["orig"].append({"group": group, "device": tensor.device.type})
@@ -53,6 +59,7 @@ def patched(monkeypatch):
     monkeypatch.setattr(D, "_orig_all_reduce", fake_orig_all_reduce)
     monkeypatch.setattr(D, "_GLOO_DP_REP_PG", _REP_PG)
     monkeypatch.setattr(D, "_DP_REP_DEGREE", 7)
+    monkeypatch.setattr(D, "_FSDP1_HSDP_CPU_POSTDIVIDE", 1.0)
     monkeypatch.setattr(torch.distributed, "get_world_size", fake_get_world_size)
 
     return types.SimpleNamespace(
@@ -66,32 +73,43 @@ class _XpuLikeTensor:
     without real XPU hardware. The patch does:
         tensor_cpu = tensor.contiguous().to("cpu")   # D2H  → real cpu tensor
         _orig_all_reduce(tensor_cpu, ..., group=gloo)
-        tensor.copy_(tensor_cpu.to(tensor.device))   # H2D  → back onto self
+        tensor.copy_(tensor_cpu)                     # direct H2D into existing shard
     We make `.device` a real torch.device('xpu') (constructs fine on a CPU box),
-    `.to('cpu')` return the backing cpu tensor, and intercept the H2D `.to(xpu)`
-    on the RESULT by returning a plain cpu tensor `copy_` can consume."""
+    and `.to('cpu')` return the backing CPU tensor."""
+
     def __init__(self, x):
         self._x = x
         self.device = torch.device("xpu")
+
     def contiguous(self):
         return self
+
     def to(self, *a, **k):
         # D2H: return the backing cpu tensor wrapped so its own .to(xpu) is a no-op.
         return _CpuBounce(self._x)
+
     def copy_(self, other):
         self._x.copy_(other._x if isinstance(other, _CpuBounce) else other)
 
 
 class _CpuBounce:
-    """The 'cpu' tensor inside the patch: real enough for _orig_all_reduce (which
-    is faked in the test) and whose .to(device) is a no-op returning itself."""
+    """CPU tensor stand-in that rejects an extra device allocation."""
+
     def __init__(self, x):
         self._x = x
         self.device = torch.device("cpu")
+
     def contiguous(self):
         return self
-    def to(self, *a, **k):
+
+    def div_(self, divisor):
+        self._x.div_(divisor)
         return self
+
+    def to(self, *a, **k):
+        raise AssertionError(
+            "CPU bounce must copy directly into the existing XPU shard"
+        )
 
 
 def test_reroutes_inter_node_replicate_call_to_gloo(patched, monkeypatch):
@@ -103,6 +121,14 @@ def test_reroutes_inter_node_replicate_call_to_gloo(patched, monkeypatch):
     assert len(patched.calls["orig"]) == 1
     assert patched.calls["orig"][0]["group"] is patched.REP_PG
     assert patched.calls["orig"][0]["device"] == "cpu"
+
+
+def test_cpu_postdivide_happens_before_direct_copy(patched, monkeypatch):
+    monkeypatch.setattr(D, "_FSDP1_HSDP_INTER_NODE_GLOO", True)
+    monkeypatch.setattr(D, "_FSDP1_HSDP_CPU_POSTDIVIDE", 7.0)
+    shim = _XpuLikeTensor(torch.full((4,), 14.0))
+    D._xpu_all_reduce_inter_node_gloo(shim, group=patched.XCCL_REP)
+    torch.testing.assert_close(shim._x, torch.full((4,), 2.0))
 
 
 def test_passthrough_when_flag_off(patched, monkeypatch):
@@ -135,6 +161,7 @@ def test_enable_sets_flag_and_installs_patch(monkeypatch):
     # enable_fsdp1_hsdp_inter_node_gloo flips the flag and swaps dist.all_reduce.
     monkeypatch.setattr(D, "_FSDP1_HSDP_INTER_NODE_GLOO", False)
     import torch.distributed as _d
+
     orig = _d.all_reduce
     try:
         D.enable_fsdp1_hsdp_inter_node_gloo()

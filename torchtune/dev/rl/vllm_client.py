@@ -63,10 +63,8 @@ class VLLMClient:
         # HTTPAdapter.send(), below any of our own logging), which looked identical to
         # "just slow" until directly inspected. Retrying a read-timeout on a stateful
         # generation call doesn't help anyway -- if the server's engine is wedged, a retry
-        # just re-queues another doomed request. connect=5 (fast connection-refused
-        # retries, e.g. server mid-restart) is still useful and kept. status=3 (retry on
-        # 500/502/503) kept since those are typically transient. read=0 makes a read
-        # timeout fail immediately and visibly instead of silently multiplying the wait.
+        # just re-queues another doomed request. Restrict adapter retries to GET so no
+        # stateful POST (generation or weight update) is replayed automatically.
         retry = Retry(
             total=5,
             connect=5,
@@ -74,7 +72,7 @@ class VLLMClient:
             status=3,
             status_forcelist=[500, 502, 503],
             backoff_factor=2,
-            allowed_methods=["POST", "GET"],
+            allowed_methods=["GET"],
         )
         # requests/urllib3 default pool_maxsize is 10 -- a caller dispatching more than 10
         # concurrent requests per host (e.g. eval_cafa_fmax.py's --concurrency ThreadPoolExecutor)
@@ -131,7 +129,9 @@ class VLLMClient:
             if r.status_code == 200:
                 self._api_type = "openai"
                 data = r.json()
-                self._model_name = data["data"][0]["id"] if data.get("data") else "default"
+                self._model_name = (
+                    data["data"][0]["id"] if data.get("data") else "default"
+                )
                 logger.info("Detected OpenAI API server (model=%s)", self._model_name)
                 return
         except Exception:
@@ -254,9 +254,7 @@ class VLLMClient:
             payload["include_stop_str_in_output"] = True
         r = self.session.post(comp_url, json=payload, timeout=600)
         if r.status_code != 200:
-            raise RuntimeError(
-                f"vLLM /v1/completions failed: {r.status_code} {r.text}"
-            )
+            raise RuntimeError(f"vLLM /v1/completions failed: {r.status_code} {r.text}")
         data = r.json()
         if "choices" not in data:
             error_msg = data.get("error", data.get("message", str(data)))
@@ -297,12 +295,15 @@ class VLLMClient:
     def generate_from_embeds(
         self,
         prompt_embeds: list[torch.Tensor],
+        n: int = 1,
         max_tokens: int = 256,
         temperature: float = 1.0,
         top_k: int = 0,
         top_p: float = 1.0,
         stop_token_ids: Optional[list[int]] = None,
         repetition_penalty: Optional[float] = None,
+        read_timeout: float = 3600.0,
+        return_logprobs: bool = False,
     ) -> list[list[int]]:
         """Send pre-computed prompt embeddings to vLLM and return completion token IDs.
 
@@ -317,9 +318,19 @@ class VLLMClient:
         Args:
             prompt_embeds: list of length B, each element a [P_i, H] bf16/fp16 tensor.
             max_tokens, temperature, top_k, top_p: sampling params.
+            read_timeout: seconds to wait for this non-idempotent request to complete.
+            return_logprobs: if True, also return the sampler's log-probability of
+                each sampled token, so the caller can use vLLM's own behavior-policy
+                logprobs as ``pi_old`` instead of paying a second full policy
+                forward on the training side. See the "BEHAVIOR-POLICY LOGPROBS"
+                note below for the exactness conditions — they are NOT unconditional.
 
         Returns:
-            list[list[int]] of length B — token IDs for each completion.
+            If ``return_logprobs`` is False: ``list[list[int]]`` of length B — token
+            IDs for each completion (unchanged legacy signature).
+            If True: ``(token_ids, logprobs)`` where ``logprobs[i]`` is a
+            ``list[float]`` aligned 1:1 with ``token_ids[i]``. An element is None
+            when the server did not return a logprob for that position.
         """
         if self._api_type != "openai":
             raise RuntimeError(
@@ -330,26 +341,67 @@ class VLLMClient:
 
         import base64
         import io
+
         import requests
 
         comp_url = f"{self.base_url}/v1/completions"
+        serialize_t0 = time.perf_counter()
         encoded = []
         for t in prompt_embeds:
             buf = io.BytesIO()
             # NOTE: use torch.save (NOT tensor.numpy().tobytes()) — vLLM's
             # OpenAIServingCompletion calls torch.load(...) on the bytes.
-            torch.save(t.detach().cpu().contiguous(), buf)
+            # A row selected from an expanded+contiguous [B*G, P, H] tensor can be
+            # contiguous while still sharing the full batch storage. torch.save
+            # preserves that storage and would serialize the entire batch once per
+            # row (5.6 GiB observed for 16 logical 350 MiB prompts). clone() gives
+            # each request item storage matching only its logical [P, H] contents.
+            torch.save(
+                t.detach().cpu().clone(memory_format=torch.contiguous_format), buf
+            )
             encoded.append(base64.b64encode(buf.getvalue()).decode("ascii"))
+        serialize_time = time.perf_counter() - serialize_t0
+        payload_mib = sum(len(item) for item in encoded) / 1024**2
 
         payload = {
             "model": self._model_name,
             "prompt_embeds": encoded if len(encoded) > 1 else encoded[0],
+            "n": n,
+            "return_token_ids": True,
             "max_tokens": max_tokens,
             "temperature": temperature,
             "top_p": top_p,
         }
         if top_k and top_k > 0:
             payload["top_k"] = top_k
+        # ── BEHAVIOR-POLICY LOGPROBS (opt-in) ────────────────────────────────
+        #
+        # `logprobs: 0` asks for zero *alternative* tokens but still returns the
+        # SAMPLED token's own logprob: vLLM concatenates the sampled token id in
+        # front of the top-k indices (v1/sample/sampler.py) and the engine
+        # explicitly documents "Sampler puts the sampled logprob in first"
+        # (v1/engine/logprobs.py). So 0 is the cheapest request that still
+        # answers our question — do not raise it to 1 "to be safe", that costs
+        # an extra column per position for no benefit.
+        #
+        # Verified against the INSTALLED vLLM 0.15.0 that actually executes
+        # (/opt/aurora/.../site-packages/vllm), not the vendored tree:
+        # entrypoints/openai/completion/serving.py rejects only `echo` and
+        # `prompt_logprobs` in combination with prompt_embeds. Sampled-token
+        # `logprobs` is NOT blocked with prompt_embeds.
+        #
+        # ⚠ EXACTNESS IS CONDITIONAL ON THE SERVER'S --logprobs-mode. vLLM's
+        # default is `raw_logprobs`, which snapshots log_softmax BEFORE the fp32
+        # cast and BEFORE the temperature division — i.e. temperature-1.0
+        # values. torchtune's trainer computes pi/pi_old as
+        # log_softmax(logits / temperature) (rlhf.batched_logits_to_logprobs), so
+        # feeding raw_logprobs into an IS ratio against a temperature-scaled
+        # pi_logprobs is a SYSTEMATIC mismatch at any temperature != 1.0, not a
+        # small numerical drift. The server must be started with
+        # `--logprobs-mode processed_logprobs` for these to be comparable.
+        # The caller is responsible for that; this client cannot check it.
+        if return_logprobs:
+            payload["logprobs"] = 0
         if repetition_penalty is not None:
             payload["repetition_penalty"] = repetition_penalty
         # NOTE: no_repeat_ngram_size is a HF-generate-only concept -- vLLM's
@@ -364,33 +416,64 @@ class VLLMClient:
         if stop_token_ids:
             payload["stop_token_ids"] = list(stop_token_ids)
 
-        # Retry transient connection failures (timeouts, connection resets) —
-        # at high fan-in (e.g. 240 concurrent requests/step across a centralized
-        # vLLM pool at 16-node scale), a single request occasionally times out
-        # even though the server itself is healthy (confirmed via pbsnodes: not
-        # an offline/dead node), and with no retry this raises immediately and
-        # kills the whole multi-hundred-rank MPI job over one transient blip.
-        # See memory/project_bioreason_32b_grpo_fsdp1_per_layer_first_working_path_20260906.md
-        # (16N job 8812775: rank 72 hit MaxRetryError while the vLLM node stayed
-        # job-exclusive/healthy — same pattern as the earlier 2/180-rank failure
-        # at job 8811293). Bounded retries, no backoff needed beyond vLLM's own
-        # queueing — a retry either finds the request scheduled by then or the
-        # server is genuinely down, in which case it fails fast on connect.
-        _max_attempts = 3
-        for _attempt in range(_max_attempts):
+        logger.info(
+            "vLLM prompt-embeds payload ready: url=%s prompts=%d n=%d encoded=%.1f MiB "
+            "serialize=%.2fs max_tokens=%d",
+            self.base_url,
+            len(encoded),
+            n,
+            payload_mib,
+            serialize_time,
+            max_tokens,
+        )
+
+        # Generation is not idempotent. A read timeout or reset does not prove that the
+        # server stopped the request, so replaying it can duplicate a still-running
+        # decode and amplify overload. This happened at 16-node BioReason scale: normal
+        # queueing exceeded the old 600s timeout, retries doubled/tripled outstanding
+        # work, and later requests stretched to 20-30 minutes.
+        #
+        # NOTE: do NOT use requests' (connect, read) timeout tuple here. urllib3 only
+        # switches the socket to the read timeout right before conn.getresponse() --
+        # conn.request() (which includes sendall() of the full request body) still runs
+        # under the CONNECT timeout. This payload is base64-encoded prompt_embeds for up
+        # to grpo_samples*batch_size sequences at hidden_size=5120 (~100-200 MB JSON for
+        # BioReason 32B) sent concurrently by up to dp_replicate shard leaders into 2
+        # engines on one node -- a short connect timeout clips the body upload itself
+        # under fan-in contention, not just a slow/dead connection. HW-confirmed 2026-09-09
+        # (job 8814595): rank 12 timed out inside `self.sock.sendall(data)`, i.e. mid-
+        # upload, with timeout=(15.0, 3600.0) -- the 3600s never had a chance to apply.
+        # A single scalar timeout covers connect+send+read uniformly and is what we want:
+        # the adapter's automatic Retry is scoped to allowed_methods=["GET"] anyway, so a
+        # short connect value buys nothing for this non-retried POST.
+        request_t0 = time.perf_counter()
+        try:
+            r = self.session.post(
+                comp_url,
+                json=payload,
+                timeout=read_timeout,
+            )
+        except requests.exceptions.RequestException as e:
+            health = "unknown"
             try:
-                r = self.session.post(comp_url, json=payload, timeout=600)
-                break
-            except requests.exceptions.RequestException as e:
-                if _attempt == _max_attempts - 1:
-                    raise RuntimeError(
-                        f"vLLM /v1/completions (prompt_embeds) failed after "
-                        f"{_max_attempts} attempts: {e}"
-                    ) from e
-                logger.warning(
-                    "generate_from_embeds: request failed (attempt %d/%d): %s — retrying",
-                    _attempt + 1, _max_attempts, e,
-                )
+                probe = requests.get(f"{self.base_url}/health/", timeout=(5.0, 10.0))
+                health = f"HTTP {probe.status_code}"
+            except requests.exceptions.RequestException as health_error:
+                health = f"unreachable ({health_error})"
+            raise RuntimeError(
+                "vLLM /v1/completions (prompt_embeds) failed; request was not replayed "
+                f"because generation is non-idempotent (health={health}): {e}"
+            ) from e
+        logger.info(
+            "vLLM prompt-embeds response: url=%s prompts=%d n=%d encoded=%.1f MiB "
+            "elapsed=%.1fs status=%d",
+            self.base_url,
+            len(encoded),
+            n,
+            payload_mib,
+            time.perf_counter() - request_t0,
+            r.status_code,
+        )
         if r.status_code != 200:
             raise RuntimeError(
                 f"vLLM /v1/completions (prompt_embeds) failed: "
@@ -404,7 +487,19 @@ class VLLMClient:
         # Token IDs may not be present in every choice — fall back to /tokenize.
         tok_url = f"{self.base_url}/tokenize"
         out = []
+        lps: list[Optional[list]] = []
         for choice in data["choices"]:
+            if return_logprobs:
+                # CompletionLogProbs.token_logprobs is aligned 1:1 with the
+                # generated tokens. We deliberately do NOT fall back to the
+                # /tokenize path's token list here: if the server returned no
+                # logprobs for a choice we append None and let the caller decide,
+                # rather than silently emitting a misaligned shorter list. A
+                # misaligned pi_old corrupts every IS ratio in that row, which is
+                # far worse than a loud missing value.
+                _lp_obj = choice.get("logprobs") or {}
+                _tl = _lp_obj.get("token_logprobs")
+                lps.append(list(_tl) if _tl is not None else None)
             ids = choice.get("token_ids")
             if ids:
                 out.append(list(ids))
@@ -419,6 +514,23 @@ class VLLMClient:
                         f"/tokenize failed: {tok_r.status_code} {tok_r.text[:500]}"
                     )
                 out.append(tok_r.json()["tokens"])
+        if return_logprobs:
+            # Truncate/flag any row whose logprob list disagrees with its token
+            # list. This SHOULD never fire (vLLM emits one logprob per generated
+            # token), but an off-by-one here would be invisible downstream and
+            # would silently bias every ratio in the row.
+            for _i, (_ids, _lp) in enumerate(zip(out, lps)):
+                if _lp is not None and len(_lp) != len(_ids):
+                    logger.warning(
+                        "vLLM logprobs length mismatch on choice %d: %d logprobs "
+                        "vs %d token ids — dropping logprobs for this row so the "
+                        "caller falls back rather than using a misaligned pi_old.",
+                        _i,
+                        len(_lp),
+                        len(_ids),
+                    )
+                    lps[_i] = None
+            return out, lps
         return out
 
     # ------------------------------------------------------------------
@@ -438,7 +550,7 @@ class VLLMClient:
         vllm_world_size = r.json()["world_size"]
 
         world_size = vllm_world_size + 1  # +1 for this client
-        self.rank = vllm_world_size       # client is the last rank
+        self.rank = vllm_world_size  # client is the last rank
 
         # 2. Get device UUID (best-effort; Aurora may not expose it yet)
         if hasattr(torch.xpu, "get_device_properties"):
@@ -488,7 +600,9 @@ class VLLMClient:
     def update_named_param(self, name: str, weights: torch.Tensor) -> None:
         """Push a single named parameter to the vLLM server via XCCL broadcast."""
         if self.communicator is None:
-            raise RuntimeError("Communicator not initialized — call init_communicator first")
+            raise RuntimeError(
+                "Communicator not initialized — call init_communicator first"
+            )
 
         dtype_str = str(weights.dtype)
         shape = tuple(weights.shape)
@@ -505,13 +619,28 @@ class VLLMClient:
         self.communicator.broadcast(weights, root=self.rank)
         self.communicator.barrier()
 
-    def reset_prefix_cache(self) -> None:
+    def reset_prefix_cache(
+        self,
+        fail_on_error: bool = False,
+        reset_running_requests: bool = False,
+    ) -> None:
         """Invalidate vLLM's prefix cache after weight update."""
         try:
-            r = self.session.post(f"{self.base_url}/reset_prefix_cache/", timeout=30)
+            r = self.session.post(
+                f"{self.base_url}/reset_prefix_cache/",
+                params={"reset_running_requests": "true"}
+                if reset_running_requests
+                else None,
+                timeout=30,
+            )
             if r.status_code != 200:
-                logger.warning("reset_prefix_cache failed: %s", r.text)
+                message = f"reset_prefix_cache failed: {r.status_code} {r.text}"
+                if fail_on_error:
+                    raise RuntimeError(message)
+                logger.warning(message)
         except Exception:
+            if fail_on_error:
+                raise
             logger.warning("reset_prefix_cache request failed", exc_info=True)
 
     def close_communicator(self) -> None:
@@ -597,7 +726,7 @@ def vllm_http_generate(
     t0 = time.perf_counter()
     num_clients = len(vllm_clients)
     if num_clients > 1:
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from concurrent.futures import as_completed, ThreadPoolExecutor
 
         chunks = [prompts[i::num_clients] for i in range(num_clients)]
 
@@ -637,6 +766,10 @@ def vllm_http_generate(
     total_tokens = sum(len(c) for c in completions)
     logger.info(
         "vLLM generation: %d sequences (%d clients), %d tokens in %.1fs (%.1f tok/s)",
-        bsz, num_clients, total_tokens, gen_time, total_tokens / max(gen_time, 0.01),
+        bsz,
+        num_clients,
+        total_tokens,
+        gen_time,
+        total_tokens / max(gen_time, 0.01),
     )
     return query_responses

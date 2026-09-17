@@ -44,6 +44,58 @@ def _lora_engine_kwargs(cfg) -> dict:
         "max_loras": int(get("max_loras", 2)),
     }
 
+
+def _logprobs_engine_kwargs(cfg) -> dict:
+    """Return the ``logprobs_mode`` kwarg for vLLM engine construction.
+
+    vLLM defaults to ``raw_logprobs``, which are the UNSCALED logits-derived
+    logprobs -- not ``log_softmax(logits / temperature)``. The async gen/train
+    overlap path feeds vLLM's logprobs straight into ``GRPOLoss``'s importance
+    ratio, where that mismatch is a measured 4.09x error at T=0.8. Sync runs
+    never read these (the trainer recomputes), so this is inert until async is on
+    -- which is exactly why it silently stayed unset.
+
+    Version-guarded: older engines have no ``logprobs_mode`` EngineArgs field and
+    raise ``TypeError`` on an unknown kwarg, so return ``{}`` there. Override with
+    ``cfg.vllm_logprobs_mode`` if a run genuinely needs raw logprobs.
+
+    FAIL-FAST: when ``async_generation.enabled`` is true and the mode could not be
+    set, this raises instead of returning ``{}``. A silent 4.09x-wrong importance
+    ratio produces a run that neither crashes nor warns -- the whole reason this
+    gap survived a passing test suite. Better to refuse to start.
+    """
+    _async_cfg = cfg.get("async_generation", None)
+    _async_on = bool(
+        _async_cfg is not None
+        and (_async_cfg.get("enabled", False) if hasattr(_async_cfg, "get") else False)
+    )
+
+    def _bail(reason: str) -> dict:
+        if _async_on:
+            raise RuntimeError(
+                "async_generation.enabled=true requires vLLM logprobs_mode="
+                f"'processed_logprobs', but it could not be set: {reason}. "
+                "vLLM's default raw_logprobs are unscaled (not log_softmax(logits/T)) "
+                "and give a ~4.09x-wrong GRPOLoss importance ratio at T=0.8. "
+                "Refusing to start rather than train on it."
+            )
+        log.warning("logprobs_mode not set (%s); harmless on the sync path.", reason)
+        return {}
+
+    mode = cfg.get("vllm_logprobs_mode", "processed_logprobs")
+    if not mode:
+        return _bail("explicitly disabled via cfg.vllm_logprobs_mode")
+    try:
+        import dataclasses
+
+        from vllm.engine.arg_utils import EngineArgs
+
+        if not any(f.name == "logprobs_mode" for f in dataclasses.fields(EngineArgs)):
+            return _bail("this vLLM's EngineArgs has no 'logprobs_mode' field")
+    except Exception as e:  # pragma: no cover - defensive
+        return _bail(f"could not introspect EngineArgs ({e})")
+    return {"logprobs_mode": mode}
+
 def _init_vllm_early(self, cfg):
     """Initialize colocated vLLM engine(s) before the training PG.
 
@@ -227,6 +279,7 @@ def _init_vllm_early_dedicated(self, cfg):
         enable_sleep_mode=False,
         enable_prompt_embeds=True,
         **_lora_engine_kwargs(cfg),
+        **_logprobs_engine_kwargs(cfg),
     )
 
     # Restore TORCH_COMPILE_DISABLE so training ranks can use torch.compile.
@@ -416,6 +469,7 @@ def _init_vllm_tp1(self, cfg, rank, world_size, local_rank,
         llm_kwargs["enable_prefix_caching"] = _prefix_cache
         log.info("%s: enable_prefix_caching=%s", vllm_mode, _prefix_cache)
     llm_kwargs.update(_lora_engine_kwargs(cfg))
+    llm_kwargs.update(_logprobs_engine_kwargs(cfg))
 
     self._vllm_llm = LLM(**llm_kwargs)
 
@@ -616,6 +670,7 @@ def _init_vllm_tp(self, cfg, rank, world_size, local_rank, tp_size,
     if vllm_mode == "colocate_sleep":
         llm_kwargs["enable_sleep_mode"] = True
     llm_kwargs.update(_lora_engine_kwargs(cfg))
+    llm_kwargs.update(_logprobs_engine_kwargs(cfg))
 
     # _init_vllm_early() sets TORCH_COMPILE_DISABLE=1 to protect early init from
     # torch.compile overhead. For PIECEWISE XPU graph mode we need inductor active,
@@ -821,6 +876,10 @@ def _setup_vllm_server_mode(self):
     self._weight_versions = WeightVersionTracker()
     self._rollout_producer = None
     self._last_rollout_item = None
+    # Weight version observed at the last async CONSUME. The METRICS async tail
+    # prefers this over the live counter, which it would otherwise read after
+    # the step's own publish and inflate the reported lag by one.
+    self._last_rollout_consume_wver = None
     if self._async_generation_enabled:
         log.info(
             "Rank %d: async generation enabled (max_staleness=%d).",
@@ -1056,6 +1115,7 @@ def _init_vllm_ray_colocate(self, cfg) -> None:
         disable_log_stats=True,
     )
     llm_kwargs.update(_lora_engine_kwargs(cfg))
+    llm_kwargs.update(_logprobs_engine_kwargs(cfg))
     _t0 = time.monotonic()
     self._vllm_llm = LLM(**llm_kwargs)
     log.info("Rank 0: Ray-colocate LLM loaded in %.1fs", time.monotonic() - _t0)

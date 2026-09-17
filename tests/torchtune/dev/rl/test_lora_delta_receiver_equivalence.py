@@ -18,6 +18,7 @@ import json
 import os
 import struct
 import tempfile
+from unittest import mock
 
 import torch
 from torch import nn
@@ -507,3 +508,27 @@ def test_delta_tp_receiver_uses_native_packed_local_shards_without_drift():
     assert any(not torch.equal(snapshots[0][k], snapshots[1][k]) for k in snapshots[0])
     for name in snapshots[0]:
         assert torch.equal(snapshots[0][name], snapshots[2][name]), name
+
+
+def test_delta_tp_receiver_can_cache_pristine_shards_on_cpu():
+    model = _ToyLoRA()
+    full_base = _build_base_payload(model)
+    tp_model = _FakeTPQwenModel(full_base, tp_rank=1, tp_size=2)
+    worker = _FakeWorker(tp_model)
+    worker._lora_resident_param_name = staticmethod(
+        WeightSyncFromFileExtension._lora_resident_param_name
+    )
+    worker.load_lora_delta_tp_from_raw = (
+        WeightSyncFromFileExtension.load_lora_delta_tp_from_raw.__get__(worker)
+    )
+
+    _randomize_adapter(model, seed=41)
+    tensors, meta = _build_payload(model)
+    with tempfile.TemporaryDirectory() as directory:
+        path = os.path.join(directory, "adapter.bin")
+        _save_raw_bytes(tensors, path)
+        with mock.patch.dict(os.environ, {"TORCHTUNE_LORA_DELTA_TP_BASE_CPU": "1"}):
+            result = worker.load_lora_delta_tp_from_raw(path, json.dumps(meta))
+
+    assert result["status"] == "ok", result
+    assert all(tensor.device.type == "cpu" for tensor in worker._lora_tp_base_cache.values())
