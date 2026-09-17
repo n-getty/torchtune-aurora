@@ -20,7 +20,161 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
+from torchtune import utils
+
 logger = logging.getLogger(__name__)
+runtime_logger = utils.get_logger()
+
+_USE_HF_XPU_FLASH = os.environ.get("TORCHTUNE_USE_XPU_FLASH", "0") == "1"
+_HF_XPU_FLASH_ATTENTION_NAME = "bioreason_xpu_flash"
+_hf_xpu_flash_log_done = False
+_hf_xpu_flash_skip_log_done = False
+_hf_xpu_flash_grad_skip_log_done = False
+
+
+def _to_bshd_memory(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.transpose(1, 2).is_contiguous():
+        return tensor
+    return tensor.transpose(1, 2).contiguous().transpose(1, 2)
+
+
+def _repeat_kv_for_xpu_flash(
+    hidden_states: torch.Tensor, num_key_value_groups: int
+) -> torch.Tensor:
+    if num_key_value_groups == 1:
+        return hidden_states
+    batch_size, num_key_value_heads, seq_len, head_dim = hidden_states.shape
+    hidden_states = hidden_states[:, :, None, :, :].expand(
+        batch_size,
+        num_key_value_heads,
+        num_key_value_groups,
+        seq_len,
+        head_dim,
+    )
+    return hidden_states.reshape(
+        batch_size, num_key_value_heads * num_key_value_groups, seq_len, head_dim
+    )
+
+
+def _is_unpadded_or_right_padded(attention_mask: torch.Tensor) -> bool:
+    if attention_mask.ndim != 2:
+        return False
+    binary_mask = attention_mask.bool()
+    return not bool((~binary_mask[:, :-1] & binary_mask[:, 1:]).any().item())
+
+
+def _bioreason_xpu_flash_attention_forward(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    dropout: float = 0.0,
+    scaling: Optional[float] = None,
+    is_causal: Optional[bool] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, None]:
+    from transformers.integrations.sdpa_attention import sdpa_attention_forward
+
+    if is_causal is None:
+        is_causal = (
+            query.shape[2] > 1
+            and attention_mask is None
+            and getattr(module, "is_causal", True)
+        )
+    eligible = (
+        query.device.type == "xpu"
+        and query.dtype in (torch.bfloat16, torch.float16)
+        and query.shape[-1] in (64, 96, 128, 192)
+        and attention_mask is None
+        and dropout == 0.0
+        and bool(is_causal)
+        and query.shape[-2] == key.shape[-2]
+    )
+    if not eligible:
+        global _hf_xpu_flash_grad_skip_log_done, _hf_xpu_flash_skip_log_done
+        skip_log_done = (
+            _hf_xpu_flash_grad_skip_log_done
+            if torch.is_grad_enabled()
+            else _hf_xpu_flash_skip_log_done
+        )
+        if query.device.type == "xpu" and not skip_log_done:
+            runtime_logger.info(
+                "BioReason HF Qwen xpu_flash=skipped grad=%s dtype=%s head_dim=%d "
+                "mask=%s dropout=%s causal=%s q_len=%d kv_len=%d",
+                torch.is_grad_enabled(),
+                query.dtype,
+                query.shape[-1],
+                "none" if attention_mask is None else tuple(attention_mask.shape),
+                dropout,
+                is_causal,
+                query.shape[-2],
+                key.shape[-2],
+            )
+            if torch.is_grad_enabled():
+                _hf_xpu_flash_grad_skip_log_done = True
+            else:
+                _hf_xpu_flash_skip_log_done = True
+        return sdpa_attention_forward(
+            module,
+            query,
+            key,
+            value,
+            attention_mask,
+            dropout=dropout,
+            scaling=scaling,
+            is_causal=is_causal,
+            **kwargs,
+        )
+
+    global _hf_xpu_flash_log_done
+    if not _hf_xpu_flash_log_done:
+        runtime_logger.info("BioReason HF Qwen xpu_flash=engaged")
+        _hf_xpu_flash_log_done = True
+
+    num_key_value_groups = getattr(module, "num_key_value_groups", 1)
+    key = _repeat_kv_for_xpu_flash(key, num_key_value_groups)
+    value = _repeat_kv_for_xpu_flash(value, num_key_value_groups)
+    query = _to_bshd_memory(query)
+    key = _to_bshd_memory(key)
+    value = _to_bshd_memory(value)
+
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+
+    with sdpa_kernel([SDPBackend.FLASH_ATTENTION]):
+        attn_output = torch.nn.functional.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=None,
+            dropout_p=dropout,
+            scale=scaling,
+            is_causal=True,
+        )
+    return attn_output.transpose(1, 2).contiguous(), None
+
+
+def _bioreason_xpu_flash_mask(**kwargs) -> Optional[torch.Tensor]:
+    if kwargs.get("attention_mask") is None:
+        return None
+
+    from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS
+
+    return ALL_MASK_ATTENTION_FUNCTIONS["sdpa"](**kwargs)
+
+
+def _register_hf_xpu_flash_attention() -> str:
+    from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+    ALL_ATTENTION_FUNCTIONS.register(
+        _HF_XPU_FLASH_ATTENTION_NAME, _bioreason_xpu_flash_attention_forward
+    )
+    ALL_MASK_ATTENTION_FUNCTIONS.register(
+        _HF_XPU_FLASH_ATTENTION_NAME, _bioreason_xpu_flash_mask
+    )
+    runtime_logger.info("BioReason HF Qwen xpu_flash backend registered")
+    return _HF_XPU_FLASH_ATTENTION_NAME
 
 _DEFAULT_BIOREASON_SRC = "/flare/ModCon/ngetty/BioReason-Pro"
 _DEFAULT_BIOREASON_DEPS = "/lus/flare/projects/ModCon/ngetty/bioreason_deps"
@@ -126,6 +280,7 @@ class BioReasonModel(nn.Module):
         disable_protein_splice: bool = False,
         disable_go_splice: bool = False,
         load_backbone: bool = True,
+        backbone_cpu_init: bool = False,
     ):
         super().__init__()
         _ensure_paths()
@@ -165,6 +320,8 @@ class BioReasonModel(nn.Module):
         cfg = AutoConfig.from_pretrained(ckpt_dir, trust_remote_code=True)
         self.hidden_size = cfg.hidden_size
         self.vocab_size = cfg.vocab_size
+        if _USE_HF_XPU_FLASH and attn_implementation == "sdpa":
+            attn_implementation = _register_hf_xpu_flash_attention()
 
         # ── LLM backbone ──────────────────────────────────────────────────────
         # load_backbone=False: the vLLM-HTTP eval client only needs _embed +
@@ -188,6 +345,22 @@ class BioReasonModel(nn.Module):
                 trust_remote_code=True,
                 device_map=self._backbone_device_map,
             )
+        elif backbone_cpu_init:
+            # FSDP1-wrap callers (server/dedicated/colocate mode) shard the backbone
+            # across ranks immediately after construction via FSDP(..., device_id=device)
+            # — FSDP itself moves each rank's SHARD to GPU, not the caller. Calling
+            # .to(device) here would materialize the FULL backbone on every rank's
+            # single tile BEFORE FSDP ever runs, which fits at 4B (~8 GiB) but OOMs at
+            # 32B (~65.6 GiB > one 64 GiB tile, confirmed on HW: every rank hit
+            # `torch.OutOfMemoryError` inside module.py's `.to()` conversion at model
+            # construction, long before the recipe's own FSDP-wrap block executes).
+            # Leave the backbone on CPU/meta and let FSDP's device_id handle placement.
+            self.backbone = AutoModelForCausalLM.from_pretrained(
+                ckpt_dir,
+                torch_dtype=dtype,
+                attn_implementation=attn_implementation,
+                trust_remote_code=True,
+            )
         else:
             self.backbone = AutoModelForCausalLM.from_pretrained(
                 ckpt_dir,
@@ -195,6 +368,11 @@ class BioReasonModel(nn.Module):
                 attn_implementation=attn_implementation,
                 trust_remote_code=True,
             ).to(device)
+        if self.backbone is not None and _USE_HF_XPU_FLASH:
+            runtime_logger.info(
+                "BioReason HF Qwen resolved attn_implementation=%s",
+                self.backbone.config._attn_implementation,
+            )
 
         # ── PEFT-LoRA on the HF backbone (published BioReason-Pro RL recipe) ───
         # The backbone is an HF AutoModelForCausalLM, so we wrap it with PEFT
@@ -579,6 +757,8 @@ class BioReasonModel(nn.Module):
         self,
         prompt_embeds: torch.Tensor,
         completion_ids: torch.Tensor,
+        prompt_lengths: Optional[torch.Tensor] = None,
+        packed_width: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Extend prompt_embeds with completion token embeddings for training forward.
@@ -591,7 +771,28 @@ class BioReasonModel(nn.Module):
         """
         prompt_embeds = prompt_embeds.to(device=self.device, dtype=self.dtype)
         comp_embeds = self._embed(completion_ids.to(self.device))
-        return torch.cat([prompt_embeds, comp_embeds], dim=1)
+        full_embeds = torch.cat([prompt_embeds, comp_embeds], dim=1)
+        if prompt_lengths is None:
+            return full_embeds
+
+        batch_size, max_prompt_length = prompt_embeds.shape[:2]
+        completion_length = completion_ids.shape[1]
+        padding = full_embeds.new_zeros((batch_size, 1, full_embeds.shape[-1]))
+        source_embeds = torch.cat([full_embeds, padding], dim=1)
+        output_positions = torch.arange(
+            packed_width or max_prompt_length + completion_length,
+            device=full_embeds.device,
+        ).unsqueeze(0)
+        prompt_lengths = prompt_lengths.to(full_embeds.device).unsqueeze(1)
+        gather_indices = torch.where(
+            output_positions < prompt_lengths,
+            output_positions,
+            max_prompt_length + output_positions - prompt_lengths,
+        ).clamp_max(source_embeds.shape[1] - 1)
+        return source_embeds.gather(
+            1,
+            gather_indices.unsqueeze(-1).expand(-1, -1, source_embeds.shape[-1]),
+        )
 
     def _get_go_embeds(
         self, go_aspects: list[str], batch_size: int
@@ -610,25 +811,182 @@ class BioReasonModel(nn.Module):
 
     # ── Standard nn.Module forward (inputs_embeds path) ──────────────────────
 
+    def supports_response_only_logits(self) -> bool:
+        """Whether this instance can project only the response span in ``forward``.
+
+        Requires a loaded backbone exposing HF's ``get_output_embeddings()``
+        lm_head (the module the pre-hook attaches to). ``load_backbone=False``
+        clients (vLLM-HTTP eval) have no backbone at all.
+
+        Returns:
+            bool: True when :meth:`forward` honors ``response_prompt_lengths``.
+        """
+        if self.backbone is None:
+            return False
+        getter = getattr(self.backbone, "get_output_embeddings", None)
+        return callable(getter) and getter() is not None
+
     def forward(
         self,
         inputs_embeds: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
+        response_prompt_lengths: Optional[object] = None,
+        response_length: Optional[int] = None,
         **kwargs,
     ) -> torch.Tensor:
         """
         Forward pass using pre-computed inputs_embeds.
-        Returns logits [B, seq_len, vocab_size].
+
+        Args:
+            inputs_embeds (torch.Tensor): ``[B, seq_len, H]`` input embeddings.
+            attention_mask (Optional[torch.Tensor]): ``[B, seq_len]`` padding mask.
+            position_ids (Optional[torch.Tensor]): ``[B, seq_len]`` position IDs.
+            response_prompt_lengths (Optional[object]): When set (an ``int`` or a
+                ``[B]`` ``torch.Tensor``), only the response span's next-token
+                logits are computed — the hidden states are sliced BEFORE the
+                lm_head so the ``[B, seq_len, vocab_size]`` tensor is never
+                materialized. Requires ``response_length``. Bit-identical to
+                slicing the full-width logits afterwards. Gated by the caller
+                (``TORCHTUNE_RESPONSE_ONLY_LOGITS``); default ``None`` reproduces
+                the historical full-width behavior exactly.
+            response_length (Optional[int]): Number of response positions; required
+                with ``response_prompt_lengths``.
+            **kwargs: Extra kwargs forwarded to the HF backbone.
+
+        Returns:
+            torch.Tensor: ``[B, seq_len, vocab_size]`` logits, or
+            ``[B, response_length, vocab_size]`` when ``response_prompt_lengths``
+            is set.
+
+        Raises:
+            ValueError: If exactly one of ``response_prompt_lengths`` /
+                ``response_length`` is supplied.
+            RuntimeError: If a response-only projection is requested but this
+                instance cannot support it (no backbone / no lm_head).
+        """
+        if (response_prompt_lengths is None) != (response_length is None):
+            raise ValueError(
+                "response_prompt_lengths and response_length must be supplied "
+                "together (got response_prompt_lengths=%r, response_length=%r)"
+                % (type(response_prompt_lengths), response_length)
+            )
+        if (
+            _USE_HF_XPU_FLASH
+            and inputs_embeds.device.type == "xpu"
+            and attention_mask is not None
+            and _is_unpadded_or_right_padded(attention_mask)
+        ):
+            attention_mask = None
+            position_ids = None
+
+        hook_handle = None
+        if response_prompt_lengths is not None:
+            if not self.supports_response_only_logits():
+                raise RuntimeError(
+                    "response-only logits requested but this BioReasonModel has no "
+                    "backbone lm_head (load_backbone=False?)"
+                )
+            # Slice at the lm_head's INPUT rather than passing HF's logits_to_keep:
+            # a forward pre-hook is independent of the backbone's forward signature,
+            # so it works identically through PEFT's PeftModelForCausalLM wrapper
+            # (which forwards **kwargs) and any HF version that renamed the kwarg,
+            # and it cannot silently no-op the way an unrecognized kwarg swallowed
+            # by **kwargs would.
+            from torchtune.dev.rl.generation import gather_response_span
+
+            def _slice_hidden_states(_module, args):
+                hidden_states = args[0]
+                return (
+                    gather_response_span(
+                        hidden_states, response_prompt_lengths, response_length
+                    ),
+                    *args[1:],
+                )
+
+            hook_handle = self.backbone.get_output_embeddings().register_forward_pre_hook(
+                _slice_hidden_states
+            )
+        try:
+            out = self.backbone(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                use_cache=False,
+                **kwargs,
+            )
+        finally:
+            if hook_handle is not None:
+                hook_handle.remove()
+        return out.logits
+
+    def embed_completion_ids(self, completion_ids: torch.Tensor) -> torch.Tensor:
+        """Embed completion token IDs with the frozen completion-token lookup.
+
+        Exposes the same ``self._embed`` path :meth:`build_full_embeds` uses, so a
+        caller that already owns the prompt-side activations (e.g. the shared-prefix
+        reference forward) can build only the completion span.
+
+        Args:
+            completion_ids (torch.Tensor): ``[B, C]`` completion token IDs.
+
+        Returns:
+            torch.Tensor: ``[B, C, H]`` embeddings on ``self.device``.
+        """
+        return self._embed(completion_ids.to(self.device))
+
+    def forward_cached(
+        self,
+        inputs_embeds: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        past_key_values: Optional[object] = None,
+        use_cache: bool = True,
+        logits_to_keep: int = 0,
+        **kwargs,
+    ) -> tuple[torch.Tensor, object]:
+        """KV-cache-aware forward returning ``(logits, cache)``.
+
+        Companion to :meth:`forward` for the exact shared-prefix reference forward
+        (``TORCHTUNE_REF_PREFIX_SHARE=1``, see
+        :mod:`torchtune.dev.rl.ref_prefix_share`). Kept separate from
+        :meth:`forward` so the production training path's signature and its
+        ``use_cache=False`` guarantee are untouched.
+
+        Unlike :meth:`forward`, this deliberately does **not** null out a
+        right-padded ``attention_mask`` to re-enable the XPU flash kernel. With a
+        populated cache the query and key lengths differ, and SDPA's
+        ``is_causal=True`` shortcut means *top-left* alignment — the wrong mask for
+        a cached suffix, which needs *bottom-right* alignment. Dropping the mask
+        here would silently compute incorrect logits rather than merely slower
+        ones. The caller is responsible for passing a full-width
+        (``prefix + suffix``) mask on cached calls.
+
+        Args:
+            inputs_embeds (torch.Tensor): ``[B, S, H]`` input embeddings.
+            attention_mask (Optional[torch.Tensor]): ``[B, kv_len]`` mask spanning the
+                cached prefix plus this call's queries.
+            position_ids (Optional[torch.Tensor]): ``[B, S]`` positions, or ``None``
+                to let the backbone derive them from the cache offset.
+            past_key_values (Optional[object]): a ``transformers`` cache, or ``None``.
+            use_cache (bool): whether the backbone should populate/extend the cache.
+            logits_to_keep (int): if > 0, only compute logits for the final
+                ``logits_to_keep`` positions.
+            **kwargs: forwarded to the backbone.
+
+        Returns:
+            tuple[torch.Tensor, object]: ``(logits, past_key_values)``.
         """
         out = self.backbone(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            use_cache=False,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            logits_to_keep=logits_to_keep,
             **kwargs,
         )
-        return out.logits
+        return out.logits, out.past_key_values
 
     def trainable_parameters(self):
         """Yield (name, param) for trainable parameters (backbone + projectors)."""

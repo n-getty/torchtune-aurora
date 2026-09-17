@@ -57,6 +57,7 @@ class BioReasonRLDataset(Dataset):
         num_go_tokens: int = 200,
         answer_column: str = "go_ids",
         inject_go_pred: bool = False,
+        add_uniprot_summary: bool = False,
     ):
         self.tokenizer = tokenizer
         self.max_seq_len = max_seq_len
@@ -79,6 +80,14 @@ class BioReasonRLDataset(Dataset):
         # legacy cold-prompt path byte-identical for A/B. See
         # memory/project_bioreason_eval_fixed_rl_flat_vs_sft_20260626.
         self.inject_go_pred = inject_go_pred
+        # Prompt-distribution match for the v8 32B SFT checkpoint (trained with
+        # add_uniprot_summary=True in sft_bioreason_qwen3_32B_lora_r128_lrsched_v8_xpu.yaml):
+        # appends " Summarize in UniProt format." to the user prompt, matching
+        # dataset_sft.py's identical suffix byte-for-byte. Without this, RL trains on a
+        # prompt distribution the SFT policy never saw — the same class of RL/SFT
+        # distribution mismatch already root-caused once for inject_go_pred (see
+        # memory/project_bioreason_eval_fixed_rl_flat_vs_sft_20260626).
+        self.add_uniprot_summary = bool(add_uniprot_summary)
 
         self.examples = self._load(data_files)
         logger.info(f"Loaded {len(self.examples)} BioReason RL examples from {data_files}")
@@ -168,6 +177,10 @@ class BioReasonRLDataset(Dataset):
         go_aspects_suffix = (
             f" and focus more on its {', '.join(aspects)}." if aspects else "."
         )
+        uniprot_summary_suffix = (
+            " Summarize in UniProt format."
+            if getattr(self, "add_uniprot_summary", False) else ""
+        )
 
         if ppi_data and (interpro_data or go_spec):
             user = (
@@ -178,6 +191,7 @@ class BioReasonRLDataset(Dataset):
                 f"And the following initial GO term speculations:\n"
                 f"{go_spec if go_spec else 'None'}\n\n"
                 f"Reason about the function of the protein{go_aspects_suffix}"
+                f"{uniprot_summary_suffix}"
             )
         else:
             user = (
@@ -327,6 +341,7 @@ def bioreason_rl_dataset(
     num_go_tokens: int = 200,
     answer_column: str = "go_ids",
     inject_go_pred: bool = False,
+    add_uniprot_summary: bool = False,
 ) -> BioReasonRLDataset:
     """TorchTune component factory for use in YAML configs."""
     return BioReasonRLDataset(
@@ -337,6 +352,7 @@ def bioreason_rl_dataset(
         num_go_tokens=num_go_tokens,
         answer_column=answer_column,
         inject_go_pred=inject_go_pred,
+        add_uniprot_summary=add_uniprot_summary,
     )
 
 

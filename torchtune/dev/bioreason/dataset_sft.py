@@ -39,6 +39,13 @@ logger = logging.getLogger(__name__)
 DEFAULT_PROTEIN_TOKEN_ID = 262142  # <unused6225>
 DEFAULT_GO_TOKEN_ID = 262143  # <unused6226>
 
+# Floor for every rerank_target verbalized score. cafa_eval sweeps tau in
+# (th_step, 1, th_step) — a term scored below th_step is skipped at every tested
+# threshold, i.e. invisible to the eval regardless of how the model ranked it. th_step=0.05
+# is the value the parallel scorer (experiments/bioreason/score_fmax_scored.py) evaluates
+# at; keep this floor in sync with that value.
+_RERANK_MIN_SCORE = 0.05
+
 
 def _nonempty(v) -> bool:
     if v is None:
@@ -102,7 +109,76 @@ class BioReasonSFTDataset(Dataset):
             memory/project_bioreason_32b_capability_push_20260718.md). The curated
             reasoning+final_answer trace is kept BEFORE the appended list (coherence +
             reasoning-derived terms not in go_pred are preserved). Mutually exclusive with
-            exhaustive_target (only one may be True). Default: False.
+            exhaustive_target and rerank_target (only one may be True). Default: False.
+        rerank_target (bool): append a per-candidate VERBALIZED SCORE list ("GO:0005515
+            0.92") after the curated reasoning+final_answer trace, instead of a bare term
+            list. Candidates are the in-prompt go_pred terms (self._gopred_terms); the
+            target score for each is a frozen empirical prior (P(correct | in go_pred),
+            built by scripts/build_gopred_prior.py over TRAIN shards only) when the term
+            IS in this example's ground truth, and its complement (1 - prior) when it is
+            not — varied per-term targets instead of a binary 0/1 mask, so the CAFA eval's
+            own tau sweep (which already takes an argmax over confidence thresholds) has a
+            real per-term signal to rank against instead of a single degenerate threshold.
+            Every emitted score is floored at ``_RERANK_MIN_SCORE`` so it remains visible at
+            the eval's tested tau range. Candidates are selected/ordered by descending prior
+            confidence so, if the per-example token budget is tight, the most informative
+            terms survive the cut (see rerank_max_candidates and the room-based capping in
+            __getitem__ — never a fixed candidate count, since a fixed cap truncates on the
+            long-prompt tail). Requires rerank_prior_path. Mutually exclusive with
+            exhaustive_target and append_gopred_target. Default: False.
+        rerank_prior_path (Optional[str]): path to the frozen per-term prior JSON built by
+            scripts/build_gopred_prior.py (``{"global_rate": float, "terms": {term:
+            {"reliability": float, ...}}}``). Required when rerank_target=True; loaded once
+            at construction. Terms absent from the prior fall back to its global_rate.
+            Optional when keep_list_target=True — if given, surviving candidates are
+            ordered by descending prior confidence (matches rerank_target); if omitted,
+            keep_list_target keeps go_pred's original first-seen order.
+        rerank_max_candidates (Optional[int]): optional hard cap on the number of scored
+            candidates considered, applied BEFORE the room-based cap (after sorting by
+            descending prior confidence). Default: None (uncapped; room is the only limit).
+        rerank_candidates_first (bool): put the scored candidate list BEFORE the curated
+            reasoning trace instead of after (default False = trace-then-candidates, the
+            original design). Rationale: eval-time generation was observed to sometimes
+            derail into a repetition loop WHILE producing the trace and never reach the
+            scored list at all — putting the highest-value content first means a
+            mid-generation derailment still preserves it. This is a DIFFERENT fix from
+            raising the eval token budget (which recovers truncated-list coverage but,
+            measured directly, barely moves F_max since most recovered terms are
+            ancestor-redundant with terms already emitted — see
+            memory/project_bioreason_rerank_eval_max_new_tokens_768_truncates_candidate_list_20260807.md).
+            Under this ordering a tight room budget truncates the TRACE, not candidates
+            (the reverse priority from the default). Default: False.
+        rerank_rank_only (bool): ABLATION. When True, emit bare "GO:0005515" lines (no
+            verbalized score digits) instead of "GO:0005515 0.92" — candidate SELECTION
+            and ORDER (by descending prior confidence) are unchanged, only the score
+            token sequence is dropped. Isolates whether the model benefits from being
+            asked to reproduce a per-example score at all, vs. whether the format's
+            value is entirely in the (protein-conditioned) subset/order of terms it
+            emits. Motivation: `_rerank_score` is a frozen, protein-INDEPENDENT lookup
+            (same value for a given term regardless of which protein it's scoring, see
+            `_rerank_score` docstring) — the model has nothing protein-specific to learn
+            from the score digits themselves, and each digit is an independent
+            150K-way CE classification with no numeric inductive bias (predicting "9"
+            for a target of "8" is exactly as wrong as predicting "1"). Requires
+            rerank_target=True (this only changes how rerank_target's candidate lines
+            are rendered, not candidate selection/ordering). Default: False. See
+            memory/project_bioreason_rerank_score_digit_ablation_20260807.md.
+        keep_list_target (bool): append a BINARY keep-list — bare "GO:0005515" lines,
+            candidates-first, emitting ONLY the in-prompt go_pred candidates that are
+            ALSO in this example's ground truth. Dropped (non-GT) candidates are simply
+            absent from the target — no score digits, no explicit negative-class lines.
+            This is a per-candidate FILTERING task: go_pred and the GT (go_bp/mf/cc) both
+            come from the training row itself, so labeling which in-prompt candidates are
+            correct is not leakage of held-out information, only of this row's own label.
+            Candidates-first is NOT configurable for this mode (unlike
+            rerank_candidates_first) — the list is always emitted before the trace, so a
+            tight token budget truncates the trace, never the list, removing by
+            construction the early-stopping failure mode observed on rerank_rank_only
+            (see that flag's docstring). If rerank_prior_path is also given, surviving
+            candidates are ordered by descending prior confidence (matches rerank_target);
+            otherwise they keep go_pred's original first-seen order. Mutually exclusive
+            with exhaustive_target, append_gopred_target, and rerank_target. Default:
+            False.
         bp_oversample_factor (float): duplicate examples whose ``go_bp`` column is
             non-empty this many times in ``self.examples`` (e.g. 2.0 = each BP-containing
             row appears twice, giving it ~2x its natural per-epoch sampling frequency).
@@ -133,13 +209,26 @@ class BioReasonSFTDataset(Dataset):
         go_pred_dropout_seed: int = 0,
         exhaustive_target: bool = False,
         append_gopred_target: bool = False,
+        rerank_target: bool = False,
+        rerank_prior_path: Optional[str] = None,
+        rerank_max_candidates: Optional[int] = None,
+        rerank_candidates_first: bool = False,
+        rerank_rank_only: bool = False,
+        keep_list_target: bool = False,
+        keep_list_prefix: bool = False,
         bp_oversample_factor: float = 1.0,
+        add_uniprot_summary: bool = False,
     ):
-        if exhaustive_target and append_gopred_target:
+        if sum([exhaustive_target, append_gopred_target, rerank_target, keep_list_target]) > 1:
             raise ValueError(
-                "exhaustive_target and append_gopred_target are mutually exclusive "
-                "(both append a term list to the target; pick one)."
+                "exhaustive_target, append_gopred_target, rerank_target, and "
+                "keep_list_target are mutually exclusive (all four append a term list "
+                "to the target; pick one)."
             )
+        if rerank_target and not rerank_prior_path:
+            raise ValueError("rerank_target=True requires rerank_prior_path.")
+        if rerank_rank_only and not rerank_target:
+            raise ValueError("rerank_rank_only=True requires rerank_target=True.")
         if bp_oversample_factor < 1.0:
             raise ValueError(
                 f"bp_oversample_factor must be >= 1.0 (1.0 = off); got "
@@ -169,6 +258,34 @@ class BioReasonSFTDataset(Dataset):
         # Approach B: append the IN-PROMPT go_pred terms (no GT leak) to the target so the
         # model learns to natively preserve go_pred's breadth on top of its own reasoning.
         self.append_gopred_target = bool(append_gopred_target)
+        # Per-candidate reranking: append a verbalized {term: score} list instead of a bare
+        # term list, with scores drawn from a frozen train-only empirical prior (loaded once
+        # here; see the docstring above and scripts/build_gopred_prior.py).
+        self.rerank_target = bool(rerank_target)
+        self.rerank_max_candidates = rerank_max_candidates
+        self.rerank_candidates_first = bool(rerank_candidates_first)
+        self.rerank_rank_only = bool(rerank_rank_only)
+        # Binary keep-list mode: candidates-first, bare in-GT-only lines (see docstring).
+        # Was previously accepted as a constructor arg but never assigned to self — every
+        # __new__-bypass CPU test missed this because they set attributes directly; only a
+        # real-constructor test (see test_keep_list_attribute_is_set) catches it.
+        self.keep_list_target = bool(keep_list_target)
+        self.keep_list_prefix = bool(keep_list_prefix)
+        if self.keep_list_prefix and not self.keep_list_target:
+            raise ValueError("keep_list_prefix=True requires keep_list_target=True.")
+        # Parity with rbdgx3's recipe (BioReason-Pro/bioreason2/dataset/cafa5/load.py
+        # _format_reasoning_prompt/_add_uniprot_summary): inject a "- UniProt Summary: "
+        # line (from the row's protein_function column) as the second line of the target,
+        # and add a "Summarize in UniProt format." instruction to the prompt. Off by
+        # default — every existing Aurora checkpoint trained without this field.
+        self.add_uniprot_summary = bool(add_uniprot_summary)
+        self._rerank_prior: dict = {}
+        self._rerank_global_rate: float = 0.5
+        if self.rerank_target or (self.keep_list_target and rerank_prior_path):
+            with open(rerank_prior_path) as f:
+                prior = json.load(f)
+            self._rerank_prior = prior["terms"]
+            self._rerank_global_rate = float(prior["global_rate"])
         self.examples = self._load(data_files)
         logger.info(
             "Loaded %d BioReason SFT examples from %s", len(self.examples), data_files
@@ -314,10 +431,12 @@ class BioReasonSFTDataset(Dataset):
         non-native _format_reasoning_prompt path — this checkpoint's native
         BioReasonSFTDataset._build_prompt_text had no equivalent knob until now,
         closing gap #6 in docs/reports/bioreason_ablations_headline_findings_20260730.md).
-        Default True = unchanged prior behavior. There is no
-        include_protein_function_summary equivalent here — this prompt format
-        never includes a protein_function/UniProt-summary field at all, unlike the
-        published paper's format_cafa5_for_protein_llm.
+        Default True = unchanged prior behavior.
+
+        self.add_uniprot_summary appends " Summarize in UniProt format." to the user
+        prompt (matching rbdgx3's CAFA5_REASONING_TEMPLATE_WITH_CONTEXT_PPI_UNIPROT
+        user_prompt's `{uniprot_summary}` slot exactly — verbatim string, byte-for-byte).
+        Off by default: every existing Aurora checkpoint trained without this suffix.
         """
         org = ex.get("organism", "") or "Unknown"
         interpro_data = (ex.get("interpro_formatted", "") or "") if interpro_in_prompt else ""
@@ -335,6 +454,10 @@ class BioReasonSFTDataset(Dataset):
             f" and focus more on its {', '.join(aspects)}." if aspects else "."
         )
 
+        uniprot_summary_suffix = (
+            " Summarize in UniProt format."
+            if getattr(self, "add_uniprot_summary", False) else ""
+        )
         if ppi_data and (interpro_data or go_spec):
             user = (
                 f"Given the protein above from organism {org} with the following InterPro "
@@ -344,6 +467,7 @@ class BioReasonSFTDataset(Dataset):
                 f"And the following initial GO term speculations:\n"
                 f"{go_spec if go_spec else 'None'}\n\n"
                 f"Reason about the function of the protein{go_aspects_suffix}"
+                f"{uniprot_summary_suffix}"
             )
         else:
             user = (
@@ -390,6 +514,10 @@ class BioReasonSFTDataset(Dataset):
         ids += self._strip_bos(
             tok.encode("\nReasoning:\n", add_bos=False, add_eos=False), bos
         )
+        if self.keep_list_prefix:
+            ids += self._strip_bos(
+                tok.encode("GO terms:\n", add_bos=False, add_eos=False), bos
+            )
         return ids
 
     @staticmethod
@@ -429,9 +557,284 @@ class BioReasonSFTDataset(Dataset):
                 out.append(t)
         return out
 
-    def _build_target_ids(self, ex: dict) -> list[int]:
+    def _rerank_confidence(self, term: str) -> float:
+        """Prior reliability for `term` (fallback to the global rate for unseen terms).
+        Used to ORDER candidates so, under a cap, the most informative terms survive."""
+        entry = self._rerank_prior.get(term)
+        return entry["reliability"] if entry is not None else self._rerank_global_rate
+
+    def _rerank_score(self, term: str, in_gt: bool) -> float:
+        """Graded target score for `term`: its prior reliability if this example's GT
+        contains it, the complement otherwise. Floored at _RERANK_MIN_SCORE so the term
+        stays visible at every tau the eval sweeps (see module-level constant)."""
+        reliability = self._rerank_confidence(term)
+        score = reliability if in_gt else (1.0 - reliability)
+        return max(score, _RERANK_MIN_SCORE)
+
+    def _build_rerank_target_ids(
+        self, ex: dict, trace_text: str, room: Optional[int]
+    ) -> list[int]:
+        """Append a verbalized per-candidate score list ("GO:0005515 0.92") to the
+        curated trace. Candidates are the in-prompt go_pred terms, ordered by descending
+        prior confidence so a tight room budget drops the LEAST informative terms first.
+
+        `self.rerank_candidates_first` (default False) controls ORDER: candidates-then-
+        trace (default, matches the original design) puts the curated reasoning trace
+        first and the scored list last, so a tight room budget truncates candidates,
+        not the trace. Candidates-first puts the scored list FIRST and the trace last,
+        so a tight budget truncates the (lower-value) trace instead — tested as a lever
+        against eval-time generation derailing into repetition before ever reaching the
+        list (see the rerank eval max_new_tokens/ancestor-propagation investigation:
+        raising the eval token budget recovered coverage 33%->90% but did NOT move
+        F_max, since most of the recovered terms were ancestor-redundant with terms
+        already emitted — this reordering targets a DIFFERENT failure, generation
+        collapsing during the trace and never reaching the list at all, not budget).
+
+        When `room` is None (the compute_lengths length-estimation path), the full
+        candidate list is encoded uncapped — compute_lengths clips the (prompt+target)
+        SUM to max_seq_len itself, same as every other target mode.
+
+        When `room` is given (the real __getitem__ path), whichever section comes
+        SECOND is added WHOLE-LINE-AT-A-TIME (candidates) or right-truncated (trace,
+        which has no comparable "whole unit" concept) up to the budget, and EOS is
+        always appended last within budget — the fix for Risk 2 (a naive right-slice
+        truncates the tail, including a partially-emitted GO id, and drops EOS first
+        since _build_target_ids appends it last)."""
+        gt = set(self._gt_terms(ex))
+        candidates = sorted(self._gopred_terms(ex), key=self._rerank_confidence, reverse=True)
+        if self.rerank_max_candidates is not None:
+            candidates = candidates[: self.rerank_max_candidates]
+        if getattr(self, "rerank_rank_only", False):
+            # Ablation: same selection/order, no verbalized score digits.
+            lines = list(candidates)
+        else:
+            lines = [
+                f"{t} {self._rerank_score(t, t in gt):.2f}" for t in candidates
+            ]
+        rank_only = getattr(self, "rerank_rank_only", False)
+        header_label = "GO terms:" if rank_only else "GO terms (scored):"
+        candidates_first = getattr(self, "rerank_candidates_first", False)
+        if candidates_first:
+            # No candidates: no header, and the trace follows directly (no leading blank
+            # section). header/footer separate the list from the trace either way.
+            header = f"{header_label}\n" if candidates else ""
+            footer = "\n\n" if candidates else ""
+            target = header + "\n".join(lines) + footer + trace_text
+        else:
+            # No candidates (empty go_pred, e.g. under go_pred_dropout): no header
+            # either — an empty header section would just teach a hollow boilerplate
+            # line.
+            header = f"\n\n{header_label}\n" if candidates else ""
+            target = trace_text + header + "\n".join(lines)
+
+        if room is None:
+            ids = self.tokenizer.encode(target, add_bos=False, add_eos=True)
+            return self._strip_bos(ids, self.tokenizer.bos_id)
+
+        eos_id = self.tokenizer.eos_id
+
+        if candidates_first:
+            return self._fit_candidates_first(
+                candidates, lines, header, footer, trace_text, room, eos_id, ex,
+            )
+        return self._fit_trace_first(lines, header, trace_text, room, eos_id, ex, candidates)
+
+    def _fit_trace_first(
+        self, lines: list[str], header: str, trace_text: str, room: int,
+        eos_id: int, ex: dict, candidates: list[str],
+    ) -> list[int]:
+        """Original ordering: trace+header is the fixed prefix, candidates fill
+        remaining room whole-line-at-a-time. A tight budget drops candidates first."""
+        prefix_ids = self._strip_bos(
+            self.tokenizer.encode(trace_text + header, add_bos=False, add_eos=False),
+            self.tokenizer.bos_id,
+        )
+        budget = room - len(prefix_ids) - 1  # reserve exactly 1 slot for EOS
+
+        if budget < 0:
+            # Even the trace+header alone doesn't fit — fail visibly rather than
+            # silently emitting a target with no EOS. This is the same "prompt-shaped
+            # room can't fit even the minimum target" failure _filter_over_length
+            # exists to keep rare; surfacing it here rather than truncating mid-trace
+            # avoids training on an EOS-less example.
+            logger.warning(
+                "rerank_target: trace+header (%d tok) exceeds available room (%d) — "
+                "truncating the trace itself, ALL %d candidates dropped.",
+                len(prefix_ids), room, len(candidates),
+            )
+            trunc = prefix_ids[: max(room - 1, 0)]
+            return trunc + ([eos_id] if room > 0 else [])
+
+        included: list[int] = []
+        n_included = 0
+        for i, line in enumerate(lines):
+            piece = ("\n" + line) if i > 0 else line
+            line_ids = self._strip_bos(
+                self.tokenizer.encode(piece, add_bos=False, add_eos=False),
+                self.tokenizer.bos_id,
+            )
+            if len(line_ids) > budget:
+                break
+            included.extend(line_ids)
+            budget -= len(line_ids)
+            n_included += 1
+
+        if n_included < len(candidates):
+            self._rerank_dropped_candidates = (
+                getattr(self, "_rerank_dropped_candidates", 0)
+                + (len(candidates) - n_included)
+            )
+            logger.warning(
+                "rerank_target: room-capped %d/%d candidates for protein %s "
+                "(room=%d); running total dropped=%d.",
+                len(candidates) - n_included, len(candidates),
+                ex.get("protein_id", "?"), room, self._rerank_dropped_candidates,
+            )
+
+        return prefix_ids + included + [eos_id]
+
+    def _fit_candidates_first(
+        self, candidates: list[str], lines: list[str], header: str, footer: str,
+        trace_text: str, room: int, eos_id: int, ex: dict, target_label: str = "rerank_target",
+    ) -> list[int]:
+        """Candidates-first ordering: the scored list (header+lines) is the fixed
+        prefix, the trace fills remaining room, right-truncated if necessary. A tight
+        budget truncates the (lower-value) trace instead of dropping candidates."""
+        header_ids = self._strip_bos(
+            self.tokenizer.encode(header, add_bos=False, add_eos=False),
+            self.tokenizer.bos_id,
+        )
+        line_ids_list = [
+            self._strip_bos(
+                self.tokenizer.encode(("\n" + line) if i > 0 else line,
+                                       add_bos=False, add_eos=False),
+                self.tokenizer.bos_id,
+            )
+            for i, line in enumerate(lines)
+        ]
+        total_line_tokens = sum(len(l) for l in line_ids_list)
+        # Candidates are the fixed, highest-priority prefix — included in full
+        # regardless of room. If they alone (plus footer, minus EOS) exceed room,
+        # there's no space left for the trace or EOS; fail loudly rather than
+        # silently emit a truncated candidate list (which would corrupt the very
+        # thing this reordering exists to protect).
+        footer_ids = self._strip_bos(
+            self.tokenizer.encode(footer, add_bos=False, add_eos=False),
+            self.tokenizer.bos_id,
+        ) if footer else []
+        prefix_len = len(header_ids) + total_line_tokens + len(footer_ids)
+        budget = room - prefix_len - 1  # reserve exactly 1 slot for EOS
+
+        if budget < 0:
+            logger.warning(
+                "%s (candidates_first): candidate list+header+footer (%d tok) "
+                "exceeds available room (%d) for protein %s — candidates take priority, "
+                "so the TRACE is dropped entirely (0 trace tokens) rather than "
+                "truncating any candidate line.",
+                target_label, prefix_len, room, ex.get("protein_id", "?"),
+            )
+            # Still can't fit even the bare candidate list — this is the equivalent
+            # of _fit_trace_first's "trace+header exceeds room" failure, just with
+            # the roles reversed. Fall back to truncating the candidate BLOCK from
+            # the end (drops lowest-confidence lines first, same priority as
+            # _fit_trace_first's normal room-capping) until it plus EOS fits.
+            prefix_ids = header_ids
+            for l in line_ids_list:
+                prefix_ids = prefix_ids + l
+            trunc = prefix_ids[: max(room - 1, 0)]
+            return trunc + ([eos_id] if room > 0 else [])
+
+        trace_ids = self._strip_bos(
+            self.tokenizer.encode(trace_text, add_bos=False, add_eos=False),
+            self.tokenizer.bos_id,
+        )
+        if len(trace_ids) > budget:
+            self._rerank_trace_truncated = getattr(self, "_rerank_trace_truncated", 0) + 1
+            logger.warning(
+                "%s (candidates_first): trace truncated from %d to %d "
+                "tokens for protein %s (all %d candidates preserved); running total "
+                "trace-truncations=%d.",
+                target_label, len(trace_ids), budget, ex.get("protein_id", "?"), len(candidates),
+                self._rerank_trace_truncated,
+            )
+            trace_ids = trace_ids[:budget]
+
+        out = list(header_ids)
+        for l in line_ids_list:
+            out.extend(l)
+        out.extend(footer_ids)
+        out.extend(trace_ids)
+        out.append(eos_id)
+        return out
+
+    def _build_keep_list_target_ids(
+        self, ex: dict, trace_text: str, room: Optional[int]
+    ) -> list[int]:
+        """Append a BINARY keep-list — bare in-GT-only candidate lines, ALWAYS
+        candidates-first (see keep_list_target docstring). Reuses _fit_candidates_first
+        as-is: it already fixes the list as the priority prefix, truncates the trace
+        (never candidates) under a tight room budget, adds lines whole-line-at-a-time
+        so a GO id is never half-emitted, and reserves exactly one EOS slot."""
+        gt = set(self._gt_terms(ex))
+        candidates = [t for t in self._gopred_terms(ex) if t in gt]
+        if self._rerank_prior:
+            candidates = sorted(candidates, key=self._rerank_confidence, reverse=True)
+        if self.rerank_max_candidates is not None:
+            candidates = candidates[: self.rerank_max_candidates]
+        lines = list(candidates)
+
+        header = "" if getattr(self, "keep_list_prefix", False) else ("GO terms:\n" if candidates else "")
+        footer = "\n\n" if candidates else ""
+        target = header + "\n".join(lines) + footer + trace_text
+
+        if room is None:
+            ids = self.tokenizer.encode(target, add_bos=False, add_eos=True)
+            return self._strip_bos(ids, self.tokenizer.bos_id)
+
+        return self._fit_candidates_first(
+            candidates, lines, header, footer, trace_text, room, self.tokenizer.eos_id, ex,
+            target_label="keep_list_target",
+        )
+
+    def _build_append_gopred_target_ids(
+        self, ex: dict, trace_text: str, room: Optional[int]
+    ) -> list[int]:
+        """Append every in-prompt go_pred term without slicing through its tail.
+
+        The candidate list is the highest-value part of this target because its purpose is
+        to teach breadth. Under a tight room budget, preserve complete GO-term lines and
+        truncate only the reasoning trace, while always reserving EOS.
+        """
+        candidates = self._gopred_terms(ex)
+        lines = list(candidates)
+        header = "GO terms:\n" if candidates else ""
+        footer = "\n\n" if candidates else ""
+        target = header + "\n".join(lines) + footer + trace_text
+        if room is None:
+            ids = self.tokenizer.encode(target, add_bos=False, add_eos=True)
+            return self._strip_bos(ids, self.tokenizer.bos_id)
+        return self._fit_candidates_first(
+            candidates, lines, header, footer, trace_text, room, self.tokenizer.eos_id, ex,
+            target_label="append_gopred_target",
+        )
+
+    @staticmethod
+    def _add_uniprot_summary_line(final_answer: str, protein_function: str) -> str:
+        """Insert '- UniProt Summary: {protein_function}' as the second line of
+        final_answer. Verbatim port of BioReason-Pro's
+        bioreason2.dataset.cafa5.load._add_uniprot_summary — same line-1-insertion
+        logic, same field, so the target text is byte-identical to rbdgx3's when
+        add_uniprot_summary=True."""
+        lines = final_answer.split("\n")
+        return lines[0] + "\n- UniProt Summary: " + (protein_function or "").strip() + "\n" + "\n".join(lines[1:])
+
+    def _build_target_ids(
+        self, ex: dict, room: Optional[int] = None
+    ) -> list[int]:
         reasoning = ex.get("reasoning", "") or ""
         final = ex.get("final_answer", "") or ""
+        if getattr(self, "add_uniprot_summary", False):
+            final = self._add_uniprot_summary_line(final, ex.get("protein_function", ""))
         if self.train_on_reasoning and reasoning:
             target = f"{reasoning}\n{final}"
         else:
@@ -451,9 +854,11 @@ class BioReasonSFTDataset(Dataset):
         # memory/project_bioreason_32b_capability_push_20260718.md for the post-hoc-union
         # diagnostic (+0.067 F_max, zero training) that motivated this.
         elif self.append_gopred_target:
-            terms = self._gopred_terms(ex)
-            if terms:
-                target = f"{target}\n\nGO terms: " + ", ".join(terms)
+            return self._build_append_gopred_target_ids(ex, target, room)
+        elif self.rerank_target:
+            return self._build_rerank_target_ids(ex, target, room)
+        elif self.keep_list_target:
+            return self._build_keep_list_target_ids(ex, target, room)
         ids = self.tokenizer.encode(target, add_bos=False, add_eos=True)
         return self._strip_bos(ids, self.tokenizer.bos_id)
 
@@ -488,7 +893,6 @@ class BioReasonSFTDataset(Dataset):
             ex = {**ex, "go_pred": ""}
 
         prompt_ids = self._build_prompt_ids(ex, protein_seq)
-        target_ids = self._build_target_ids(ex)
 
         # Budget: keep the FULL prompt (the placeholder runs are load-bearing for the
         # embed-splice and must never be cut) and truncate the TARGET from the right to
@@ -502,10 +906,43 @@ class BioReasonSFTDataset(Dataset):
                 f"{self.num_go_tokens} GO + text) exceeds max_seq_len={self.max_seq_len}. "
                 f"Raise max_seq_len or lower max_protein_len/num_go_tokens."
             )
+        # rerank_target respects `room` internally (whole-line capping, EOS reserved —
+        # see _build_rerank_target_ids); other modes build the full target uncapped and
+        # rely on the right-slice below, same as before this cap-instrumentation was added.
+        target_ids = self._build_target_ids(ex, room=room_for_target)
+        if len(target_ids) > room_for_target:
+            self._trunc_dropped_examples = getattr(self, "_trunc_dropped_examples", 0) + 1
+            logger.warning(
+                "Target truncated from %d to %d tokens for protein %s (right-slice — "
+                "EOS and/or trailing content dropped; running total truncated=%d). See "
+                "Risk 2 in the rerank-target design notes.",
+                len(target_ids), room_for_target, ex.get("protein_id", "?"),
+                self._trunc_dropped_examples,
+            )
         target_ids = target_ids[:room_for_target]
 
         tokens = prompt_ids + target_ids
-        labels = [CROSS_ENTROPY_IGNORE_IDX] * len(prompt_ids) + list(target_ids)
+        # Labels are SHIFTED one position left relative to tokens (torchtune convention,
+        # see torchtune/datasets/_sft.py): the hidden state at position i predicts
+        # token i+1. Position len(prompt_ids)-1 (the last prompt token) is the first
+        # supervised position — it predicts target_ids[0]. The final position has no
+        # successor, so it is IGNORE.
+        #
+        # Do NOT write `labels[i] = tokens[i]`. Under causal attention position i has
+        # already attended to token i, so an unshifted label makes the objective "copy
+        # the token you can already see" — an identity map the trainable projector
+        # solves alone, driving loss to ~0.001 while teaching nothing about next-token
+        # prediction. That was the pre-2026-08-05 behavior and it silently degraded
+        # every 32B SFT checkpoint. Regression-guarded by
+        # tests/torchtune/dev/bioreason/test_sft_label_shift.py.
+        labels = (
+            [CROSS_ENTROPY_IGNORE_IDX] * (len(prompt_ids) - 1)
+            + list(target_ids)
+            + [CROSS_ENTROPY_IGNORE_IDX]
+        )
+        assert len(labels) == len(tokens), (
+            f"label/token length desync ({len(labels)} vs {len(tokens)})"
+        )
 
         # Invariant: placeholder counts intact (prompt was never truncated).
         n_prot = sum(1 for t in tokens if t == self.protein_token_id)
@@ -895,7 +1332,15 @@ def bioreason_sft_dataset(
     go_pred_dropout_seed: int = 0,
     exhaustive_target: bool = False,
     append_gopred_target: bool = False,
+    rerank_target: bool = False,
+    rerank_prior_path: Optional[str] = None,
+    rerank_max_candidates: Optional[int] = None,
+    rerank_candidates_first: bool = False,
+    rerank_rank_only: bool = False,
+    keep_list_target: bool = False,
+    keep_list_prefix: bool = False,
     bp_oversample_factor: float = 1.0,
+    add_uniprot_summary: bool = False,
 ) -> BioReasonSFTDataset:
     """TorchTune component factory (YAML config entry point)."""
     return BioReasonSFTDataset(
@@ -913,5 +1358,13 @@ def bioreason_sft_dataset(
         go_pred_dropout_seed=go_pred_dropout_seed,
         exhaustive_target=exhaustive_target,
         append_gopred_target=append_gopred_target,
+        rerank_target=rerank_target,
+        rerank_prior_path=rerank_prior_path,
+        rerank_max_candidates=rerank_max_candidates,
+        rerank_candidates_first=rerank_candidates_first,
+        rerank_rank_only=rerank_rank_only,
+        keep_list_target=keep_list_target,
+        keep_list_prefix=keep_list_prefix,
         bp_oversample_factor=bp_oversample_factor,
+        add_uniprot_summary=add_uniprot_summary,
     )

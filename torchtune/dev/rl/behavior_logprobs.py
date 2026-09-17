@@ -48,7 +48,9 @@ __all__ = [
     "require_processed_mode",
     "rows_needing_fallback",
     "build_behavior_logprobs",
+    "fit_behavior_logprobs_width",
     "broadcast_behavior_logprobs",
+    "audit_behavior_logprobs",
 ]
 
 PROCESSED_LOGPROBS_MODE = "processed_logprobs"
@@ -195,6 +197,139 @@ def build_behavior_logprobs(
                 list(lp[:used]), dtype=dtype, device=device
             )
     return out
+
+
+def fit_behavior_logprobs_width(
+    behavior: torch.Tensor,
+    width: int,
+) -> torch.Tensor:
+    """Narrow a ``[num_seqs, cap]`` behavior tensor to the batch's ACTUAL response width.
+
+    WHY THIS EXISTS (a real crash, not a defensive nicety). ``build_behavior_logprobs``
+    returns the width it is told, which is ``max_generated_tokens`` -- the *cap*. The
+    trainer's ``responses`` tensor is instead the *actual* longest generation in the
+    batch, which equals the cap only when some row ran to the limit. On job 8833972 steps
+    0 and 1 both had such a row (width 3072) and looked fine; step 2's longest generation
+    was 1743 and the run died in ``logprobs.masked_fill_(response_padding_masks, 1.0)``
+    with "expanded size of the tensor (3072) must match the existing size (1743)".
+
+    The bug survived the audit because ``TORCHTUNE_BLP_AUDIT`` forces the recompute
+    branch: disabling the shortcut in order to measure it also disabled its plumbing, so
+    the audited steps exercised numerics the production path never reached. Hence the
+    loud error below rather than a silent reshape -- a width that is *larger* than the
+    cap means the caller's assumptions are wrong, and quietly padding it would push the
+    inconsistency downstream to where it is unreadable.
+
+    Args:
+        behavior: ``[num_seqs, cap]`` tensor from :func:`build_behavior_logprobs`.
+        width: the trainer's actual response width (``responses.shape[1]``).
+
+    Returns:
+        ``behavior`` itself when the widths already agree, else a ``[num_seqs, width]``
+        narrowed view. Trailing columns are dropped: they are :data:`PAD_FILL` sentinels
+        beyond every row's generation, never real logprobs.
+
+    Raises:
+        ValueError: if ``width`` exceeds the tensor's width, which no correct caller can
+            produce -- the trainer cannot generate past its own cap.
+    """
+    cap = behavior.shape[1]
+    if width == cap:
+        return behavior
+    if width > cap:
+        raise ValueError(
+            f"trainer response width {width} exceeds the behavior-logprob width {cap}; "
+            f"pi_old would be zero-padded on positions that carry real tokens. This "
+            f"means max_generated_tokens disagrees with the generated batch -- fix the "
+            f"caller rather than padding here"
+        )
+    return behavior[:, :width]
+
+
+def audit_behavior_logprobs(
+    behavior: torch.Tensor,
+    recomputed: torch.Tensor,
+    *,
+    padding_mask: Optional[torch.Tensor] = None,
+) -> dict:
+    """Quantify how far vLLM's sampler logprobs sit from the trainer's own recompute.
+
+    WHY AN AUDIT RATHER THAN A TEST. The CPU equivalence tests pin the *alignment*
+    contract (no shift, correct packing) against synthetic inputs. They cannot speak to
+    numerical agreement, because that depends on things only present on hardware: vLLM
+    runs different kernels, a different TP sharding, and a different batch composition
+    than the trainer's forward. Agreement is therefore an empirical question, and the
+    failure mode is silent -- a systematically-biased ``pi_old`` still yields IS ratios
+    near 1.0, still trains, and still produces a plausible loss curve. Nothing
+    downstream distinguishes "ratios are 1.0 because the policy has not moved" from
+    "ratios are 1.0 because both sides are wrong in the same direction".
+
+    HOW TO READ THE RESULT. ``ratio_p99`` is the number that matters: it is
+    ``exp(|dlogp|)``, the multiplicative error this substitution injects into the
+    importance weight of a typical worst-case token. For scale, the known-acceptable
+    recompute noise between two trainer forwards on a healthy run reached 1.0739, and
+    the unscaled-``raw_logprobs`` bug this feature guards against sits at 4.09x. A p99
+    near the former is the substitution working; anything approaching the latter means
+    the mode flag did not reach the server.
+
+    Args:
+        behavior: ``[num_seqs, C]`` logprobs from the vLLM sampler.
+        recomputed: ``[num_seqs, C]`` logprobs from the trainer's policy forward.
+        padding_mask: optional ``[num_seqs, C]`` bool, True at positions to EXCLUDE.
+            Padded positions carry :data:`PAD_FILL` sentinels in one tensor and real
+            (arbitrary) values in the other, so including them would dominate the
+            statistics with a difference that means nothing.
+
+    Returns:
+        dict with ``n_compared``, ``max_abs``, ``mean_abs``, ``p99_abs``,
+        ``ratio_max``, ``ratio_p99``, and ``bias`` (signed mean, positive when vLLM
+        reports the token as MORE likely than the trainer does -- a bias term is what
+        separates a systematic offset from symmetric kernel noise).
+
+    Raises:
+        ValueError: if the two tensors disagree in shape.
+    """
+    if behavior.shape != recomputed.shape:
+        raise ValueError(
+            f"shape mismatch: behavior {tuple(behavior.shape)} vs recomputed "
+            f"{tuple(recomputed.shape)} -- these must be the same [num_seqs, C] grid"
+        )
+
+    b = behavior.detach().to(torch.float32).flatten()
+    r = recomputed.detach().to(torch.float32).flatten()
+
+    keep = torch.isfinite(b) & torch.isfinite(r)
+    if padding_mask is not None:
+        keep &= ~padding_mask.detach().flatten().bool()
+
+    n = int(keep.sum().item())
+    if n == 0:
+        # Not an error: a fully-padded or fully-fallback batch legitimately has nothing
+        # to compare. Report it as such rather than emitting NaN statistics that would
+        # read as a catastrophic disagreement.
+        return {
+            "n_compared": 0,
+            "max_abs": 0.0,
+            "mean_abs": 0.0,
+            "p99_abs": 0.0,
+            "ratio_max": 1.0,
+            "ratio_p99": 1.0,
+            "bias": 0.0,
+        }
+
+    diff = b[keep] - r[keep]
+    absd = diff.abs()
+    p99 = torch.quantile(absd, 0.99).item() if n >= 100 else absd.max().item()
+
+    return {
+        "n_compared": n,
+        "max_abs": absd.max().item(),
+        "mean_abs": absd.mean().item(),
+        "p99_abs": p99,
+        "ratio_max": float(torch.exp(absd.max()).item()),
+        "ratio_p99": float(torch.exp(torch.tensor(p99)).item()),
+        "bias": diff.mean().item(),
+    }
 
 
 # Sentinel row prepended to the broadcast payload. Row 0 column 0 carries 1.0 when the

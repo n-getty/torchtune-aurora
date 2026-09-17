@@ -68,6 +68,33 @@ _FLASH_SUPPORTED_HEAD_DIMS = (64, 96, 128, 192)
 _fused_unavailable_logged = False
 
 
+def is_bshd(t: torch.Tensor) -> bool:
+    """Whether ``t`` (logical ``[B, H, S, D]``) is stored BSHD, i.e. ``[B, S, H, D]``.
+
+    A hard precondition of the Aurora fused flash kernel, and the one that is easiest to
+    lose: ``expand``/``repeat_interleave``/``permute``/``reshape`` and even
+    ``.contiguous()`` on an expanded view all produce BHSD-contiguous output, which the
+    kernel rejects. It says so only as a stderr ``UserWarning``
+    (``FlashAttentionXPU requires query, key, and value to be in BSHD layout``); the
+    exception that reaches Python is the causeless ``No available kernel``. Cost three
+    HW runs of the gate #3b probe to localize. See
+    memory/feedback_replay_must_copy_the_helper_not_just_the_call_20260916.md.
+    """
+    return t.transpose(1, 2).is_contiguous()
+
+
+def to_bshd(t: torch.Tensor) -> torch.Tensor:
+    """Re-lay ``t`` into BSHD memory, a no-op when it already is.
+
+    Mirrors ``torchtune/dev/bioreason/model.py::_to_bshd_memory``, which production's
+    flash wrapper applies to q/k/v *after* its GQA KV repeat -- the step whose omission
+    caused the probe failures above.
+    """
+    if t.transpose(1, 2).is_contiguous():
+        return t
+    return t.transpose(1, 2).contiguous().transpose(1, 2)
+
+
 def fused_split_supported(q: torch.Tensor) -> tuple[bool, str]:
     """Whether the fused flash path can serve this tensor.
 
@@ -266,7 +293,91 @@ def split_prefix_attention(
                 _fused_unavailable_logged = True
         return _reference_split_attention(q, k_prefix, v_prefix, k_resp, v_resp, scale)
 
+    # Re-lay-out to BSHD before the fused call. Callers reach this function through
+    # expand/reshape/permute plumbing (the prefix broadcast, the GQA head fold), every
+    # step of which produces BHSD-contiguous output that the kernel rejects. Doing it
+    # here rather than at each call site means a new caller cannot reintroduce the bug,
+    # and to_bshd is a no-op when the tensor is already correct so it costs nothing on
+    # the path that was already right. See is_bshd for why this is not optional.
+    q = to_bshd(q)
+    k_prefix, v_prefix = to_bshd(k_prefix), to_bshd(v_prefix)
+    k_resp, v_resp = to_bshd(k_resp), to_bshd(v_resp)
+
     return _SplitPrefixAttention.apply(q, k_prefix, v_prefix, k_resp, v_resp, scale)
+
+
+def fold_groups_into_heads(q_rows: torch.Tensor, group_size: int) -> torch.Tensor:
+    """Fold the rollout group ``G`` out of the batch axis and into the query-head axis.
+
+    Turns ``[B*G, H, R, D]`` into ``[B, H*G, R, D]`` so the prefix KV can stay at ``B``
+    rows and be consumed by native GQA (``enable_gqa=True``) instead of being
+    materialized ``G`` times. At BioReason's production shape that is the difference
+    between 8.0 MiB and 64.0 MiB of prefix KV per layer (HW-measured, job 8830340).
+
+    **The head order is load-bearing and must be ``h*G + g``, not ``g*H + h``.** GQA maps
+    query head ``i`` to KV head ``i // (n_q_total // n_kv)``; with ``h*G + g`` every
+    continuation ``g`` of query head ``h`` lands in the same KV group as ``h`` did
+    before the fold, so group ``g`` of prompt ``b`` reads prompt ``b``'s prefix. The
+    natural ``reshape`` of a ``[B, G, H, ...]`` layout gives ``g*H + h`` instead, which
+    routes every rollout to *another rollout's prompt*: HW-measured wrong by
+    ``rel=8.5e-01`` -- yet finite, so it trains to garbage rather than crashing. A
+    permute between the two reshapes is what fixes it, and it is a real copy
+    (~604 MiB/layer at production shape, transient, freed per layer) -- ~8x cheaper than
+    the ~34 GiB of duplicated prefix KV it avoids.
+
+    Args:
+        q_rows (torch.Tensor): per-rollout queries, ``[B*G, H, R, D]``, group-contiguous
+            (the ``G`` continuations of prompt ``b`` occupy rows ``[b*G, (b+1)*G)``).
+        group_size (int): ``G``, continuations per prompt.
+
+    Returns:
+        torch.Tensor: ``[B, H*G, R, D]``, query head ``h*G + g``.
+
+    Raises:
+        ValueError: if the leading dimension is not divisible by ``group_size``.
+    """
+    bg, h, r, d = q_rows.shape
+    if bg % group_size:
+        raise ValueError(
+            f"leading dim {bg} is not divisible by group_size {group_size}; "
+            "the fold assumes group-contiguous rollout layout"
+        )
+    b = bg // group_size
+    # reshape, not view: q_rows is BSHD-strided on the fused path, so the B and G axes
+    # are not adjacent in memory and view() raises. See
+    # memory/feedback_probe_gates_need_independent_exception_boundaries_20260916.md.
+    return (
+        q_rows.reshape(b, group_size, h, r, d)
+        .permute(0, 2, 1, 3, 4)  # (b, g, h, ...) -> (b, h, g, ...) == head h*G + g
+        .reshape(b, h * group_size, r, d)
+    )
+
+
+def unfold_heads_into_groups(out: torch.Tensor, group_size: int) -> torch.Tensor:
+    """Inverse of :func:`fold_groups_into_heads`: ``[B, H*G, R, D]`` -> ``[B*G, H, R, D]``.
+
+    Args:
+        out (torch.Tensor): folded attention output, ``[B, H*G, R, D]``.
+        group_size (int): ``G``, the same value passed to the fold.
+
+    Returns:
+        torch.Tensor: ``[B*G, H, R, D]``, group-contiguous.
+
+    Raises:
+        ValueError: if the head dimension is not divisible by ``group_size``.
+    """
+    b, hg, r, d = out.shape
+    if hg % group_size:
+        raise ValueError(
+            f"head dim {hg} is not divisible by group_size {group_size}; "
+            "this tensor did not come from fold_groups_into_heads"
+        )
+    h = hg // group_size
+    return (
+        out.reshape(b, h, group_size, r, d)
+        .permute(0, 2, 1, 3, 4)
+        .reshape(b * group_size, h, r, d)
+    )
 
 
 def broadcast_prefix_kv(kv: torch.Tensor, group_size: int) -> torch.Tensor:
@@ -278,6 +389,11 @@ def broadcast_prefix_kv(kv: torch.Tensor, group_size: int) -> torch.Tensor:
     Note the result is materialized: ``reshape`` on an expanded tensor copies, because
     the fused kernel needs real strides. The saving is that the prefix was *computed*
     once, not that it occupies one row of memory.
+
+    **Prefer :func:`fold_groups_into_heads`** on the fused path: folding ``G`` into the
+    query heads lets the prefix KV stay at ``B`` rows entirely (8.0 MiB vs 64.0 MiB at
+    G=8, HW-measured). This function remains for the reference path and for callers that
+    genuinely need ``B*G`` KV rows.
 
     Args:
         kv (torch.Tensor): prefix keys or values, ``[B, H, P, D]``.

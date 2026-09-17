@@ -73,8 +73,8 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 )
 from torch.utils.checkpoint import checkpoint as _torch_checkpoint
 from torchtune import modules, utils
-from torchtune.training import device_empty_cache as _orig_device_empty_cache
 from torchtune.dev.rl.types import GRPOTrajectory
+from torchtune.training import device_empty_cache as _orig_device_empty_cache
 
 log = utils.get_logger("DEBUG")
 
@@ -105,6 +105,7 @@ _DP_SHARD_DEGREE = 1  # dp_shard world size
 # reduce_grads=False means FSDP2 never fires it) and for flat single-node FSDP1
 # (no inter-node PG at all).
 _FSDP1_HSDP_INTER_NODE_GLOO = False
+_FSDP1_HSDP_CPU_POSTDIVIDE = 1.0
 
 # Iter2 opt-in: route _ep_release_fsdp_unsharded_grads's per-param all_reduce
 # through native XCCL on the XPU dp_shard PG instead of the gloo CPU-bounce
@@ -396,7 +397,9 @@ def _xpu_all_reduce_inter_node_gloo(tensor, op=None, group=None, async_op=False)
         if _n is not None and _n == _DP_REP_DEGREE and _DP_REP_DEGREE > 1:
             tensor_cpu = tensor.contiguous().to("cpu")
             _orig_all_reduce(tensor_cpu, op=op, group=_GLOO_DP_REP_PG)
-            tensor.copy_(tensor_cpu.to(tensor.device))
+            if _FSDP1_HSDP_CPU_POSTDIVIDE != 1.0:
+                tensor_cpu.div_(_FSDP1_HSDP_CPU_POSTDIVIDE)
+            tensor.copy_(tensor_cpu)
             if async_op:
                 return _DoneWork()
             return
@@ -415,6 +418,14 @@ def enable_fsdp1_hsdp_inter_node_gloo() -> None:
         "grad reduction (dp_rep_degree=%d) to avoid XCCL/RDMA CXI MR leak",
         _DP_REP_DEGREE,
     )
+
+
+def set_fsdp1_hsdp_cpu_postdivide(divisor: float) -> None:
+    """Apply HSDP's final gradient averaging on the CPU bounce buffer."""
+    if divisor <= 0:
+        raise ValueError(f"CPU postdivide must be positive, got {divisor}")
+    global _FSDP1_HSDP_CPU_POSTDIVIDE
+    _FSDP1_HSDP_CPU_POSTDIVIDE = float(divisor)
 
 
 # ---------------------------------------------------------------------------
@@ -905,7 +916,9 @@ def _ep_release_fsdp_unsharded_grads_streaming(
 
             sharded_param = fsdp_param.sharded_param
             target_size = fsdp_param.sharded_size
-            current = local_chunk.size(shard_dim) if local_chunk.dim() > shard_dim else 0
+            current = (
+                local_chunk.size(shard_dim) if local_chunk.dim() > shard_dim else 0
+            )
             target = target_size[shard_dim] if len(target_size) > shard_dim else 0
             if current < target:
                 pad_shape = list(local_chunk.shape)
@@ -931,7 +944,9 @@ def _ep_release_fsdp_unsharded_grads_streaming(
             else:
                 existing = sharded_param.grad
                 existing_local = (
-                    existing._local_tensor if hasattr(existing, "_local_tensor") else existing
+                    existing._local_tensor
+                    if hasattr(existing, "_local_tensor")
+                    else existing
                 )
                 existing_local.add_(local_shard)
 
@@ -1208,9 +1223,7 @@ def _ep_release_fsdp_unsharded_grads(
             if _EP_GRAD_RELEASE_LEGACY:
                 for i in idxs:
                     grad = entries[i]["grad_for_reduce"]
-                    _orig_all_reduce(
-                        grad, op=torch.distributed.ReduceOp.SUM, group=pg
-                    )
+                    _orig_all_reduce(grad, op=torch.distributed.ReduceOp.SUM, group=pg)
                     grad.div_(entries[i]["degree"])
             else:
                 tensors = [entries[i]["grad_for_reduce"] for i in idxs]

@@ -24,14 +24,24 @@ converts this into the flat ``Qwen3_5ForCausalLM`` state-dict layout
 from __future__ import annotations
 
 import json
-import logging
 import os
+from contextlib import nullcontext
 from typing import Optional
 
 import torch
 import torch.nn as nn
 
-logger = logging.getLogger(__name__)
+from torchtune import utils
+
+# NOTE: a bare logging.getLogger(__name__) here never attaches a handler (unlike
+# torchtune's utils.get_logger(), which does) — engagement-confirmation lines
+# (xpu_flash=/TORCHTUNE_USE_FLA_GDN patch) were silently dropped from every real
+# training log despite log_level: INFO being set (confirmed via log grep, job
+# 8797724, 2026-09-02). utils.get_logger() always returns the same underlying
+# torchtune.utils._logging logger regardless of caller module (see its own
+# logging.getLogger(__name__) using ITS OWN __name__) — this is the same shared
+# logger torchtune.dev.rl.weight_sync uses, not a per-module logger.
+logger = utils.get_logger()
 
 # Shared with model_native.py's qwen3_5_27b_hf + enable_lora branch (construction)
 # and sft_bioreason_distributed_xpu.py's eval-checkpoint save (LoRA merge) — a single
@@ -44,6 +54,117 @@ HF_QWEN35_LORA_TARGET_MODULES = [
     "gate_proj", "up_proj", "down_proj",
     "in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj",
 ]
+
+_fla_patch_applied = False
+
+# Opt-in native SYCL-TLA flash-attention path for this backbone's full-attention
+# layers (Qwen3_5Attention, 1-in-4 layers per full_attention_interval). Reuses
+# the SAME env var as torchtune-native attention_utils.py's TORCHTUNE_USE_XPU_FLASH
+# (this is the identical vendor kernel, libtorch-xpu-ops-sycltla-mha_{fwd,bwd}.so,
+# reached through a different call site): Qwen3_5Attention.forward -> HF's own
+# `sdpa_attention_forward` -> torch.nn.functional.scaled_dot_product_attention.
+# HFQwen35Backbone.forward always passes attention_mask=None (no packing support,
+# see the class docstring), so transformers' create_causal_mask/_ignore_causal_mask_sdpa
+# already relies on SDPA's own is_causal=True argument rather than a materialized
+# mask -- exactly the precondition the forcing trick below needs; no new masking
+# logic required, just forcing the backend auto-dispatch would otherwise skip (see
+# attention_utils.py's GATE 0 comment: XPU auto-dispatch never selects flash even
+# when viable).
+#
+# HEAD_DIM GUARD (HW-confirmed 2026-09-02, job 8797724): CLAUDE.md's
+# TORCHTUNE_USE_XPU_FLASH table entry claims head_dim {64,96,128,192,256} are all
+# supported by the vendor kernel -- but that claim was validated on Qwen3-32B, whose
+# own head_dim is 128, and was never actually exercised at 256. This backbone's real
+# head_dim IS 256 (Qwen3.8-27B config.json: hidden_size=5120, num_attention_heads=24
+# -> head_dim computed independently as 256, not hidden_size/heads). Direct HW probe
+# (both frameworks/2025.3.1's torch 2.10.0a0 AND torch211_venv's torch 2.11.0+xpu,
+# with proper BSHD memory coercion, any batch/head/seqlen/GQA combination) confirms
+# `sdpa_kernel([FLASH_ATTENTION])` raises `RuntimeError: No available kernel` for
+# head_dim=256 categorically -- head_dim 64/96/128/192 all work fine on the same
+# hardware. This is a genuine kernel-support gap for this backbone's actual shape,
+# not a wiring bug. Rather than crash real training (as an unguarded force would),
+# skip forcing FLASH when head_dim isn't in the confirmed-working set and fall back
+# to the framework's own auto-dispatch (math/whatever it picks) -- same posture as
+# torchtune-native attention_utils.py takes when its own preconditions aren't met.
+_XPU_FLASH_SUPPORTED_HEAD_DIMS = frozenset((64, 96, 128, 192))
+_USE_XPU_FLASH = os.environ.get("TORCHTUNE_USE_XPU_FLASH", "0") == "1"
+_xpu_flash_sdpa_kernel = None
+_xpu_flash_backend = None
+if _USE_XPU_FLASH:
+    try:
+        from torch.nn.attention import SDPBackend as _xpu_flash_SDPBackend
+        from torch.nn.attention import sdpa_kernel as _xpu_flash_sdpa_kernel
+
+        _xpu_flash_backend = _xpu_flash_SDPBackend.FLASH_ATTENTION
+    except ImportError:
+        _USE_XPU_FLASH = False
+
+_xpu_flash_log_done = False
+
+
+def _log_xpu_flash_status_once(device_type: str, head_dim: int) -> None:
+    global _xpu_flash_log_done
+    if _xpu_flash_log_done:
+        return
+    _xpu_flash_log_done = True
+    if not _USE_XPU_FLASH:
+        logger.info("hf_qwen35 xpu_flash=disabled (TORCHTUNE_USE_XPU_FLASH unset)")
+    elif _xpu_flash_sdpa_kernel is None:
+        logger.info("hf_qwen35 xpu_flash=disabled (sdpa_kernel import failed)")
+    elif device_type != "xpu":
+        logger.info("hf_qwen35 xpu_flash=requested-but-skipped (device=%s)", device_type)
+    elif head_dim not in _XPU_FLASH_SUPPORTED_HEAD_DIMS:
+        logger.info(
+            "hf_qwen35 xpu_flash=requested-but-skipped (head_dim=%d not in "
+            "HW-confirmed supported set %s; see head_dim guard comment)",
+            head_dim, sorted(_XPU_FLASH_SUPPORTED_HEAD_DIMS),
+        )
+    else:
+        logger.info("hf_qwen35 xpu_flash=engaged")
+
+
+def _maybe_patch_fla_gated_delta_rule() -> None:
+    """Route ``Qwen3_5GatedDeltaNet``'s training-path recurrence through the
+    upstream ``fla`` (flash-linear-attention) Triton kernel on XPU, gated by
+    ``TORCHTUNE_USE_FLA_GDN=1`` (default OFF).
+
+    ``transformers``' own ``is_flash_linear_attention_available()`` (see
+    ``transformers/utils/import_utils.py``) hard-codes
+    ``torch.cuda.is_available()`` — it returns False on XPU-only hardware even
+    when ``fla`` is correctly installed and importable, so
+    ``modeling_qwen3_5.py`` module-level import always falls through to
+    ``chunk_gated_delta_rule = None`` / ``fused_recurrent_gated_delta_rule = None``
+    on this stack, and every ``Qwen3_5GatedDeltaNet`` silently trains on the
+    pure-PyTorch ``torch_chunk_gated_delta_rule`` fallback.
+
+    This patches the two names directly on the ``modeling_qwen3_5`` module
+    namespace, bypassing the broken gate rather than monkeypatching
+    ``is_flash_linear_attention_available()`` itself (smaller blast radius: it
+    only affects this one model file's already-resolved globals, not every
+    other model in this ``transformers`` install that consults the same gate).
+    Must run BEFORE ``Qwen3_5GatedDeltaNet.__init__`` executes —
+    ``modeling_qwen3_5.py:409-410`` reads these names as module globals and
+    captures them as per-instance attributes (``self.chunk_gated_delta_rule = ...``)
+    at construction time; patching after a model is already built has no effect
+    on that instance. PVC correctness has NOT been established for this kernel
+    (validated upstream only on Battlemage/Xe2 client GPUs, not Ponte
+    Vecchio/Xe-HPC) — do not flip the default without a passing Phase-1
+    numeric-parity gate on real Aurora hardware.
+    """
+    global _fla_patch_applied
+    if _fla_patch_applied or not bool(int(os.environ.get("TORCHTUNE_USE_FLA_GDN", "0"))):
+        return
+    import fla.ops.gated_delta_rule as _fla_gdr
+    import transformers.models.qwen3_5.modeling_qwen3_5 as _mq35
+
+    _mq35.chunk_gated_delta_rule = _fla_gdr.chunk_gated_delta_rule
+    _mq35.fused_recurrent_gated_delta_rule = _fla_gdr.fused_recurrent_gated_delta_rule
+    logger.info(
+        "TORCHTUNE_USE_FLA_GDN=1: patched modeling_qwen3_5.{chunk_gated_delta_rule,"
+        "fused_recurrent_gated_delta_rule} with the fla Triton kernels "
+        "(bypassing is_flash_linear_attention_available()'s CUDA-only gate)."
+    )
+    _fla_patch_applied = True
 
 
 class HFQwen35Backbone(nn.Module):
@@ -84,6 +205,8 @@ class HFQwen35Backbone(nn.Module):
         text_config = dict(full_config["text_config"])
         text_config["use_cache"] = False
         config = Qwen3_5TextConfig(**text_config)
+
+        _maybe_patch_fla_gated_delta_rule()
 
         if skip_init_weights:
             # HF's PreTrainedModel.__init__ calls post_init() -> init_weights()
@@ -166,13 +289,27 @@ class HFQwen35Backbone(nn.Module):
                 "single-document batches."
             )
         causal_lm = self._causal_lm
-        hidden_states = causal_lm.model(
-            input_ids=tokens if input_embeds is None else None,
-            inputs_embeds=input_embeds,
-            attention_mask=None,
-            position_ids=None,
-            use_cache=False,
-        ).last_hidden_state
+        device_type = (tokens if input_embeds is None else input_embeds).device.type
+        head_dim = self.config.head_dim
+        _log_xpu_flash_status_once(device_type, head_dim)
+        _flash_ctx = (
+            _xpu_flash_sdpa_kernel([_xpu_flash_backend])
+            if (
+                _USE_XPU_FLASH
+                and _xpu_flash_sdpa_kernel is not None
+                and device_type == "xpu"
+                and head_dim in _XPU_FLASH_SUPPORTED_HEAD_DIMS
+            )
+            else nullcontext()
+        )
+        with _flash_ctx:
+            hidden_states = causal_lm.model(
+                input_ids=tokens if input_embeds is None else None,
+                inputs_embeds=input_embeds,
+                attention_mask=None,
+                position_ids=None,
+                use_cache=False,
+            ).last_hidden_state
         if self.skip_output_layer:
             return hidden_states
         return causal_lm.lm_head(hidden_states)

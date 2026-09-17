@@ -72,7 +72,7 @@ def truncate_sequence_at_first_stop_token(
         >>>     ]
         >>> )
     """
-    eos_mask = torch.isin(sequences, stop_tokens)
+    eos_mask = (sequences.unsqueeze(-1) == stop_tokens.flatten()).any(dim=-1)
     seq_lens = torch.cumsum(eos_mask, dim=1)
     padding_mask = (seq_lens > 1) | ((seq_lens == 1) & ~eos_mask)
     sequences[padding_mask] = fill_value

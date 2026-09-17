@@ -123,3 +123,62 @@ def test_matches_paper_format_reasoning_prompt():
     # the text block is content[2]["text"] of the user message
     paper_text = chat["prompt"][0]["content"][2]["text"]
     assert ours == paper_text, f"\nOURS:\n{ours}\n\nPAPER:\n{paper_text}"
+
+
+def test_add_uniprot_summary_false_is_unchanged():
+    mod = _load_dataset_module()
+    ds = mod.BioReasonRLDataset.__new__(mod.BioReasonRLDataset)
+    ds.inject_go_pred = True
+    ds.add_uniprot_summary = False
+    row = _sample_row()
+    txt = ds._build_go_pred_prompt_text(row)
+    assert "Summarize in UniProt format" not in txt
+
+
+def test_add_uniprot_summary_true_appends_suffix():
+    """Pins the v8 32B SFT prompt-distribution match (sft_bioreason_qwen3_32B_lora_r128_
+    lrsched_v8_xpu.yaml trains with add_uniprot_summary=True) -- any 32B GRPO run resuming
+    from that checkpoint must inject the identical suffix or RL trains off-distribution
+    from the policy it's meant to refine (same failure class as
+    memory/project_bioreason_eval_fixed_rl_flat_vs_sft_20260626)."""
+    mod = _load_dataset_module()
+    ds = mod.BioReasonRLDataset.__new__(mod.BioReasonRLDataset)
+    ds.inject_go_pred = True
+    ds.add_uniprot_summary = True
+    row = _sample_row()
+    txt = ds._build_go_pred_prompt_text(row)
+    assert txt.endswith("Summarize in UniProt format.")
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("bioreason2") is None
+    and not os.environ.get("BIOREASON_SRC"),
+    reason="bioreason2 not importable (needs BIOREASON_SRC on Aurora)",
+)
+def test_add_uniprot_summary_matches_paper_format_reasoning_prompt():
+    """Byte-equality vs the paper's own formatter with add_uniprot_summary=True."""
+    src = os.environ.get("BIOREASON_SRC", "/lus/flare/projects/ModCon/ngetty/BioReason-Pro")
+    if src not in sys.path:
+        sys.path.insert(0, src)
+    try:
+        from bioreason2.dataset.cafa5.load import _format_reasoning_prompt
+        from bioreason2.dataset.cafa5.format import format_cafa5_for_protein_llm
+    except Exception as e:  # pragma: no cover
+        pytest.skip(f"bioreason2 import failed: {e}")
+
+    mod = _load_dataset_module()
+    ds = mod.BioReasonRLDataset.__new__(mod.BioReasonRLDataset)
+    ds.inject_go_pred = True
+    ds.add_uniprot_summary = True
+    row = _sample_row()
+
+    ours = ds._build_go_pred_prompt_text(row)
+
+    fr = _format_reasoning_prompt(
+        dict(row), go_gpt_predictions_column="go_pred",
+        interpro_in_prompt=True, ppi_in_prompt=True,
+        add_uniprot_summary=True,
+    )
+    chat = format_cafa5_for_protein_llm({**row, "prompt": fr["prompt"]})
+    paper_text = chat["prompt"][0]["content"][2]["text"]
+    assert ours == paper_text, f"\nOURS:\n{ours}\n\nPAPER:\n{paper_text}"

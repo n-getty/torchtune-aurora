@@ -366,3 +366,103 @@ def test_have_flag_cannot_collide_with_a_real_logprob():
         "the have-flag must occupy its own row; packing it into a data row would make "
         "a real logprob of exactly 1.0 indistinguishable from the flag"
     )
+
+
+# ------------------------------------------------- width: cap vs actual (HW crash)
+
+def test_fit_narrows_cap_width_to_actual_response_width():
+    """The builder pads to the CAP; the trainer's tensors are at the ACTUAL width.
+
+    HW provenance: job 8833972. `build_behavior_logprobs` returns
+    [num_seqs, max_generated_tokens]; the recipe's `responses` is the batch's longest
+    generation, which equals the cap only when some row ran to the limit. Steps 0 and 1
+    both had such a row (3072) and ran clean; step 2's longest was 1743 and the run died
+    in `logprobs.masked_fill_(response_padding_masks, 1.0)`:
+
+        RuntimeError: The expanded size of the tensor (3072) must match the existing
+        size (1743) at non-singleton dimension 1.
+    """
+    from torchtune.dev.rl.behavior_logprobs import fit_behavior_logprobs_width
+
+    blp = build_behavior_logprobs([[-0.1, -0.2]], [[7, 8]], 1, 3072)
+    assert blp.shape == (1, 3072)
+    fitted = fit_behavior_logprobs_width(blp, 1743)
+    assert fitted.shape == (1, 1743)
+    # the real values survive the narrowing -- this must not silently zero pi_old
+    assert math.isclose(fitted[0, 0].item(), -0.1, rel_tol=1e-6)
+    assert math.isclose(fitted[0, 1].item(), -0.2, rel_tol=1e-6)
+
+
+def test_fit_is_identity_when_widths_already_agree():
+    """Steps 0-1 of the crashing job took this branch; it must stay a no-op."""
+    from torchtune.dev.rl.behavior_logprobs import fit_behavior_logprobs_width
+
+    blp = build_behavior_logprobs([[-0.1, -0.2]], [[7, 8]], 1, 4)
+    assert fit_behavior_logprobs_width(blp, 4) is blp
+
+
+def test_fit_refuses_to_widen_past_the_cap():
+    """Padding up would fabricate pi_old for positions holding real tokens.
+
+    A caller asking for more than the cap has a broken max_generated_tokens; quietly
+    zero-filling would push an unreadable inconsistency into the loss instead of
+    failing where the disagreement actually is.
+    """
+    from torchtune.dev.rl.behavior_logprobs import fit_behavior_logprobs_width
+
+    blp = build_behavior_logprobs([[-0.1, -0.2]], [[7, 8]], 1, 4)
+    with pytest.raises(ValueError, match="exceeds the behavior-logprob width"):
+        fit_behavior_logprobs_width(blp, 5)
+
+
+def test_narrowed_tensor_survives_the_masked_fill_that_crashed():
+    """Reproduce the exact failing operation, pre- and post-fix.
+
+    The negative half matters more than the positive half: without it this test would
+    pass against a no-op implementation of the fitter.
+    """
+    from torchtune.dev.rl.behavior_logprobs import fit_behavior_logprobs_width
+
+    cap, actual, n = 3072, 1743, 4
+    blp = build_behavior_logprobs([[-0.1] * 10] * n, [[7] * 10] * n, n, cap)
+    pad = torch.zeros(n, actual, dtype=torch.bool)
+    pad[:, 900:] = True
+
+    with pytest.raises(RuntimeError):  # what production actually hit
+        blp.clone().masked_fill_(pad, 1.0)
+
+    fit_behavior_logprobs_width(blp, actual).clone().masked_fill_(pad, 1.0)
+
+
+def test_recipe_fits_width_on_the_substitution_path():
+    """AST guard: the substitution branch must not assign _behavior_logprobs raw.
+
+    The bug survived the audit because TORCHTUNE_BLP_AUDIT forces the recompute branch
+    -- disabling the shortcut in order to measure it also disabled its plumbing. So the
+    audited steps could never reach this line, and no CPU test covered it either. Pin
+    the call site, not just the helper.
+    """
+    import ast
+    import pathlib
+
+    src = pathlib.Path("recipes/dev/grpo_bioreason_distributed_xpu.py").read_text()
+    tree = ast.parse(src)
+
+    assigns = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(t, ast.Name) and t.id == "logprobs" for t in node.targets
+        )
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "_behavior_logprobs"
+    ]
+    assert not assigns, (
+        "the substitution path assigns _behavior_logprobs to logprobs without fitting "
+        "its width; that is the job-8833972 crash. Wrap it in "
+        "fit_behavior_logprobs_width(..., responses.shape[1])"
+    )
+    assert "fit_behavior_logprobs_width" in src, (
+        "recipe no longer fits the behavior-logprob width anywhere"
+    )
